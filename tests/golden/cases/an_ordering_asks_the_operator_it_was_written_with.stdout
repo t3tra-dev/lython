@@ -1,0 +1,33 @@
+False False False False True
+True True
+False
+'<=' not supported between instances of 'L' and 'L'
+B.gt
+True
+A.lt
+True
+A.lt
+True
+[G(1), G(2), G(3)]
+'<' not supported between instances of 'NoneType' and 'int'
+'>=' not supported between instances of 'complex' and 'complex'
+'>' not supported between instances of 'LongNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameName' and 'LongNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameName'
+'<=' not supported between instances of 'int' and 'str'
+'<' not supported between instances of 'int' and 'str'
+'<' not supported between instances of 'NoneType' and 'int'
+'<' not supported between instances of 'bytes' and 'int'
+True True False False
+False True False True
+False False True True
+True True False False
+False True False True
+False False True True
+True True False False
+False False True True
+False True False True
+True False True
+True True
+'<' not supported between instances of 'str' and 'int'
+'<' not supported between instances of 'int' and 'str'
+'<=' not supported between instances of 'E' and 'E'
+'>' not supported between instances of 'int' and 'str'

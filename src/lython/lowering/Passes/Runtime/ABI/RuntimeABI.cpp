@@ -614,6 +614,97 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassNameHook() {
   return mlir::success();
 }
 
+// The class ids `classOp` strictly derives from: its source bases'
+// transitively, and the manifest class a source base chain ends at.
+llvm::SmallVector<std::int64_t, 8>
+RuntimeBundleLowerer::classAncestorIds(py::ClassOp classOp) const {
+  llvm::SmallDenseSet<std::int64_t, 8> ancestors;
+  llvm::SmallVector<py::ClassOp, 8> worklist{classOp};
+  llvm::SmallPtrSet<mlir::Operation *, 8> visited;
+  while (!worklist.empty()) {
+    py::ClassOp current = worklist.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    auto bases = current->getAttrOfType<mlir::ArrayAttr>("base_names");
+    if (!bases)
+      continue;
+    for (mlir::Attribute attr : bases) {
+      auto name = mlir::dyn_cast<mlir::StringAttr>(attr);
+      if (!name)
+        continue;
+      py::ClassOp base = RuntimeBundleLowerer::classForContract(
+          runtimeContractType(classOp->getContext(), name.getValue()));
+      if (base && base != current) {
+        if (std::optional<std::int64_t> baseId =
+                RuntimeBundleLowerer::runtimeClassIdForClass(base))
+          ancestors.insert(*baseId);
+        worklist.push_back(base);
+        continue;
+      }
+      std::optional<std::int64_t> manifestId =
+          manifest.classId(name.getValue());
+      if (!manifestId)
+        manifestId = manifest.classId(("builtins." + name.getValue()).str());
+      if (manifestId)
+        ancestors.insert(*manifestId);
+    }
+  }
+  return llvm::SmallVector<std::int64_t, 8>(ancestors.begin(), ancestors.end());
+}
+
+// ⭐ WHICH CLASS IDS STRICTLY DERIVE FROM WHICH, for the one question the
+// ordering dispatch asks of two boxes: do_richcompare tries the RIGHT operand's
+// reflected method first when its class is a strict subclass of the left's, so
+// a subclass's override decides `base < sub` as it decides `sub > base`.
+// A source class's ancestors are its bases' transitively; a manifest base
+// ends the walk, since no manifest class below `object` derives from another
+// in a way an ordering can tell (bool orders as int on the numeric path).
+mlir::LogicalResult RuntimeBundleLowerer::synthesizeClassDerivesHook() {
+  constexpr llvm::StringLiteral kHook = "__ly_class_derives_strictly";
+  auto existing = module.lookupSymbol<mlir::func::FuncOp>(kHook);
+  if (!existing || !existing.isExternal())
+    return mlir::success();
+  existing.erase();
+  llvm::SmallVector<std::pair<std::int64_t, std::int64_t>, 16> pairs;
+  module.walk([&](py::ClassOp classOp) {
+    std::optional<std::int64_t> subId =
+        RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
+    if (!subId)
+      return;
+    for (std::int64_t ancestor :
+         RuntimeBundleLowerer::classAncestorIds(classOp))
+      if (ancestor != *subId)
+        pairs.emplace_back(*subId, ancestor);
+  });
+
+  mlir::OpBuilder builder(context);
+  builder.setInsertionPointToEnd(module.getBody());
+  mlir::Location loc = module.getLoc();
+  mlir::Type i64 = builder.getI64Type();
+  mlir::Type i1 = builder.getI1Type();
+  auto fn = mlir::func::FuncOp::create(
+      builder, loc, kHook, builder.getFunctionType({i64, i64}, {i1}));
+  fn.setPrivate();
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToStart(entry);
+  mlir::Value sub = entry->getArgument(0);
+  mlir::Value base = entry->getArgument(1);
+  mlir::Value result = mlir::arith::ConstantIntOp::create(builder, loc, 0, 1);
+  for (auto [subId, baseId] : pairs) {
+    auto equals = [&](mlir::Value value, std::int64_t id) {
+      return mlir::arith::CmpIOp::create(
+          builder, loc, mlir::arith::CmpIPredicate::eq, value,
+          mlir::arith::ConstantIntOp::create(builder, loc, id, 64));
+    };
+    mlir::Value both = mlir::arith::AndIOp::create(
+        builder, loc, equals(sub, subId), equals(base, baseId));
+    result = mlir::arith::OrIOp::create(builder, loc, result, both);
+  }
+  mlir::func::ReturnOp::create(builder, loc, mlir::ValueRange{result});
+  return mlir::success();
+}
+
 std::optional<std::int64_t>
 RuntimeBundleLowerer::runtimeClassIdForClass(py::ClassOp classOp) const {
   if (!classOp)
@@ -3037,15 +3128,45 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
     });
   }
 
-  // Every entry that resolves the same implementation shares a layout, so each
-  // one accepts the others on the right. A manifest entry has no symbol here
-  // and keeps its own id alone.
+  // ⭐ A source entry accepts on the right every class that derives from the
+  // class its OTHER parameter declares: those boxes carry that class's lanes,
+  // which is what the callee reads. A manifest entry keeps its own id alone.
+  //
+  // ⛔ Not "every entry resolving the same implementation", which stood here
+  // and is the same set only while the parameter names the declaring class.
+  // A subclass's reflected override -- `class B(A): def __gt__(self, other:
+  // A)` -- was refused an A on the right, so `[A(1)] < [B(2)]` answered from
+  // `A.__lt__` where CPython asks `B.__gt__` first.
+  llvm::SmallVector<std::pair<std::int64_t, llvm::SmallVector<std::int64_t, 8>>,
+                    16>
+      sourceAncestry;
+  module.walk([&](py::ClassOp classOp) {
+    if (std::optional<std::int64_t> id =
+            RuntimeBundleLowerer::runtimeClassIdForClass(classOp))
+      sourceAncestry.push_back(
+          {*id, RuntimeBundleLowerer::classAncestorIds(classOp)});
+  });
   for (HookEntry &hookEntry : entries) {
     if (hookEntry.calleeSymbol.empty())
       continue;
-    for (const HookEntry &other : entries)
-      if (other.calleeSymbol == hookEntry.calleeSymbol)
-        hookEntry.acceptedRightIds.push_back(other.classId);
+    std::optional<std::int64_t> declaredOther;
+    if (auto attr =
+            hookEntry.callee->getAttrOfType<mlir::TypeAttr>("callable_type"))
+      if (auto callable = mlir::dyn_cast<py::CallableType>(attr.getValue()))
+        if (callable.getPositionalTypes().size() == 2)
+          if (py::ClassOp declared = RuntimeBundleLowerer::classForContract(
+                  callable.getPositionalTypes()[1]))
+            declaredOther =
+                RuntimeBundleLowerer::runtimeClassIdForClass(declared);
+    if (!declaredOther) {
+      for (const HookEntry &other : entries)
+        if (other.calleeSymbol == hookEntry.calleeSymbol)
+          hookEntry.acceptedRightIds.push_back(other.classId);
+      continue;
+    }
+    for (const auto &[id, ancestors] : sourceAncestry)
+      if (id == *declaredOther || llvm::is_contained(ancestors, *declaredOther))
+        hookEntry.acceptedRightIds.push_back(id);
   }
 
   mlir::OpBuilder builder(context);
@@ -3199,6 +3320,19 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedLtHook() {
   mlir::Type i1 = mlir::IntegerType::get(context, 1);
   return generateBoxedBinaryMethodHookFor("__ly_lt_boxed_by_contract",
                                           "__lt__", {i1});
+}
+
+// The other three orderings, which `__ly_box_order` asks for the operator a
+// sequence comparison was written with (and the reflected one after it).
+mlir::LogicalResult RuntimeBundleLowerer::generateBoxedOrderingHooks() {
+  mlir::Type i1 = mlir::IntegerType::get(context, 1);
+  for (auto [hook, method] : {std::pair<llvm::StringRef, llvm::StringRef>{
+                                  "__ly_le_boxed_by_contract", "__le__"},
+                              {"__ly_gt_boxed_by_contract", "__gt__"},
+                              {"__ly_ge_boxed_by_contract", "__ge__"}})
+    if (mlir::failed(generateBoxedBinaryMethodHookFor(hook, method, {i1})))
+      return mlir::failure();
+  return mlir::success();
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::generateBoxedEqHook() {

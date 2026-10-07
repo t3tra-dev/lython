@@ -38,7 +38,7 @@ module attributes {
   func.func private @__ly_seq_fill_slice(%dst_items: memref<?xi64>, %count: i64, %start: i64, %step: i64, %src_items: memref<?xi64>)
   func.func private @__ly_seq_repeat_count(%nm: memref<2xi64>, %nd: memref<?xi32>) -> i64
   func.func private @__ly_seq_slice_bounds(%len: i64, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) -> (i64, i64, i64)
-  func.func private @__ly_sequence_compare_lens(%lhs_len: i64, %lhs_items: memref<?xi64>, %rhs_len: i64, %rhs_items: memref<?xi64>) -> i64
+  func.func private @__ly_sequence_compare_op(%lhs_len: i64, %lhs_items: memref<?xi64>, %rhs_len: i64, %rhs_items: memref<?xi64>, %op: i64) -> i1
   func.func private @__ly_sequence_count_lens(%len: i64, %items: memref<?xi64>, %probe: !llvm.ptr) -> i64
   func.func private @__ly_sequence_equal_lens(%lhs_len: i64, %lhs_items: memref<?xi64>, %rhs_len: i64, %rhs_items: memref<?xi64>) -> i1
   func.func private @__ly_sequence_find_lens(%len: i64, %items: memref<?xi64>, %probe: !llvm.ptr) -> i64
@@ -421,14 +421,14 @@ module attributes {
 
   // The six list comparisons read length from handle word 2 and the items
   // array through the handle, then share tuple's element loops.
-  func.func private @__ly_list_compare(%lhs: memref<5xi64>, %rhs: memref<5xi64>) -> i64 {
+  func.func private @__ly_list_compare(%lhs: memref<5xi64>, %rhs: memref<5xi64>, %op: i64) -> i1 {
     %length_slot = arith.constant 2 : index
     %llen = memref.load %lhs[%length_slot] : memref<5xi64>
     %rlen = memref.load %rhs[%length_slot] : memref<5xi64>
     %li = func.call @__ly_list_items(%lhs) : (memref<5xi64>) -> memref<?xi64>
     %ri = func.call @__ly_list_items(%rhs) : (memref<5xi64>) -> memref<?xi64>
-    %cmp = func.call @__ly_sequence_compare_lens(%llen, %li, %rlen, %ri) : (i64, memref<?xi64>, i64, memref<?xi64>) -> i64
-    func.return %cmp : i64
+    %cmp = func.call @__ly_sequence_compare_op(%llen, %li, %rlen, %ri, %op) : (i64, memref<?xi64>, i64, memref<?xi64>, i64) -> i1
+    func.return %cmp : i1
   }
 
   func.func @LyList_EqBool(%lhs: memref<5xi64> {ly.ownership.object_header}, %rhs: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__eq__"} {
@@ -449,31 +449,27 @@ module attributes {
   }
 
   func.func @LyList_LtBool(%lhs: memref<5xi64> {ly.ownership.object_header}, %rhs: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__lt__"} {
-    %zero = arith.constant 0 : i64
-    %cmp = func.call @__ly_list_compare(%lhs, %rhs) : (memref<5xi64>, memref<5xi64>) -> i64
-    %lt = arith.cmpi slt, %cmp, %zero : i64
-    func.return %lt : i1
+    %op = arith.constant 0 : i64
+    %result = func.call @__ly_list_compare(%lhs, %rhs, %op) : (memref<5xi64>, memref<5xi64>, i64) -> i1
+    func.return %result : i1
   }
 
   func.func @LyList_LeBool(%lhs: memref<5xi64> {ly.ownership.object_header}, %rhs: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__le__"} {
-    %one = arith.constant 1 : i64
-    %cmp = func.call @__ly_list_compare(%lhs, %rhs) : (memref<5xi64>, memref<5xi64>) -> i64
-    %le = arith.cmpi slt, %cmp, %one : i64
-    func.return %le : i1
+    %op = arith.constant 1 : i64
+    %result = func.call @__ly_list_compare(%lhs, %rhs, %op) : (memref<5xi64>, memref<5xi64>, i64) -> i1
+    func.return %result : i1
   }
 
   func.func @LyList_GtBool(%lhs: memref<5xi64> {ly.ownership.object_header}, %rhs: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__gt__"} {
-    %zero = arith.constant 0 : i64
-    %cmp = func.call @__ly_list_compare(%lhs, %rhs) : (memref<5xi64>, memref<5xi64>) -> i64
-    %gt = arith.cmpi sgt, %cmp, %zero : i64
-    func.return %gt : i1
+    %op = arith.constant 4 : i64
+    %result = func.call @__ly_list_compare(%lhs, %rhs, %op) : (memref<5xi64>, memref<5xi64>, i64) -> i1
+    func.return %result : i1
   }
 
   func.func @LyList_GeBool(%lhs: memref<5xi64> {ly.ownership.object_header}, %rhs: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__ge__"} {
-    %minus_one = arith.constant -1 : i64
-    %cmp = func.call @__ly_list_compare(%lhs, %rhs) : (memref<5xi64>, memref<5xi64>) -> i64
-    %ge = arith.cmpi sgt, %cmp, %minus_one : i64
-    func.return %ge : i1
+    %op = arith.constant 5 : i64
+    %result = func.call @__ly_list_compare(%lhs, %rhs, %op) : (memref<5xi64>, memref<5xi64>, i64) -> i1
+    func.return %result : i1
   }
 
   func.func @LyList_Copy(%self: memref<5xi64> {ly.ownership.object_header}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "copy", ly.runtime.result_contract = "builtins.list"} {

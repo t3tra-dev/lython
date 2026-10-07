@@ -1386,16 +1386,164 @@ module attributes {
   }
 
   func.func private @__ly_lt_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_id: i64, %rhs_class_id: i64) -> (i1, i1)
+  func.func private @__ly_le_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_id: i64, %rhs_class_id: i64) -> (i1, i1)
+  func.func private @__ly_gt_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_id: i64, %rhs_class_id: i64) -> (i1, i1)
+  func.func private @__ly_ge_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_id: i64, %rhs_class_id: i64) -> (i1, i1)
 
-  // "'<' not supported between operand types"
-  memref.global "private" constant @__ly_cmp_msg_unorderable : memref<39xi8> = dense<[39, 60, 39, 32, 110, 111, 116, 32, 115, 117, 112, 112, 111, 114, 116, 101, 100, 32, 98, 101, 116, 119, 101, 101, 110, 32, 111, 112, 101, 114, 97, 110, 100, 32, 116, 121, 112, 101, 115]>
+  // The four ordering hooks under CPython's op numbers (Py_LT 0, Py_LE 1,
+  // Py_GT 4, Py_GE 5): the method `op` names, called on the LEFT box's class.
+  func.func private @__ly_order_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_id: i64, %rhs_class_id: i64, %op: i64) -> (i1, i1) {
+    %c0 = arith.constant 0 : i64
+    %c1 = arith.constant 1 : i64
+    %c4 = arith.constant 4 : i64
+    %is_lt = arith.cmpi eq, %op, %c0 : i64
+    %r:2 = scf.if %is_lt -> (i1, i1) {
+      %v, %h = func.call @__ly_lt_boxed_by_contract(%lhs, %rhs, %class_id, %rhs_class_id) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
+      scf.yield %v, %h : i1, i1
+    } else {
+      %is_le = arith.cmpi eq, %op, %c1 : i64
+      %r1:2 = scf.if %is_le -> (i1, i1) {
+        %v, %h = func.call @__ly_le_boxed_by_contract(%lhs, %rhs, %class_id, %rhs_class_id) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
+        scf.yield %v, %h : i1, i1
+      } else {
+        %is_gt = arith.cmpi eq, %op, %c4 : i64
+        %r2:2 = scf.if %is_gt -> (i1, i1) {
+          %v, %h = func.call @__ly_gt_boxed_by_contract(%lhs, %rhs, %class_id, %rhs_class_id) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
+          scf.yield %v, %h : i1, i1
+        } else {
+          %v, %h = func.call @__ly_ge_boxed_by_contract(%lhs, %rhs, %class_id, %rhs_class_id) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
+          scf.yield %v, %h : i1, i1
+        }
+        scf.yield %r2#0, %r2#1 : i1, i1
+      }
+      scf.yield %r1#0, %r1#1 : i1, i1
+    }
+    func.return %r#0, %r#1 : i1, i1
+  }
 
-  func.func private @__ly_cmp_raise_unorderable() {
+  // Strict-subclass table over class ids, synthesized per program by the
+  // lowering from the source classes' bases (RuntimeABI.cpp).
+  func.func private @__ly_class_derives_strictly(%sub_class: i64, %base_class: i64) -> i1
+
+  memref.global "private" constant @__ly_cmp_msg_between : memref<38xi8> = dense<[39, 32, 110, 111, 116, 32, 115, 117, 112, 112, 111, 114, 116, 101, 100, 32, 98, 101, 116, 119, 101, 101, 110, 32, 105, 110, 115, 116, 97, 110, 99, 101, 115, 32, 111, 102, 32, 39]>
+  memref.global "private" constant @__ly_cmp_msg_and : memref<7xi8> = dense<[39, 32, 97, 110, 100, 32, 39]>
+
+  // Append `length` bytes of `source` to the message being built at `at`.
+  func.func private @__ly_msg_append(%buffer: memref<?xi8>, %at: index, %source: memref<?xi8>, %length: index) -> index {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    scf.for %i = %c0 to %length step %c1 {
+      %byte = memref.load %source[%i] : memref<?xi8>
+      %slot = arith.addi %at, %i : index
+      memref.store %byte, %buffer[%slot] : memref<?xi8>
+    }
+    %end = arith.addi %at, %length : index
+    func.return %end : index
+  }
+
+  // Append a class's name -- the leaf of the table's qualified entry, at most
+  // 100 bytes as CPython's "%.100s" -- or "object" for an id the program did
+  // not declare (`LyObject_ClassNameFromId`'s rule).
+  func.func private @__ly_msg_append_class_name(%buffer: memref<?xi8>, %at: index, %class_id: i64) -> index {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %cap = arith.constant 256 : index
+    %most = arith.constant 100 : index
+    %zero_i8 = arith.constant 0 : i8
+    %dot = arith.constant 46 : i8
+    %name_ptr = func.call @__ly_source_class_name(%class_id) : (i64) -> !llvm.ptr
+    %null = llvm.mlir.zero : !llvm.ptr
+    %is_null = llvm.icmp "eq" %name_ptr, %null : !llvm.ptr
+    %end = scf.if %is_null -> (index) {
+      %object_static = memref.get_global @__ly_class_name_object : memref<6xi8>
+      %object_name = memref.cast %object_static : memref<6xi8> to memref<?xi8>
+      %c6 = arith.constant 6 : index
+      %e = func.call @__ly_msg_append(%buffer, %at, %object_name, %c6) : (memref<?xi8>, index, memref<?xi8>, index) -> (index)
+      scf.yield %e : index
+    } else {
+      // Where the NUL is and where the last '.' left off.
+      %true = arith.constant true
+      %scan:3 = scf.while (%i = %c0, %go = %true, %start = %c0) : (index, i1, index) -> (index, i1, index) {
+        %in_bounds = arith.cmpi ult, %i, %cap : index
+        %continue = arith.andi %in_bounds, %go : i1
+        scf.condition(%continue) %i, %go, %start : index, i1, index
+      } do {
+      ^bb0(%i: index, %go: i1, %start: index):
+        %i_i64 = arith.index_cast %i : index to i64
+        %slot = llvm.getelementptr %name_ptr[%i_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
+        %byte = llvm.load %slot : !llvm.ptr -> i8
+        %is_nul = arith.cmpi eq, %byte, %zero_i8 : i8
+        %not_nul = arith.xori %is_nul, %true : i1
+        %next = arith.addi %i, %c1 : index
+        %kept = arith.select %is_nul, %i, %next : index
+        %is_dot = arith.cmpi eq, %byte, %dot : i8
+        %next_start = arith.select %is_dot, %next, %start : index
+        scf.yield %kept, %not_nul, %next_start : index, i1, index
+      }
+      %leaf = arith.subi %scan#0, %scan#2 : index
+      %over = arith.cmpi ugt, %leaf, %most : index
+      %count = arith.select %over, %most, %leaf : index
+      scf.for %k = %c0 to %count step %c1 {
+        %from = arith.addi %scan#2, %k : index
+        %from_i64 = arith.index_cast %from : index to i64
+        %slot = llvm.getelementptr %name_ptr[%from_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
+        %byte = llvm.load %slot : !llvm.ptr -> i8
+        %to = arith.addi %at, %k : index
+        memref.store %byte, %buffer[%to] : memref<?xi8>
+      }
+      %e = arith.addi %at, %count : index
+      scf.yield %e : index
+    }
+    func.return %end : index
+  }
+
+  // do_richcompare's refusal, word for word: "'<=' not supported between
+  // instances of 'A' and 'B'". `op` is CPython's: Py_LT 0, Py_LE 1, Py_GT 4,
+  // Py_GE 5.
+  // ⛔ The leaf name where CPython prints `tp_name`, which is dotted for a
+  // C-implemented type outside builtins (`collections.deque`); every builtin
+  // and every source class prints the same either way.
+  func.func private @__ly_cmp_raise_unorderable(%op: i64, %lhs_class: i64, %rhs_class: i64) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c4 = arith.constant 4 : i64
+    %c7 = arith.constant 7 : index
+    %c38 = arith.constant 38 : index
+    %quote = arith.constant 39 : i8
+    %less = arith.constant 60 : i8
+    %greater = arith.constant 62 : i8
+    %equals = arith.constant 61 : i8
+    %one_bit = arith.constant 1 : i64
+    %c0_i64 = arith.constant 0 : i64
+    %buffer_static = memref.alloca() : memref<256xi8>
+    %buffer = memref.cast %buffer_static : memref<256xi8> to memref<?xi8>
+    memref.store %quote, %buffer[%c0] : memref<?xi8>
+    %is_greater = arith.cmpi uge, %op, %c4 : i64
+    %sign = arith.select %is_greater, %greater, %less : i8
+    memref.store %sign, %buffer[%c1] : memref<?xi8>
+    %equal_bit = arith.andi %op, %one_bit : i64
+    %or_equal = arith.cmpi ne, %equal_bit, %c0_i64 : i64
+    %after_op = scf.if %or_equal -> (index) {
+      memref.store %equals, %buffer[%c2] : memref<?xi8>
+      %c3 = arith.constant 3 : index
+      scf.yield %c3 : index
+    } else {
+      scf.yield %c2 : index
+    }
+    %between_static = memref.get_global @__ly_cmp_msg_between : memref<38xi8>
+    %between = memref.cast %between_static : memref<38xi8> to memref<?xi8>
+    %a1 = func.call @__ly_msg_append(%buffer, %after_op, %between, %c38) : (memref<?xi8>, index, memref<?xi8>, index) -> (index)
+    %a2 = func.call @__ly_msg_append_class_name(%buffer, %a1, %lhs_class) : (memref<?xi8>, index, i64) -> (index)
+    %and_static = memref.get_global @__ly_cmp_msg_and : memref<7xi8>
+    %and = memref.cast %and_static : memref<7xi8> to memref<?xi8>
+    %a3 = func.call @__ly_msg_append(%buffer, %a2, %and, %c7) : (memref<?xi8>, index, memref<?xi8>, index) -> (index)
+    %a4 = func.call @__ly_msg_append_class_name(%buffer, %a3, %rhs_class) : (memref<?xi8>, index, i64) -> (index)
+    memref.store %quote, %buffer[%a4] : memref<?xi8>
+    %end = arith.addi %a4, %c1 : index
+    %length = arith.index_cast %end : index to i64
     %type_error = arith.constant 52 : i64
-    %msg_static = memref.get_global @__ly_cmp_msg_unorderable : memref<39xi8>
-    %msg = memref.cast %msg_static : memref<39xi8> to memref<?xi8>
-    %len = arith.constant 39 : i64
-    func.call @__ly_raise_static_message(%type_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%type_error, %buffer, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -1447,12 +1595,21 @@ module attributes {
     func.return %result : f64
   }
 
-  // Strict less-than over two boxed values: numeric tower across classes,
-  // same-class `__lt__` through the generated hook, TypeError otherwise
-  // (CPython rejects cross-type ordering).
-  func.func private @__ly_box_less(%lhs: !llvm.ptr, %rhs: !llvm.ptr) -> i1 {
+  // PyObject_RichCompare for an ordering over two boxed values (`op` as in
+  // `__ly_order_boxed_by_contract`): the numeric tower across classes, bytes
+  // against bytearray by content, otherwise the left class's method for `op`,
+  // then the right class's REFLECTED one, then TypeError -- do_richcompare.
+  //
+  // ⛔ Not `<` alone with the others derived from it, which is what stood
+  // here: `[nan] > [1.0]` answered True as "not equal and not less" where
+  // CPython asks `nan > 1.0` and answers False, a class with only `__gt__`
+  // could not be ordered at all, and every refusal said '<'.
+  func.func private @__ly_box_order(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %op: i64) -> i1 {
     %false = arith.constant false
+    %true = arith.constant true
+    %c0_i64 = arith.constant 0 : i64
     %c1_i64 = arith.constant 1 : i64
+    %c4_i64 = arith.constant 4 : i64
     %lhs_word = llvm.load %lhs : !llvm.ptr -> i64
     %rhs_word = llvm.load %rhs : !llvm.ptr -> i64
     %lhs_class = func.call @__ly_slot_class(%lhs_word) : (i64) -> i64
@@ -1471,47 +1628,93 @@ module attributes {
     %rhs_num0 = arith.ori %rhs_int, %rhs_float : i1
     %rhs_num = arith.ori %rhs_num0, %rhs_bool : i1
     %both_num = arith.andi %lhs_num, %rhs_num : i1
-    %same = arith.cmpi eq, %lhs_class, %rhs_class : i64
     %mixed_num = arith.cmpi ne, %lhs_class, %rhs_class : i64
-    // bool/bool pairs also take the numeric path: bool has no __lt__ hook
+    // bool/bool pairs also take the numeric path: bool has no ordering hook
     // entry of its own (CPython orders bools as ints).
     %both_bool = arith.andi %lhs_bool, %rhs_bool : i1
     %mixed_or_bool = arith.ori %mixed_num, %both_bool : i1
     %numeric_mixed = arith.andi %both_num, %mixed_or_bool : i1
+    // Which side `op` asks for, and whether equal values satisfy it.
+    %greater_side = arith.cmpi uge, %op, %c4_i64 : i64
+    %equal_bit = arith.andi %op, %c1_i64 : i64
+    %or_equal = arith.cmpi ne, %equal_bit, %c0_i64 : i64
     %result = scf.if %numeric_mixed -> (i1) {
       // Equal values first (exact), then the f64 ordering: only values that
-      // differ by less than one f64 ulp beyond 2^53 can misorder here.
+      // differ by less than one f64 ulp beyond 2^53 can misorder here. A NaN
+      // is neither equal nor ordered, so every op answers False for it.
       %eq = func.call @__ly_box_equal_numeric(%lhs, %lhs_class, %rhs, %rhs_class) : (!llvm.ptr, i64, !llvm.ptr, i64) -> i1
       %ordered = scf.if %eq -> (i1) {
-        scf.yield %false : i1
+        scf.yield %or_equal : i1
       } else {
         %lf = func.call @__ly_boxed_num_as_f64(%lhs, %lhs_class) : (!llvm.ptr, i64) -> f64
         %rf = func.call @__ly_boxed_num_as_f64(%rhs, %rhs_class) : (!llvm.ptr, i64) -> f64
         %lt = arith.cmpf olt, %lf, %rf : f64
-        scf.yield %lt : i1
+        %gt = arith.cmpf ogt, %lf, %rf : f64
+        %pick = arith.select %greater_side, %gt, %lt : i1
+        scf.yield %pick : i1
       }
       scf.yield %ordered : i1
     } else {
-      // The same rule as the equality hook: a subclass resolves its base's
-      // `__lt__`, so the two ids need not be equal for the callee's lanes to be
-      // there. `sorted([Q(2), P(1)])` raised TypeError where CPython sorts.
       %bytes_mixed = func.call @__ly_box_bytes_like_pair(%lhs_class, %rhs_class) : (i64, i64) -> i1
       %inner = scf.if %bytes_mixed -> (i1) {
+        // Content order is total: `a > b` is `b < a`, `a <= b` is not `b < a`.
         %lh, %rh = func.call @__ly_box_bytes_handles(%lhs_word, %rhs_word) : (i64, i64) -> (memref<4xi64>, memref<4xi64>)
-        %c = func.call @LyBytes_LtBool(%lh, %rh) : (memref<4xi64>, memref<4xi64>) -> i1
+        %ab = func.call @LyBytes_LtBool(%lh, %rh) : (memref<4xi64>, memref<4xi64>) -> i1
+        %ba = func.call @LyBytes_LtBool(%rh, %lh) : (memref<4xi64>, memref<4xi64>) -> i1
+        %strict = arith.select %greater_side, %ba, %ab : i1
+        %reverse = arith.select %greater_side, %ab, %ba : i1
+        %not_reverse = arith.xori %reverse, %true : i1
+        %c = arith.select %or_equal, %not_reverse, %strict : i1
         scf.yield %c : i1
       } else {
-        %lt, %handled = func.call @__ly_lt_boxed_by_contract(%lhs, %rhs, %lhs_class, %rhs_class) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
-        scf.if %handled {
+        // `_Py_SwappedOp`: LT<->GT and LE<->GE are the 4 bit.
+        %swapped = arith.xori %op, %c4_i64 : i64
+        // ⭐ A right operand of a STRICT SUBCLASS of the left's class is asked
+        // first, as do_richcompare does, so a subclass's override decides.
+        %different = arith.cmpi ne, %lhs_class, %rhs_class : i64
+        %derives = func.call @__ly_class_derives_strictly(%rhs_class, %lhs_class) : (i64, i64) -> i1
+        %reflect_first = arith.andi %different, %derives : i1
+        %first:2 = scf.if %reflect_first -> (i1, i1) {
+          %v, %h = func.call @__ly_order_boxed_by_contract(%rhs, %lhs, %rhs_class, %lhs_class, %swapped) : (!llvm.ptr, !llvm.ptr, i64, i64, i64) -> (i1, i1)
+          scf.yield %v, %h : i1, i1
         } else {
-          func.call @__ly_cmp_raise_unorderable() : () -> ()
+          scf.yield %false, %false : i1, i1
         }
-        %ordered = arith.select %handled, %lt, %false : i1
+        %ordered = scf.if %first#1 -> (i1) {
+          scf.yield %first#0 : i1
+        } else {
+          %v, %h = func.call @__ly_order_boxed_by_contract(%lhs, %rhs, %lhs_class, %rhs_class, %op) : (!llvm.ptr, !llvm.ptr, i64, i64, i64) -> (i1, i1)
+          %answer = scf.if %h -> (i1) {
+            scf.yield %v : i1
+          } else {
+            %not_tried = arith.xori %reflect_first, %true : i1
+            %rv, %rh2 = scf.if %not_tried -> (i1, i1) {
+              %w, %k = func.call @__ly_order_boxed_by_contract(%rhs, %lhs, %rhs_class, %lhs_class, %swapped) : (!llvm.ptr, !llvm.ptr, i64, i64, i64) -> (i1, i1)
+              scf.yield %w, %k : i1, i1
+            } else {
+              scf.yield %false, %false : i1, i1
+            }
+            scf.if %rh2 {
+            } else {
+              func.call @__ly_cmp_raise_unorderable(%op, %lhs_class, %rhs_class) : (i64, i64, i64) -> ()
+            }
+            %got = arith.select %rh2, %rv, %false : i1
+            scf.yield %got : i1
+          }
+          scf.yield %answer : i1
+        }
         scf.yield %ordered : i1
       }
       scf.yield %inner : i1
     }
     func.return %result : i1
+  }
+
+  // `<`, which is all a sort asks (list.sort compares with Py_LT only).
+  func.func private @__ly_box_less(%lhs: !llvm.ptr, %rhs: !llvm.ptr) -> i1 {
+    %lt = arith.constant 0 : i64
+    %r = func.call @__ly_box_order(%lhs, %rhs, %lt) : (!llvm.ptr, !llvm.ptr, i64) -> i1
+    func.return %r : i1
   }
 
   // One 16-word element from %src[%s] to %dst[%d]. Raw words: a slot move is

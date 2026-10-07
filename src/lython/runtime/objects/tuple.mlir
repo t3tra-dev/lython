@@ -38,7 +38,7 @@ module attributes {
   func.func private @__ly_seq_fill_slice(%dst_items: memref<?xi64>, %count: i64, %start: i64, %step: i64, %src_items: memref<?xi64>)
   func.func private @__ly_seq_repeat_count(%nm: memref<2xi64>, %nd: memref<?xi32>) -> i64
   func.func private @__ly_seq_slice_bounds(%len: i64, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) -> (i64, i64, i64)
-  func.func private @__ly_sequence_compare_lens(%lhs_len: i64, %lhs_items: memref<?xi64>, %rhs_len: i64, %rhs_items: memref<?xi64>) -> i64
+  func.func private @__ly_sequence_compare_op(%lhs_len: i64, %lhs_items: memref<?xi64>, %rhs_len: i64, %rhs_items: memref<?xi64>, %op: i64) -> i1
   func.func private @__ly_sequence_count_lens(%len: i64, %items: memref<?xi64>, %probe: !llvm.ptr) -> i64
   func.func private @__ly_sequence_equal_lens(%lhs_len: i64, %lhs_items: memref<?xi64>, %rhs_len: i64, %rhs_items: memref<?xi64>) -> i1
   func.func private @__ly_sequence_find_lens(%len: i64, %items: memref<?xi64>, %probe: !llvm.ptr) -> i64
@@ -129,44 +129,40 @@ module attributes {
   // Lane-shaped wrapper for the contracts whose length is still a lane.
 
   // Lexicographic compare of two tuple handles. Length by value and a plain
-  // slot array, so the shared `__ly_sequence_compare_lens` is reached without
+  // slot array, so the shared `__ly_sequence_compare_op` is reached without
   // a tuple-shaped variant of it.
-  func.func private @__ly_tuple_compare(%lhs: memref<5xi64>, %rhs: memref<5xi64>) -> i64 {
+  func.func private @__ly_tuple_compare(%lhs: memref<5xi64>, %rhs: memref<5xi64>, %op: i64) -> i1 {
     %length_slot = arith.constant 2 : index
     %lhs_len = memref.load %lhs[%length_slot] : memref<5xi64>
     %rhs_len = memref.load %rhs[%length_slot] : memref<5xi64>
     %li = func.call @__ly_tuple_items(%lhs) : (memref<5xi64>) -> memref<?xi64>
     %ri = func.call @__ly_tuple_items(%rhs) : (memref<5xi64>) -> memref<?xi64>
-    %cmp = func.call @__ly_sequence_compare_lens(%lhs_len, %li, %rhs_len, %ri) : (i64, memref<?xi64>, i64, memref<?xi64>) -> i64
-    func.return %cmp : i64
+    %cmp = func.call @__ly_sequence_compare_op(%lhs_len, %li, %rhs_len, %ri, %op) : (i64, memref<?xi64>, i64, memref<?xi64>, i64) -> i1
+    func.return %cmp : i1
   }
 
   func.func @LyTuple_LtBool(%lhs: memref<5xi64> {ly.ownership.object_header}, %rhs: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__lt__"} {
-    %zero = arith.constant 0 : i64
-    %cmp = func.call @__ly_tuple_compare(%lhs, %rhs) : (memref<5xi64>, memref<5xi64>) -> i64
-    %lt = arith.cmpi slt, %cmp, %zero : i64
-    func.return %lt : i1
+    %op = arith.constant 0 : i64
+    %result = func.call @__ly_tuple_compare(%lhs, %rhs, %op) : (memref<5xi64>, memref<5xi64>, i64) -> i1
+    func.return %result : i1
   }
 
   func.func @LyTuple_LeBool(%lhs: memref<5xi64> {ly.ownership.object_header}, %rhs: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__le__"} {
-    %one = arith.constant 1 : i64
-    %cmp = func.call @__ly_tuple_compare(%lhs, %rhs) : (memref<5xi64>, memref<5xi64>) -> i64
-    %le = arith.cmpi slt, %cmp, %one : i64
-    func.return %le : i1
+    %op = arith.constant 1 : i64
+    %result = func.call @__ly_tuple_compare(%lhs, %rhs, %op) : (memref<5xi64>, memref<5xi64>, i64) -> i1
+    func.return %result : i1
   }
 
   func.func @LyTuple_GtBool(%lhs: memref<5xi64> {ly.ownership.object_header}, %rhs: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__gt__"} {
-    %zero = arith.constant 0 : i64
-    %cmp = func.call @__ly_tuple_compare(%lhs, %rhs) : (memref<5xi64>, memref<5xi64>) -> i64
-    %gt = arith.cmpi sgt, %cmp, %zero : i64
-    func.return %gt : i1
+    %op = arith.constant 4 : i64
+    %result = func.call @__ly_tuple_compare(%lhs, %rhs, %op) : (memref<5xi64>, memref<5xi64>, i64) -> i1
+    func.return %result : i1
   }
 
   func.func @LyTuple_GeBool(%lhs: memref<5xi64> {ly.ownership.object_header}, %rhs: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__ge__"} {
-    %minus_one = arith.constant -1 : i64
-    %cmp = func.call @__ly_tuple_compare(%lhs, %rhs) : (memref<5xi64>, memref<5xi64>) -> i64
-    %ge = arith.cmpi sgt, %cmp, %minus_one : i64
-    func.return %ge : i1
+    %op = arith.constant 5 : i64
+    %result = func.call @__ly_tuple_compare(%lhs, %rhs, %op) : (memref<5xi64>, memref<5xi64>, i64) -> i1
+    func.return %result : i1
   }
 
   // Store an owned int (h, m, d) into a tuple slot as its canonical handle.

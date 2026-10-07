@@ -138,6 +138,11 @@ private:
   // __ly_user_exception_class_name (id -> C-string ptr, null unknown).
   mlir::LogicalResult synthesizeUserExceptionHooks();
   mlir::LogicalResult synthesizeSourceClassNameHook();
+  // __ly_class_derives_strictly (sub id, base id -> i1) for the ordering
+  // dispatch's reflected-first rule.
+  mlir::LogicalResult synthesizeClassDerivesHook();
+  llvm::SmallVector<std::int64_t, 8>
+  classAncestorIds(py::ClassOp classOp) const;
   // Class id of an except-clause handler type (manifest or source class).
   mlir::FailureOr<std::int64_t> handlerClassId(mlir::Operation *op,
                                                mlir::Type handler) const;
@@ -1123,6 +1128,8 @@ private:
   mlir::LogicalResult generateBoxedEqHook();
   // lt instance of the binary dispatch (sort/ordering over erased values).
   mlir::LogicalResult generateBoxedLtHook();
+  // le, gt and ge instances, for an ordering written with that operator.
+  mlir::LogicalResult generateBoxedOrderingHooks();
   mlir::LogicalResult lowerListEvidenceNext(py::NextOp op,
                                             RuntimeBundle iterator);
   // True when `op` sits in a different block than the one defining the
