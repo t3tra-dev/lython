@@ -443,7 +443,7 @@ module attributes {
   }
 
   // bytes[i:j:k] -- byte-indexed strided copy into a fresh bytes object.
-  func.func @LyBytes_GetSlice(%header: memref<4xi64> {ly.ownership.object_header}, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) -> memref<4xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytes"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__getslice__"} {
+  func.func @LyBytes_GetSlice(%header: memref<4xi64> {ly.ownership.object_header}, %start_raw: i64 {ly.runtime.clip_i64}, %stop_raw: i64 {ly.runtime.clip_i64}, %step_raw: i64 {ly.runtime.clip_i64}, %mask: i64) -> memref<4xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytes"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__getslice__"} {
     %bytes = func.call @__ly_bytes_payload(%header) : (memref<4xi64>) -> memref<?xi8>
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
@@ -941,7 +941,7 @@ module attributes {
   // "byte must be in range(0, 256)"
   memref.global "private" constant @__ly_bytes_byte_range_message : memref<29xi8> = dense<[98, 121, 116, 101, 32, 109, 117, 115, 116, 32, 98, 101, 32, 105, 110, 32, 114, 97, 110, 103, 101, 40, 48, 44, 32, 50, 53, 54, 41]>
 
-  func.func @LyBytes_Find(%header: memref<4xi64> {ly.ownership.object_header}, %sub_header: memref<4xi64> {ly.ownership.object_header}, %start_raw: i64 {ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.default_i64 = 9223372036854775807 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "find", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyBytes_Find(%header: memref<4xi64> {ly.ownership.object_header}, %sub_header: memref<4xi64> {ly.ownership.object_header}, %start_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 9223372036854775807 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "find", ly.runtime.result_contract = "builtins.int"} {
     %bytes = func.call @__ly_bytes_payload(%header) : (memref<4xi64>) -> memref<?xi8>
     %sub_bytes = func.call @__ly_bytes_payload(%sub_header) : (memref<4xi64>) -> memref<?xi8>
     %false_bit = arith.constant false
@@ -953,7 +953,7 @@ module attributes {
     func.return %result : memref<2xi64>
   }
 
-  func.func @LyBytes_CountSub(%header: memref<4xi64> {ly.ownership.object_header}, %sub_header: memref<4xi64> {ly.ownership.object_header}, %start_raw: i64 {ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.default_i64 = 9223372036854775807 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "count", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyBytes_CountSub(%header: memref<4xi64> {ly.ownership.object_header}, %sub_header: memref<4xi64> {ly.ownership.object_header}, %start_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 9223372036854775807 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "count", ly.runtime.result_contract = "builtins.int"} {
     %bytes = func.call @__ly_bytes_payload(%header) : (memref<4xi64>) -> memref<?xi8>
     %sub_bytes = func.call @__ly_bytes_payload(%sub_header) : (memref<4xi64>) -> memref<?xi8>
     %zero = arith.constant 0 : i64
@@ -990,7 +990,7 @@ module attributes {
     func.return %result : memref<2xi64>
   }
 
-  func.func @LyBytes_StartsWith(%header: memref<4xi64> {ly.ownership.object_header}, %prefix_header: memref<4xi64> {ly.ownership.object_header}, %start_raw: i64 {ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.default_i64 = 9223372036854775807 : i64}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "startswith"} {
+  func.func @LyBytes_StartsWith(%header: memref<4xi64> {ly.ownership.object_header}, %prefix_header: memref<4xi64> {ly.ownership.object_header}, %start_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 9223372036854775807 : i64}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "startswith"} {
     %bytes = func.call @__ly_bytes_payload(%header) : (memref<4xi64>) -> memref<?xi8>
     %prefix_bytes = func.call @__ly_bytes_payload(%prefix_header) : (memref<4xi64>) -> memref<?xi8>
     %len = func.call @__ly_bytes_len_of(%bytes) : (memref<?xi8>) -> i64
@@ -1010,7 +1010,7 @@ module attributes {
     func.return %result : i1
   }
 
-  func.func @LyBytes_EndsWith(%header: memref<4xi64> {ly.ownership.object_header}, %suffix_header: memref<4xi64> {ly.ownership.object_header}, %start_raw: i64 {ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.default_i64 = 9223372036854775807 : i64}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "endswith"} {
+  func.func @LyBytes_EndsWith(%header: memref<4xi64> {ly.ownership.object_header}, %suffix_header: memref<4xi64> {ly.ownership.object_header}, %start_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 9223372036854775807 : i64}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "endswith"} {
     %bytes = func.call @__ly_bytes_payload(%header) : (memref<4xi64>) -> memref<?xi8>
     %suffix_bytes = func.call @__ly_bytes_payload(%suffix_header) : (memref<4xi64>) -> memref<?xi8>
     %len = func.call @__ly_bytes_len_of(%bytes) : (memref<?xi8>) -> i64

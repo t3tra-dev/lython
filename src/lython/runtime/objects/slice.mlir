@@ -39,12 +39,13 @@ module attributes {
     func.return
   }
 
-  // CPython PySlice_Unpack + PySlice_AdjustIndices over a length: absent
-  // bounds (mask bit0 = start present, bit1 = stop present) default by the
-  // step's sign, explicit bounds normalize (+len) and clamp into the window
-  // the sign allows. Returns (start, slicelength); the caller iterates
-  // start, start+step, ... slicelength times.
-  func.func private @__ly_slice_adjust(%len: i64, %start_in: i64, %stop_in: i64, %step: i64, %mask: i64) -> (i64, i64) {
+  // CPython PySlice_Unpack + the clamping half of PySlice_AdjustIndices over
+  // a length: absent bounds (mask bit0 = start present, bit1 = stop present)
+  // default by the step's sign, explicit bounds normalize (+len) and clamp
+  // into the window the sign allows. Returns (start, stop) -- the pair
+  // _PySlice_GetLongIndices answers with exact ints, which `slice.indices`
+  // and a range's slice need, where a sequence copy needs the count instead.
+  func.func private @__ly_slice_indices(%len: i64, %start_in: i64, %stop_in: i64, %step: i64, %mask: i64) -> (i64, i64) {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %two = arith.constant 2 : i64
@@ -77,6 +78,17 @@ module attributes {
     %e_adj = arith.select %e_isneg, %e_neg_val, %e_pos_val : i1, i64
     %e_default = arith.select %neg_step, %minus_one, %len : i1, i64
     %stop = arith.select %has_stop, %e_adj, %e_default : i1, i64
+    func.return %start, %stop : i64, i64
+  }
+
+  // CPython PySlice_Unpack + PySlice_AdjustIndices over a length. Returns
+  // (start, slicelength); the caller iterates start, start+step, ...
+  // slicelength times.
+  func.func private @__ly_slice_adjust(%len: i64, %start_in: i64, %stop_in: i64, %step: i64, %mask: i64) -> (i64, i64) {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %neg_step = arith.cmpi slt, %step, %zero : i64
+    %start, %stop = func.call @__ly_slice_indices(%len, %start_in, %stop_in, %step, %mask) : (i64, i64, i64, i64, i64) -> (i64, i64)
 
     %pos_diff = arith.subi %stop, %start : i64
     %neg_diff = arith.subi %start, %stop : i64

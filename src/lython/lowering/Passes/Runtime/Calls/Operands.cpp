@@ -163,13 +163,19 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
     return mlir::success();
   };
 
+  // An index input reads a wider int as the nearest end of the word, the way
+  // CPython's _PyEval_SliceIndex does; every other i64 input raises.
+  bool clipsToWord =
+      mlir::func::FuncOp(symbol.function)
+          .getArgAttr(inputIndex, kManifestClipI64Attr) != nullptr;
   if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(source) &&
       expected.isInteger(64)) {
     mlir::Value word = source.primitiveI64->value;
     // A deferred read's value is the value only where its flag says so.
     if (source.deferredObject)
-      if (std::optional<RuntimeSymbol> checked =
-              manifest.primitive("builtins.int", "read_value_checked"))
+      if (std::optional<RuntimeSymbol> checked = manifest.primitive(
+              "builtins.int",
+              clipsToWord ? "read_value_clipped" : "read_value_checked"))
         word = RuntimeBundleLowerer::createRuntimeCall(
                    op->getLoc(), *checked,
                    mlir::ValueRange{source.primitiveI64->value,
@@ -299,8 +305,13 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
   }
 
   if (expected.isInteger(64)) {
-    std::optional<RuntimeSymbol> unbox =
-        manifest.primitive(source.contractName(), "unbox.i64");
+    // ⛔ Not only the clipping read for an index input: a bool always fits,
+    // and it spells only the plain one.
+    std::optional<RuntimeSymbol> unbox;
+    if (clipsToWord)
+      unbox = manifest.primitive(source.contractName(), "unbox.i64.clip");
+    if (!unbox)
+      unbox = manifest.primitive(source.contractName(), "unbox.i64");
     if (unbox) {
       mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
           op->getLoc(), *unbox, sourceValues);
