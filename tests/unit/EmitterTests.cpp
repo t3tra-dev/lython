@@ -2495,6 +2495,37 @@ TEST(EmitterTest, ASubscriptedSliceAnnotationNamesTheSlice) {
 // What: what CPython's bytearray refuses with a TypeError as it runs -- a float
 // or a str without an encoding to build from, a list to `+=` -- is refused
 // here when the program is compiled, and the spellings it accepts emit.
+// A classmethod through an instance is re-spelled as the class's call only
+// while the class name still names the class: a program that binds `bytes`
+// keeps the refusal instead of calling whatever the name now holds.
+TEST(EmitterTest, AClassmethodThroughAnInstanceNeedsItsClassName) {
+  lython::driver::DriverOptions native;
+  native.targetTriple = llvm::sys::getDefaultTargetTriple();
+  {
+    mlir::MLIRContext context(testRegistry());
+    mlir::OwningOpRef<mlir::ModuleOp> module;
+    std::string diagnostics;
+    llvm::raw_string_ostream diag(diagnostics);
+    EXPECT_TRUE(mlir::succeeded(lython::driver::emitMLIRFromSource(
+        "a = b\"x\".fromhex(\"41\")\nd: dict[str, int] = {}\n"
+        "e = d.fromkeys([\"k\"], 1)\nt = \"s\".maketrans(\"a\", \"b\")\n"
+        "print(a, e, t)\n",
+        "main.py", "<lython-no-import-dir>", native, context, module, diag)))
+        << diagnostics;
+  }
+  mlir::MLIRContext context(testRegistry());
+  mlir::OwningOpRef<mlir::ModuleOp> module;
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  EXPECT_TRUE(mlir::failed(lython::driver::emitMLIRFromSource(
+      "def f() -> None:\n    bytes = 3\n    print(b\"x\".fromhex(\"41\"), "
+      "bytes)\nf()\n",
+      "main.py", "<lython-no-import-dir>", native, context, module, diag)));
+  EXPECT_NE(diagnostics.find("has manifest method 'fromhex' but no signature"),
+            std::string::npos)
+      << diagnostics;
+}
+
 TEST(EmitterTest, ABytearrayTakesWhatCPythonTakes) {
   lython::driver::DriverOptions native;
   native.targetTriple = llvm::sys::getDefaultTargetTriple();

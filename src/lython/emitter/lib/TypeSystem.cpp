@@ -1926,6 +1926,31 @@ TypeSystem::manifestMethodReceiverContract(mlir::Type typeObject,
   return contract;
 }
 
+bool TypeSystem::isManifestClassMethod(mlir::Type instance,
+                                       llvm::StringRef methodName) const {
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(instance);
+  if (!contract)
+    return false;
+  const py::protocols::Table &table = py::protocols::Table::get(context);
+  std::vector<py::protocols::ContractResolution> methods =
+      table.methodContractCandidatesWithEvidence(contract, methodName);
+  if (methods.empty())
+    return false;
+  for (const py::protocols::ContractResolution &candidate : methods) {
+    py::CallableType signature = candidate.method.signature;
+    if (!signature || signature.getPositionalTypes().empty())
+      return false;
+    auto classObject =
+        mlir::dyn_cast<py::TypeType>(signature.getPositionalTypes().front());
+    auto declared = classObject ? mlir::dyn_cast_if_present<py::ContractType>(
+                                      classObject.getInstanceType())
+                                : py::ContractType();
+    if (!declared || declared.getContractName() != contract.getContractName())
+      return false;
+  }
+  return true;
+}
+
 std::optional<py::CallableType>
 TypeSystem::unboundManifestMethodCallable(mlir::Type typeObject,
                                           llvm::StringRef methodName) const {
@@ -4854,6 +4879,44 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           if (*methodName == "format" &&
               widenLiteral(receiver) == strType())
             return strType();
+          // ⭐ THE CLASS-LEVEL METHODS THE EMITTER BUILDS ITSELF, typed here
+          // as it builds them -- `str.maketrans(x, y)` is a dict of code
+          // points, `dict.fromkeys(ks[, v])` a dict of the keys' element to
+          // `v` (or None) -- for the class and an instance alike. With no
+          // manifest signature to read, the walk answered nothing, and a
+          // name bound to one inside a loop was "unresolved" after it.
+          // ⛔ The NAME `dict` is no class to this walk (it answers object),
+          // so the class spelling is recognized as the emitter's sugar
+          // recognizes it: the name, unbound.
+          mlir::Type builtOwner = staticOwner;
+          if (receiverNode->kind == "Name" &&
+              ast::nameSpelling(*receiverNode) == "dict" &&
+              !lookupSymbol("dict"))
+            builtOwner = contract("builtins.dict");
+          if (auto ownerContract =
+                  mlir::dyn_cast_if_present<py::ContractType>(builtOwner)) {
+            const auto *callArgs = ast::nodeList(*node, "args");
+            if (ownerContract.getContractName() == "builtins.str" &&
+                *methodName == "maketrans" && positional.size() == 2 &&
+                keywords.empty())
+              return contract("builtins.dict", {intType(), intType()});
+            if (ownerContract.getContractName() == "builtins.dict" &&
+                *methodName == "fromkeys" && keywords.empty() && callArgs &&
+                (callArgs->size() == 1 || callArgs->size() == 2) &&
+                callArgs->front() && callArgs->front()->kind != "Starred")
+              if (mlir::Type key = widenLiteral(
+                      iterationElementType(callArgs->front().get())))
+                return contract("builtins.dict",
+                                {key, callArgs->size() == 2
+                                          ? widenLiteral(positional.back())
+                                          : none()});
+          }
+          // ⭐ A manifest classmethod through an instance is the class's call
+          // (the emitter re-spells it so), and is typed as that call.
+          if (auto instance = mlir::dyn_cast_if_present<py::ContractType>(
+                  widenLiteral(receiver));
+              instance && isManifestClassMethod(instance, *methodName))
+            receiver = py::TypeType::get(&context, instance);
           CallInferenceResult inference = inferMethodCallWithEvidence(
               widenLiteral(receiver), *methodName, positional, keywords);
           if (inference)
