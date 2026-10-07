@@ -114,6 +114,11 @@ struct ExprInferenceContext {
   // Non-strict contexts keep the object() fallbacks but still see
   // localCallables/localSymbols.
   bool strict = true;
+  // Whether this walk answers about the code the emitter is emitting, and so
+  // sees the proofs it holds about fields and cells (`setMemberProofs`). A
+  // context derived inside such a walk carries it on; a body walk of some
+  // OTHER function does not, since `self.s` there names another object.
+  bool seesEmitterProofs = false;
 };
 
 struct AwaitInferenceResult {
@@ -226,6 +231,17 @@ public:
   // manifest does not resolve to exactly one method.
   mlir::Type manifestMethodReceiverContract(mlir::Type typeObject,
                                             llvm::StringRef methodName) const;
+  // The emitter's proofs about field paths (`self.s`) and re-read names (a
+  // cell, a module global), consulted by the walks that answer about the
+  // code being emitted.
+  // `suppressed` is the emitter's own switch for a RAW read -- the load a
+  // checked read tests before it spends the proof -- which must be typed as
+  // the storage is, not as the proof says.
+  void setMemberProofs(const llvm::StringMap<mlir::Type> *proofs,
+                       const bool *suppressed) {
+    memberProofs = proofs;
+    memberProofsSuppressed = suppressed;
+  }
   // True when the manifest class of the instance type `instance` declares
   // `methodName` as a CLASSMETHOD in every overload -- its first parameter is
   // the class object -- so `instance.methodName(...)` is the class's call.
@@ -504,6 +520,8 @@ private:
 
   mlir::MLIRContext &context;
   mutable InferenceContext inferenceState;
+  const llvm::StringMap<mlir::Type> *memberProofs = nullptr;
+  const bool *memberProofsSuppressed = nullptr;
   llvm::StringSet<llvm::MallocAllocator> importedModuleLocalNames;
   // The module names each pushed scope bound, beside `scopes`: a module name
   // is a fact about one binding, and goes when its scope does.

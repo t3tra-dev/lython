@@ -3581,7 +3581,7 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       return inferExprImpl(child, nullptr);
     static const llvm::StringMap<mlir::Type> kNoCallables;
     ExprInferenceContext lenient{kNoCallables, nullptr, ctx->localSymbols,
-                                 /*strict=*/false};
+                                 /*strict=*/false, ctx->seesEmitterProofs};
     return inferExprImpl(child, &lenient);
   };
   if (node->kind == "Constant") {
@@ -3701,7 +3701,8 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     }
     static const llvm::StringMap<mlir::Type> kNoCallables;
     ExprInferenceContext inner{ctx ? ctx->localCallables : kNoCallables,
-                               nullptr, &bound, /*strict=*/false};
+                               nullptr, &bound, /*strict=*/false,
+                               !ctx || ctx->seesEmitterProofs};
     auto part = [&](const parser::Node *child) -> mlir::Type {
       mlir::Type inferred = widenLiteral(inferExprImpl(child, &inner));
       return inferred == object() ? mlir::Type() : inferred;
@@ -3735,6 +3736,21 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       return literal("\"" + *value + "\"");
     return std::nullopt;
   };
+  // ⭐ WHAT THE EMITTER HAS PROVED ABOUT A RE-READ STORAGE -- a field path,
+  // a cell, a module global -- is what this walk answers too, when it is
+  // answering about the code being emitted. The proof lives in the emitter's
+  // `narrowedMemberTypes` and is spent at each READ the emitter makes, but an
+  // argument typed by this walk first -- `sorted(self.s)`, `list(self.s)`,
+  // `[x for x in self.s]`, `max(self.s)` under `if self.s is not None:` --
+  // was typed as the whole union and refused.
+  const bool seesProofs = memberProofs && (!ctx || ctx->seesEmitterProofs) &&
+                          !(memberProofsSuppressed && *memberProofsSuppressed);
+  auto provedFor = [&](llvm::StringRef path) -> mlir::Type {
+    if (!seesProofs)
+      return {};
+    auto found = memberProofs->find(path);
+    return found == memberProofs->end() ? mlir::Type() : found->second;
+  };
   if (node->kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(*node);
     if (ctx) {
@@ -3747,6 +3763,8 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           return local->second;
       }
     }
+    if (mlir::Type proved = provedFor(name))
+      return proved;
     if (auto found = lookupSymbol(name))
       return *found;
     if (std::optional<mlir::Type> constant = staticStringLiteral(name))
@@ -3755,6 +3773,12 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
   }
   if (node->kind == "Attribute") {
     std::string qualified = ast::qualifiedName(node);
+    if (const parser::Node *owner = ast::node(*node, "value");
+        owner && owner->kind == "Name")
+      if (auto attr = ast::string(*node, "attr"))
+        if (mlir::Type proved = provedFor(
+                (llvm::Twine(ast::nameSpelling(*owner)) + "." + *attr).str()))
+          return proved;
     // A proved field path is carried in the same map as a local, under its
     // dotted name -- a local name can never collide with one.
     if (!qualified.empty() && ctx && ctx->localSymbols)
@@ -4040,7 +4064,8 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       if (anyProof) {
         static const llvm::StringMap<mlir::Type> kNoCallables;
         ExprInferenceContext provenCtx{kNoCallables, nullptr, &provenLocals,
-                                       /*strict=*/false};
+                                       /*strict=*/false,
+                                       !ctx || ctx->seesEmitterProofs};
         operandType = widenLiteral(inferExprImpl(operand.get(), &provenCtx));
       } else {
         operandType = widenLiteral(lenientRecurse(operand.get()));
@@ -4202,7 +4227,8 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       }
       static const llvm::StringMap<mlir::Type> kNoCallables;
       ExprInferenceContext narrowedCtx{kNoCallables, nullptr, &armLocals,
-                                       /*strict=*/false};
+                                       /*strict=*/false,
+                                       !ctx || ctx->seesEmitterProofs};
       return widenLiteral(inferExprImpl(arm, &narrowedCtx));
     };
     llvm::SmallVector<mlir::Type, 2> collected{

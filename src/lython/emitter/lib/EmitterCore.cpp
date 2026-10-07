@@ -28,6 +28,7 @@ ModuleEmitter::ModuleEmitter(const parser::Node &moduleNode,
       builder(&context), types(context) {
   types.setTargetTriple(this->options.targetTriple);
   types.setJsHost(this->options.jsHost);
+  types.setMemberProofs(&narrowedMemberTypes, &suppressMemberNarrowing);
   if (this->sourceName.empty())
     this->sourceName = this->moduleName;
 }
