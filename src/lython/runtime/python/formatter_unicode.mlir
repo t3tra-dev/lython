@@ -156,7 +156,7 @@ module {
   }
 
   func.func private @__ly_fmt_raise_bytes(%message: memref<?xi8>, %length: i64) {
-    %value_error = arith.constant 53 : i64
+    %value_error = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
     func.call @__ly_raise_static_message(%value_error, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }

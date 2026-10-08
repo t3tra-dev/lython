@@ -48,9 +48,9 @@ module attributes {
   func.func private @__ly_ucd_numeric_value(%idx: i64) -> f64
   func.func private @__ly_ucd_category_char(%cat: i64, %j: i64) -> i64
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
-  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
-  func.func private @LyFloat_FromF64(%value: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 2 : i64, ly.runtime.contract = "builtins.float", ly.runtime.initializer = "__new__"}
-  func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 5 : i64, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
+  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
+  func.func private @LyFloat_FromF64(%value: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.float", ly.runtime.initializer = "__new__"}
+  func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
   func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "raise"}
 
@@ -80,7 +80,7 @@ module attributes {
     %true_bit = arith.constant true
     %bad = arith.xori %single, %true_bit : i1
     scf.if %bad {
-      %class_id = arith.constant 52 : i64
+      %class_id = arith.constant {ly.class_id_of = "builtins.TypeError"} 52 : i64
       %length = arith.constant 36 : i64
       %static = memref.get_global @__ly_ucd_msg_not_single : memref<36xi8>
       %message = memref.cast %static : memref<36xi8> to memref<?xi8>
@@ -116,7 +116,7 @@ module attributes {
     %cat, %numeric = func.call @__ly_ucd_info(%cp) : (i64) -> (i64, i64)
     %missing = arith.cmpi eq, %numeric, %minus_one : i64
     scf.if %missing {
-      %class_id = arith.constant 53 : i64
+      %class_id = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
       %length = arith.constant 23 : i64
       %static = memref.get_global @__ly_ucd_msg_not_numeric : memref<23xi8>
       %message = memref.cast %static : memref<23xi8> to memref<?xi8>
@@ -136,7 +136,7 @@ module attributes {
     %upper, %lower, %fold, %title, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
     %missing = arith.cmpi eq, %decimal, %minus_one : i64
     scf.if %missing {
-      %class_id = arith.constant 53 : i64
+      %class_id = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
       %length = arith.constant 13 : i64
       %static = memref.get_global @__ly_ucd_msg_not_decimal : memref<13xi8>
       %message = memref.cast %static : memref<13xi8> to memref<?xi8>
@@ -152,7 +152,7 @@ module attributes {
     %upper, %lower, %fold, %title, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
     %missing = arith.cmpi eq, %digit, %minus_one : i64
     scf.if %missing {
-      %class_id = arith.constant 53 : i64
+      %class_id = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
       %length = arith.constant 11 : i64
       %static = memref.get_global @__ly_ucd_msg_not_digit : memref<11xi8>
       %message = memref.cast %static : memref<11xi8> to memref<?xi8>

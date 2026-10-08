@@ -1,3 +1,4 @@
+#include "ClassIds.h"
 #include "Common/SupportBuilder.h"
 #include "ExceptionTaxonomy.h"
 #include "Runtime/ABI/BoxLayout.h"
@@ -2173,7 +2174,7 @@ void buildExceptionGroupMemberCount(SupportBuilder &b) {
   mlir::Value classId =
       b.loadI64(b.gepI64(entry->getArgument(0), b.iconst(2)));
   mlir::Value isGroup = b.call("LyEH_ClassIdMatches", b.i1(),
-                               mlir::ValueRange{classId, b.iconst(101)})
+                               mlir::ValueRange{classId, b.iconst(py::class_ids::of("builtins.BaseExceptionGroup"))})
                             .front();
   mlir::cf::CondBranchOp::create(b.builder, b.loc, isGroup, load,
                                  mlir::ValueRange{}, zero, mlir::ValueRange{});
@@ -2771,7 +2772,7 @@ void buildPrintExceptionSummary(SupportBuilder &b) {
                                    mlir::ValueRange{excPtr})
                                 .front();
   mlir::Value isGroupClass = b.call("LyEH_ClassIdMatches", b.i1(),
-                                    mlir::ValueRange{classId, b.iconst(101)})
+                                    mlir::ValueRange{classId, b.iconst(py::class_ids::of("builtins.BaseExceptionGroup"))})
                                  .front();
   mlir::Value groupSuffix = mlir::arith::AndIOp::create(
       b.builder, b.loc, isGroupClass,
@@ -2977,7 +2978,7 @@ void buildPrintChainNode(SupportBuilder &b) {
                                  .front();
   mlir::Value chainIsGroupClass =
       b.call("LyEH_ClassIdMatches", b.i1(),
-             mlir::ValueRange{classId, b.iconst(101)})
+             mlir::ValueRange{classId, b.iconst(py::class_ids::of("builtins.BaseExceptionGroup"))})
           .front();
   mlir::Value chainGroup = mlir::arith::AndIOp::create(
       b.builder, b.loc, chainIsGroupClass,
@@ -3662,7 +3663,7 @@ void buildTracebackPrintMessage(SupportBuilder &b) {
                                 .front();
   mlir::Value isGroupClass =
       b.call("LyEH_ClassIdMatches", b.i1(),
-             mlir::ValueRange{entry->getArgument(0), b.iconst(101)})
+             mlir::ValueRange{entry->getArgument(0), b.iconst(py::class_ids::of("builtins.BaseExceptionGroup"))})
           .front();
   mlir::Value groupDisplay = mlir::arith::AndIOp::create(
       b.builder, b.loc, isGroupClass,

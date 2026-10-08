@@ -25,8 +25,8 @@ module attributes {
   func.func private @LyBytes_EqBool(%lhs_header: memref<4xi64> {ly.ownership.object_header}, %rhs_header: memref<4xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__eq__"}
   func.func private @LyBytes_Hash(%header: memref<4xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__hash__"}
   func.func private @LyBytes_Hex(%header: memref<4xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "hex", ly.runtime.result_contract = "builtins.str"}
-  func.func private @LyList_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 10 : i64, ly.runtime.contract = "builtins.list", ly.runtime.initializer = "__new__", ly.runtime.result_contract = "builtins.list"}
-  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
+  func.func private @LyList_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.list", ly.runtime.initializer = "__new__", ly.runtime.result_contract = "builtins.list"}
+  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
   func.func private @LyLong_SlotWordFromI64(%value: i64) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "slot_word_from_i64"}
   func.func private @LyObject_ReleaseBoxedPayloadArraySlotRaw(%payload: memref<?xi64>, %logical_index: i64)
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "release_to_zero"}
@@ -157,7 +157,7 @@ module attributes {
     %bit = arith.andi %flags, %released_bit : i64
     %released = arith.cmpi ne, %bit, %zero : i64
     scf.if %released {
-      %value_error = arith.constant 53 : i64
+      %value_error = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
       %length = arith.constant 49 : i64
       %static = memref.get_global @__ly_memoryview_msg_released : memref<49xi8>
       %message = memref.cast %static : memref<49xi8> to memref<?xi8>
@@ -190,7 +190,7 @@ module attributes {
   func.func private @__ly_memoryview_alloc(%data: i64, %length: i64, %stride: i64, %source: i64, %readonly: i1, %exported: i1) -> memref<8xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.memoryview"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.memoryview"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
-    %class_memoryview = arith.constant 27 : i64
+    %class_memoryview = arith.constant {ly.class_id_of = "builtins.memoryview"} 27 : i64
     %header_bytes = arith.constant 64 : index
     %c0 = arith.constant 0 : index
     %raw = memref.alloc(%header_bytes) {alignment = 16 : i64} : memref<?xi8>
@@ -260,9 +260,9 @@ module attributes {
   // memoryview(b), memoryview(ba): one initializer, since bytes and bytearray
   // hand over the same four words; the class word tells them apart -- a
   // bytearray's view is writable and holds one of its exports.
-  func.func @LyMemoryView_New(%source: memref<4xi64> {ly.ownership.object_header}) -> memref<8xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 27 : i64, ly.runtime.contract = "builtins.memoryview", ly.runtime.initializer = "__new__"} {
+  func.func @LyMemoryView_New(%source: memref<4xi64> {ly.ownership.object_header}) -> memref<8xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.memoryview", ly.runtime.initializer = "__new__"} {
     %one = arith.constant 1 : i64
-    %bytearray_class = arith.constant 26 : i64
+    %bytearray_class = arith.constant {ly.class_id_of = "builtins.bytearray"} 26 : i64
     %true = arith.constant true
     %class_slot = arith.constant 1 : index
     %payload_slot = arith.constant 2 : index
@@ -283,7 +283,7 @@ module attributes {
   }
 
   // memoryview(view): a new view of the same memory, holding its own export.
-  func.func @LyMemoryView_NewFromView(%source: memref<8xi64> {ly.ownership.object_header}) -> memref<8xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 27 : i64, ly.runtime.contract = "builtins.memoryview", ly.runtime.initializer = "__new__"} {
+  func.func @LyMemoryView_NewFromView(%source: memref<8xi64> {ly.ownership.object_header}) -> memref<8xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.memoryview", ly.runtime.initializer = "__new__"} {
     %zero = arith.constant 0 : i64
     %s2 = arith.constant 2 : index
     %s3 = arith.constant 3 : index
@@ -359,7 +359,7 @@ module attributes {
     %valid = arith.andi %low, %high : i1
     scf.if %valid {
     } else {
-      %index_error = arith.constant 55 : i64
+      %index_error = arith.constant {ly.class_id_of = "builtins.IndexError"} 55 : i64
       %message_length = arith.constant 34 : i64
       %static = memref.get_global @__ly_memoryview_msg_index : memref<34xi8>
       %message = memref.cast %static : memref<34xi8> to memref<?xi8>
@@ -445,7 +445,7 @@ module attributes {
   func.func private @__ly_memoryview_check_writable(%self: memref<8xi64>) attributes {ly.runtime.contract = "builtins.memoryview"} {
     %readonly = func.call @__ly_memoryview_readonly(%self) : (memref<8xi64>) -> i1
     scf.if %readonly {
-      %type_error = arith.constant 52 : i64
+      %type_error = arith.constant {ly.class_id_of = "builtins.TypeError"} 52 : i64
       %length = arith.constant 30 : i64
       %static = memref.get_global @__ly_memoryview_msg_readonly : memref<30xi8>
       %message = memref.cast %static : memref<30xi8> to memref<?xi8>
@@ -466,7 +466,7 @@ module attributes {
     %fits = arith.andi %low, %high : i1
     scf.if %fits {
     } else {
-      %value_error = arith.constant 53 : i64
+      %value_error = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
       %length = arith.constant 40 : i64
       %static = memref.get_global @__ly_memoryview_msg_value : memref<40xi8>
       %message = memref.cast %static : memref<40xi8> to memref<?xi8>
@@ -497,7 +497,7 @@ module attributes {
     %start, %count = func.call @__ly_slice_adjust(%length, %start_raw, %stop_raw, %step, %mask) : (i64, i64, i64, i64, i64) -> (i64, i64)
     %mismatch = arith.cmpi ne, %count, %given : i64
     scf.if %mismatch {
-      %value_error = arith.constant 53 : i64
+      %value_error = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
       %message_length = arith.constant 66 : i64
       %static = memref.get_global @__ly_memoryview_msg_structure : memref<66xi8>
       %message = memref.cast %static : memref<66xi8> to memref<?xi8>
@@ -619,7 +619,7 @@ module attributes {
   func.func @LyMemoryView_ToList(%self: memref<8xi64> {ly.ownership.object_header}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.memoryview", ly.runtime.method = "tolist", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.int"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %int_class = arith.constant 1 : i64
+    %int_class = arith.constant {ly.class_id_of = "builtins.int"} 1 : i64
     %s2 = arith.constant 2 : index
     %s3 = arith.constant 3 : index
     %s4 = arith.constant 4 : index
@@ -776,7 +776,7 @@ module attributes {
     %readonly = func.call @__ly_memoryview_readonly(%self) : (memref<8xi64>) -> i1
     %writable = arith.xori %readonly, %true : i1
     scf.if %writable {
-      %value_error = arith.constant 53 : i64
+      %value_error = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
       %length = arith.constant 38 : i64
       %static = memref.get_global @__ly_memoryview_msg_hash : memref<38xi8>
       %message = memref.cast %static : memref<38xi8> to memref<?xi8>
@@ -903,7 +903,7 @@ module attributes {
   func.func private @__ly_memoryview_one_tuple(%self: memref<8xi64>, %slot: index) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.memoryview"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
-    %int_class = arith.constant 1 : i64
+    %int_class = arith.constant {ly.class_id_of = "builtins.int"} 1 : i64
     func.call @__ly_memoryview_check(%self) : (memref<8xi64>) -> ()
     %value = memref.load %self[%slot] : memref<8xi64>
     %tuple = func.call @__ly_tuple_alloc(%one) : (i64) -> memref<5xi64>
@@ -961,7 +961,7 @@ module attributes {
   func.func @LyMemoryView_Iter(%self: memref<8xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.memoryview", ly.runtime.method = "__iter__", ly.runtime.result_contract = "builtins.memory_iterator"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
-    %class_iterator = arith.constant 29 : i64
+    %class_iterator = arith.constant {ly.class_id_of = "builtins.memory_iterator"} 29 : i64
     %header_bytes = arith.constant 32 : index
     %c0 = arith.constant 0 : index
     %s0 = arith.constant 0 : index

@@ -60,15 +60,15 @@ module attributes {
   func.func private @LyObject_IdentityKey(%word: i64) -> i64 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "identity_key"}
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
-  func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 5 : i64, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
+  func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
   func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "raise"}
   func.func private @LyList_Copy(%self: memref<5xi64> {ly.ownership.object_header}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "copy", ly.runtime.result_contract = "builtins.list"}
   func.func private @LyLong_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.int", ly.runtime.deallocator}
-  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
+  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
   func.func private @LyLong_Mod(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__mod__"}
   func.func private @LyLong_Mul(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__mul__"}
   func.func private @LyUnicode_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.str", ly.runtime.deallocator}
-  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
+  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_FromI64(%value: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyUnicode_Print(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) attributes {ly.runtime.contract = "builtins.str", ly.runtime.primitive = "print"}
   func.func private @__ly_fmt_copy_bytes(%dst: memref<?xi8>, %dpos: i64, %src: memref<?xi8>, %len: i64) -> i64
@@ -244,7 +244,7 @@ module attributes {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64
-    %value_error = arith.constant 53 : i64
+    %value_error = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
     %exp_sign = memref.load %exp_meta[%c0] : memref<2xi64>
     %exp_negative = arith.cmpi slt, %exp_sign, %zero : i64
     scf.if %exp_negative {
@@ -321,7 +321,7 @@ module attributes {
       // found" (Python/bltinmodule.c, builtin_ord). Stopping at "expected a
       // character" hides whether the argument was empty or too long, which
       // is the only thing the message is for.
-      %type_error = arith.constant 52 : i64
+      %type_error = arith.constant {ly.class_id_of = "builtins.TypeError"} 52 : i64
       %buf_s = memref.alloca() : memref<96xi8>
       %buf = memref.cast %buf_s : memref<96xi8> to memref<?xi8>
       %zero = arith.constant 0 : i64
@@ -402,7 +402,7 @@ module attributes {
 
   ^raise(%rbuf: memref<?xi8>):
     memref.dealloc %rbuf : memref<?xi8>
-    %eof_class = arith.constant 106 : i64
+    %eof_class = arith.constant {ly.class_id_of = "builtins.EOFError"} 106 : i64
     %msg_static = memref.get_global @__ly_input_eof_msg : memref<23xi8>
     %msg = memref.cast %msg_static : memref<23xi8> to memref<?xi8>
     %msg_len = arith.constant 23 : i64
@@ -439,7 +439,7 @@ module attributes {
     %bad0 = arith.ori %negative, %too_big : i1
     %bad = arith.ori %bad0, %not_fits : i1
     scf.if %bad {
-      %value_error = arith.constant 53 : i64
+      %value_error = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
       %msg_static = memref.get_global @__ly_chr_msg : memref<32xi8>
       %msg = memref.cast %msg_static : memref<32xi8> to memref<?xi8>
       %len = arith.constant 32 : i64

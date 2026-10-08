@@ -1,3 +1,4 @@
+#include "ClassIds.h"
 #include "Runtime/Core/Lowerer.h"
 
 #include "PyProtocols.h"
@@ -966,7 +967,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
       mlir::Value classSlot =
           mlir::arith::ConstantIntOp::create(builder, loc, 2, 64).getResult();
       mlir::Value exceptionGroupId =
-          mlir::arith::ConstantIntOp::create(builder, loc, 102, 64)
+          mlir::arith::ConstantIntOp::create(
+              builder, loc, py::class_ids::of("builtins.ExceptionGroup"), 64)
               .getResult();
       llvm::ArrayRef<mlir::Type> extInputs =
           extSet->function.getFunctionType().getInputs();

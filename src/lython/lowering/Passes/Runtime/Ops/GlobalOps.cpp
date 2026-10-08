@@ -1,3 +1,4 @@
+#include "ClassIds.h"
 #include "Runtime/Core/Lowerer.h"
 #include "Runtime/Ctypes/Internal.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -358,7 +359,9 @@ RuntimeBundleLowerer::lowerObjectGlobalGet(py::GlobalGetOp op) {
     mlir::Value messageBuffer =
         RuntimeBundleLowerer::materializeByteBuffer(loc, message);
     mlir::Value classId =
-        mlir::arith::ConstantIntOp::create(builder, loc, 51, 64).getResult();
+        mlir::arith::ConstantIntOp::create(
+          builder, loc, py::class_ids::of("builtins.RuntimeError"), 64)
+          .getResult();
     mlir::Value length =
         mlir::arith::ConstantIntOp::create(
             builder, loc, static_cast<std::int64_t>(message.size()), 64)

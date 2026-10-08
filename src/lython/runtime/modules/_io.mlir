@@ -174,12 +174,12 @@ module attributes {
   func.func private @LyHost_OSErrorClassId(i32) -> i64
   func.func private @LyHost_OSErrorMessagePath(i32, memref<?xi8>, i64, memref<?xi8>, i64) -> i64
   func.func private @LyHost_Stat(memref<?xi8>, i64, memref<?xi64>) -> i32
-  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
-  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
+  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
+  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_CodepointLength(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> i64 attributes {ly.runtime.contract = "builtins.str", ly.runtime.method = "__len__"}
   func.func private @LyUnicode_Encode(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "encode", ly.runtime.result_contract = "builtins.bytes"}
   func.func private @LyBytes_DecRef(%header: memref<4xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.deallocator}
-  func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 5 : i64, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
+  func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
   func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "raise"}
   func.func private @LyObject_ReleaseStorageToZero(memref<?xi64>) -> i1
@@ -187,7 +187,7 @@ module attributes {
   // ===== impls: UnsupportedOperation (OSError subclass, id 69) =====
   func.func private @LyUnsupportedOperation_Shape() -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "_io.UnsupportedOperation", ly.runtime.shape}
 
-  func.func @LyUnsupportedOperation_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 69 : i64, ly.runtime.contract = "_io.UnsupportedOperation", ly.runtime.initializer = "__new__"} {
+  func.func @LyUnsupportedOperation_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "_io.UnsupportedOperation", ly.runtime.initializer = "__new__"} {
     %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
@@ -280,7 +280,7 @@ module attributes {
 
   // ValueError (53): "I/O operation on closed file."
   func.func private @__ly_io_raise_closed() {
-    %class_id = arith.constant 53 : i64
+    %class_id = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
     %length = arith.constant 29 : i64
     %static = memref.get_global @__ly_io_msg_closed : memref<29xi8>
     %message = memref.cast %static : memref<29xi8> to memref<?xi8>
@@ -290,7 +290,7 @@ module attributes {
 
   // UnsupportedOperation (69): "not readable" / "not writable".
   func.func private @__ly_io_raise_not_readable() {
-    %class_id = arith.constant 69 : i64
+    %class_id = arith.constant {ly.class_id_of = "_io.UnsupportedOperation"} 69 : i64
     %length = arith.constant 12 : i64
     %static = memref.get_global @__ly_io_msg_not_readable : memref<12xi8>
     %message = memref.cast %static : memref<12xi8> to memref<?xi8>
@@ -299,7 +299,7 @@ module attributes {
   }
 
   func.func private @__ly_io_raise_not_writable() {
-    %class_id = arith.constant 69 : i64
+    %class_id = arith.constant {ly.class_id_of = "_io.UnsupportedOperation"} 69 : i64
     %length = arith.constant 12 : i64
     %static = memref.get_global @__ly_io_msg_not_writable : memref<12xi8>
     %message = memref.cast %static : memref<12xi8> to memref<?xi8>
@@ -309,7 +309,7 @@ module attributes {
 
   // ValueError (53) seek diagnostics.
   func.func private @__ly_io_raise_neg_seek() {
-    %class_id = arith.constant 53 : i64
+    %class_id = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
     %length = arith.constant 22 : i64
     %static = memref.get_global @__ly_io_msg_neg_seek : memref<22xi8>
     %message = memref.cast %static : memref<22xi8> to memref<?xi8>
@@ -318,7 +318,7 @@ module attributes {
   }
 
   func.func private @__ly_io_raise_bad_whence() {
-    %class_id = arith.constant 53 : i64
+    %class_id = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
     %length = arith.constant 14 : i64
     %static = memref.get_global @__ly_io_msg_bad_whence : memref<14xi8>
     %message = memref.cast %static : memref<14xi8> to memref<?xi8>
@@ -329,7 +329,7 @@ module attributes {
   // stringio.c raises OSError (not ValueError) for nonzero relative seeks.
   // UnsupportedOperation (69): seeking on a raw-fd text stream.
   func.func private @__ly_io_raise_not_seekable() {
-    %class_id = arith.constant 69 : i64
+    %class_id = arith.constant {ly.class_id_of = "_io.UnsupportedOperation"} 69 : i64
     %length = arith.constant 33 : i64
     %static = memref.get_global @__ly_io_msg_not_seekable : memref<33xi8>
     %message = memref.cast %static : memref<33xi8> to memref<?xi8>
@@ -339,7 +339,7 @@ module attributes {
 
   // ValueError (53): truncate with an explicit negative size.
   func.func private @__ly_io_raise_neg_size() {
-    %class_id = arith.constant 53 : i64
+    %class_id = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
     %length = arith.constant 19 : i64
     %static = memref.get_global @__ly_io_msg_neg_size : memref<19xi8>
     %message = memref.cast %static : memref<19xi8> to memref<?xi8>
@@ -348,7 +348,7 @@ module attributes {
   }
 
   func.func private @__ly_io_raise_nonzero_seek() {
-    %class_id = arith.constant 66 : i64
+    %class_id = arith.constant {ly.class_id_of = "builtins.OSError"} 66 : i64
     %length = arith.constant 31 : i64
     %static = memref.get_global @__ly_io_msg_nonzero_seek : memref<31xi8>
     %message = memref.cast %static : memref<31xi8> to memref<?xi8>
@@ -361,7 +361,7 @@ module attributes {
   // builds the object, and a manifest class id comes from the function that
   // says which class it makes. Without one, a file in a container was boxed
   // with class 0 and printed as `<object object at 0x...>`.
-  func.func private @LyTextIO_Shape() -> memref<8xi64> attributes {ly.runtime.class_id = 65 : i64, ly.runtime.contract = "_io.TextIOWrapper", ly.runtime.shape}
+  func.func private @LyTextIO_Shape() -> memref<8xi64> attributes {ly.runtime.class_id, ly.runtime.contract = "_io.TextIOWrapper", ly.runtime.shape}
 
   func.func private @__ly_textio_check_open(%self: memref<8xi64>) {
     %closed_slot = arith.constant 6 : index
@@ -778,7 +778,7 @@ module attributes {
   func.func private @LyHost_BufferCopyIn(i64, i64, memref<?xi8>, i64)
   func.func private @LyHost_BufferCopyOut(i64, i64, memref<?xi8>, i64)
   func.func private @LyHost_BufferFree(i64)
-  func.func private @LyBytes_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 70 : i64, ly.runtime.contract = "builtins.bytes", ly.runtime.initializer = "__new__"}
+  func.func private @LyBytes_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.bytes", ly.runtime.initializer = "__new__"}
   func.func private @__ly_bytes_payload(%self: memref<4xi64>) -> memref<?xi8> attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.interior_word, ly.runtime.primitive = "payload_view"}
 
   func.func private @LyStringIO_Shape() -> memref<8xi64> attributes {ly.runtime.contract = "_io.StringIO", ly.runtime.shape}
@@ -912,7 +912,7 @@ module attributes {
   // 73, not 68: 68 belongs to builtins.GeneratorExit in the exception
   // taxonomy (ExceptionTaxonomy.h), and the dynamic-id repr path resolves
   // class names through that table, so reusing it would mislabel StringIO.
-  func.func @LyStringIO_New(%class_id: i64 {ly.runtime.class_id_argument}) -> memref<8xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 73 : i64, ly.runtime.contract = "_io.StringIO", ly.runtime.initializer = "__new__"} {
+  func.func @LyStringIO_New(%class_id: i64 {ly.runtime.class_id_argument}) -> memref<8xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "_io.StringIO", ly.runtime.initializer = "__new__"} {
     %self = func.call @__ly_membuf_new(%class_id) : (i64) -> memref<8xi64>
     func.return %self : memref<8xi64>
   }
@@ -1114,7 +1114,7 @@ module attributes {
   }
 
   // ---- BytesIO (class id 71) ----
-  func.func @LyBytesIO_New(%class_id: i64 {ly.runtime.class_id_argument}) -> memref<8xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 71 : i64, ly.runtime.contract = "_io.BytesIO", ly.runtime.initializer = "__new__"} {
+  func.func @LyBytesIO_New(%class_id: i64 {ly.runtime.class_id_argument}) -> memref<8xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "_io.BytesIO", ly.runtime.initializer = "__new__"} {
     %self = func.call @__ly_membuf_new(%class_id) : (i64) -> memref<8xi64>
     func.return %self : memref<8xi64>
   }
@@ -1263,7 +1263,7 @@ module attributes {
   // surface: reads and writes are bytes, unlike TextIOWrapper's str) ----
   func.func private @LyFileIO_Shape() -> memref<8xi64> attributes {ly.runtime.contract = "_io.FileIO", ly.runtime.shape}
 
-  func.func @LyFileIO_New(%class_id: i64 {ly.runtime.class_id_argument}) -> memref<8xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 72 : i64, ly.runtime.contract = "_io.FileIO", ly.runtime.initializer = "__new__"} {
+  func.func @LyFileIO_New(%class_id: i64 {ly.runtime.class_id_argument}) -> memref<8xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "_io.FileIO", ly.runtime.initializer = "__new__"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %self = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<8xi64>
@@ -1644,7 +1644,7 @@ module attributes {
     cf.cond_br %is_invalid, ^invalid, ^binary
 
   ^invalid:
-    %class_invalid = arith.constant 53 : i64
+    %class_invalid = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
     %len_invalid = arith.constant 12 : i64
     %static_invalid = memref.get_global @__ly_io_msg_invalid_mode : memref<12xi8>
     %msg_invalid = memref.cast %static_invalid : memref<12xi8> to memref<?xi8>
@@ -1652,7 +1652,7 @@ module attributes {
     func.return
 
   ^binary:
-    %class_binary = arith.constant 53 : i64
+    %class_binary = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
     %len_binary = arith.constant 28 : i64
     %static_binary = memref.get_global @__ly_io_msg_binary_mode : memref<28xi8>
     %msg_binary = memref.cast %static_binary : memref<28xi8> to memref<?xi8>
@@ -1834,7 +1834,7 @@ module attributes {
     %writable_slot = arith.constant 5 : index
     %closed_slot = arith.constant 6 : index
     %reserved_slot = arith.constant 7 : index
-    %class_id = arith.constant 65 : i64
+    %class_id = arith.constant {ly.class_id_of = "_io.TextIOWrapper"} 65 : i64
     %meta = func.call @__ly_io_meta_new(%path_header, %mode_header) : (memref<2xi64>, memref<2xi64>) -> i64
     memref.store %one, %wrapper[%refcount_slot] : memref<8xi64>
     memref.store %class_id, %wrapper[%class_slot] : memref<8xi64>
@@ -1885,7 +1885,7 @@ module attributes {
     %writable_slot = arith.constant 5 : index
     %closed_slot = arith.constant 6 : index
     %reserved_slot = arith.constant 7 : index
-    %class_id = arith.constant 72 : i64
+    %class_id = arith.constant {ly.class_id_of = "_io.FileIO"} 72 : i64
     %meta = func.call @__ly_io_fileio_meta(%path_header, %base, %plus) : (memref<2xi64>, i64, i64) -> i64
     memref.store %one, %wrapper[%refcount_slot] : memref<8xi64>
     memref.store %class_id, %wrapper[%class_slot] : memref<8xi64>
