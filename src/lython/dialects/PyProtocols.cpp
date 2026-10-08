@@ -457,7 +457,8 @@ std::optional<std::string> manifestClassNameForLiteral(py::LiteralType literal) 
 
 std::optional<std::pair<std::string, std::map<std::string, mlir::Type>>>
 bindReceiver(mlir::Type type,
-             const std::map<std::string, ProtocolInfo> &classes) {
+             const std::map<std::string, ProtocolInfo> &classes,
+             const std::map<std::string, std::string> &protocolKeys) {
   if (auto concrete = bindConcrete(type))
     return concrete;
 
@@ -494,14 +495,17 @@ bindReceiver(mlir::Type type,
   auto protocol = mlir::dyn_cast<py::ProtocolType>(type);
   if (!protocol)
     return std::nullopt;
-  auto found = classes.find(protocol.getProtocolName().str());
+  std::string key = protocol.getProtocolName().str();
+  if (auto moved = protocolKeys.find(key); moved != protocolKeys.end())
+    key = moved->second;
+  auto found = classes.find(key);
   if (found == classes.end() || !found->second.isProtocol)
     return std::nullopt;
   std::optional<std::map<std::string, mlir::Type>> binding =
       bindProtocolInstantiation(found->second, protocol.getArguments());
   if (!binding)
     return std::nullopt;
-  return {{protocol.getProtocolName().str(), *binding}};
+  return {{key, *binding}};
 }
 
 std::map<std::string, mlir::Type>
@@ -514,12 +518,13 @@ withSelfBinding(const std::map<std::string, mlir::Type> &binding,
 
 std::optional<std::vector<mlir::Type>>
 protocolArgumentsForImpl(const std::map<std::string, ProtocolInfo> &classes,
+                         const std::map<std::string, std::string> &protocolKeys,
                          mlir::Type receiverType,
                          llvm::StringRef protocolName) {
   auto target = classes.find(protocolName.str());
   if (target == classes.end() || !target->second.isProtocol)
     return std::nullopt;
-  auto binding = bindReceiver(receiverType, classes);
+  auto binding = bindReceiver(receiverType, classes, protocolKeys);
   if (!binding)
     return std::nullopt;
 
@@ -879,6 +884,7 @@ const Table &Table::get(mlir::MLIRContext &context) {
             FieldParamBinding{field.str(), param.str(), viaBase.str()});
       }
       classInfo.isProtocol = hasMarker(classOp, "ly.typing.protocol");
+      classInfo.fromManifest = true;
       classInfo.isAbstract = hasMarker(classOp, "ly.typing.abstract");
       classInfo.isFinal = hasMarker(classOp, "ly.typing.final");
       classInfo.keepsArguments =
@@ -1009,8 +1015,34 @@ Table &Table::getMutable(mlir::MLIRContext &context) {
   return *cache.table;
 }
 
+// ⭐ A PROGRAM CLASS MAY BE NAMED LIKE A MANIFEST PROTOCOL. Python binds the
+// name to the class; the protocol keeps meaning what it meant to every manifest
+// class whose bases name it (`list` derives from `Sequence`). Overwriting the
+// one entry both share made `class Sequence` in a program take list's methods
+// with it -- "'Iterable' ... does not provide manifest method" for a list
+// comprehension. The protocol moves to a key no program class can spell, and
+// the manifest's references move with it.
 void Table::registerClass(llvm::StringRef name, ProtocolInfo info) {
-  classes[name.str()] = std::move(info);
+  std::string key = name.str();
+  if (!info.fromManifest && !protocolKeys.count(key))
+    if (auto existing = classes.find(key);
+        existing != classes.end() && existing->second.fromManifest &&
+        existing->second.isProtocol) {
+      std::string moved = "\x01protocol." + key;
+      classes[moved] = existing->second;
+      protocolKeys[key] = moved;
+      for (auto &[entryName, entry] : classes)
+        if (entry.fromManifest)
+          for (ProtocolBase &base : entry.bases)
+            if (base.name == key)
+              base.name = moved;
+    }
+  classes[key] = std::move(info);
+}
+
+std::string Table::keyForProtocol(llvm::StringRef name) const {
+  auto moved = protocolKeys.find(name.str());
+  return moved == protocolKeys.end() ? name.str() : moved->second;
 }
 
 std::optional<std::string>
@@ -1209,7 +1241,7 @@ Table::collectReceiverMethodContracts(mlir::Type receiverType,
       return result;
   }
 
-  auto binding = bindReceiver(receiverType, classes);
+  auto binding = bindReceiver(receiverType, classes, protocolKeys);
   if (binding) {
     std::map<std::string, mlir::Type> selfBinding =
         withSelfBinding(binding->second, receiverType);
@@ -1222,7 +1254,7 @@ Table::collectReceiverMethodContracts(mlir::Type receiverType,
   // receiver; instance methods there fail that bind and are filtered out).
   if (auto typeObject = mlir::dyn_cast<py::TypeType>(receiverType)) {
     auto instanceBinding =
-        bindReceiver(typeObject.getInstanceType(), classes);
+        bindReceiver(typeObject.getInstanceType(), classes, protocolKeys);
     if (instanceBinding) {
       std::map<std::string, mlir::Type> selfBinding = withSelfBinding(
           instanceBinding->second, typeObject.getInstanceType());
@@ -1359,7 +1391,7 @@ Table::aggregateFieldsSpec(llvm::StringRef className) const {
 bool Table::structurallyAccepts(
     mlir::Type actual, llvm::StringRef protocolName,
     llvm::ArrayRef<mlir::Type> expectedArguments) const {
-  const ProtocolInfo *info = lookup(protocolName);
+  const ProtocolInfo *info = lookup(keyForProtocol(protocolName));
   if (!info || !info->isProtocol)
     return false;
 
@@ -1385,7 +1417,8 @@ std::optional<std::vector<mlir::Type>>
 Table::protocolArgumentsFor(mlir::Type receiverType,
                             llvm::StringRef protocolName) const {
   if (std::optional<std::vector<mlir::Type>> nominal =
-          protocolArgumentsForImpl(classes, receiverType, protocolName))
+          protocolArgumentsForImpl(classes, protocolKeys, receiverType,
+                                   keyForProtocol(protocolName)))
     return nominal;
 
   auto oneConsistentPayload =
@@ -1442,7 +1475,7 @@ Table::protocolArgumentsFor(mlir::Type receiverType,
 
 Variance Table::parameterVariance(llvm::StringRef protocolName,
                                   unsigned index) const {
-  const ProtocolInfo *info = lookup(protocolName);
+  const ProtocolInfo *info = lookup(keyForProtocol(protocolName));
   if (!info || index >= info->paramVariance.size())
     return Variance::Covariant;
   return parseVariance(info->paramVariance[index]);
@@ -1452,7 +1485,8 @@ bool Table::isProtocolSubtypeOf(
     py::ProtocolType subtype, py::ProtocolType supertype,
     llvm::function_ref<bool(mlir::Type, mlir::Type, Variance)> argumentMatches)
     const {
-  const ProtocolInfo *targetInfo = lookup(supertype.getProtocolName());
+  const ProtocolInfo *targetInfo =
+      lookup(keyForProtocol(supertype.getProtocolName()));
   if (!targetInfo || !targetInfo->isProtocol)
     return false;
 
@@ -1462,7 +1496,7 @@ bool Table::isProtocolSubtypeOf(
   if (!targetArgs)
     return false;
 
-  auto binding = bindReceiver(subtype, classes);
+  auto binding = bindReceiver(subtype, classes, protocolKeys);
   if (!binding)
     return false;
 
@@ -1476,7 +1510,7 @@ bool Table::isProtocolSubtypeOf(
       return false;
     const ProtocolInfo &info = found->second;
 
-    if (className == supertype.getProtocolName()) {
+    if (className == keyForProtocol(supertype.getProtocolName())) {
       std::vector<mlir::Type> sourceArgs;
       sourceArgs.reserve(info.params.size());
       for (const std::string &param : info.params) {
@@ -1513,7 +1547,7 @@ bool Table::isProtocolSubtypeOf(
 
 std::optional<ProtocolEvidence>
 Table::evidenceFor(mlir::Type receiverType) const {
-  auto binding = bindReceiver(receiverType, classes);
+  auto binding = bindReceiver(receiverType, classes, protocolKeys);
   if (!binding)
     return std::nullopt;
   const ProtocolInfo *info = lookup(binding->first);
@@ -1543,7 +1577,8 @@ bool Table::isManifestSubclassOf(mlir::Type receiverType,
   std::optional<ProtocolEvidence> evidence = evidenceFor(receiverType);
   if (!evidence)
     return false;
-  std::string target = manifestClassNameForContract(baseClassName);
+  std::string target =
+      keyForProtocol(manifestClassNameForContract(baseClassName));
 
   auto walk = [&](auto &&self, llvm::StringRef className,
                   unsigned depth) -> bool {

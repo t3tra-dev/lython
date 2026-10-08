@@ -3109,25 +3109,23 @@ mlir::Type TypeSystem::annotationTypeForName(llvm::StringRef rawName) const {
   // class, and in Python the module-level binding shadows anything a name
   // could otherwise mean.
   //
-  // ⛔ The PROTOCOL spellings are claimed the same way -- `Sequence`,
-  // `Iterator`, `Generator` and eleven more -- and letting a declared class
-  // win over those was tried and REVERTED: the emitter's own iteration typing
-  // asks this function for `Iterator`, so `class Iterator` in a program broke
-  // every `for` loop in it with "static type !py.protocol<"Iterator", [...]>
-  // does not provide manifest method '__next__'". A user class of that name
-  // keeps the old refusal until the compiler's internal spellings are ones a
-  // program cannot shadow.
+  // ⭐ AND OVER A PROTOCOL SPELLING -- `Sequence`, `Iterator`, `Sized` and
+  // the rest. This was tried once and reverted, and what broke it was not this
+  // function: the protocol table keyed the program's `class Iterator` and the
+  // manifest's protocol under one name, so registering the class replaced the
+  // protocol every `for` loop and every list method reaches through. The table
+  // now moves a displaced protocol to a key of its own (`registerClass`).
   //
   // ⛔ Bare names only: `asyncio.Task` spelled with its module still means the
   // manifest contract, `collections.abc.Sequence` still means the protocol,
   // and so does a name inside a runtime module that declares no class of that
   // name.
-  if (auto protocolName = protocolAnnotationName(name))
-    return protocol(*protocolName);
   bool bare = !name.contains('.');
   if (bare)
     if (auto declared = lookupClass(name))
       return *declared;
+  if (auto protocolName = protocolAnnotationName(name))
+    return protocol(*protocolName);
   if (auto contractName = contractAnnotationName(name))
     return contract(*contractName);
   if (auto knownClass = lookupClass(name))
@@ -5744,6 +5742,9 @@ TypeSystem::functionSignature(const parser::Node &function,
       std::string resolved = resolveAnnotationName(
           qualified.empty() ? llvm::StringRef(spelling.data(), spelling.size())
                             : llvm::StringRef(qualified));
+      // A bare name the program declares as a class is that class.
+      if (!llvm::StringRef(resolved).contains('.') && lookupClass(resolved))
+        return;
       if (std::optional<std::string> generic =
               bareGenericAnnotationName(resolved))
         sig.invalidParameterAnnotations.push_back(
