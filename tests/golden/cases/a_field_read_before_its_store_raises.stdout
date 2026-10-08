@@ -1,0 +1,8 @@
+AttributeError 'A' object has no attribute 'x'
+AttributeError 'Lazy' object has no attribute 'label'
+AttributeError 'NoSuper' object has no attribute 'tag'
+startedstarted base base
+early: 'Early' object has no attribute 'v'
+late
+False AE 'Flagged' object has no attribute 'flag'
+True False True

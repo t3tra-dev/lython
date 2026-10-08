@@ -1482,6 +1482,37 @@ module attributes {
     func.return %r#0, %r#1 : i1, i1
   }
 
+  memref.global "private" constant @__ly_attr_msg_object_has_no : memref<27xi8> = dense<[39, 32, 111, 98, 106, 101, 99, 116, 32, 104, 97, 115, 32, 110, 111, 32, 97, 116, 116, 114, 105, 98, 117, 116, 101, 32, 39]>
+
+  // AttributeError "'<class>' object has no attribute '<name>'" for a field
+  // whose slot no store has filled -- CPython's lookup finds nothing in the
+  // instance and nothing on the class. The class is the instance's own, as
+  // CPython's message names type(obj).
+  func.func @LyObject_RaiseUnsetField(%class_id: i64, %name: memref<?xi8>, %name_length: i64) attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "raise_unset_field"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %quote = arith.constant 39 : i8
+    %buffer_static = memref.alloca() : memref<512xi8>
+    %buffer = memref.cast %buffer_static : memref<512xi8> to memref<?xi8>
+    memref.store %quote, %buffer[%c0] : memref<?xi8>
+    %a1 = func.call @__ly_msg_append_class_name(%buffer, %c1, %class_id) : (memref<?xi8>, index, i64) -> (index)
+    %middle_static = memref.get_global @__ly_attr_msg_object_has_no : memref<27xi8>
+    %middle = memref.cast %middle_static : memref<27xi8> to memref<?xi8>
+    %middle_length = arith.constant 27 : index
+    %a2 = func.call @__ly_msg_append(%buffer, %a1, %middle, %middle_length) : (memref<?xi8>, index, memref<?xi8>, index) -> (index)
+    %most = arith.constant 300 : i64
+    %over = arith.cmpi sgt, %name_length, %most : i64
+    %kept = arith.select %over, %most, %name_length : i64
+    %kept_index = arith.index_cast %kept : i64 to index
+    %a3 = func.call @__ly_msg_append(%buffer, %a2, %name, %kept_index) : (memref<?xi8>, index, memref<?xi8>, index) -> (index)
+    memref.store %quote, %buffer[%a3] : memref<?xi8>
+    %end = arith.addi %a3, %c1 : index
+    %length = arith.index_cast %end : index to i64
+    %attribute_error = arith.constant 112 : i64
+    func.call @__ly_raise_static_message(%attribute_error, %buffer, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.return
+  }
+
   // Strict-subclass table over class ids, synthesized per program by the
   // lowering from the source classes' bases (RuntimeABI.cpp).
   func.func private @__ly_class_derives_strictly(%sub_class: i64, %base_class: i64) -> i1

@@ -1,3 +1,4 @@
+#include "Runtime/ABI/ConstantData.h"
 #include "PyProtocols.h"
 #include "PyTypeObject.h"
 #include "Runtime/Core/Lowerer.h"
@@ -1573,6 +1574,45 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
       // bool's physical lane IS the i1, so the word is narrowed back into one
       // rather than carried as primitive-i64 evidence (which only int has).
       if (isBoolFieldType(fieldType)) {
+        if (op->hasAttr("ly.field.maybe_unset")) {
+          // The allocation marks a bool word 2 until its first store.
+          std::optional<RuntimeSymbol> raiser =
+              manifest.primitive("builtins.object", "raise_unset_field");
+          if (!raiser)
+            return op.emitError() << "runtime manifest has no raise_unset_field";
+          mlir::Location loc = op.getLoc();
+          mlir::Value unsetMark =
+              mlir::arith::ConstantIntOp::create(builder, loc, 2, 64);
+          mlir::Value unset = mlir::arith::CmpIOp::create(
+              builder, loc, mlir::arith::CmpIPredicate::eq, raw, unsetMark);
+          mlir::FailureOr<mlir::Value> classId =
+              RuntimeBundleLowerer::exactRuntimeClassId(op, *object);
+          if (mlir::failed(classId))
+            return mlir::failure();
+          builder.setInsertionPointAfterValue(raw);
+          if (mlir::Operation *after = classId->getDefiningOp())
+            builder.setInsertionPointAfter(after);
+          auto check = mlir::scf::IfOp::create(builder, loc, unset,
+                                               /*withElseRegion=*/false);
+          {
+            mlir::OpBuilder::InsertionGuard guard(builder);
+            builder.setInsertionPointToStart(&check.getThenRegion().front());
+            llvm::StringRef name = op.getName();
+            llvm::SmallVector<std::int8_t, 32> bytes(name.begin(), name.end());
+            auto elements = mlir::DenseElementsAttr::get(
+                mlir::RankedTensorType::get(
+                    {static_cast<std::int64_t>(bytes.size())},
+                    builder.getI8Type()),
+                llvm::ArrayRef<std::int8_t>(bytes));
+            mlir::Value text = py::lowering::constant_data::internReadOnlyBlock(
+                module, builder, loc, "field_name", name, elements);
+            mlir::Value length = mlir::arith::ConstantIntOp::create(
+                builder, loc, static_cast<std::int64_t>(bytes.size()), 64);
+            RuntimeBundleLowerer::createRuntimeCall(
+                loc, *raiser, mlir::ValueRange{*classId, text, length});
+          }
+          builder.setInsertionPoint(op);
+        }
         mlir::Value zero =
             mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 0, 64)
                 .getResult();
@@ -1615,6 +1655,70 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
   bool boxedField =
       fieldIndex && *fieldIndex < fieldTypes.size() &&
       RuntimeBundleLowerer::classFieldStoredBoxed(fieldTypes[*fieldIndex]);
+
+  // ⭐ A FIELD NO STORE MAY HAVE FILLED IS TESTED before it is read. Its slot
+  // is zero until the first store, and for a type that does not admit None a
+  // zero entity names nothing: `class A: x: str` then `A().x` loaded it as a
+  // str header and crashed, where CPython raises AttributeError. The emitter
+  // marks only the reads it cannot prove follow a store
+  // (`ly.field.maybe_unset`); a field every constructor fills before `self`
+  // escapes is read untested.
+  //
+  // ⛔ Not for a field that admits None: its zero IS None, and an unfilled one
+  // reads as None rather than raising -- a deviation, not a crash.
+  if (boxedField && classOp && op->hasAttr("ly.field.maybe_unset")) {
+    mlir::Type fieldType = fieldTypes[*fieldIndex];
+    bool admitsNone = false;
+    if (auto unionType = mlir::dyn_cast<py::UnionType>(fieldType))
+      for (mlir::Type member : unionType.getMemberTypes())
+        if (runtimeShapeContractName(member) == "types.NoneType")
+          admitsNone = true;
+    if (!admitsNone) {
+      std::optional<RuntimeSymbol> raiser =
+          manifest.primitive("builtins.object", "raise_unset_field");
+      if (!raiser)
+        return op.emitError() << "runtime manifest has no raise_unset_field";
+      mlir::FailureOr<std::pair<mlir::Value, unsigned>> slot =
+          RuntimeBundleLowerer::classBoxedFieldSlot(op, *object, classOp,
+                                                    *fieldIndex, "unset test");
+      if (mlir::failed(slot))
+        return mlir::failure();
+      builder.setInsertionPoint(op);
+      mlir::Location loc = op.getLoc();
+      mlir::Value word = mlir::arith::ConstantIndexOp::create(
+          builder, loc, slot->second + box_abi::kEntityWord);
+      mlir::Value entity =
+          mlir::memref::LoadOp::create(builder, loc, slot->first, word);
+      mlir::Value zero = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
+      mlir::Value unset = mlir::arith::CmpIOp::create(
+          builder, loc, mlir::arith::CmpIPredicate::eq, entity, zero);
+      mlir::FailureOr<mlir::Value> classId =
+          RuntimeBundleLowerer::exactRuntimeClassId(op, *object);
+      if (mlir::failed(classId))
+        return mlir::failure();
+      builder.setInsertionPoint(op);
+      auto check = mlir::scf::IfOp::create(builder, loc, unset,
+                                           /*withElseRegion=*/false);
+      {
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToStart(&check.getThenRegion().front());
+        llvm::StringRef name = op.getName();
+        llvm::SmallVector<std::int8_t, 32> bytes(name.begin(), name.end());
+        auto elements = mlir::DenseElementsAttr::get(
+            mlir::RankedTensorType::get(
+                {static_cast<std::int64_t>(bytes.size())},
+                builder.getI8Type()),
+            llvm::ArrayRef<std::int8_t>(bytes));
+        mlir::Value text = py::lowering::constant_data::internReadOnlyBlock(
+            module, builder, loc, "field_name", name, elements);
+        mlir::Value length = mlir::arith::ConstantIntOp::create(
+            builder, loc, static_cast<std::int64_t>(bytes.size()), 64);
+        RuntimeBundleLowerer::createRuntimeCall(
+            loc, *raiser, mlir::ValueRange{*classId, text, length});
+      }
+      builder.setInsertionPoint(op);
+    }
+  }
 
   // A box-fronted field's LANES always come from the box words, never from the
   // recorded bundle, for two independent reasons. (1) The words are the storage:
