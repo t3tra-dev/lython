@@ -1683,30 +1683,7 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
           llvm::errs() << " " << b;
         llvm::errs() << "\n";
       }
-      auto &methods = declaredClassMethods[qualified];
-      auto &attributes = declaredClassAttributes[qualified];
-      if (const auto *classBody = ast::nodeList(*statement, "body"))
-        for (const parser::NodePtr &member : *classBody) {
-          if (!member)
-            continue;
-          if (member->kind == "FunctionDef" ||
-              member->kind == "AsyncFunctionDef") {
-            if (auto methodName = ast::string(*member, "name"))
-              methods.insert(*methodName);
-            continue;
-          }
-          if (member->kind == "AnnAssign") {
-            if (const parser::Node *target = ast::node(*member, "target"))
-              if (target->kind == "Name")
-                attributes.insert(ast::nameSpelling(*target));
-            continue;
-          }
-          if (member->kind == "Assign")
-            if (const auto *targets = ast::nodeList(*member, "targets"))
-              for (const parser::NodePtr &target : *targets)
-                if (target && target->kind == "Name")
-                  attributes.insert(ast::nameSpelling(*target));
-        }
+      recordClassBodyDeclarations(qualified, *statement);
     }
   }
   for (const EmitOptions::SourceModule &source : options.sourceModules) {

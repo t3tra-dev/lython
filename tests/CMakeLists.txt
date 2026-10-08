@@ -618,6 +618,11 @@ set(LYTHON_LEAK_GATE_RUNNER "${CMAKE_CURRENT_SOURCE_DIR}/leak_gate.py")
 #     dict literal family whose dict side was repaired earlier and which
 #     rfc/test-suite-debt.md listed as still leaking. Both are net zero now.
 set(LYTHON_LEAK_GATE_CASES
+    # Protocol values are class instances (desugarProtocols), counted as
+    # any; a union narrowed to its members' base is a view of the header the
+    # union owns.
+    a_protocol_is_satisfied_by_its_members
+    a_runtime_checkable_protocol_answers_isinstance
     # An `object` value stored into another container: the slot keeps the
     # box's entity, so the retain has to be the entity's -- retaining the box
     # leaked every box and left the entity a reference short.

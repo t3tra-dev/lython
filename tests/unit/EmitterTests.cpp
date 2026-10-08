@@ -2665,3 +2665,68 @@ TEST(EmitterTest, IdAndTheValuelessBuiltinsSayWhyTheyAreRefused) {
         << source << diagnostics;
   }
 }
+
+// A protocol is refused where CPython refuses it or where this compiler
+// cannot give CPython's answer: built directly, generic, a class that misses
+// a member passed for it (the message names the member), and isinstance()
+// without @runtime_checkable, over a builtin value, or where a class has the
+// method names but not the signatures.
+TEST(EmitterTest, AProtocolSaysWhyItIsRefused) {
+  lython::driver::DriverOptions native;
+  native.targetTriple = llvm::sys::getDefaultTargetTriple();
+  const std::string shape =
+      "from typing import Protocol, runtime_checkable\n"
+      "class Shape(Protocol):\n    def area(self) -> float: ...\n"
+      "@runtime_checkable\n"
+      "class Closer(Protocol):\n    def close(self) -> None: ...\n";
+  for (auto [tail, expected] :
+       std::initializer_list<std::pair<const char *, const char *>>{
+           {"s = Shape()\n", "'Shape' is a Protocol, and protocols cannot be "
+                              "instantiated"},
+           {"class Blob:\n    def volume(self) -> float:\n        return "
+            "1.0\ndef one(s: Shape) -> float:\n    return "
+            "s.area()\nprint(one(Blob()))\n",
+            "argument 1 ('Blob') does not satisfy the protocol 'Shape': it has "
+            "no member 'area'"},
+           {"class Odd:\n    def area(self, k: float) -> float:\n        "
+            "return k\ndef one(s: Shape) -> float:\n    return "
+            "s.area()\nprint(one(Odd()))\n",
+            "its 'area' does not take the parameters the protocol's does"},
+           {"class Sq:\n    def area(self) -> float:\n        return "
+            "1.0\nprint(isinstance(Sq(), Shape))\n",
+            "it is not @runtime_checkable"},
+           {"x: int | str = 1\nprint(isinstance(x, Closer))\n",
+            "is decided here only for values of this program's own classes"},
+           {"class Shut:\n    def close(self, now: bool) -> None:\n        "
+            "pass\nclass Door:\n    def close(self) -> None:\n        "
+            "pass\nprint(isinstance(Door(), Closer))\n",
+            "'Shut' has its method names, which CPython's check accepts"}}) {
+    std::string source = shape + tail;
+    mlir::MLIRContext context(testRegistry());
+    mlir::OwningOpRef<mlir::ModuleOp> module;
+    std::string diagnostics;
+    llvm::raw_string_ostream diag(diagnostics);
+    EXPECT_TRUE(mlir::failed(lython::driver::emitMLIRFromSource(
+        source, "main.py", "<lython-no-import-dir>", native, context, module,
+        diag)))
+        << source;
+    EXPECT_NE(diagnostics.find(expected), std::string::npos)
+        << source << diagnostics;
+  }
+  {
+    const char *source = "from typing import Protocol, TypeVar\nT = "
+                         "TypeVar(\"T\")\nclass Box(Protocol[T]):\n    def "
+                         "get(self) -> T: ...\n";
+    mlir::MLIRContext context(testRegistry());
+    mlir::OwningOpRef<mlir::ModuleOp> module;
+    std::string diagnostics;
+    llvm::raw_string_ostream diag(diagnostics);
+    EXPECT_TRUE(mlir::failed(lython::driver::emitMLIRFromSource(
+        source, "main.py", "<lython-no-import-dir>", native, context, module,
+        diag)));
+    EXPECT_NE(diagnostics.find("a generic Protocol (`Protocol[T]`) is not "
+                               "supported yet"),
+              std::string::npos)
+        << diagnostics;
+  }
+}

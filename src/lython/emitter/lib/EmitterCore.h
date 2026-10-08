@@ -223,7 +223,22 @@ private:
       const parser::Node &anchor, Value receiver, llvm::StringRef methodName,
       unsigned argumentCount, bool asProperty = false,
       llvm::ArrayRef<std::string> keywordNames = {}, bool asAttribute = false,
-      bool asSetter = false);
+      bool asSetter = false, bool asField = false);
+  // A base's instance FIELD read where a subclass makes the name readable
+  // another way (a class attribute with a value, a property).
+  std::optional<Value> tryEmitVirtualFieldRead(const parser::Node &anchor,
+                                               Value receiver,
+                                               llvm::StringRef fieldName,
+                                               mlir::Type fieldType);
+  bool subclassReadsFieldOtherwise(llvm::StringRef receiverClass,
+                                   llvm::StringRef fieldName) const;
+  // Whether any class in `cls`'s line, or any subclass of it, stores the
+  // name on `self` -- whether an instance can ever hold it.
+  bool fieldEverStored(llvm::StringRef cls, llvm::StringRef fieldName) const;
+  // Whether `cls` or an ancestor binds the name by a plain class-level
+  // assignment or a property (`declaredClassReadableNames`).
+  bool classLineBindsReadable(llvm::StringRef cls,
+                              llvm::StringRef name) const;
   // `self.kind` where a subclass redeclares the class attribute `kind`: the
   // same dispatcher, reading a class attribute instead of calling a method.
   std::optional<Value> tryEmitVirtualAttributeRead(const parser::Node &anchor,
@@ -260,6 +275,10 @@ private:
   // Non-zero while a property dispatcher's body is being emitted, where the
   // unresolvable-dispatch gate is the question the dispatcher answers.
   unsigned virtualPropertyBodyDepth = 0;
+  // Every module's ClassDefs have been emitted, so a dispatcher's arms can
+  // name any class's methods; before then its body is queued here.
+  bool classDeclarationsEmitted = false;
+  std::vector<std::function<void()>> deferredDispatcherBodies;
   // Keyed "<class>.<method>", so one dispatcher serves every call site and a
   // method that dispatches on itself terminates. Filled BEFORE the body is
   // emitted for that second reason.
@@ -513,6 +532,16 @@ private:
   // back. Rewritten into `type_params` before anything reads the tree, so the
   // machinery that already compiles `class Stack[T]` compiles both.
   void desugarClassicGenerics(const parser::Node &moduleNode);
+  // `class P(Protocol)` becomes a plain class and a base of every class (in
+  // any module of the program) that has its members; EmitterProtocols.cpp.
+  void desugarProtocols();
+  // The classes that were declared as protocols, by their own name.
+  llvm::StringSet<> protocolClassNames;
+  // "Class\0Protocol" (contract names) -> why the class does not satisfy it.
+  llvm::StringMap<std::string> protocolMisses;
+  // Protocol contract name -> why isinstance() against it cannot be answered
+  // exactly (empty when it can).
+  llvm::StringMap<std::string> protocolIsinstance;
   std::optional<EnumKind> enumBaseKind(const parser::Node &classDef) const;
   void collectEnumMembers(const parser::Node &classDef, EnumKind kind);
   void rewriteEnumClassDef(const parser::Node &classDef);
@@ -1423,6 +1452,14 @@ private:
   llvm::StringMap<llvm::SmallVector<std::string, 4>> declaredClassBases;
   llvm::StringMap<llvm::StringSet<>> declaredClassMethods;
   llvm::StringMap<llvm::StringSet<>> declaredClassAttributes;
+  // The names a class body makes readable WITHOUT an instance store: a plain
+  // class-level assignment (`name = "R2"`), or a property. A base's FIELD of
+  // that name is shadowed by them, where an annotation shadows nothing.
+  llvm::StringMap<llvm::StringSet<>> declaredClassReadableNames;
+  // The names a class's own methods store on `self`.
+  llvm::StringMap<llvm::StringSet<>> declaredClassStoredFields;
+  void recordClassBodyDeclarations(llvm::StringRef name,
+                                   const parser::Node &classDef);
   // How many except handler bodies enclose the statement being emitted. A bare
   // `raise` re-raises what a handler caught, so at zero there is nothing to
   // re-raise -- the question the lowering cannot ask, because `py.try`'s

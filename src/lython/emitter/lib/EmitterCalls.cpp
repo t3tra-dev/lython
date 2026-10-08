@@ -394,6 +394,27 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     if (!root.empty() && values.find(root) != values.end())
       calleeQualified.clear();
   }
+  // CPython's `Protocol.__init__` refuses: a protocol describes classes, it
+  // is not one to build. Here it is an ordinary class (desugarProtocols), so
+  // the call would construct an instance whose methods are the stubs.
+  if (calleeNode && (calleeNode->kind == "Name" ||
+                     calleeNode->kind == "Attribute")) {
+    llvm::StringRef leaf = calleeNode->kind == "Name"
+                               ? llvm::StringRef(ast::nameSpelling(*calleeNode))
+                               : llvm::StringRef(ast::string(*calleeNode, "attr")
+                                                     .value_or(""));
+    if (protocolClassNames.count(leaf) &&
+        (calleeNode->kind != "Name" || values.find(leaf) == values.end()) &&
+        types.lookupClass(canonicalClassName(calleeQualified)) !=
+            mlir::Type()) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "'" + leaf.str() + "' is a Protocol, and protocols cannot be "
+          "instantiated (CPython raises TypeError); construct a class that "
+          "has its members"});
+      return emitNone(expr);
+    }
+  }
   if (!calleeQualified.empty())
     if (std::optional<Value> host =
             tryEmitJsHostFunctionCall(expr, calleeQualified))
@@ -2903,6 +2924,52 @@ ModuleEmitter::tryEmitIsInstanceCall(const parser::Node &expr,
     return emitNone(expr);
   }
 
+  // ⭐ A PROTOCOL TARGET IS CPython's STRUCTURAL CHECK, which this answers
+  // with the base the desugar gave every satisfying class -- exact only where
+  // the two agree. CPython refuses outright without @runtime_checkable; with
+  // it, it asks only whether the METHOD NAMES exist, so a class that has the
+  // names but not the parameters (no base here) or a builtin value would be
+  // True there. Each is refused rather than answered False.
+  for (mlir::Type target : *targets) {
+    auto contract = mlir::dyn_cast_if_present<py::ContractType>(target);
+    if (!contract)
+      continue;
+    auto info = protocolIsinstance.find(contract.getContractName());
+    if (info == protocolIsinstance.end())
+      continue;
+    if (!info->second.empty()) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "isinstance() against the protocol '" +
+              contract.getContractName().str() + "' is refused: " +
+              info->second});
+      return emitNone(expr);
+    }
+    mlir::Type subject = types.widenLiteral(types.inferExpr(args->front().get()));
+    llvm::SmallVector<mlir::Type, 4> members;
+    if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(subject))
+      members.append(unionType.getMemberTypes().begin(),
+                     unionType.getMemberTypes().end());
+    else
+      members.push_back(subject);
+    for (mlir::Type member : members) {
+      member = types.widenLiteral(member);
+      if (member == types.none())
+        continue;
+      auto memberContract = mlir::dyn_cast_if_present<py::ContractType>(member);
+      if (!memberContract || !declaredClassBases.count(
+                                 memberContract.getContractName())) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "isinstance() against the protocol '" +
+                contract.getContractName().str() +
+                "' is decided here only for values of this program's own "
+                "classes; this one may be " + typeText(member) +
+                ", whose methods CPython would inspect at run time"});
+        return emitNone(expr);
+      }
+    }
+  }
   Value input = emitExpr(args->front().get());
   IsInstanceAnalysis analysis =
       analyzeIsInstanceAny(input.type, *targets, types, module);
@@ -3056,14 +3123,16 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
                                     llvm::StringRef methodName,
                                     unsigned argumentCount, bool asProperty,
                                     llvm::ArrayRef<std::string> keywordNames,
-                                    bool asAttribute, bool asSetter) {
+                                    bool asAttribute, bool asSetter,
+                                    bool asField) {
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(receiver.type);
   if (!contract)
     return nullptr;
   llvm::StringRef receiverClass = contract.getContractName();
   const parser::Node &expr = anchor;
-  // A property and a class attribute are both READ; only a method is called.
-  bool readsWithoutCall = asProperty || asAttribute;
+  // A property, a class attribute and a field are all READ; only a method is
+  // called.
+  bool readsWithoutCall = asProperty || asAttribute || asField;
 
   // ⭐ A CLASS ATTRIBUTE A SUBCLASS REDECLARES DISPATCHES TOO, and it was the
   // one redeclaration this synthesis did not cover:
@@ -3092,6 +3161,32 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
   bool staticKind = false;
   bool classKind = false;
   const parser::Node *arguments = nullptr;
+  // ⭐ A FIELD THE BASE DECLARES AND A SUBCLASS ANSWERS ANOTHER WAY. `class
+  // Named: name: str` gives every instance a slot; `class Robot(Named): name
+  // = "R2"` never fills it, and a Named-typed read loaded the empty slot as a
+  // str (a segfault where CPython prints R2). The arms read through the
+  // narrowed receiver, so each class answers the way its own instance does --
+  // a class attribute, a property, or its own store -- and the fallback is the
+  // field read itself. This is how a protocol's data member is satisfied by a
+  // class attribute or a property.
+  if (asField) {
+    if (argumentCount != 0 || !keywordNames.empty())
+      return nullptr;
+    std::optional<mlir::Type> fieldType =
+        lookupClassField(receiver.type, methodName);
+    llvm::StringRef spelling;
+    if (fieldType)
+      if (auto fieldContract = mlir::dyn_cast_if_present<py::ContractType>(
+              types.widenLiteral(*fieldType)))
+        if (fieldContract.getArguments().empty()) {
+          spelling = fieldContract.getContractName();
+          if (spelling.consume_front("builtins.") && spelling.contains('.'))
+            spelling = {};
+        }
+    if (spelling.empty())
+      return nullptr;
+    returns = synth::name(spelling, range);
+  }
   if (asAttribute) {
     if (argumentCount != 0 || !keywordNames.empty())
       return nullptr;
@@ -3133,7 +3228,7 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
 
   // The body the STATIC type resolves to: its signature is the one the
   // dispatcher restates, and its declaring class is how the fallback names it.
-  if (!asAttribute) {
+  if (!asAttribute && !asField) {
   // ⭐ A `@property` WRITE IS A DISPATCH TOO, and the assignment path had no
   // gate at all: `x.v = 5` inlined the setter the STATIC class resolves to, so
   // a base-typed receiver ran the BASE's setter while `x.v` one line over
@@ -3240,7 +3335,7 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
   llvm::SmallVector<synth::Param, 4> params;
   llvm::SmallVector<std::string, 2> keywordParameters;
   params.push_back(synth::Param{"__ly_recv", synth::name(receiverClass, range)});
-  if (!asAttribute) {
+  if (!asAttribute && !asField) {
   // A staticmethod declares no receiver, so there is no first parameter to
   // skip -- `__ly_recv` above is the dispatcher's own, not the method's.
   // A classmethod's first parameter is `cls`, which the arm supplies by
@@ -3321,7 +3416,7 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
   std::string key =
       (receiverClass + "." + methodName + "/" + llvm::Twine(argumentCount) +
        (asProperty ? "$get" : "") + (asAttribute ? "$attr" : "") +
-       (asSetter ? "$set" : ""))
+       (asSetter ? "$set" : "") + (asField ? "$field" : ""))
           .str();
   for (const std::string &keywordName : keywordParameters)
     key += "," + keywordName;
@@ -3344,8 +3439,11 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
       // ⛔ EVERY SUBCLASS FOR A CLASSMETHOD, not only the redeclaring ones:
       // `cls` is the runtime class, so a subclass that declares nothing still
       // has its own answer.
-      if (!classKind && !candidateRedeclares(declarations, receiverClass,
-                                             candidate, methodName))
+      if (asField ? !candidateRedeclares(declaredClassReadableNames,
+                                         receiverClass, candidate, methodName)
+                  : (!classKind &&
+                     !candidateRedeclares(declarations, receiverClass,
+                                          candidate, methodName)))
         continue;
       unsigned depth = 0;
       llvm::SmallVector<llvm::StringRef, 8> worklist{candidate};
@@ -3441,8 +3539,38 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
       // candidate's binding), so `Candidate.attr` is the same value -- and it
       // is available on BOTH channels, where a read through the receiver needs
       // the cell only a main-module class has.
+      // ⭐ A field arm reads a CLASS attribute through the class when no
+      // class in the candidate's line stores the name on an instance: the
+      // inherited field slot is then always empty, and the narrowed receiver
+      // would resolve to it rather than to the attribute CPython finds.
+      bool fieldArmThroughClass = false;
+      if (asField) {
+        auto readable = declaredClassReadableNames.find(candidate.second);
+        bool isProperty = false;
+        if (std::optional<MethodBinding> binding = resolveMroMethod(
+                candidate.second, methodName))
+          isProperty = binding->kind == "property";
+        if (!isProperty && readable != declaredClassReadableNames.end()) {
+          bool storedSomewhere = false;
+          llvm::SmallVector<llvm::StringRef, 8> line{candidate.second};
+          llvm::StringSet<> seen;
+          while (!line.empty()) {
+            llvm::StringRef current = line.pop_back_val();
+            auto stores = declaredClassStoredFields.find(current);
+            if (stores != declaredClassStoredFields.end() &&
+                stores->second.contains(methodName))
+              storedSomewhere = true;
+            auto bases = declaredClassBases.find(current);
+            if (bases != declaredClassBases.end())
+              for (const std::string &base : bases->second)
+                if (seen.insert(base).second)
+                  line.push_back(base);
+          }
+          fieldArmThroughClass = !storedSomewhere;
+        }
+      }
       parser::NodePtr subject =
-          asAttribute || staticKind || classKind
+          asAttribute || staticKind || classKind || fieldArmThroughClass
               ? synth::name(candidate.second, range)
               : synth::name("__ly_recv", range);
       // ⛔ A candidate that redeclares the GETTER and no setter has no setter
@@ -3481,6 +3609,9 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
           synth::attribute(synth::name(fallbackClass, range), methodName,
                            range),
           range));
+    } else if (asField) {
+      body.push_back(
+          synth::returnStmt(read(synth::name("__ly_recv", range)), range));
     } else if (asSetter) {
       body.push_back(write(synth::name("__ly_recv", range)));
     } else if (asProperty) {
@@ -3519,7 +3650,8 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
     // available is a name. `$` cannot appear in a source identifier, so the
     // binding cannot shadow one.
     types.bindRootSymbol(symbol, sig.publicCallable);
-    {
+    bool suppressGate = readsWithoutCall || asSetter;
+    auto emitBody = [this, def, symbol, sig, suppressGate] {
       // ⛔ The dispatcher is a FUNCTION, even when the call that needed it was
       // inside an inlined method body. Emitting it under the inliner's state
       // made its `return` branch to the INLINER's continuation block --
@@ -3538,7 +3670,6 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
       // from that; the inline stack belongs to the body being interrupted.
       auto savedInlineFrames = std::move(inlineFrames);
       inlineFrames.clear();
-      bool suppressGate = readsWithoutCall || asSetter;
       if (suppressGate)
         ++virtualPropertyBodyDepth;
       llvm::scope_exit restoreSuppression([&, suppressGate] {
@@ -3553,7 +3684,19 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
         inlineFrames = std::move(savedInlineFrames);
       });
       emitCallableFunction(*def, symbol, sig, {}, /*isLambda=*/false);
-    }
+    };
+    // ⭐ THE BODY WAITS FOR EVERY CLASS IT NAMES. Its arms call methods of
+    // candidates gathered from every module's declarations, and a candidate
+    // in a module emitted later (the program's own class implementing a
+    // library's base or protocol) has no method table until its ClassDef is
+    // emitted: `total(xs)` in base.py over `class Sq(Shape)` in main was
+    // "'Sq.area' is used before 'Sq' is defined" -- an ordering the program
+    // cannot change. The symbol and signature above are all a caller needs,
+    // so only the body is deferred, to the end of the declarations.
+    if (classDeclarationsEmitted)
+      emitBody();
+    else
+      deferredDispatcherBodies.push_back(std::move(emitBody));
     memo = virtualDispatchHelpers.find(key);
   }
   if (!memo->second.callable)
@@ -3781,6 +3924,26 @@ std::optional<Value> ModuleEmitter::tryEmitVirtualDispatch(
 // wrong on a base-typed receiver before the refusal existed.
 // The class-attribute spelling of the same read. Declines for a TYPE receiver:
 // `Shape.kind` names the base's own binding and has never been ambiguous.
+std::optional<Value>
+ModuleEmitter::tryEmitVirtualFieldRead(const parser::Node &anchor,
+                                       Value receiver,
+                                       llvm::StringRef fieldName,
+                                       mlir::Type fieldType) {
+  (void)fieldType;
+  if (!mlir::isa_and_nonnull<py::ContractType>(receiver.type))
+    return std::nullopt;
+  const VirtualDispatchHelper *helper = virtualDispatcherFor(
+      anchor, receiver, fieldName, /*argumentCount=*/0, /*asProperty=*/false,
+      /*keywordNames=*/{}, /*asAttribute=*/false, /*asSetter=*/false,
+      /*asField=*/true);
+  if (!helper)
+    return std::nullopt;
+  Value callee = emitBindingRef(anchor, helper->symbol, helper->callable);
+  return emitCallableDispatch(
+      anchor, callee,
+      emitCallOperands(anchor, {receiver}, /*includeAstArguments=*/false));
+}
+
 std::optional<Value>
 ModuleEmitter::tryEmitVirtualAttributeRead(const parser::Node &anchor,
                                            Value receiver,

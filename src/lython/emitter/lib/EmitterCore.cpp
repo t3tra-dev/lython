@@ -1,3 +1,4 @@
+#include <functional>
 #include "EmitterCore.h"
 #include "EmitterSupport.h"
 #include "PyProtocols.h"
@@ -29,6 +30,7 @@ ModuleEmitter::ModuleEmitter(const parser::Node &moduleNode,
   types.setTargetTriple(this->options.targetTriple);
   types.setJsHost(this->options.jsHost);
   types.setMemberProofs(&narrowedMemberTypes, &suppressMemberNarrowing);
+  types.setProtocolMisses(&protocolMisses);
   if (this->sourceName.empty())
     this->sourceName = this->moduleName;
 }
@@ -66,6 +68,9 @@ EmitResult ModuleEmitter::emit() {
     if (source.moduleNode && !source.isStub)
       desugarClassicGenerics(*source.moduleNode);
   desugarClassicGenerics(moduleNode);
+  // After the generic desugar (a `Protocol[T]` base is what it leaves for a
+  // generic protocol) and before any binder reads a base list.
+  desugarProtocols();
   // Before any binder reads an imported module's top level: a container
   // constant there is a module GLOBAL, and the binders below hand out its
   // canonical name.
@@ -118,6 +123,11 @@ EmitResult ModuleEmitter::emit() {
   genericClassEmissionReady = true;
   emitSourceModuleDeclarations();
   emitTopLevelDeclarations();
+  classDeclarationsEmitted = true;
+  // A body may ask for another dispatcher, which then emits at once.
+  for (std::size_t index = 0; index < deferredDispatcherBodies.size(); ++index)
+    deferredDispatcherBodies[index]();
+  deferredDispatcherBodies.clear();
 
   auto mainType = builder.getFunctionType({}, {});
   auto main = mlir::func::FuncOp::create(builder, loc(moduleNode), "__main__",
@@ -258,33 +268,7 @@ void ModuleEmitter::collectTopLevelBindings() {
       // isinstance analysis reads class ops that do not exist yet for a class
       // declared further down.
       types.bindDeclaredBases(*name, bases);
-      auto &methods = declaredClassMethods[*name];
-      auto &attributes = declaredClassAttributes[*name];
-      if (const auto *classBody = ast::nodeList(*statement, "body"))
-        for (const parser::NodePtr &member : *classBody) {
-          if (!member)
-            continue;
-          if (member->kind == "FunctionDef" ||
-              member->kind == "AsyncFunctionDef") {
-            if (auto methodName = ast::string(*member, "name"))
-              methods.insert(*methodName);
-            continue;
-          }
-          // A class-level binding is shadowed by a subclass exactly the way a
-          // method is overridden, and reading it through a base-typed
-          // reference is the same unresolvable dispatch.
-          if (member->kind == "AnnAssign") {
-            if (const parser::Node *target = ast::node(*member, "target"))
-              if (target->kind == "Name")
-                attributes.insert(ast::nameSpelling(*target));
-            continue;
-          }
-          if (member->kind == "Assign")
-            if (const auto *targets = ast::nodeList(*member, "targets"))
-              for (const parser::NodePtr &target : *targets)
-                if (target && target->kind == "Name")
-                  attributes.insert(ast::nameSpelling(*target));
-        }
+      recordClassBodyDeclarations(*name, *statement);
       continue;
     }
     moduleFunctionNames.insert(*name);
@@ -416,5 +400,78 @@ bool ModuleEmitter::requireStaticEvidence(
           : inference.failureReason});
   return false;
 }
+
+// A class-level binding is shadowed by a subclass exactly the way a method is
+// overridden, and reading it through a base-typed reference is the same
+// unresolvable dispatch. One walk for both the main module's classes and an
+// imported module's (which name them qualified).
+void ModuleEmitter::recordClassBodyDeclarations(llvm::StringRef name,
+                                                const parser::Node &classDef) {
+  auto &methods = declaredClassMethods[name];
+  auto &attributes = declaredClassAttributes[name];
+  auto &readable = declaredClassReadableNames[name];
+  auto &stored = declaredClassStoredFields[name];
+  const auto *classBody = ast::nodeList(classDef, "body");
+  if (!classBody)
+    return;
+  std::function<void(const parser::Node &)> collectStores =
+      [&](const parser::Node &node) {
+        auto record = [&](const parser::Node *target) {
+          if (target && target->kind == "Attribute")
+            if (const parser::Node *owner = ast::node(*target, "value"))
+              if (owner->kind == "Name" && ast::nameSpelling(*owner) == "self")
+                if (auto attr = ast::string(*target, "attr"))
+                  stored.insert(*attr);
+        };
+        if (node.kind == "Assign") {
+          if (const auto *targets = ast::nodeList(node, "targets"))
+            for (const parser::NodePtr &target : *targets)
+              record(target.get());
+        } else if (node.kind == "AnnAssign" || node.kind == "AugAssign") {
+          record(ast::node(node, "target"));
+        }
+        for (llvm::StringRef group :
+             {"body", "orelse", "finalbody", "handlers", "cases"})
+          if (const auto *children = ast::nodeList(node, group))
+            for (const parser::NodePtr &child : *children)
+              if (child && child->kind != "ClassDef")
+                collectStores(*child);
+      };
+  for (const parser::NodePtr &member : *classBody) {
+    if (!member)
+      continue;
+    if (member->kind == "FunctionDef" || member->kind == "AsyncFunctionDef") {
+      auto methodName = ast::string(*member, "name");
+      if (!methodName)
+        continue;
+      methods.insert(*methodName);
+      collectStores(*member);
+      if (const auto *decorators = ast::nodeList(*member, "decorator_list"))
+        for (const parser::NodePtr &decorator : *decorators)
+          if (decorator && decorator->kind == "Name" &&
+              ast::nameSpelling(*decorator) == "property")
+            readable.insert(*methodName);
+      continue;
+    }
+    if (member->kind == "AnnAssign") {
+      if (const parser::Node *target = ast::node(*member, "target"))
+        if (target->kind == "Name") {
+          // ⛔ Not readable without a store: `x: int = 0` is a field with a
+          // default in a dataclass or a NamedTuple, filled by an `__init__`
+          // this walk does not see.
+          attributes.insert(ast::nameSpelling(*target));
+        }
+      continue;
+    }
+    if (member->kind == "Assign")
+      if (const auto *targets = ast::nodeList(*member, "targets"))
+        for (const parser::NodePtr &target : *targets)
+          if (target && target->kind == "Name") {
+            attributes.insert(ast::nameSpelling(*target));
+            readable.insert(ast::nameSpelling(*target));
+          }
+  }
+}
+
 
 } // namespace lython::emitter

@@ -749,6 +749,81 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
     return op->emitError()
            << "aliasing contract view input has no lowered runtime bundle";
 
+  // ⭐ A UNION OF CLASSES SEEN AS THEIR COMMON BASE is the active member's
+  // header: each member is one header lane, and the base reads the same
+  // header (`def up(x: A | B) -> Base: return x`, and the arm of
+  // `isinstance(t, Base)` over `A | B | C`). The tag picks it, as
+  // `union.unwrap` picks a member's lanes, and the view owns what an unwrap
+  // owns.
+  if (auto inputUnion = mlir::dyn_cast<py::UnionType>(input.getType());
+      inputUnion && inputBundle->kind == RuntimeBundle::Kind::Object &&
+      mlir::isa<py::ContractType>(resultValue.getType()) &&
+      !inputBundle->physicalValues().empty()) {
+    mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> expected =
+        RuntimeBundleLowerer::runtimeValueTypesFor(op, resultValue.getType(),
+                                                   "union base view ABI");
+    if (mlir::failed(expected))
+      return mlir::failure();
+    auto headerType = expected->size() == 1
+                          ? mlir::dyn_cast<mlir::MemRefType>(expected->front())
+                          : mlir::MemRefType();
+    if (!headerType)
+      return op->emitError() << "a union seen as " << resultValue.getType()
+                             << " needs that class to be one header lane";
+    builder.setInsertionPoint(op);
+    mlir::Location loc = op->getLoc();
+    mlir::Value tag = inputBundle->physicalValues().front();
+    mlir::MemRefType dynamicHeader = mlir::MemRefType::get(
+        {mlir::ShapedType::kDynamic}, headerType.getElementType());
+    auto asHeader = [&](mlir::Value lane) -> mlir::Value {
+      if (lane.getType() == headerType)
+        return lane;
+      if (lane.getType() != dynamicHeader)
+        lane = mlir::memref::CastOp::create(builder, loc, dynamicHeader, lane);
+      if (headerType != dynamicHeader)
+        lane = mlir::memref::CastOp::create(builder, loc, headerType, lane);
+      return lane;
+    };
+    mlir::Value selected;
+    for (auto [index, member] : llvm::enumerate(inputUnion.getMemberTypes())) {
+      mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> memberTypes =
+          RuntimeBundleLowerer::runtimeValueTypesFor(op, member,
+                                                     "union member ABI");
+      if (mlir::failed(memberTypes))
+        return mlir::failure();
+      if (memberTypes->size() != 1 ||
+          !mlir::isa<mlir::MemRefType>(memberTypes->front()))
+        return op->emitError() << "a union seen as " << resultValue.getType()
+                               << " needs every member to be one header "
+                                  "lane, and "
+                               << member << " is not";
+      mlir::FailureOr<unsigned> offset =
+          RuntimeBundleLowerer::unionMemberValueOffset(
+              op, inputUnion, static_cast<unsigned>(index), "union member ABI");
+      if (mlir::failed(offset))
+        return mlir::failure();
+      mlir::Value lane = asHeader(inputBundle->physicalValues()[*offset]);
+      if (!selected) {
+        selected = lane;
+        continue;
+      }
+      mlir::Value matches = mlir::arith::CmpIOp::create(
+          builder, loc, mlir::arith::CmpIPredicate::eq, tag,
+          mlir::arith::ConstantIntOp::create(
+              builder, loc, static_cast<std::int64_t>(index), 64));
+      selected =
+          mlir::arith::SelectOp::create(builder, loc, matches, lane, selected);
+    }
+    RuntimeBundle result;
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+            op, resultValue.getType(), mlir::ValueRange{selected}, result)))
+      return mlir::failure();
+    result.copyEvidenceFrom(*inputBundle);
+    valueBundles[resultValue] = std::move(result);
+    erase.push_back(op);
+    return mlir::success();
+  }
+
   if (inputBundle->kind == RuntimeBundle::Kind::Object &&
       mlir::isa<py::ContractType>(resultValue.getType())) {
     if (inputBundle->boxedObject &&

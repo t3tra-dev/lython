@@ -718,6 +718,53 @@ bool ModuleEmitter::subclassShadowsAttribute(
                             attributeName);
 }
 
+bool ModuleEmitter::subclassReadsFieldOtherwise(
+    llvm::StringRef receiverClass, llvm::StringRef fieldName) const {
+  return subclassRedeclares(declaredClassReadableNames, receiverClass,
+                            fieldName);
+}
+
+bool ModuleEmitter::classLineBindsReadable(llvm::StringRef cls,
+                                           llvm::StringRef name) const {
+  llvm::SmallVector<llvm::StringRef, 8> line{cls};
+  llvm::StringSet<> seen;
+  while (!line.empty()) {
+    llvm::StringRef current = line.pop_back_val();
+    auto readable = declaredClassReadableNames.find(current);
+    if (readable != declaredClassReadableNames.end() &&
+        readable->second.contains(name))
+      return true;
+    auto bases = declaredClassBases.find(current);
+    if (bases != declaredClassBases.end())
+      for (const std::string &base : bases->second)
+        if (seen.insert(base).second)
+          line.push_back(base);
+  }
+  return false;
+}
+
+bool ModuleEmitter::fieldEverStored(llvm::StringRef cls,
+                                    llvm::StringRef fieldName) const {
+  auto stores = [&](llvm::StringRef current) {
+    auto found = declaredClassStoredFields.find(current);
+    return found != declaredClassStoredFields.end() &&
+           found->second.contains(fieldName);
+  };
+  llvm::SmallVector<llvm::StringRef, 8> line{cls};
+  llvm::StringSet<> seen;
+  while (!line.empty()) {
+    llvm::StringRef current = line.pop_back_val();
+    if (stores(current))
+      return true;
+    auto bases = declaredClassBases.find(current);
+    if (bases != declaredClassBases.end())
+      for (const std::string &base : bases->second)
+        if (seen.insert(base).second)
+          line.push_back(base);
+  }
+  return subclassRedeclares(declaredClassStoredFields, cls, fieldName);
+}
+
 bool ModuleEmitter::subclassRedeclares(
     const llvm::StringMap<llvm::StringSet<>> &declarations,
     llvm::StringRef receiverClass, llvm::StringRef name) const {
