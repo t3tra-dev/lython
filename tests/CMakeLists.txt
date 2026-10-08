@@ -618,6 +618,11 @@ set(LYTHON_LEAK_GATE_RUNNER "${CMAKE_CURRENT_SOURCE_DIR}/leak_gate.py")
 #     dict literal family whose dict side was repaired earlier and which
 #     rfc/test-suite-debt.md listed as still leaking. Both are net zero now.
 set(LYTHON_LEAK_GATE_CASES
+    # int and float methods: a native body is given no releases, so the
+    # temporaries as_integer_ratio shifts by leaked for every value past the
+    # small ints.
+    an_int_speaks_bytes_and_ratios
+    a_float_speaks_hex_and_ratios
     # asyncio: a task's driver holds the task (a cycle the run breaks when the
     # task is done), and an awaited Future or Task crosses its `__await__`'s
     # suspension in a payload box that takes its own reference -- each once

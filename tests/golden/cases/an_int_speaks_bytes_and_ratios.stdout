@@ -1,0 +1,31 @@
+5 True (-7, 1) (0, 1)
+2 8 100 0
+b'\x04\x00' b'\x00\x04' b'\x05'
+b'\xff' b'\xff\xff' b'\x80'
+b'\x7f\xff' b'\x00@\x00\x00\x00\x00\x00\x00\x00\x00' b''
+b',\x01' b'\xff\xff'
+1024 4 -1
+-1 -32768 0
+5731378969925109483151705226338364782964441345 -170141183460469231731687303715884105728
+513 b'\x01\x00\x00\x00\x00\x00\x00\x00\x00'
+True
+True
+True
+True
+True
+True
+True
+True
+OverflowError int too big to convert
+OverflowError can't convert negative int to unsigned
+OverflowError int too big to convert
+OverflowError int too big to convert
+ValueError byteorder must be either 'little' or 'big'
+ValueError length argument must be non-negative
+ValueError byteorder must be either 'little' or 'big'
+0
+11 24
+[(1, 2), (9, 4), (-8, 1)]
+4932
+4950
+0x1.4000000000000p+1 2.5 20

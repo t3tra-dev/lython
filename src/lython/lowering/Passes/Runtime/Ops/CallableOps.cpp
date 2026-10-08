@@ -467,13 +467,30 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
           mlir::failed(
               requireEmptyAggregate(op, op.getKwvalues(), "kw values")))
         return mlir::failure();
-      if (mlir::failed(verifySelectedRuntimeTarget(op, *initializer)))
-        return mlir::failure();
       llvm::SmallVector<const RuntimeBundle *, 8> sources;
       llvm::SmallVector<RuntimeBundle, 8> unpackedSources;
       if (mlir::failed(collectPackedObjectSources(op, op.getPosargs(),
                                                   "positional args", sources,
                                                   &unpackedSources)))
+        return mlir::failure();
+      // ⭐ Picked by what it can take, as `__new__` is: the first recorded
+      // overload of `int.from_bytes` takes only the bytes, and with unused
+      // sources allowed it took `(b, "little", signed=True)` as big-endian
+      // and unsigned -- an answer, not a refusal.
+      for (bool allowUnused : {false, true}) {
+        bool selected = false;
+        for (const RuntimeSymbol &candidate :
+             manifest.initializerCandidates(contract, methodName))
+          if (canBuildRuntimeCallOperands(candidate, sources, allowUnused,
+                                          &receiver)) {
+            initializer = candidate;
+            selected = true;
+            break;
+          }
+        if (selected)
+          break;
+      }
+      if (mlir::failed(verifySelectedRuntimeTarget(op, *initializer)))
         return mlir::failure();
       llvm::SmallVector<mlir::Value, 8> operands;
       builder.setInsertionPoint(op);

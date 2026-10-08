@@ -493,6 +493,12 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
       static const llvm::StringRef kReplaceNames[] = {"old", "new", "count"};
       static const llvm::StringRef kSplitlinesNames[] = {"keepends"};
       static const llvm::StringRef kCodecNames[] = {"encoding", "errors"};
+      // ⛔ `signed` is keyword-only in CPython and is accepted positionally
+      // here: the position is how the manifest's overloads are told apart.
+      static const llvm::StringRef kToBytesNames[] = {"length", "byteorder",
+                                                      "signed"};
+      static const llvm::StringRef kFromBytesNames[] = {"bytes", "byteorder",
+                                                        "signed"};
       static const MethodParameters kMethodParameters[] = {
           {llvm::StringLiteral("split"), kSplitNames, 0},
           {llvm::StringLiteral("rsplit"), kSplitNames, 0},
@@ -500,6 +506,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
           {llvm::StringLiteral("splitlines"), kSplitlinesNames, 0},
           {llvm::StringLiteral("encode"), kCodecNames, 0},
           {llvm::StringLiteral("decode"), kCodecNames, 0},
+          {llvm::StringLiteral("to_bytes"), kToBytesNames, 0},
+          {llvm::StringLiteral("from_bytes"), kFromBytesNames, 0},
       };
       llvm::StringRef methodName =
           ast::string(*calleeNode, "attr").value_or("");
