@@ -5538,20 +5538,18 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
                                             llvm::StringRef name,
                                             mlir::Type instanceType) {
   // `object()` is refused at the earliest static boundary rather than lowered.
-  // Why NOT allocate a bare handle: the runtime object header reserves class
-  // id 0 for builtins.object, and that is also the None singleton's id — the
-  // boxed dispatchers (__ly_box_hash, __ly_box_equal) read id 0 as None, so a
-  // plain instance would hash and compare as None. It is a representation
-  // conflict, not a missing implementation, which is why the fix is a class
-  // rather than a manifest __new__.
+  // ⛔ No longer for a representation conflict -- object has its own class
+  // number and None is an object of its own (ClassIds.h) -- but because a
+  // bare object has nothing to be: an `object` value is a box around an
+  // entity, and there is no manifest `__new__` that allocates a header-only
+  // entity nor a deallocator its release would dispatch to.
   if (auto contract =
           mlir::dyn_cast_if_present<py::ContractType>(instanceType);
       contract && contract.getContractName() == "builtins.object") {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, expr.range.start,
-        "`object()` cannot be constructed: a bare object shares the runtime "
-        "class id of the None singleton, so its identity, hash and equality "
-        "would be None's. Declare a class (`class Sentinel: pass`) and "
+        "`object()` cannot be constructed yet: a bare object has no runtime "
+        "allocation of its own. Declare a class (`class Sentinel: pass`) and "
         "instantiate that instead"});
     return emitNone(expr);
   }

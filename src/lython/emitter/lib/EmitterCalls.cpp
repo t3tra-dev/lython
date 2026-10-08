@@ -5971,9 +5971,10 @@ ModuleEmitter::tryEmitHashCall(const parser::Node &expr,
             "argument has no stable identity here"});
         return emitNone(expr);
       }
-      // None has no lanes to box; inside an `object` it is the entity word
-      // 0, which is what id() of that `object` answers, so a None-typed
-      // argument is evaluated and answers the same.
+      // None's identity key is 0 (LyObject_IdentityKey reads the None
+      // object's word as it), which is what id() of an `object` holding None
+      // answers, so a None-typed argument is evaluated and answers the same
+      // without building a box.
       if (argType == types.none()) {
         emitExpr(idArgs->front().get());
         parser::NodePtr zero = synth::intConstant(0, expr.range);

@@ -1583,6 +1583,9 @@ private:
   mlir::LogicalResult lowerJsMethodCall(py::CallOp op, RuntimeBundle receiver,
                                         llvm::StringRef methodName);
   mlir::LogicalResult lowerAttrGet(py::AttrGetOp op);
+  mlir::LogicalResult raiseIfFieldUnset(py::AttrGetOp op,
+                                        const RuntimeBundle &object,
+                                        mlir::Value unset);
   mlir::LogicalResult lowerAttrSet(py::AttrSetOp op);
   mlir::LogicalResult lowerPack(py::PackOp op);
   mlir::LogicalResult lowerBindingRef(py::BindingRefOp op);

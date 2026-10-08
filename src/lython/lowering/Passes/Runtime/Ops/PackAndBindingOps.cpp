@@ -298,7 +298,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
   // tuples where CPython holds one. Only where its elements may go in as slot
   // words anyway (`literalMayStoreWords`) -- the contents evidence is then
   // dropped either way -- and only elements whose word is the same on every
-  // target: None, and an int a 31-bit immediate holds.
+  // target: an int a 31-bit immediate holds.
+  // ⛔ Not None: its word is the None object's address, which an image of
+  // words cannot name without a relocation to another symbol.
   // ⛔ Not a float: a narrow target has no float immediates, so its word would
   // be an object this image cannot name.
   if (contractName == "builtins.tuple" && !values.empty() &&
@@ -311,11 +313,6 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
         std::string key;
         for (mlir::Value value : values) {
           mlir::Operation *definition = value.getDefiningOp();
-          if (definition && mlir::isa<py::NoneOp>(definition)) {
-            items.push_back(0);
-            key += "N,";
-            continue;
-          }
           auto constant = mlir::dyn_cast_if_present<py::IntConstantOp>(definition);
           std::int64_t parsed = 0;
           if (!constant ||

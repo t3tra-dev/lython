@@ -113,7 +113,7 @@ module attributes {
     cf.cond_br %class_zero, ^zero_class, ^try_hook
 
   ^zero_class:
-    %entity_zero = arith.cmpi eq, %entity, %zero : i64
+    %entity_zero = func.call @__ly_word_is_none(%entity) : (i64) -> i1
     cf.cond_br %entity_zero, ^none, ^default
 
   ^none:
@@ -202,8 +202,7 @@ module attributes {
   // disagree -- and a subclass that does define __eq__/__hash__ is still
   // reached, because those dispatchers consult the per-class-id hook before
   // falling back to identity (CPython's object.__eq__ / object.__hash__).
-  // None inside an erased box: sixteen zero words, so no payload class and no
-  // entity. Every other value in a box has at least one of the two.
+  // None inside an erased box: class 0 and the None object's word.
   func.func @LyObject_IsNone(%box: memref<5xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.method = "__ly_is_none__"} {
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
@@ -211,7 +210,7 @@ module attributes {
     %class_id = memref.load %box[%c1] : memref<5xi64>
     %entity = memref.load %box[%c2] : memref<5xi64>
     %no_class = arith.cmpi eq, %class_id, %zero : i64
-    %no_entity = arith.cmpi eq, %entity, %zero : i64
+    %no_entity = func.call @__ly_word_is_none(%entity) : (i64) -> i1
     %is_none = arith.andi %no_class, %no_entity : i1
     func.return %is_none : i1
   }
@@ -637,9 +636,10 @@ module attributes {
     func.return %is : i1
   }
 
-  // The class a slot word names: 0 for None (the word 0), int or float for an
-  // immediate by its tag, and otherwise the class id every object keeps in
-  // its header's word 1.
+  // The class a slot word names: int or float for an immediate by its tag,
+  // and otherwise the class id every object keeps in its header's word 1 --
+  // 0 for the None object. A 0 word (nothing stored) answers 0 as well,
+  // without a load.
   func.func private @__ly_slot_class(%word: i64) -> i64 {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
@@ -684,10 +684,12 @@ module attributes {
     %float_class = arith.constant {ly.class_id_of = "builtins.float"} 2 : i64
     %three = arith.constant 3 : i64
     %immediate = func.call @__ly_slot_word_is_immediate(%word) : (i64) -> i1
-    %is_null = arith.cmpi eq, %word, %zero : i64
+    // None is one identity whichever word holds it.
+    %is_null = func.call @__ly_word_is_none(%word) : (i64) -> i1
     %plain = arith.ori %immediate, %is_null : i1
     %key = scf.if %plain -> (i64) {
-      scf.yield %word : i64
+      %canonical_plain = arith.select %is_null, %zero, %word : i64
+      scf.yield %canonical_plain : i64
     } else {
       %class = func.call @__ly_slot_class(%word) : (i64) -> i64
       %is_int = arith.cmpi eq, %class, %one : i64
@@ -745,6 +747,33 @@ module attributes {
   // The entity word a slot view was built from, read back off the view. On a
   // 32-bit target the view kept the low half, zero-extended; an immediate
   // there is a sign-extended 32-bit word, so the sign is put back.
+  // ⭐ None IS ONE IMMORTAL OBJECT, as CPython's is. A slot or a box holds
+  // its address; 0 is left to mean "nothing stored". Its class word is 0,
+  // the number every None test reads (ClassIds.h), and its refcount is the
+  // immortal marker, so retain and release pass it by.
+  //
+  // ⛔ Writable, like the bool singletons: a generic retain reads the
+  // refcount before deciding, and read-only data is not where an object
+  // header lives.
+  memref.global "private" @__ly_none_object : memref<5xi64> = dense<[9223372036854775807, 0, 0, 0, 0]>
+
+  // The slot word None is written as.
+  func.func @__ly_none_word() -> i64 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "none_word"} {
+    %none = memref.get_global @__ly_none_object : memref<5xi64>
+    %index = memref.extract_aligned_pointer_as_index %none : memref<5xi64> -> index
+    %address = arith.index_cast %index : index to i64
+    %word = func.call @__ly_slot_word_from_view_address(%address) : (i64) -> i64
+    func.return %word : i64
+  }
+
+  // Whether a slot word is None: the None object's. A 0 is a slot nothing
+  // was stored in, which is not None.
+  func.func @__ly_word_is_none(%word: i64) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "word_is_none"} {
+    %none = func.call @__ly_none_word() : () -> i64
+    %is_none = arith.cmpi eq, %word, %none : i64
+    func.return %is_none : i1
+  }
+
   func.func private @__ly_slot_word_from_view_address(%address: i64) -> i64 {
     %wide = func.call @__ly_addresses_are_word_wide() : () -> i1
     %thirty_two = arith.constant 32 : i64
@@ -1874,7 +1903,8 @@ module attributes {
   // Box the canonical payload handle stored at a collection slot into a
   // fresh owned `builtins.object` box (the erased read lane): the box adopts
   // one new reference to the payload entity. An invalid slot (exhausted
-  // iteration) yields the all-zero None handle without touching the array.
+  // iteration) yields an all-zero box without touching the array; nothing
+  // reads it.
   func.func @LyObject_FromSlot(%items: memref<?xi64>, %slot: i64, %valid: i1) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "from_slot", ly.runtime.result_contract = "builtins.object"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index

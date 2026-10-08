@@ -618,6 +618,10 @@ set(LYTHON_LEAK_GATE_RUNNER "${CMAKE_CURRENT_SOURCE_DIR}/leak_gate.py")
 #     dict literal family whose dict side was repaired earlier and which
 #     rfc/test-suite-debt.md listed as still leaking. Both are net zero now.
 set(LYTHON_LEAK_GATE_CASES
+    # The same raise for a field that admits None and for an exception's
+    # field; None itself is immortal and never released.
+    a_field_admitting_none_read_before_a_store_raises
+    none_is_an_object_of_its_own
     # A field read that raises because no store filled it: the instance it
     # was read from is released on the way out.
     a_field_read_before_its_store_raises

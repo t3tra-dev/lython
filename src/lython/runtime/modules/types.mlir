@@ -4,12 +4,20 @@ module attributes {
   ly.runtime.contracts = ["types.GeneratorType", "types.CoroutineType", "types.CoroutineAwaitIterator", "builtins.function"],ly.typing.module = "types"} {
   py.class @NoneType attributes {
     base_names = ["object"], ly.typing.final,
-    method_names = ["__bool__"],
+    method_names = ["__bool__", "__hash__"],
     method_contracts = [
-      !py.protocol<"Callable", [!py.contract<"types.NoneType">] -> [!py.literal<False>]>
+      !py.protocol<"Callable", [!py.contract<"types.NoneType">] -> [!py.literal<False>]>,
+      !py.protocol<"Callable", [!py.contract<"types.NoneType">] -> [!py.contract<"builtins.int">]>
     ],
-    method_kinds = ["instance"]
+    method_kinds = ["instance", "instance"]
   } {}
+
+  // hash(None): CPython 3.12's constant (Objects/object.c none_hash), the
+  // value a boxed None already hashes to (__ly_box_hash_as).
+  func.func @LyNone_Hash() -> i64 attributes {ly.runtime.contract = "types.NoneType", ly.runtime.method = "__hash__"} {
+    %hash = arith.constant 4238894112 : i64
+    func.return %hash : i64
+  }
 
   py.class @NotImplementedType attributes {base_names = ["object"],
                                           ly.typing.final} {}

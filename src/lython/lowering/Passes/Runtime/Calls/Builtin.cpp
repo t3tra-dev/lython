@@ -203,9 +203,12 @@ RuntimeBundleLowerer::lowerBuiltinMethodCall(py::CallOp op,
 
   llvm::SmallVector<const RuntimeBundle *, 1> sources{receiver};
   std::optional<EmittedRuntimeCall> emitted;
+  // None's methods take nothing: the value is the type.
+  bool noneReceiver =
+      runtimeContractName(receiver->contract) == "types.NoneType";
   if (mlir::failed(RuntimeBundleLowerer::emitManifestMethodCall(
           op, *receiver, symbol.builtinMethod, sources,
-          /*allowUnusedSources=*/false, emitted)))
+          /*allowUnusedSources=*/noneReceiver, emitted)))
     return mlir::failure();
 
   std::string resultContract = runtimeContractName(op.getResult(0).getType());

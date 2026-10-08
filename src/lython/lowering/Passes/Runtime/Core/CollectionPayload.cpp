@@ -484,8 +484,17 @@ RuntimeBundleLowerer::objectPayloadClassEntity(mlir::Operation *op,
   // None aborted in Ly_DecRef without the body touching v. A slot does not read
   // word 0 at all, and LyObject_FromSlot overwrites it with 1 on the way out,
   // so the two uses agree on 1 and disagreed only on 0.
-  auto emptyHandle = [&]() {
-    return llvm::SmallVector<mlir::Value, 4>{zero, zero};
+  //
+  // ⭐ AND None's ENTITY IS THE None OBJECT (`none_word`), not 0: 0 is a slot
+  // nothing was stored in, which a field read refuses where None answers.
+  auto emptyHandle = [&]() -> llvm::SmallVector<mlir::Value, 4> {
+    mlir::Value none = zero;
+    if (std::optional<RuntimeSymbol> noneWord =
+            manifest.primitive("builtins.object", "none_word"))
+      none = RuntimeBundleLowerer::createRuntimeCall(loc, *noneWord,
+                                                     mlir::ValueRange{})
+                 .getResult(0);
+    return llvm::SmallVector<mlir::Value, 4>{zero, none};
   };
 
   const RuntimeBundle *concrete =

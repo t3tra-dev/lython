@@ -1505,8 +1505,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIs(py::IsOp op) {
   // object): return a is b` answered False for `same(x, x)`, for an instance,
   // a list, None and True alike. When either side is a box, identity is the
   // ENTITY (box_abi::kBoxEntityWord), the word a box or a slot keeps for its
-  // value -- the object's address, an int's or float's immediate, 0 for None
-  // -- and the other side's is the word its box would keep.
+  // value -- the object's address, an int's or float's immediate, the None
+  // object's for None -- and the other side's is the word its box would
+  // keep.
   auto isBox = [&](const RuntimeBundle &bundle) {
     return RuntimeBundleLowerer::isBuiltinsObjectContract(bundle.contract) &&
            bundle.physicalValues().size() == 1 &&

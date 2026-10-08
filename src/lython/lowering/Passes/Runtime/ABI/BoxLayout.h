@@ -1,7 +1,8 @@
 #pragma once
 
 // Physical layout of a payload slot: one i64 word per element, the entity --
-// the address of the value's object, or 0 for None, or for an int or float
+// the address of the value's object (None's is the None object), or for an
+// int or float
 // the value itself with a nonzero low two bits (an "immediate";
 // `__ly_slot_word_is_immediate` in objects/object.mlir has the encodings). A
 // slot owns a reference exactly when its entity is an address. The runtime
@@ -48,8 +49,9 @@
 
 namespace py::lowering::box_abi {
 
-// ⭐ ONE WORD: a slot is its entity alone. The entity is 0 for None, an
-// immediate for an int or float that has one (low two bits nonzero: int
+// ⭐ ONE WORD: a slot is its entity alone. The entity is the None object's
+// address for None (0 is a slot nothing was stored in), an immediate for an
+// int or float that has one (low two bits nonzero: int
 // `...1`, float `...10`; see `__ly_slot_word_is_immediate`), and otherwise the
 // address of the value's object -- whose header word 1 is its class id. So the
 // class is never stored beside the entity: `slotClassFromEntity` reads it the
@@ -85,8 +87,8 @@ inline mlir::MemRefType slotWordsType(mlir::Builder &builder) {
   return mlir::MemRefType::get({kWordsPerBox}, builder.getI64Type());
 }
 
-// The class id a slot's entity word names (`__ly_slot_class`): 0 for None,
-// int or float by an immediate's tag, else the object's header word 1.
+// The class id a slot's entity word names (`__ly_slot_class`): int or float
+// by an immediate's tag, else the object's header word 1 (0 for None's).
 inline mlir::Value slotClassFromEntity(mlir::OpBuilder &builder,
                                        mlir::Location loc, mlir::Value entity) {
   mlir::Type i64 = builder.getI64Type();

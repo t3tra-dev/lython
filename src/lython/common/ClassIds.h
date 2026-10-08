@@ -13,16 +13,15 @@
 // here is refused when the runtime is built. Program classes are numbered from
 // 2^32 by the lowering (`runtimeClassIdForClass`), above all of these.
 //
-// ⛔ `builtins.object` is 0, the number that also means "no class" and that a
-// None slot reads as. Separating the three is the None-object work; until then
-// object keeps 0 so that what reads 0 as None keeps reading it.
+// 0 is None's (its object's class word, objects/object.mlir) and the end of
+// a base chain; no listed class has it.
 
 #include <cstdint>
 #include <string_view>
 
 namespace py::class_ids {
 
-// No class: the end of a base chain, a slot that names none.
+// None's class, and the end of a base chain.
 inline constexpr std::int64_t kNoClass = 0;
 
 inline constexpr std::string_view kRuntimeClasses[] = {
@@ -135,7 +134,7 @@ constexpr std::int64_t lookup(std::string_view contract) {
   std::int64_t position = 0;
   for (std::string_view entry : kRuntimeClasses) {
     if (entry == contract)
-      return entry == "builtins.object" ? kNoClass : position + 1;
+      return position + 1;
     ++position;
   }
   return -1;

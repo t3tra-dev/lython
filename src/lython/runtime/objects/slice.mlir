@@ -20,6 +20,8 @@ module attributes {
   ly.runtime.contracts = ["builtins.slice"]
 } {
   // ===== declared here, defined in another runtime file or built by the lowering =====
+  func.func private @__ly_none_word() -> i64 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "none_word"}
+  func.func private @__ly_word_is_none(%word: i64) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "word_is_none"}
   func.func private @LyLong_Add(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__add__"}
   func.func private @LyLong_Compare(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__richcompare__"}
   func.func private @LyLong_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.int", ly.runtime.deallocator}
@@ -198,9 +200,9 @@ module attributes {
   // ===== the slice object (sliceobject.c's PySliceObject) =====
   //
   // One entity, five words: the refcount, class 25, and start/stop/step as
-  // the slot words a container element keeps -- 0 for None, an int's
-  // immediate, or the address of an int object the slice holds a reference
-  // to.
+  // the slot words a container element keeps -- the None object's for None,
+  // an int's immediate, or the address of an int object the slice holds a
+  // reference to.
   func.func private @LySlice_Shape() -> memref<5xi64> attributes {ly.runtime.contract = "builtins.slice", ly.runtime.shape}
 
   // The three words as an items array, the shape the slot helpers take.
@@ -226,7 +228,7 @@ module attributes {
   }
 
   // The word a slice keeps for an argument handed over in a box: the box's
-  // entity -- 0 for None, an int's immediate or its object -- with a
+  // entity -- the None object, an int's immediate or its object -- with a
   // reference of its own, as slice_new keeps each object it is given.
   func.func private @__ly_slice_word_of(%box: memref<?xi64>) -> i64 {
     %entity_slot = arith.constant 2 : index
@@ -259,14 +261,14 @@ module attributes {
   // initializer per arity, as slice_new reads one to three arguments; an
   // absent start or step is None.
   func.func @LySlice_New(%stop: memref<?xi64>) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.slice", ly.runtime.initializer = "__new__"} {
-    %none = arith.constant 0 : i64
+    %none = func.call @__ly_none_word() : () -> i64
     %stop_word = func.call @__ly_slice_word_of(%stop) : (memref<?xi64>) -> i64
     %self = func.call @__ly_slice_alloc(%none, %stop_word, %none) : (i64, i64, i64) -> memref<5xi64>
     func.return %self : memref<5xi64>
   }
 
   func.func @LySlice_NewStart(%start: memref<?xi64>, %stop: memref<?xi64>) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.slice", ly.runtime.initializer = "__new__"} {
-    %none = arith.constant 0 : i64
+    %none = func.call @__ly_none_word() : () -> i64
     %start_word = func.call @__ly_slice_word_of(%start) : (memref<?xi64>) -> i64
     %stop_word = func.call @__ly_slice_word_of(%stop) : (memref<?xi64>) -> i64
     %self = func.call @__ly_slice_alloc(%start_word, %stop_word, %none) : (i64, i64, i64) -> memref<5xi64>
@@ -295,7 +297,7 @@ module attributes {
     %two = arith.constant 2 : i64
     %ptr = func.call @__ly_slice_word_ptr(%self, %which) : (memref<5xi64>, i64) -> !llvm.ptr
     %word = llvm.load %ptr : !llvm.ptr -> i64
-    %is_none = arith.cmpi eq, %word, %zero : i64
+    %is_none = func.call @__ly_word_is_none(%word) : (i64) -> i1
     %tag = arith.select %is_none, %none_tag, %int_tag : i64
     %value = scf.if %is_none -> (memref<2xi64>) {
       %stand_in = func.call @LyLong_DeferredStandIn() : () -> memref<2xi64>
@@ -345,9 +347,13 @@ module attributes {
     %start_word = memref.load %self[%start_slot] : memref<5xi64>
     %stop_word = memref.load %self[%stop_slot] : memref<5xi64>
     %step_word = memref.load %self[%step_slot] : memref<5xi64>
-    %has_start = arith.cmpi ne, %start_word, %zero : i64
-    %has_stop = arith.cmpi ne, %stop_word, %zero : i64
-    %has_step = arith.cmpi ne, %step_word, %zero : i64
+    %true = arith.constant true
+    %start_none = func.call @__ly_word_is_none(%start_word) : (i64) -> i1
+    %stop_none = func.call @__ly_word_is_none(%stop_word) : (i64) -> i1
+    %step_none = func.call @__ly_word_is_none(%step_word) : (i64) -> i1
+    %has_start = arith.xori %start_none, %true : i1
+    %has_stop = arith.xori %stop_none, %true : i1
+    %has_step = arith.xori %step_none, %true : i1
     %start = scf.if %has_start -> (i64) {
       %v = func.call @__ly_slice_word_index(%start_word) : (i64) -> i64
       scf.yield %v : i64
@@ -407,7 +413,9 @@ module attributes {
     }
     %start_raw, %stop_raw, %step, %mask = func.call @__ly_slice_unpack(%self) : (memref<5xi64>) -> (i64, i64, i64, i64)
     %step_held = memref.load %self[%step_slot] : memref<5xi64>
-    %has_step = arith.cmpi ne, %step_held, %zero : i64
+    %step_held_none = func.call @__ly_word_is_none(%step_held) : (i64) -> i1
+    %true_step = arith.constant true
+    %has_step = arith.xori %step_held_none, %true_step : i1
     %step_word = scf.if %has_step -> (i64) {
       func.call @__ly_handle_retain_raw(%step_held) : (i64) -> ()
       scf.yield %step_held : i64
@@ -469,7 +477,7 @@ module attributes {
     %zero = arith.constant 0 : i64
     %two = arith.constant 2 : i64
     %zero_h = func.call @LyLong_FromI64(%zero) : (i64) -> memref<2xi64>
-    %is_none = arith.cmpi eq, %word, %zero : i64
+    %is_none = func.call @__ly_word_is_none(%word) : (i64) -> i1
     %bound = scf.if %is_none -> (memref<2xi64>) {
       %chosen = arith.select %none_is_upper, %upper, %lower : memref<2xi64>
       %copy = func.call @LyLong_Add(%chosen, %zero_h) : (memref<2xi64>, memref<2xi64>) -> memref<2xi64>

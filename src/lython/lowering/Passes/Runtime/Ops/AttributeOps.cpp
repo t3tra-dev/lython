@@ -525,11 +525,19 @@ RuntimeBundleLowerer::storeOptionalBoxedField(mlir::Operation *op,
       builder, loc, boxWord / static_cast<unsigned>(box_abi::kWordsPerBox));
   mlir::func::CallOp::create(builder, loc, releaseBoxed,
                              mlir::ValueRange{releaseStorage, releaseSlot});
-  mlir::Value zero = constantI64(builder, loc, 0);
+  // The absent arm stores the None object, which a read tells from a slot
+  // nothing was stored in.
+  std::optional<RuntimeSymbol> noneWord =
+      manifest.primitive("builtins.object", "none_word");
+  if (!noneWord)
+    return op->emitError() << "runtime manifest has no none_word";
+  mlir::Value none = RuntimeBundleLowerer::createRuntimeCall(
+                         loc, *noneWord, mlir::ValueRange{})
+                         .getResult(0);
   for (auto [wordIndex, word] : llvm::enumerate(*words)) {
     mlir::Value stored = word;
     if (static_cast<std::int64_t>(wordIndex) == box_abi::kEntityWord)
-      stored = mlir::arith::SelectOp::create(builder, loc, present, word, zero)
+      stored = mlir::arith::SelectOp::create(builder, loc, present, word, none)
                    .getResult();
     mlir::Value slot = mlir::arith::ConstantIndexOp::create(
         builder, loc, static_cast<std::int64_t>(boxWord + wordIndex));
@@ -1231,6 +1239,47 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticClassAttributeConstant(
   return mlir::success();
 }
 
+// AttributeError "'<class>' object has no attribute '<name>'" when `unset`
+// holds, after everything `unset` was computed from: the read of a field no
+// store may have filled (`ly.field.maybe_unset`). The class is the instance's
+// own, as CPython's message names type(obj).
+mlir::LogicalResult
+RuntimeBundleLowerer::raiseIfFieldUnset(py::AttrGetOp op,
+                                        const RuntimeBundle &object,
+                                        mlir::Value unset) {
+  std::optional<RuntimeSymbol> raiser =
+      manifest.primitive("builtins.object", "raise_unset_field");
+  if (!raiser)
+    return op.emitError() << "runtime manifest has no raise_unset_field";
+  mlir::Location loc = op.getLoc();
+  builder.setInsertionPoint(op);
+  mlir::FailureOr<mlir::Value> classId =
+      RuntimeBundleLowerer::exactRuntimeClassId(op, object);
+  if (mlir::failed(classId))
+    return mlir::failure();
+  builder.setInsertionPoint(op);
+  auto check =
+      mlir::scf::IfOp::create(builder, loc, unset, /*withElseRegion=*/false);
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(&check.getThenRegion().front());
+    llvm::StringRef name = op.getName();
+    llvm::SmallVector<std::int8_t, 32> bytes(name.begin(), name.end());
+    auto elements = mlir::DenseElementsAttr::get(
+        mlir::RankedTensorType::get({static_cast<std::int64_t>(bytes.size())},
+                                    builder.getI8Type()),
+        llvm::ArrayRef<std::int8_t>(bytes));
+    mlir::Value text = py::lowering::constant_data::internReadOnlyBlock(
+        module, builder, loc, "field_name", name, elements);
+    mlir::Value length = mlir::arith::ConstantIntOp::create(
+        builder, loc, static_cast<std::int64_t>(bytes.size()), 64);
+    RuntimeBundleLowerer::createRuntimeCall(
+        loc, *raiser, mlir::ValueRange{*classId, text, length});
+  }
+  builder.setInsertionPoint(op);
+  return mlir::success();
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
   const RuntimeBundle *object = RuntimeBundleLowerer::bundleFor(op.getObject());
   if (!object)
@@ -1576,42 +1625,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
       if (isBoolFieldType(fieldType)) {
         if (op->hasAttr("ly.field.maybe_unset")) {
           // The allocation marks a bool word 2 until its first store.
-          std::optional<RuntimeSymbol> raiser =
-              manifest.primitive("builtins.object", "raise_unset_field");
-          if (!raiser)
-            return op.emitError() << "runtime manifest has no raise_unset_field";
-          mlir::Location loc = op.getLoc();
-          mlir::Value unsetMark =
-              mlir::arith::ConstantIntOp::create(builder, loc, 2, 64);
           mlir::Value unset = mlir::arith::CmpIOp::create(
-              builder, loc, mlir::arith::CmpIPredicate::eq, raw, unsetMark);
-          mlir::FailureOr<mlir::Value> classId =
-              RuntimeBundleLowerer::exactRuntimeClassId(op, *object);
-          if (mlir::failed(classId))
+              builder, op.getLoc(), mlir::arith::CmpIPredicate::eq, raw,
+              mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 2, 64));
+          if (mlir::failed(raiseIfFieldUnset(op, *object, unset)))
             return mlir::failure();
-          builder.setInsertionPointAfterValue(raw);
-          if (mlir::Operation *after = classId->getDefiningOp())
-            builder.setInsertionPointAfter(after);
-          auto check = mlir::scf::IfOp::create(builder, loc, unset,
-                                               /*withElseRegion=*/false);
-          {
-            mlir::OpBuilder::InsertionGuard guard(builder);
-            builder.setInsertionPointToStart(&check.getThenRegion().front());
-            llvm::StringRef name = op.getName();
-            llvm::SmallVector<std::int8_t, 32> bytes(name.begin(), name.end());
-            auto elements = mlir::DenseElementsAttr::get(
-                mlir::RankedTensorType::get(
-                    {static_cast<std::int64_t>(bytes.size())},
-                    builder.getI8Type()),
-                llvm::ArrayRef<std::int8_t>(bytes));
-            mlir::Value text = py::lowering::constant_data::internReadOnlyBlock(
-                module, builder, loc, "field_name", name, elements);
-            mlir::Value length = mlir::arith::ConstantIntOp::create(
-                builder, loc, static_cast<std::int64_t>(bytes.size()), 64);
-            RuntimeBundleLowerer::createRuntimeCall(
-                loc, *raiser, mlir::ValueRange{*classId, text, length});
-          }
-          builder.setInsertionPoint(op);
         }
         mlir::Value zero =
             mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 0, 64)
@@ -1664,60 +1682,25 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
   // (`ly.field.maybe_unset`); a field every constructor fills before `self`
   // escapes is read untested.
   //
-  // ⛔ Not for a field that admits None: its zero IS None, and an unfilled one
-  // reads as None rather than raising -- a deviation, not a crash.
+  // A field that admits None is tested the same way: None is the None
+  // object's word, so a zero is only ever "nothing stored".
   if (boxedField && classOp && op->hasAttr("ly.field.maybe_unset")) {
-    mlir::Type fieldType = fieldTypes[*fieldIndex];
-    bool admitsNone = false;
-    if (auto unionType = mlir::dyn_cast<py::UnionType>(fieldType))
-      for (mlir::Type member : unionType.getMemberTypes())
-        if (runtimeShapeContractName(member) == "types.NoneType")
-          admitsNone = true;
-    if (!admitsNone) {
-      std::optional<RuntimeSymbol> raiser =
-          manifest.primitive("builtins.object", "raise_unset_field");
-      if (!raiser)
-        return op.emitError() << "runtime manifest has no raise_unset_field";
-      mlir::FailureOr<std::pair<mlir::Value, unsigned>> slot =
-          RuntimeBundleLowerer::classBoxedFieldSlot(op, *object, classOp,
-                                                    *fieldIndex, "unset test");
-      if (mlir::failed(slot))
-        return mlir::failure();
-      builder.setInsertionPoint(op);
-      mlir::Location loc = op.getLoc();
-      mlir::Value word = mlir::arith::ConstantIndexOp::create(
-          builder, loc, slot->second + box_abi::kEntityWord);
-      mlir::Value entity =
-          mlir::memref::LoadOp::create(builder, loc, slot->first, word);
-      mlir::Value zero = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
-      mlir::Value unset = mlir::arith::CmpIOp::create(
-          builder, loc, mlir::arith::CmpIPredicate::eq, entity, zero);
-      mlir::FailureOr<mlir::Value> classId =
-          RuntimeBundleLowerer::exactRuntimeClassId(op, *object);
-      if (mlir::failed(classId))
-        return mlir::failure();
-      builder.setInsertionPoint(op);
-      auto check = mlir::scf::IfOp::create(builder, loc, unset,
-                                           /*withElseRegion=*/false);
-      {
-        mlir::OpBuilder::InsertionGuard guard(builder);
-        builder.setInsertionPointToStart(&check.getThenRegion().front());
-        llvm::StringRef name = op.getName();
-        llvm::SmallVector<std::int8_t, 32> bytes(name.begin(), name.end());
-        auto elements = mlir::DenseElementsAttr::get(
-            mlir::RankedTensorType::get(
-                {static_cast<std::int64_t>(bytes.size())},
-                builder.getI8Type()),
-            llvm::ArrayRef<std::int8_t>(bytes));
-        mlir::Value text = py::lowering::constant_data::internReadOnlyBlock(
-            module, builder, loc, "field_name", name, elements);
-        mlir::Value length = mlir::arith::ConstantIntOp::create(
-            builder, loc, static_cast<std::int64_t>(bytes.size()), 64);
-        RuntimeBundleLowerer::createRuntimeCall(
-            loc, *raiser, mlir::ValueRange{*classId, text, length});
-      }
-      builder.setInsertionPoint(op);
-    }
+    mlir::FailureOr<std::pair<mlir::Value, unsigned>> slot =
+        RuntimeBundleLowerer::classBoxedFieldSlot(op, *object, classOp,
+                                                  *fieldIndex, "unset test");
+    if (mlir::failed(slot))
+      return mlir::failure();
+    builder.setInsertionPoint(op);
+    mlir::Location loc = op.getLoc();
+    mlir::Value entityIndex = mlir::arith::ConstantIndexOp::create(
+        builder, loc, slot->second + box_abi::kEntityWord);
+    mlir::Value entity =
+        mlir::memref::LoadOp::create(builder, loc, slot->first, entityIndex);
+    mlir::Value unset = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::eq, entity,
+        mlir::arith::ConstantIntOp::create(builder, loc, 0, 64));
+    if (mlir::failed(raiseIfFieldUnset(op, *object, unset)))
+      return mlir::failure();
   }
 
   // A box-fronted field's LANES always come from the box words, never from the
@@ -2256,9 +2239,22 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
       mlir::Value entityWord =
           mlir::memref::LoadOp::create(builder, loc, slot->first, entityIndex)
               .getResult();
-      mlir::Value present = mlir::arith::CmpIOp::create(
-          builder, loc, mlir::arith::CmpIPredicate::ne, entityWord,
-          constantI64(builder, loc, 0));
+      // None is the None object's word; 0 (nothing stored) reads the same
+      // way here -- the store-before-read test is `ly.field.maybe_unset`'s.
+      std::optional<RuntimeSymbol> wordIsNone =
+          manifest.primitive("builtins.object", "word_is_none");
+      if (!wordIsNone)
+        return op.emitError() << "runtime manifest has no word_is_none";
+      auto presentWord = [&](mlir::Value word) -> mlir::Value {
+        mlir::Value none =
+            RuntimeBundleLowerer::createRuntimeCall(loc, *wordIsNone,
+                                                    mlir::ValueRange{word})
+                .getResult(0);
+        return mlir::arith::XOrIOp::create(
+            builder, loc, none,
+            mlir::arith::ConstantIntOp::create(builder, loc, 1, 1));
+      };
+      mlir::Value present = presentWord(entityWord);
       // ⭐ THE ABSENT ARM IS AN ADDRESS, NOT A BRANCH. Rebuilding the lane is
       // arithmetic on the entity -- a memref built AT it, nothing loaded -- so
       // both arms can be one `select` over which address to build from, and the
@@ -2319,9 +2315,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
       mlir::Value tagWord =
           mlir::memref::LoadOp::create(builder, loc, slot->first, entityIndex)
               .getResult();
-      present = mlir::arith::CmpIOp::create(
-          builder, loc, mlir::arith::CmpIPredicate::ne, tagWord,
-          constantI64(builder, loc, 0));
+      present = presentWord(tagWord);
       unsigned payloadTag =
           RuntimeBundleLowerer::optionalPayloadTag(optionalField);
       mlir::FailureOr<unsigned> payloadOffset =
@@ -3583,6 +3577,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerExceptionFieldAttrGet(
                loc, *boxWord, mlir::ValueRange{*block, slot, wordIndex})
         .getResult(0);
   };
+  // An exception's field block is zeroed when it is made, so a field no
+  // store filled is a zero entity -- tested as an instance's is.
+  if (op->hasAttr("ly.field.maybe_unset")) {
+    mlir::Value unset = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::eq,
+        loadWord(box_abi::kEntityWord),
+        mlir::arith::ConstantIntOp::create(builder, loc, 0, 64));
+    if (mlir::failed(raiseIfFieldUnset(op, object, unset)))
+      return mlir::failure();
+  }
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
       RuntimeBundleLowerer::lanesFromBoxEntity(
           builder, loc, loadWord(box_abi::kEntityWord), *shapes,
