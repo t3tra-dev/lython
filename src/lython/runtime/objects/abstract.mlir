@@ -22,7 +22,7 @@ module {
   // counts with: an int past the word, of either sign.
   memref.global "private" constant @__ly_msg_index_overflow : memref<44xi8> = dense<[99, 97, 110, 110, 111, 116, 32, 102, 105, 116, 32, 39, 105, 110, 116, 39, 32, 105, 110, 116, 111, 32, 97, 110, 32, 105, 110, 100, 101, 120, 45, 115, 105, 122, 101, 100, 32, 105, 110, 116, 101, 103, 101, 114]>
   func.func private @__ly_raise_index_overflow() {
-    %class_id = arith.constant 104 : i64
+    %class_id = arith.constant {ly.class_id_of = "builtins.OverflowError"} 104 : i64
     %length = arith.constant 44 : i64
     %message_static = memref.get_global @__ly_msg_index_overflow : memref<44xi8>
     %message = memref.cast %message_static : memref<44xi8> to memref<?xi8>

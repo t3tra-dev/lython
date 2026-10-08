@@ -24,10 +24,10 @@ module attributes {
   func.func private @Ly_IncRef(%header: memref<2xi64, strided<[1], offset: ?>> {ly.ownership.object_header})
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1
 
-  func.func @LyNullContext_New() -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 8 : i64, ly.runtime.contract = "contextlib.nullcontext", ly.runtime.initializer = "__new__"} {
+  func.func @LyNullContext_New() -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "contextlib.nullcontext", ly.runtime.initializer = "__new__"} {
     %header = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<2xi64>
     %one = arith.constant 1 : i64
-    %layout_nullcontext = arith.constant 8 : i64
+    %layout_nullcontext = arith.constant {ly.class_id_of = "contextlib.nullcontext"} 8 : i64
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
     memref.store %one, %header[%refcount_slot] : memref<2xi64>

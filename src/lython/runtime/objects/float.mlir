@@ -21,13 +21,13 @@ module attributes {
   func.func private @__ly_tuple_store_long(%items: memref<?xi64>, %slot: index, %h: memref<2xi64>)
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
-  func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 5 : i64, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
+  func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
   func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "raise"}
-  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
+  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "release_to_zero"}
   func.func private @LyUnicode_Concat(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__add__"}
   func.func private @LyUnicode_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.str", ly.runtime.deallocator}
-  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
+  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_Repr(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"}
   func.func private @__ly_addresses_are_word_wide() -> i1
   func.func private @__ly_check_alloc_count(%count: i64, %element_bytes: i64, %extra: i64)
@@ -189,7 +189,7 @@ module attributes {
   memref.global "private" constant @__ly_float_msg_invalid_literal_prefix : memref<35xi8> = dense<[99, 111, 117, 108, 100, 32, 110, 111, 116, 32, 99, 111, 110, 118, 101, 114, 116, 32, 115, 116, 114, 105, 110, 103, 32, 116, 111, 32, 102, 108, 111, 97, 116, 58, 32]>
 
   func.func private @__ly_float_raise_invalid_literal(%subject_header: memref<2xi64> {ly.ownership.object_header}, %subject_bytes: memref<?xi8>) {
-    %class_id = arith.constant 53 : i64
+    %class_id = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
     %start = arith.constant 0 : index
     %prefix_length = arith.constant 35 : i64
     %prefix_static = memref.get_global @__ly_float_msg_invalid_literal_prefix : memref<35xi8>
@@ -1093,7 +1093,7 @@ module attributes {
   // LyFloat_FromF64 / LyFloat_AsF64.
   func.func private @LyFloat_Shape() -> memref<3xi64> attributes {ly.runtime.contract = "builtins.float", ly.runtime.shape}
 
-  func.func @LyFloat_FromF64(%value: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 2 : i64, ly.runtime.contract = "builtins.float", ly.runtime.initializer = "__new__"} {
+  func.func @LyFloat_FromF64(%value: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.float", ly.runtime.initializer = "__new__"} {
     // One entity, one handle: word 2 carries the double as its bit pattern.
     // Why the bits and not an f64-typed lane: the payload is INSIDE the handle,
     // so there is no pointer word for __ly_global_view_f64 to build a
@@ -1104,7 +1104,7 @@ module attributes {
     %self_offset = arith.constant 0 : index
     %header = memref.view %block[%self_offset][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<3xi64>
     %one = arith.constant 1 : i64
-    %layout_float = arith.constant 2 : i64
+    %layout_float = arith.constant {ly.class_id_of = "builtins.float"} 2 : i64
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
     %value_slot = arith.constant 2 : index
@@ -1421,7 +1421,7 @@ module attributes {
   memref.global "private" constant @__ly_float_msg_round_overflow : memref<36xi8> = dense<[114, 111, 117, 110, 100, 101, 100, 32, 118, 97, 108, 117, 101, 32, 116, 111, 111, 32, 108, 97, 114, 103, 101, 32, 116, 111, 32, 114, 101, 112, 114, 101, 115, 101, 110, 116]>
 
   func.func private @__ly_float_raise_round_overflow() {
-    %class_id = arith.constant 104 : i64
+    %class_id = arith.constant {ly.class_id_of = "builtins.OverflowError"} 104 : i64
     %length = arith.constant 36 : i64
     %message_static = memref.get_global @__ly_float_msg_round_overflow : memref<36xi8>
     %message = memref.cast %message_static : memref<36xi8> to memref<?xi8>
@@ -1854,13 +1854,13 @@ module attributes {
         %msg_static = memref.get_global @__ly_float_text_ratio_nan : memref<35xi8>
         %msg = memref.cast %msg_static : memref<35xi8> to memref<?xi8>
         %len = arith.constant 35 : i64
-        %cls = arith.constant 53 : i64
+        %cls = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
         func.call @__ly_raise_static_message(%cls, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
       } else {
         %msg_static = memref.get_global @__ly_float_text_ratio_inf : memref<40xi8>
         %msg = memref.cast %msg_static : memref<40xi8> to memref<?xi8>
         %len = arith.constant 40 : i64
-        %cls = arith.constant 104 : i64
+        %cls = arith.constant {ly.class_id_of = "builtins.OverflowError"} 104 : i64
         func.call @__ly_raise_static_message(%cls, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
       }
     }
@@ -2505,7 +2505,7 @@ module attributes {
       %msg_static = memref.get_global @__ly_float_text_hex_too_large : memref<51xi8>
       %msg = memref.cast %msg_static : memref<51xi8> to memref<?xi8>
       %len = arith.constant 51 : i64
-      %cls = arith.constant 104 : i64
+      %cls = arith.constant {ly.class_id_of = "builtins.OverflowError"} 104 : i64
       func.call @__ly_raise_static_message(%cls, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
     }
     %negated = arith.negf %magnitude : f64
@@ -2517,7 +2517,7 @@ module attributes {
     %msg_static = memref.get_global @__ly_float_text_bad_hex : memref<41xi8>
     %msg = memref.cast %msg_static : memref<41xi8> to memref<?xi8>
     %len = arith.constant 41 : i64
-    %cls = arith.constant 53 : i64
+    %cls = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
     func.call @__ly_raise_static_message(%cls, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
     %zero_f = arith.constant 0.0 : f64
     %unreached = func.call @LyFloat_FromF64(%zero_f) : (f64) -> memref<3xi64>

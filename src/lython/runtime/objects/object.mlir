@@ -28,7 +28,7 @@ module attributes {
   func.func private @LyFloat_SlotWordAsF64(%word: i64) -> f64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.primitive = "slot_word_as_f64"}
   func.func private @LyLong_SlotWordAsI64(%word: i64) -> (i64, i1) attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "slot_word_as_i64"}
   func.func private @LyLong_TryAsI64(%header: memref<2xi64> {ly.ownership.object_header}) -> (i64, i1) attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "try_unbox.i64"}
-  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
+  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @__ly_float_immediate_fits(%bits: i64) -> i1
   func.func private @__ly_float_to_immediate(%bits: i64) -> i64
   func.func private @__ly_hash_fixup(%h: i64) -> i64
@@ -75,7 +75,7 @@ module attributes {
 
   func.func private @LyObject_Shape() -> memref<5xi64> attributes {ly.runtime.contract = "builtins.object", ly.runtime.shape}
 
-  func.func @LyObject_Init(%header: memref<5xi64> {ly.ownership.object_header}) attributes {ly.runtime.class_id = 0 : i64, ly.runtime.contract = "builtins.object", ly.runtime.method = "__init__"} {
+  func.func @LyObject_Init(%header: memref<5xi64> {ly.ownership.object_header}) attributes {ly.runtime.class_id, ly.runtime.contract = "builtins.object", ly.runtime.method = "__init__"} {
     func.return
   }
 
@@ -643,14 +643,15 @@ module attributes {
   func.func private @__ly_slot_class(%word: i64) -> i64 {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
-    %two = arith.constant 2 : i64
     %three = arith.constant 3 : i64
+    %int_class = arith.constant {ly.class_id_of = "builtins.int"} 1 : i64
+    %float_class = arith.constant {ly.class_id_of = "builtins.float"} 2 : i64
     %tag = arith.andi %word, %three : i64
     %is_object = arith.cmpi eq, %tag, %zero : i64
     %is_null = arith.cmpi eq, %word, %zero : i64
     %int_tag = arith.andi %word, %one : i64
     %is_int = arith.cmpi ne, %int_tag, %zero : i64
-    %immediate_class = arith.select %is_int, %one, %two : i1, i64
+    %immediate_class = arith.select %is_int, %int_class, %float_class : i1, i64
     %class = scf.if %is_object -> (i64) {
       %object_class = scf.if %is_null -> (i64) {
         scf.yield %zero : i64
@@ -678,8 +679,9 @@ module attributes {
   // are two objects -- `nan in [nan * 1.0]` is False in CPython.
   func.func @LyObject_IdentityKey(%word: i64) -> i64 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "identity_key"} {
     %zero = arith.constant 0 : i64
-    %one = arith.constant 1 : i64
+    %one = arith.constant {ly.class_id_of = "builtins.int"} 1 : i64
     %two = arith.constant 2 : i64
+    %float_class = arith.constant {ly.class_id_of = "builtins.float"} 2 : i64
     %three = arith.constant 3 : i64
     %immediate = func.call @__ly_slot_word_is_immediate(%word) : (i64) -> i1
     %is_null = arith.cmpi eq, %word, %zero : i64
@@ -689,7 +691,7 @@ module attributes {
     } else {
       %class = func.call @__ly_slot_class(%word) : (i64) -> i64
       %is_int = arith.cmpi eq, %class, %one : i64
-      %is_float = arith.cmpi eq, %class, %two : i64
+      %is_float = arith.cmpi eq, %class, %float_class : i64
       %canonical = scf.if %is_int -> (i64) {
         %view = func.call @__ly_global_view_i64(%word, %two) : (i64, i64) -> memref<?xi64>
         %header = memref.cast %view : memref<?xi64> to memref<2xi64>
@@ -824,7 +826,7 @@ module attributes {
       scf.yield %b3 : index
     }
     %length = arith.index_cast %end : index to i64
-    %type_error = arith.constant 52 : i64
+    %type_error = arith.constant {ly.class_id_of = "builtins.TypeError"} 52 : i64
     func.call @__ly_raise_static_message(%type_error, %buffer, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
@@ -937,13 +939,13 @@ module attributes {
       %none_hash = arith.constant 4238894112 : i64
       scf.yield %none_hash : i64
     } else {
-      %c10 = arith.constant 10 : i64
-      %c12 = arith.constant 12 : i64
-      %c21 = arith.constant 21 : i64
+      %c10 = arith.constant {ly.class_id_of = "builtins.list"} 10 : i64
+      %c12 = arith.constant {ly.class_id_of = "builtins.dict"} 12 : i64
+      %c21 = arith.constant {ly.class_id_of = "builtins.set"} 21 : i64
       %is_list = arith.cmpi eq, %class_id, %c10 : i64
       %is_dict = arith.cmpi eq, %class_id, %c12 : i64
       %is_set = arith.cmpi eq, %class_id, %c21 : i64
-      %c26 = arith.constant 26 : i64
+      %c26 = arith.constant {ly.class_id_of = "builtins.bytearray"} 26 : i64
       %is_bytearray = arith.cmpi eq, %class_id, %c26 : i64
       %mut0 = arith.ori %is_list, %is_dict : i1
       %mut1 = arith.ori %mut0, %is_set : i1
@@ -955,7 +957,7 @@ module attributes {
       // the hook to read: CPython's long_hash, v mod (2^61 - 1) with the sign
       // carried over, on a value that fits a word.
       %entity0 = llvm.load %box : !llvm.ptr -> i64
-      %int_class = arith.constant 1 : i64
+      %int_class = arith.constant {ly.class_id_of = "builtins.int"} 1 : i64
       %is_int = arith.cmpi eq, %class_id, %int_class : i64
       %is_immediate = func.call @__ly_slot_word_is_immediate(%entity0) : (i64) -> i1
       %int_immediate = arith.andi %is_int, %is_immediate : i1
@@ -971,7 +973,7 @@ module attributes {
         %true_h = arith.constant true
         scf.yield %signed, %true_h : i64, i1
       } else {
-        %tuple_class = arith.constant 11 : i64
+        %tuple_class = arith.constant {ly.class_id_of = "builtins.tuple"} 11 : i64
         %is_tuple = arith.cmpi eq, %class_id, %tuple_class : i64
         %keyed = arith.cmpi ne, %role, %zero : i64
         %keyed_tuple = arith.andi %is_tuple, %keyed : i1
@@ -1227,8 +1229,8 @@ module attributes {
   // generated hook. Distinct classes outside the tower compare unequal.
   // A bytes (70) and a bytearray (26), in either order.
   func.func private @__ly_box_bytes_like_pair(%lhs_class: i64, %rhs_class: i64) -> i1 {
-    %bytes_class = arith.constant 70 : i64
-    %bytearray_class = arith.constant 26 : i64
+    %bytes_class = arith.constant {ly.class_id_of = "builtins.bytes"} 70 : i64
+    %bytearray_class = arith.constant {ly.class_id_of = "builtins.bytearray"} 26 : i64
     %lhs_bytes = arith.cmpi eq, %lhs_class, %bytes_class : i64
     %lhs_bytearray = arith.cmpi eq, %lhs_class, %bytearray_class : i64
     %rhs_bytes = arith.cmpi eq, %rhs_class, %bytes_class : i64
@@ -1274,9 +1276,9 @@ module attributes {
         %both_none = arith.andi %lhs_none, %rhs_none : i1
         scf.yield %both_none : i1
       } else {
-        %int_class = arith.constant 1 : i64
-        %float_class = arith.constant 2 : i64
-        %bool_class = arith.constant 22 : i64
+        %int_class = arith.constant {ly.class_id_of = "builtins.int"} 1 : i64
+        %float_class = arith.constant {ly.class_id_of = "builtins.float"} 2 : i64
+        %bool_class = arith.constant {ly.class_id_of = "builtins.bool"} 22 : i64
         %lhs_int = arith.cmpi eq, %lhs_class, %int_class : i64
         %lhs_float = arith.cmpi eq, %lhs_class, %float_class : i64
         %lhs_bool = arith.cmpi eq, %lhs_class, %bool_class : i64
@@ -1379,9 +1381,9 @@ module attributes {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %false = arith.constant false
-    %int_class = arith.constant 1 : i64
-    %float_class = arith.constant 2 : i64
-    %bool_class = arith.constant 22 : i64
+    %int_class = arith.constant {ly.class_id_of = "builtins.int"} 1 : i64
+    %float_class = arith.constant {ly.class_id_of = "builtins.float"} 2 : i64
+    %bool_class = arith.constant {ly.class_id_of = "builtins.bool"} 22 : i64
     %lhs_is_float = arith.cmpi eq, %lhs_class, %float_class : i64
     %rhs_is_float = arith.cmpi eq, %rhs_class, %float_class : i64
     %either_float = arith.ori %lhs_is_float, %rhs_is_float : i1
@@ -1508,7 +1510,7 @@ module attributes {
     memref.store %quote, %buffer[%a3] : memref<?xi8>
     %end = arith.addi %a3, %c1 : index
     %length = arith.index_cast %end : index to i64
-    %attribute_error = arith.constant 112 : i64
+    %attribute_error = arith.constant {ly.class_id_of = "builtins.AttributeError"} 112 : i64
     func.call @__ly_raise_static_message(%attribute_error, %buffer, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
@@ -1634,7 +1636,7 @@ module attributes {
     memref.store %quote, %buffer[%a4] : memref<?xi8>
     %end = arith.addi %a4, %c1 : index
     %length = arith.index_cast %end : index to i64
-    %type_error = arith.constant 52 : i64
+    %type_error = arith.constant {ly.class_id_of = "builtins.TypeError"} 52 : i64
     func.call @__ly_raise_static_message(%type_error, %buffer, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
@@ -1643,8 +1645,8 @@ module attributes {
   // matching a float(int) conversion for comparison purposes).
   func.func private @__ly_boxed_num_as_f64(%box: !llvm.ptr, %class_id: i64) -> f64 {
     %long_scratch = memref.alloca() : memref<3xi32>
-    %float_class = arith.constant 2 : i64
-    %bool_class = arith.constant 22 : i64
+    %float_class = arith.constant {ly.class_id_of = "builtins.float"} 2 : i64
+    %bool_class = arith.constant {ly.class_id_of = "builtins.bool"} 22 : i64
     %is_float = arith.cmpi eq, %class_id, %float_class : i64
     %result = scf.if %is_float -> (f64) {
       %v = func.call @__ly_boxed_float_value(%box) : (!llvm.ptr) -> f64
@@ -1706,9 +1708,9 @@ module attributes {
     %rhs_word = llvm.load %rhs : !llvm.ptr -> i64
     %lhs_class = func.call @__ly_slot_class(%lhs_word) : (i64) -> i64
     %rhs_class = func.call @__ly_slot_class(%rhs_word) : (i64) -> i64
-    %int_class = arith.constant 1 : i64
-    %float_class = arith.constant 2 : i64
-    %bool_class = arith.constant 22 : i64
+    %int_class = arith.constant {ly.class_id_of = "builtins.int"} 1 : i64
+    %float_class = arith.constant {ly.class_id_of = "builtins.float"} 2 : i64
+    %bool_class = arith.constant {ly.class_id_of = "builtins.bool"} 22 : i64
     %lhs_int = arith.cmpi eq, %lhs_class, %int_class : i64
     %lhs_float = arith.cmpi eq, %lhs_class, %float_class : i64
     %lhs_bool = arith.cmpi eq, %lhs_class, %bool_class : i64

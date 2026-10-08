@@ -13,14 +13,14 @@ module attributes {
   // ===== declared here, defined in another runtime file or built by the lowering =====
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
-  func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 5 : i64, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
+  func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
   func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "raise"}
   func.func private @LyObject_ReleaseBoxedPayloadArraySlotRaw(%payload: memref<?xi64>, %logical_index: i64)
   func.func private @LyObject_ReleaseBoxedPayloadRaw(%box: memref<5xi64>)
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "release_to_zero"}
   func.func private @LyUnicode_Concat(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__add__"}
   func.func private @LyUnicode_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.str", ly.runtime.deallocator}
-  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
+  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @__ly_box_equal(%lhs: !llvm.ptr, %rhs: !llvm.ptr) -> i1
   func.func private @__ly_box_hash_key(%box: !llvm.ptr, %role: i64) -> i64
   func.func private @__ly_box_word_count() -> i64
@@ -217,7 +217,7 @@ module attributes {
     %r = scf.if %is_empty -> memref<8xi64> {
       %self = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<8xi64>
       %one = arith.constant 1 : i64
-      %class_id = arith.constant 12 : i64
+      %class_id = arith.constant {ly.class_id_of = "builtins.dict"} 12 : i64
       %stamp = memref.get_global @__ly_dict_empty_stamp : memref<1xi64>
       %stamp_index = memref.extract_aligned_pointer_as_index %stamp : memref<1xi64> -> index
       %stamp_word = arith.index_cast %stamp_index : index to i64
@@ -254,7 +254,7 @@ module attributes {
   func.func private @__ly_dict_alloc_block(%length: i64) -> memref<8xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.dict"], ly.ownership.owned_results = [0]} {
     %one = arith.constant 1 : i64
     %handle_words = func.call @__ly_box_word_count() : () -> i64
-    %class_id = arith.constant 12 : i64
+    %class_id = arith.constant {ly.class_id_of = "builtins.dict"} 12 : i64
     %zero = arith.constant 0 : i64
     %lower = arith.constant 0 : index
     %step = arith.constant 1 : index
@@ -708,7 +708,7 @@ module attributes {
     func.return
   }
 
-  func.func @LyDict_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<8xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 12 : i64, ly.runtime.contract = "builtins.dict", ly.runtime.initializer = "__new__"} {
+  func.func @LyDict_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<8xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.dict", ly.runtime.initializer = "__new__"} {
     %self = func.call @__ly_dict_alloc(%length) : (i64) -> memref<8xi64>
     func.return %self : memref<8xi64>
   }
@@ -892,7 +892,7 @@ module attributes {
     %dh, %db = func.call @__ly_default_repr_from_addr(%addr, %prefix, %prefix_len) : (i64, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
     cf.br ^raise(%dh, %db : memref<2xi64>, memref<?xi8>)
   ^raise(%mh: memref<2xi64>, %mb: memref<?xi8>):
-    %key_error = arith.constant 54 : i64
+    %key_error = arith.constant {ly.class_id_of = "builtins.KeyError"} 54 : i64
     %exception:3 = func.call @LyBaseException_New(%key_error) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %mh, %mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     // The key object, not its repr, is what .args[0] must yield -- and here

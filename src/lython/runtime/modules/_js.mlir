@@ -120,9 +120,9 @@ module attributes {
   // Words: refcount, class id, handle. The width is the one it was given when
   // a release was chosen by shape; it is now chosen by contract name, so the
   // width no longer has to be this contract's alone.
-  func.func @LyJsProxy_New(%handle: i32) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 151 : i64, ly.runtime.contract = "_js.JsProxy", ly.runtime.initializer = "__new__"} {
+  func.func @LyJsProxy_New(%handle: i32) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "_js.JsProxy", ly.runtime.initializer = "__new__"} {
     %one = arith.constant 1 : i64
-    %class_id = arith.constant 151 : i64
+    %class_id = arith.constant {ly.class_id_of = "_js.JsProxy"} 151 : i64
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
     %handle_slot = arith.constant 2 : index
@@ -174,7 +174,7 @@ module attributes {
     %failed_value = arith.constant -1 : i32
     %failed = arith.cmpi eq, %handle, %failed_value : i32
     scf.if %failed {
-      %runtime_error = arith.constant 51 : i64
+      %runtime_error = arith.constant {ly.class_id_of = "builtins.RuntimeError"} 51 : i64
       func.call @__ly_js_raise_parked(%runtime_error) : (i64) -> ()
     }
     func.return %handle : i32
@@ -188,7 +188,7 @@ module attributes {
     %bad = arith.cmpi eq, %ok, %zero : i32
     scf.if %bad {
       func.call @LyJs_Drop(%handle) : (i32) -> ()
-      %type_error = arith.constant 52 : i64
+      %type_error = arith.constant {ly.class_id_of = "builtins.TypeError"} 52 : i64
       func.call @__ly_js_raise_parked(%type_error) : (i64) -> ()
     }
     func.return

@@ -1,3 +1,4 @@
+#include "ClassIds.h"
 #include "Common/RuntimeSupportBuilder.h"
 
 #include "Common/SupportBuilder.h"
@@ -3186,7 +3187,8 @@ void buildRunPythonMain(SupportBuilder &b) {
         mlir::ValueRange{takenHeader, takenMessageHeader, takenMessageData});
   };
   mlir::Value isSystemExit =
-      b.cmpi(mlir::arith::CmpIPredicate::eq, classId, b.iconst(64));
+      b.cmpi(mlir::arith::CmpIPredicate::eq, classId,
+             b.iconst(py::class_ids::of("builtins.SystemExit")));
   mlir::LLVM::CondBrOp::create(b.builder, b.loc, isSystemExit, systemExit,
                                printTraceback);
 

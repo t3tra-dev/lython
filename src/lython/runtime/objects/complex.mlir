@@ -12,12 +12,12 @@ module attributes {
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyFloat_AsF64(%header: memref<3xi64> {ly.ownership.object_header}) -> f64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "__float__", ly.runtime.primitive = "unbox.f64"}
   func.func private @LyFloat_DecRef(%header: memref<3xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.float", ly.runtime.deallocator}
-  func.func private @LyFloat_FromF64(%value: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 2 : i64, ly.runtime.contract = "builtins.float", ly.runtime.initializer = "__new__"}
+  func.func private @LyFloat_FromF64(%value: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.float", ly.runtime.initializer = "__new__"}
   func.func private @LyFloat_Repr(%header: memref<3xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"}
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "release_to_zero"}
   func.func private @LyUnicode_Concat(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__add__"}
   func.func private @LyUnicode_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.str", ly.runtime.deallocator}
-  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
+  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @__ly_float_hash_bits(%bits: i64, %ident: i64) -> i64
   func.func private @__ly_hash_fixup(%h: i64) -> i64
   func.func private @__ly_long_cmp_f64(%meta_raw: memref<2xi64>, %digits_raw: memref<?xi32>, %d: f64) -> i64
@@ -103,7 +103,7 @@ module attributes {
   //
   func.func private @LyComplex_Shape() -> memref<4xi64> attributes {ly.runtime.contract = "builtins.complex", ly.runtime.shape}
 
-  func.func @LyComplex_FromParts(%real: f64 {ly.runtime.default_f64 = 0.0 : f64}, %imag: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 13 : i64, ly.runtime.contract = "builtins.complex", ly.runtime.initializer = "__new__"} {
+  func.func @LyComplex_FromParts(%real: f64 {ly.runtime.default_f64 = 0.0 : f64}, %imag: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.complex", ly.runtime.initializer = "__new__"} {
     // One entity, one handle: words 2 and 3 carry the two doubles as their bit
     // patterns. See LyFloat_FromF64 for why the bits and not an f64-typed lane.
     %block_bytes = arith.constant 32 : index
@@ -111,7 +111,7 @@ module attributes {
     %self_offset = arith.constant 0 : index
     %header = memref.view %block[%self_offset][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<4xi64>
     %one = arith.constant 1 : i64
-    %layout_complex = arith.constant 13 : i64
+    %layout_complex = arith.constant {ly.class_id_of = "builtins.complex"} 13 : i64
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
     %real_slot = arith.constant 2 : index
@@ -881,7 +881,7 @@ module attributes {
 
   memref.global "private" constant @__ly_complex_msg_zero_div : memref<16xi8> = dense<[100, 105, 118, 105, 115, 105, 111, 110, 32, 98, 121, 32, 122, 101, 114, 111]>
   func.func private @__ly_complex_raise_zero_division() {
-    %class_id = arith.constant 61 : i64
+    %class_id = arith.constant {ly.class_id_of = "builtins.ZeroDivisionError"} 61 : i64
     %length = arith.constant 16 : i64
     %message_static = memref.get_global @__ly_complex_msg_zero_div : memref<16xi8>
     %message = memref.cast %message_static : memref<16xi8> to memref<?xi8>
@@ -891,7 +891,7 @@ module attributes {
 
   memref.global "private" constant @__ly_complex_msg_pow_zero : memref<35xi8> = dense<[122, 101, 114, 111, 32, 116, 111, 32, 97, 32, 110, 101, 103, 97, 116, 105, 118, 101, 32, 111, 114, 32, 99, 111, 109, 112, 108, 101, 120, 32, 112, 111, 119, 101, 114]>
   func.func private @__ly_complex_raise_pow_zero() {
-    %class_id = arith.constant 61 : i64
+    %class_id = arith.constant {ly.class_id_of = "builtins.ZeroDivisionError"} 61 : i64
     %length = arith.constant 35 : i64
     %message_static = memref.get_global @__ly_complex_msg_pow_zero : memref<35xi8>
     %message = memref.cast %message_static : memref<35xi8> to memref<?xi8>
@@ -901,7 +901,7 @@ module attributes {
 
   memref.global "private" constant @__ly_complex_msg_pow_overflow : memref<22xi8> = dense<[99, 111, 109, 112, 108, 101, 120, 32, 101, 120, 112, 111, 110, 101, 110, 116, 105, 97, 116, 105, 111, 110]>
   func.func private @__ly_complex_raise_pow_overflow() {
-    %class_id = arith.constant 104 : i64
+    %class_id = arith.constant {ly.class_id_of = "builtins.OverflowError"} 104 : i64
     %length = arith.constant 22 : i64
     %message_static = memref.get_global @__ly_complex_msg_pow_overflow : memref<22xi8>
     %message = memref.cast %message_static : memref<22xi8> to memref<?xi8>
@@ -911,7 +911,7 @@ module attributes {
 
   memref.global "private" constant @__ly_complex_msg_abs_overflow : memref<24xi8> = dense<[97, 98, 115, 111, 108, 117, 116, 101, 32, 118, 97, 108, 117, 101, 32, 116, 111, 111, 32, 108, 97, 114, 103, 101]>
   func.func private @__ly_complex_raise_abs_overflow() {
-    %class_id = arith.constant 104 : i64
+    %class_id = arith.constant {ly.class_id_of = "builtins.OverflowError"} 104 : i64
     %length = arith.constant 24 : i64
     %message_static = memref.get_global @__ly_complex_msg_abs_overflow : memref<24xi8>
     %message = memref.cast %message_static : memref<24xi8> to memref<?xi8>

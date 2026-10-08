@@ -1,3 +1,4 @@
+#include "ClassIds.h"
 #include "Runtime/Core/Lowerer.h"
 #include "ArithBuilders.h"
 
@@ -602,8 +603,9 @@ RuntimeBundleLowerer::objectPayloadClassEntity(mlir::Operation *op,
           mlir::ValueRange{concrete->primitiveI64->value,
                            concrete->primitiveI64->valid,
                            concrete->deferredObject});
-      return llvm::SmallVector<mlir::Value, 4>{constantI64(builder, loc, 1),
-                                               call.getResult(0)};
+      return llvm::SmallVector<mlir::Value, 4>{
+          constantI64(builder, loc, py::class_ids::of("builtins.int")),
+          call.getResult(0)};
     }
   if (concrete->storeAsSlotWord && concrete->physicalValues().size() == 1)
     if (std::optional<RuntimeSymbol> takingRef = manifest.primitive(
@@ -615,14 +617,18 @@ RuntimeBundleLowerer::objectPayloadClassEntity(mlir::Operation *op,
             loc, *takingRef, mlir::ValueRange{handle});
         return llvm::SmallVector<mlir::Value, 4>{
             constantI64(builder, loc,
-                        concrete->contractName() == "builtins.int" ? 1 : 2),
+                        concrete->contractName() == "builtins.int"
+                            ? py::class_ids::of("builtins.int")
+                            : py::class_ids::of("builtins.float")),
             call.getResult(0)};
       }
     }
   if (concrete->payloadSlotWord)
     return llvm::SmallVector<mlir::Value, 4>{
         constantI64(builder, loc,
-                    concrete->contractName() == "builtins.float" ? 2 : 1),
+                    concrete->contractName() == "builtins.float"
+                        ? py::class_ids::of("builtins.float")
+                        : py::class_ids::of("builtins.int")),
         concrete->payloadSlotWord};
   if (concrete->physicalValues().empty())
     return op->emitError()

@@ -34,6 +34,7 @@
 // struct types through the manifest surface, and the reason to do it would have
 // to be something other than the pointer words.
 
+#include "ClassIds.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -85,7 +86,7 @@ inline mlir::MemRefType slotWordsType(mlir::Builder &builder) {
 }
 
 // The class id a slot's entity word names (`__ly_slot_class`): 0 for None,
-// int (1) or float (2) by an immediate's tag, else the object's header word 1.
+// int or float by an immediate's tag, else the object's header word 1.
 inline mlir::Value slotClassFromEntity(mlir::OpBuilder &builder,
                                        mlir::Location loc, mlir::Value entity) {
   mlir::Type i64 = builder.getI64Type();
@@ -103,7 +104,8 @@ inline mlir::Value slotClassFromEntity(mlir::OpBuilder &builder,
   mlir::Value isInt = mlir::arith::CmpIOp::create(
       builder, loc, mlir::arith::CmpIPredicate::ne, intTag, zero);
   mlir::Value immediateClass = mlir::arith::SelectOp::create(
-      builder, loc, isInt, constant(1), constant(2));
+      builder, loc, isInt, constant(py::class_ids::of("builtins.int")),
+      constant(py::class_ids::of("builtins.float")));
   mlir::Value isNull = mlir::arith::CmpIOp::create(
       builder, loc, mlir::arith::CmpIPredicate::eq, entity, zero);
   // ⛔ A branch, not a select: the load must not run for None or an

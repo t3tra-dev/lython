@@ -12,14 +12,14 @@ module attributes {
   func.func private @__ly_slice_unpack(%self: memref<5xi64>) -> (i64, i64, i64, i64)
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyErr_NoMemory() attributes {ly.runtime.contract = "builtins.MemoryError"}
-  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
+  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
   func.func private @LyObject_ReleaseBoxedPayloadArraySlotRaw(%payload: memref<?xi64>, %logical_index: i64)
   func.func private @LyObject_ReleaseBoxedPayloadRaw(%box: memref<5xi64>)
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "release_to_zero"}
   func.func private @LyObject_RetainBoxedPayloadArraySlotRaw(%payload: memref<?xi64>, %logical_index: i64)
   func.func private @LyUnicode_Concat(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__add__"}
   func.func private @LyUnicode_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.str", ly.runtime.deallocator}
-  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
+  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @__ly_alloc_count(%count: i64, %element_bytes: i64, %extra: i64) -> index
   func.func private @__ly_box_move_slot(%dst: memref<?xi64>, %d: i64, %src: memref<?xi64>, %s: i64)
   func.func private @__ly_box_word_count() -> i64
@@ -613,7 +613,7 @@ module attributes {
       // The message is a fixed string, not `repr(x) is not in list`: CPython
       // 3.14 no longer interpolates the probe here, and a fixed string also
       // keeps this path off the boxed-__repr__ dispatch.
-      %value_error = arith.constant 53 : i64
+      %value_error = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
       %msg_static = memref.get_global @__ly_list_msg_index_missing : memref<28xi8>
       %msg = memref.cast %msg_static : memref<28xi8> to memref<?xi8>
       %msg_len = arith.constant 28 : i64
@@ -638,7 +638,7 @@ module attributes {
     %found = func.call @__ly_list_find_box(%self, %elem_box) : (memref<5xi64>, memref<5xi64>) -> i64
     %missing = arith.cmpi eq, %found, %minus_one : i64
     scf.if %missing {
-      %value_error = arith.constant 53 : i64
+      %value_error = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
       %msg_static = memref.get_global @__ly_list_msg_remove_missing : memref<29xi8>
       %msg = memref.cast %msg_static : memref<29xi8> to memref<?xi8>
       %msg_len = arith.constant 29 : i64
@@ -691,7 +691,7 @@ module attributes {
     %in_range = arith.andi %lower_ok, %upper_ok : i1
     scf.if %in_range {
     } else {
-      %index_error = arith.constant 55 : i64
+      %index_error = arith.constant {ly.class_id_of = "builtins.IndexError"} 55 : i64
       %msg_static = memref.get_global @__ly_list_msg_assign_range : memref<34xi8>
       %msg = memref.cast %msg_static : memref<34xi8> to memref<?xi8>
       %msg_len = arith.constant 34 : i64
@@ -731,7 +731,7 @@ module attributes {
     scf.if %in_range {
     } else {
       func.call @LyObject_ReleaseBoxedPayloadRaw(%value_box) : (memref<5xi64>) -> ()
-      %index_error = arith.constant 55 : i64
+      %index_error = arith.constant {ly.class_id_of = "builtins.IndexError"} 55 : i64
       %msg_static = memref.get_global @__ly_list_msg_assign_range : memref<34xi8>
       %msg = memref.cast %msg_static : memref<34xi8> to memref<?xi8>
       %msg_len = arith.constant 34 : i64
@@ -805,7 +805,7 @@ module attributes {
     %c1 = arith.constant 1 : index
     %c16_words = func.call @__ly_box_word_count() : () -> i64
     %c16 = arith.index_cast %c16_words : i64 to index
-    %index_error = arith.constant 55 : i64
+    %index_error = arith.constant {ly.class_id_of = "builtins.IndexError"} 55 : i64
     %length_slot = arith.constant 2 : index
     %len = memref.load %self[%length_slot] : memref<5xi64>
     %items = func.call @__ly_list_items(%self) : (memref<5xi64>) -> memref<?xi64>
@@ -945,7 +945,7 @@ module attributes {
   func.func private @__ly_list_alloc(%length: i64) -> memref<5xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.list"], ly.ownership.owned_results = [0]} {
     %one = arith.constant 1 : i64
     %handle_words = func.call @__ly_box_word_count() : () -> i64
-    %class_id = arith.constant 10 : i64
+    %class_id = arith.constant {ly.class_id_of = "builtins.list"} 10 : i64
     %zero = arith.constant 0 : i64
     // Before the handle is made, so a refusal leaves nothing behind.
     %capacity = arith.maxsi %length, %zero : i64
@@ -1038,7 +1038,7 @@ module attributes {
     func.return %self : memref<5xi64>
   }
 
-  func.func @LyList_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 10 : i64, ly.runtime.contract = "builtins.list", ly.runtime.initializer = "__new__", ly.runtime.result_contract = "builtins.list"} {
+  func.func @LyList_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.list", ly.runtime.initializer = "__new__", ly.runtime.result_contract = "builtins.list"} {
     %self = func.call @__ly_list_alloc(%length) : (i64) -> memref<5xi64>
     func.return %self : memref<5xi64>
   }

@@ -55,7 +55,7 @@ module attributes {
   func.func private @LyBytes_Lower(%header: memref<4xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "lower", ly.runtime.result_contract = "builtins.bytes"}
   func.func private @LyBytes_LtBool(%lhs_header: memref<4xi64> {ly.ownership.object_header}, %rhs_header: memref<4xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__lt__"}
   func.func private @LyBytes_NeBool(%lhs_header: memref<4xi64> {ly.ownership.object_header}, %rhs_header: memref<4xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__ne__"}
-  func.func private @LyBytes_NewEncoded(%text_header: memref<2xi64> {ly.ownership.object_header}, %text_bytes: memref<?xi8>, %encoding_header: memref<2xi64> {ly.ownership.object_header}, %encoding_bytes: memref<?xi8>) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 70 : i64, ly.runtime.contract = "builtins.bytes", ly.runtime.initializer = "__new__"}
+  func.func private @LyBytes_NewEncoded(%text_header: memref<2xi64> {ly.ownership.object_header}, %text_bytes: memref<?xi8>, %encoding_header: memref<2xi64> {ly.ownership.object_header}, %encoding_bytes: memref<?xi8>) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.bytes", ly.runtime.initializer = "__new__"}
   func.func private @LyBytes_RStrip(%header: memref<4xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "rstrip", ly.runtime.result_contract = "builtins.bytes"}
   func.func private @LyBytes_RStripChars(%header: memref<4xi64> {ly.ownership.object_header}, %chars_header: memref<4xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "rstrip", ly.runtime.result_contract = "builtins.bytes"}
   func.func private @LyBytes_RemovePrefix(%header: memref<4xi64> {ly.ownership.object_header}, %affix_header: memref<4xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "removeprefix", ly.runtime.result_contract = "builtins.bytes"}
@@ -71,7 +71,7 @@ module attributes {
   func.func private @LyBytes_Title(%header: memref<4xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "title", ly.runtime.result_contract = "builtins.bytes"}
   func.func private @LyBytes_Upper(%header: memref<4xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "upper", ly.runtime.result_contract = "builtins.bytes"}
   func.func private @LyList_Len(%self: memref<5xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__len__"}
-  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
+  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
   func.func private @LyLong_SlotWordAsI64(%word: i64) -> (i64, i1) attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "slot_word_as_i64"}
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "release_to_zero"}
   func.func private @LyUnicode_Concat(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__add__"}
@@ -306,7 +306,7 @@ module attributes {
     %exports = func.call @__ly_bytearray_exports(%self) : (memref<4xi64>) -> i64
     %exported = arith.cmpi sgt, %exports, %zero : i64
     scf.if %exported {
-      %buffer_error = arith.constant 105 : i64
+      %buffer_error = arith.constant {ly.class_id_of = "builtins.BufferError"} 105 : i64
       %message_length = arith.constant 51 : i64
       %static = memref.get_global @__ly_bytearray_msg_exported : memref<51xi8>
       %message = memref.cast %static : memref<51xi8> to memref<?xi8>
@@ -363,7 +363,7 @@ module attributes {
   func.func private @__ly_bytearray_alloc(%length: i64) -> memref<4xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytearray"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytearray"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
-    %class_bytearray = arith.constant 26 : i64
+    %class_bytearray = arith.constant {ly.class_id_of = "builtins.bytearray"} 26 : i64
     %header_bytes = arith.constant 32 : index
     %c0 = arith.constant 0 : index
     %refcount_slot = arith.constant 0 : index
@@ -523,7 +523,7 @@ module attributes {
     %fits = arith.andi %low, %high : i1
     scf.if %fits {
     } else {
-      %value_error = arith.constant 53 : i64
+      %value_error = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
       %length = arith.constant 29 : i64
       %static = memref.get_global @__ly_bytearray_msg_byte_range : memref<29xi8>
       %message = memref.cast %static : memref<29xi8> to memref<?xi8>
@@ -546,7 +546,7 @@ module attributes {
     %valid = arith.andi %low, %high : i1
     scf.if %valid {
     } else {
-      %index_error = arith.constant 55 : i64
+      %index_error = arith.constant {ly.class_id_of = "builtins.IndexError"} 55 : i64
       %message_length = arith.constant 28 : i64
       %static = memref.get_global @__ly_bytearray_msg_index : memref<28xi8>
       %message = memref.cast %static : memref<28xi8> to memref<?xi8>
@@ -588,7 +588,7 @@ module attributes {
   //
   // One initializer per shape, as bytes has them, and an empty __init__ for
   // each: the constructor path calls both.
-  func.func @LyByteArray_NewEmpty() -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 26 : i64, ly.runtime.contract = "builtins.bytearray", ly.runtime.initializer = "__new__"} {
+  func.func @LyByteArray_NewEmpty() -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.bytearray", ly.runtime.initializer = "__new__"} {
     %zero = arith.constant 0 : i64
     %self = func.call @__ly_bytearray_alloc(%zero) : (i64) -> memref<4xi64>
     func.return %self : memref<4xi64>
@@ -600,7 +600,7 @@ module attributes {
 
   // bytearray(n): n zero bytes; "negative count" below zero, MemoryError past
   // what can be allocated.
-  func.func @LyByteArray_NewZeros(%count: i64) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 26 : i64, ly.runtime.contract = "builtins.bytearray", ly.runtime.initializer = "__new__"} {
+  func.func @LyByteArray_NewZeros(%count: i64) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.bytearray", ly.runtime.initializer = "__new__"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %word = arith.constant 8 : i64
@@ -609,7 +609,7 @@ module attributes {
     %zero_byte = arith.constant 0 : i8
     %negative = arith.cmpi slt, %count, %zero : i64
     scf.if %negative {
-      %value_error = arith.constant 53 : i64
+      %value_error = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
       %length = arith.constant 14 : i64
       %static = memref.get_global @__ly_bytearray_msg_negative_count : memref<14xi8>
       %message = memref.cast %static : memref<14xi8> to memref<?xi8>
@@ -630,7 +630,7 @@ module attributes {
   }
 
   // bytearray(b) and bytearray(ba): a copy.
-  func.func @LyByteArray_NewCopy(%source: memref<4xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 26 : i64, ly.runtime.contract = "builtins.bytearray", ly.runtime.initializer = "__new__"} {
+  func.func @LyByteArray_NewCopy(%source: memref<4xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.bytearray", ly.runtime.initializer = "__new__"} {
     %self = func.call @__ly_bytearray_from_bytes(%source) : (memref<4xi64>) -> memref<4xi64>
     func.return %self : memref<4xi64>
   }
@@ -640,7 +640,7 @@ module attributes {
   }
 
   // bytearray([65, 66]): each int a byte.
-  func.func @LyByteArray_NewFromList(%items: memref<5xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 26 : i64, ly.runtime.contract = "builtins.bytearray", ly.runtime.initializer = "__new__"} {
+  func.func @LyByteArray_NewFromList(%items: memref<5xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.bytearray", ly.runtime.initializer = "__new__"} {
     %self = func.call @__ly_bytearray_of_list(%items) : (memref<5xi64>) -> memref<4xi64>
     func.return %self : memref<4xi64>
   }
@@ -650,7 +650,7 @@ module attributes {
   }
 
   // bytearray(view): a copy of the bytes a memoryview shows.
-  func.func @LyByteArray_NewFromView(%view: memref<8xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 26 : i64, ly.runtime.contract = "builtins.bytearray", ly.runtime.initializer = "__new__"} {
+  func.func @LyByteArray_NewFromView(%view: memref<8xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.bytearray", ly.runtime.initializer = "__new__"} {
     %bytes = func.call @LyMemoryView_ToBytes(%view) : (memref<8xi64>) -> memref<4xi64>
     %self = func.call @__ly_bytearray_from_bytes(%bytes) : (memref<4xi64>) -> memref<4xi64>
     func.call @LyBytes_DecRef(%bytes) : (memref<4xi64>) -> ()
@@ -662,7 +662,7 @@ module attributes {
   }
 
   // bytearray(text, encoding): the text encoded, as bytes(text, encoding) is.
-  func.func @LyByteArray_NewEncoded(%text_header: memref<2xi64> {ly.ownership.object_header}, %text_bytes: memref<?xi8>, %encoding_header: memref<2xi64> {ly.ownership.object_header}, %encoding_bytes: memref<?xi8>) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 26 : i64, ly.runtime.contract = "builtins.bytearray", ly.runtime.initializer = "__new__"} {
+  func.func @LyByteArray_NewEncoded(%text_header: memref<2xi64> {ly.ownership.object_header}, %text_bytes: memref<?xi8>, %encoding_header: memref<2xi64> {ly.ownership.object_header}, %encoding_bytes: memref<?xi8>) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.bytearray", ly.runtime.initializer = "__new__"} {
     %encoded = func.call @LyBytes_NewEncoded(%text_header, %text_bytes, %encoding_header, %encoding_bytes) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> memref<4xi64>
     %self = func.call @__ly_bytearray_from_bytes(%encoded) : (memref<4xi64>) -> memref<4xi64>
     func.call @LyBytes_DecRef(%encoded) : (memref<4xi64>) -> ()
@@ -1062,7 +1062,7 @@ module attributes {
   func.func @LyByteArray_PopAt(%self: memref<4xi64> {ly.ownership.object_header}, %raw_index: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytearray", ly.runtime.method = "pop", ly.runtime.result_contract = "builtins.int"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
-    %index_error = arith.constant 55 : i64
+    %index_error = arith.constant {ly.class_id_of = "builtins.IndexError"} 55 : i64
     %length_slot = arith.constant 3 : index
     %length = memref.load %self[%length_slot] : memref<4xi64>
     %empty = arith.cmpi eq, %length, %zero : i64
@@ -1129,7 +1129,7 @@ module attributes {
     }
     %missing = arith.cmpi slt, %found, %zero : i64
     scf.if %missing {
-      %value_error = arith.constant 53 : i64
+      %value_error = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
       %message_length = arith.constant 28 : i64
       %static = memref.get_global @__ly_bytearray_msg_not_found : memref<28xi8>
       %message = memref.cast %static : memref<28xi8> to memref<?xi8>
@@ -1194,7 +1194,7 @@ module attributes {
     %other_index = memref.extract_aligned_pointer_as_index %other : memref<4xi64> -> index
     %same = arith.cmpi eq, %self_index, %other_index : index
     scf.if %same {
-      %buffer_error = arith.constant 105 : i64
+      %buffer_error = arith.constant {ly.class_id_of = "builtins.BufferError"} 105 : i64
       %message_length = arith.constant 51 : i64
       %static = memref.get_global @__ly_bytearray_msg_exported : memref<51xi8>
       %message = memref.cast %static : memref<51xi8> to memref<?xi8>
@@ -1337,7 +1337,7 @@ module attributes {
   func.func @LyByteArray_Iter(%self: memref<4xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytearray", ly.runtime.method = "__iter__", ly.runtime.result_contract = "builtins.bytearray_iterator"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
-    %class_iterator = arith.constant 28 : i64
+    %class_iterator = arith.constant {ly.class_id_of = "builtins.bytearray_iterator"} 28 : i64
     %header_bytes = arith.constant 32 : index
     %c0 = arith.constant 0 : index
     %refcount_slot = arith.constant 0 : index

@@ -1,3 +1,4 @@
+#include "ClassIds.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include <fstream>
@@ -1666,7 +1667,10 @@ TEST(DriverTest, ABareExceptNamesBaseException) {
         if (clause->isNullValue())
           continue;
         ++typedClauses;
-        EXPECT_EQ(clause->getName(), "__ly_exc_type_5")
+        EXPECT_EQ(clause->getName().str(),
+                  "__ly_exc_type_" +
+                      std::to_string(
+                          py::class_ids::of("builtins.BaseException")))
             << "a bare except that names anything narrower than BaseException "
                "drops the exceptions it does not name";
       }

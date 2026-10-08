@@ -11,12 +11,14 @@
 
 #include "llvm/ADT/StringRef.h"
 
+#include "ClassIds.h"
+
 #include <cstdint>
 
 namespace py::exceptions {
 
 // Base id 0 terminates the chain (only BaseException points at it).
-inline constexpr std::int64_t kRootClassId = 0;
+inline constexpr std::int64_t kRootClassId = class_ids::kNoClass;
 
 struct BuiltinExceptionInfo {
   std::int64_t classId;
@@ -28,149 +30,149 @@ struct BuiltinExceptionInfo {
 };
 
 inline constexpr BuiltinExceptionInfo kBuiltinExceptions[] = {
-    {5, llvm::StringLiteral("BaseException"), kRootClassId,
+    {class_ids::of("builtins.BaseException"), llvm::StringLiteral("BaseException"), kRootClassId,
      llvm::StringLiteral("builtins.BaseException")},
-    {50, llvm::StringLiteral("Exception"), 5,
+    {class_ids::of("builtins.Exception"), llvm::StringLiteral("Exception"), class_ids::of("builtins.BaseException"),
      llvm::StringLiteral("builtins.Exception")},
-    {51, llvm::StringLiteral("RuntimeError"), 50,
+    {class_ids::of("builtins.RuntimeError"), llvm::StringLiteral("RuntimeError"), class_ids::of("builtins.Exception"),
      llvm::StringLiteral("builtins.RuntimeError")},
-    {52, llvm::StringLiteral("TypeError"), 50,
+    {class_ids::of("builtins.TypeError"), llvm::StringLiteral("TypeError"), class_ids::of("builtins.Exception"),
      llvm::StringLiteral("builtins.TypeError")},
-    {53, llvm::StringLiteral("ValueError"), 50,
+    {class_ids::of("builtins.ValueError"), llvm::StringLiteral("ValueError"), class_ids::of("builtins.Exception"),
      llvm::StringLiteral("builtins.ValueError")},
-    {54, llvm::StringLiteral("KeyError"), 60,
+    {class_ids::of("builtins.KeyError"), llvm::StringLiteral("KeyError"), class_ids::of("builtins.LookupError"),
      llvm::StringLiteral("builtins.KeyError")},
-    {55, llvm::StringLiteral("IndexError"), 60,
+    {class_ids::of("builtins.IndexError"), llvm::StringLiteral("IndexError"), class_ids::of("builtins.LookupError"),
      llvm::StringLiteral("builtins.IndexError")},
-    {56, llvm::StringLiteral("AssertionError"), 50,
+    {class_ids::of("builtins.AssertionError"), llvm::StringLiteral("AssertionError"), class_ids::of("builtins.Exception"),
      llvm::StringLiteral("builtins.AssertionError")},
-    {57, llvm::StringLiteral("StopIteration"), 50,
+    {class_ids::of("builtins.StopIteration"), llvm::StringLiteral("StopIteration"), class_ids::of("builtins.Exception"),
      llvm::StringLiteral("builtins.StopIteration")},
-    {58, llvm::StringLiteral("StopAsyncIteration"), 50,
+    {class_ids::of("builtins.StopAsyncIteration"), llvm::StringLiteral("StopAsyncIteration"), class_ids::of("builtins.Exception"),
      llvm::StringLiteral("builtins.StopAsyncIteration")},
-    {59, llvm::StringLiteral("ArithmeticError"), 50,
+    {class_ids::of("builtins.ArithmeticError"), llvm::StringLiteral("ArithmeticError"), class_ids::of("builtins.Exception"),
      llvm::StringLiteral("builtins.ArithmeticError")},
-    {60, llvm::StringLiteral("LookupError"), 50,
+    {class_ids::of("builtins.LookupError"), llvm::StringLiteral("LookupError"), class_ids::of("builtins.Exception"),
      llvm::StringLiteral("builtins.LookupError")},
-    {61, llvm::StringLiteral("ZeroDivisionError"), 59,
+    {class_ids::of("builtins.ZeroDivisionError"), llvm::StringLiteral("ZeroDivisionError"), class_ids::of("builtins.ArithmeticError"),
      llvm::StringLiteral("builtins.ZeroDivisionError")},
-    {64, llvm::StringLiteral("SystemExit"), 5,
+    {class_ids::of("builtins.SystemExit"), llvm::StringLiteral("SystemExit"), class_ids::of("builtins.BaseException"),
      llvm::StringLiteral("builtins.SystemExit")},
-    {68, llvm::StringLiteral("GeneratorExit"), 5,
+    {class_ids::of("builtins.GeneratorExit"), llvm::StringLiteral("GeneratorExit"), class_ids::of("builtins.BaseException"),
      llvm::StringLiteral("builtins.GeneratorExit")},
-    {66, llvm::StringLiteral("OSError"), 50,
+    {class_ids::of("builtins.OSError"), llvm::StringLiteral("OSError"), class_ids::of("builtins.Exception"),
      llvm::StringLiteral("builtins.OSError")},
-    {67, llvm::StringLiteral("FileNotFoundError"), 66,
+    {class_ids::of("builtins.FileNotFoundError"), llvm::StringLiteral("FileNotFoundError"), class_ids::of("builtins.OSError"),
      llvm::StringLiteral("builtins.FileNotFoundError")},
-    {69, llvm::StringLiteral("UnsupportedOperation"), 66,
+    {class_ids::of("_io.UnsupportedOperation"), llvm::StringLiteral("UnsupportedOperation"), class_ids::of("builtins.OSError"),
      llvm::StringLiteral("_io.UnsupportedOperation")},
-    // CPython 3.14 completion (Wave 1). Ids 100+ leave room below for
-    // non-exception runtime classes; user-defined exception classes start at
-    // 2^32 (kSourceClassIdBase), so every builtin id must stay below that.
-    {100, llvm::StringLiteral("KeyboardInterrupt"), 5,
+    // CPython 3.14 completion (Wave 1). Numbers come from ClassIds.h by
+    // name; user-defined classes start at 2^32 (kSourceClassIdBase), above
+    // every one of them.
+    {class_ids::of("builtins.KeyboardInterrupt"), llvm::StringLiteral("KeyboardInterrupt"), class_ids::of("builtins.BaseException"),
      llvm::StringLiteral("builtins.KeyboardInterrupt")},
-    {101, llvm::StringLiteral("BaseExceptionGroup"), 5,
+    {class_ids::of("builtins.BaseExceptionGroup"), llvm::StringLiteral("BaseExceptionGroup"), class_ids::of("builtins.BaseException"),
      llvm::StringLiteral("builtins.BaseExceptionGroup")},
     // ExceptionGroup's second base (Exception) lives in
     // kBuiltinExceptionExtraEdges; the primary chain keeps
     // BaseExceptionGroup so except BaseExceptionGroup matches by walk.
-    {102, llvm::StringLiteral("ExceptionGroup"), 101,
+    {class_ids::of("builtins.ExceptionGroup"), llvm::StringLiteral("ExceptionGroup"), class_ids::of("builtins.BaseExceptionGroup"),
      llvm::StringLiteral("builtins.ExceptionGroup")},
-    {103, llvm::StringLiteral("FloatingPointError"), 59,
+    {class_ids::of("builtins.FloatingPointError"), llvm::StringLiteral("FloatingPointError"), class_ids::of("builtins.ArithmeticError"),
      llvm::StringLiteral("builtins.FloatingPointError")},
-    {104, llvm::StringLiteral("OverflowError"), 59,
+    {class_ids::of("builtins.OverflowError"), llvm::StringLiteral("OverflowError"), class_ids::of("builtins.ArithmeticError"),
      llvm::StringLiteral("builtins.OverflowError")},
-    {105, llvm::StringLiteral("BufferError"), 50,
+    {class_ids::of("builtins.BufferError"), llvm::StringLiteral("BufferError"), class_ids::of("builtins.Exception"),
      llvm::StringLiteral("builtins.BufferError")},
-    {106, llvm::StringLiteral("EOFError"), 50,
+    {class_ids::of("builtins.EOFError"), llvm::StringLiteral("EOFError"), class_ids::of("builtins.Exception"),
      llvm::StringLiteral("builtins.EOFError")},
-    {107, llvm::StringLiteral("ImportError"), 50,
+    {class_ids::of("builtins.ImportError"), llvm::StringLiteral("ImportError"), class_ids::of("builtins.Exception"),
      llvm::StringLiteral("builtins.ImportError")},
-    {108, llvm::StringLiteral("ModuleNotFoundError"), 107,
+    {class_ids::of("builtins.ModuleNotFoundError"), llvm::StringLiteral("ModuleNotFoundError"), class_ids::of("builtins.ImportError"),
      llvm::StringLiteral("builtins.ModuleNotFoundError")},
-    {109, llvm::StringLiteral("MemoryError"), 50,
+    {class_ids::of("builtins.MemoryError"), llvm::StringLiteral("MemoryError"), class_ids::of("builtins.Exception"),
      llvm::StringLiteral("builtins.MemoryError")},
-    {110, llvm::StringLiteral("NameError"), 50,
+    {class_ids::of("builtins.NameError"), llvm::StringLiteral("NameError"), class_ids::of("builtins.Exception"),
      llvm::StringLiteral("builtins.NameError")},
-    {111, llvm::StringLiteral("UnboundLocalError"), 110,
+    {class_ids::of("builtins.UnboundLocalError"), llvm::StringLiteral("UnboundLocalError"), class_ids::of("builtins.NameError"),
      llvm::StringLiteral("builtins.UnboundLocalError")},
-    {112, llvm::StringLiteral("AttributeError"), 50,
+    {class_ids::of("builtins.AttributeError"), llvm::StringLiteral("AttributeError"), class_ids::of("builtins.Exception"),
      llvm::StringLiteral("builtins.AttributeError")},
-    {113, llvm::StringLiteral("ReferenceError"), 50,
+    {class_ids::of("builtins.ReferenceError"), llvm::StringLiteral("ReferenceError"), class_ids::of("builtins.Exception"),
      llvm::StringLiteral("builtins.ReferenceError")},
-    {114, llvm::StringLiteral("NotImplementedError"), 51,
+    {class_ids::of("builtins.NotImplementedError"), llvm::StringLiteral("NotImplementedError"), class_ids::of("builtins.RuntimeError"),
      llvm::StringLiteral("builtins.NotImplementedError")},
-    {115, llvm::StringLiteral("RecursionError"), 51,
+    {class_ids::of("builtins.RecursionError"), llvm::StringLiteral("RecursionError"), class_ids::of("builtins.RuntimeError"),
      llvm::StringLiteral("builtins.RecursionError")},
-    {116, llvm::StringLiteral("PythonFinalizationError"), 51,
+    {class_ids::of("builtins.PythonFinalizationError"), llvm::StringLiteral("PythonFinalizationError"), class_ids::of("builtins.RuntimeError"),
      llvm::StringLiteral("builtins.PythonFinalizationError")},
-    {117, llvm::StringLiteral("SyntaxError"), 50,
+    {class_ids::of("builtins.SyntaxError"), llvm::StringLiteral("SyntaxError"), class_ids::of("builtins.Exception"),
      llvm::StringLiteral("builtins.SyntaxError")},
-    {118, llvm::StringLiteral("IndentationError"), 117,
+    {class_ids::of("builtins.IndentationError"), llvm::StringLiteral("IndentationError"), class_ids::of("builtins.SyntaxError"),
      llvm::StringLiteral("builtins.IndentationError")},
-    {119, llvm::StringLiteral("TabError"), 118,
+    {class_ids::of("builtins.TabError"), llvm::StringLiteral("TabError"), class_ids::of("builtins.IndentationError"),
      llvm::StringLiteral("builtins.TabError")},
-    {120, llvm::StringLiteral("SystemError"), 50,
+    {class_ids::of("builtins.SystemError"), llvm::StringLiteral("SystemError"), class_ids::of("builtins.Exception"),
      llvm::StringLiteral("builtins.SystemError")},
-    {121, llvm::StringLiteral("UnicodeError"), 53,
+    {class_ids::of("builtins.UnicodeError"), llvm::StringLiteral("UnicodeError"), class_ids::of("builtins.ValueError"),
      llvm::StringLiteral("builtins.UnicodeError")},
-    {122, llvm::StringLiteral("UnicodeDecodeError"), 121,
+    {class_ids::of("builtins.UnicodeDecodeError"), llvm::StringLiteral("UnicodeDecodeError"), class_ids::of("builtins.UnicodeError"),
      llvm::StringLiteral("builtins.UnicodeDecodeError")},
-    {123, llvm::StringLiteral("UnicodeEncodeError"), 121,
+    {class_ids::of("builtins.UnicodeEncodeError"), llvm::StringLiteral("UnicodeEncodeError"), class_ids::of("builtins.UnicodeError"),
      llvm::StringLiteral("builtins.UnicodeEncodeError")},
-    {124, llvm::StringLiteral("UnicodeTranslateError"), 121,
+    {class_ids::of("builtins.UnicodeTranslateError"), llvm::StringLiteral("UnicodeTranslateError"), class_ids::of("builtins.UnicodeError"),
      llvm::StringLiteral("builtins.UnicodeTranslateError")},
-    {125, llvm::StringLiteral("Warning"), 50,
+    {class_ids::of("builtins.Warning"), llvm::StringLiteral("Warning"), class_ids::of("builtins.Exception"),
      llvm::StringLiteral("builtins.Warning")},
-    {126, llvm::StringLiteral("BytesWarning"), 125,
+    {class_ids::of("builtins.BytesWarning"), llvm::StringLiteral("BytesWarning"), class_ids::of("builtins.Warning"),
      llvm::StringLiteral("builtins.BytesWarning")},
-    {127, llvm::StringLiteral("DeprecationWarning"), 125,
+    {class_ids::of("builtins.DeprecationWarning"), llvm::StringLiteral("DeprecationWarning"), class_ids::of("builtins.Warning"),
      llvm::StringLiteral("builtins.DeprecationWarning")},
-    {128, llvm::StringLiteral("EncodingWarning"), 125,
+    {class_ids::of("builtins.EncodingWarning"), llvm::StringLiteral("EncodingWarning"), class_ids::of("builtins.Warning"),
      llvm::StringLiteral("builtins.EncodingWarning")},
-    {129, llvm::StringLiteral("FutureWarning"), 125,
+    {class_ids::of("builtins.FutureWarning"), llvm::StringLiteral("FutureWarning"), class_ids::of("builtins.Warning"),
      llvm::StringLiteral("builtins.FutureWarning")},
-    {130, llvm::StringLiteral("ImportWarning"), 125,
+    {class_ids::of("builtins.ImportWarning"), llvm::StringLiteral("ImportWarning"), class_ids::of("builtins.Warning"),
      llvm::StringLiteral("builtins.ImportWarning")},
-    {131, llvm::StringLiteral("PendingDeprecationWarning"), 125,
+    {class_ids::of("builtins.PendingDeprecationWarning"), llvm::StringLiteral("PendingDeprecationWarning"), class_ids::of("builtins.Warning"),
      llvm::StringLiteral("builtins.PendingDeprecationWarning")},
-    {132, llvm::StringLiteral("ResourceWarning"), 125,
+    {class_ids::of("builtins.ResourceWarning"), llvm::StringLiteral("ResourceWarning"), class_ids::of("builtins.Warning"),
      llvm::StringLiteral("builtins.ResourceWarning")},
-    {133, llvm::StringLiteral("RuntimeWarning"), 125,
+    {class_ids::of("builtins.RuntimeWarning"), llvm::StringLiteral("RuntimeWarning"), class_ids::of("builtins.Warning"),
      llvm::StringLiteral("builtins.RuntimeWarning")},
-    {134, llvm::StringLiteral("SyntaxWarning"), 125,
+    {class_ids::of("builtins.SyntaxWarning"), llvm::StringLiteral("SyntaxWarning"), class_ids::of("builtins.Warning"),
      llvm::StringLiteral("builtins.SyntaxWarning")},
-    {135, llvm::StringLiteral("UnicodeWarning"), 125,
+    {class_ids::of("builtins.UnicodeWarning"), llvm::StringLiteral("UnicodeWarning"), class_ids::of("builtins.Warning"),
      llvm::StringLiteral("builtins.UnicodeWarning")},
-    {136, llvm::StringLiteral("UserWarning"), 125,
+    {class_ids::of("builtins.UserWarning"), llvm::StringLiteral("UserWarning"), class_ids::of("builtins.Warning"),
      llvm::StringLiteral("builtins.UserWarning")},
-    {137, llvm::StringLiteral("BlockingIOError"), 66,
+    {class_ids::of("builtins.BlockingIOError"), llvm::StringLiteral("BlockingIOError"), class_ids::of("builtins.OSError"),
      llvm::StringLiteral("builtins.BlockingIOError")},
-    {138, llvm::StringLiteral("ChildProcessError"), 66,
+    {class_ids::of("builtins.ChildProcessError"), llvm::StringLiteral("ChildProcessError"), class_ids::of("builtins.OSError"),
      llvm::StringLiteral("builtins.ChildProcessError")},
-    {139, llvm::StringLiteral("ConnectionError"), 66,
+    {class_ids::of("builtins.ConnectionError"), llvm::StringLiteral("ConnectionError"), class_ids::of("builtins.OSError"),
      llvm::StringLiteral("builtins.ConnectionError")},
-    {140, llvm::StringLiteral("BrokenPipeError"), 139,
+    {class_ids::of("builtins.BrokenPipeError"), llvm::StringLiteral("BrokenPipeError"), class_ids::of("builtins.ConnectionError"),
      llvm::StringLiteral("builtins.BrokenPipeError")},
-    {141, llvm::StringLiteral("ConnectionAbortedError"), 139,
+    {class_ids::of("builtins.ConnectionAbortedError"), llvm::StringLiteral("ConnectionAbortedError"), class_ids::of("builtins.ConnectionError"),
      llvm::StringLiteral("builtins.ConnectionAbortedError")},
-    {142, llvm::StringLiteral("ConnectionRefusedError"), 139,
+    {class_ids::of("builtins.ConnectionRefusedError"), llvm::StringLiteral("ConnectionRefusedError"), class_ids::of("builtins.ConnectionError"),
      llvm::StringLiteral("builtins.ConnectionRefusedError")},
-    {143, llvm::StringLiteral("ConnectionResetError"), 139,
+    {class_ids::of("builtins.ConnectionResetError"), llvm::StringLiteral("ConnectionResetError"), class_ids::of("builtins.ConnectionError"),
      llvm::StringLiteral("builtins.ConnectionResetError")},
-    {144, llvm::StringLiteral("FileExistsError"), 66,
+    {class_ids::of("builtins.FileExistsError"), llvm::StringLiteral("FileExistsError"), class_ids::of("builtins.OSError"),
      llvm::StringLiteral("builtins.FileExistsError")},
-    {145, llvm::StringLiteral("InterruptedError"), 66,
+    {class_ids::of("builtins.InterruptedError"), llvm::StringLiteral("InterruptedError"), class_ids::of("builtins.OSError"),
      llvm::StringLiteral("builtins.InterruptedError")},
-    {146, llvm::StringLiteral("IsADirectoryError"), 66,
+    {class_ids::of("builtins.IsADirectoryError"), llvm::StringLiteral("IsADirectoryError"), class_ids::of("builtins.OSError"),
      llvm::StringLiteral("builtins.IsADirectoryError")},
-    {147, llvm::StringLiteral("NotADirectoryError"), 66,
+    {class_ids::of("builtins.NotADirectoryError"), llvm::StringLiteral("NotADirectoryError"), class_ids::of("builtins.OSError"),
      llvm::StringLiteral("builtins.NotADirectoryError")},
-    {148, llvm::StringLiteral("PermissionError"), 66,
+    {class_ids::of("builtins.PermissionError"), llvm::StringLiteral("PermissionError"), class_ids::of("builtins.OSError"),
      llvm::StringLiteral("builtins.PermissionError")},
-    {149, llvm::StringLiteral("ProcessLookupError"), 66,
+    {class_ids::of("builtins.ProcessLookupError"), llvm::StringLiteral("ProcessLookupError"), class_ids::of("builtins.OSError"),
      llvm::StringLiteral("builtins.ProcessLookupError")},
-    {150, llvm::StringLiteral("TimeoutError"), 66,
+    {class_ids::of("builtins.TimeoutError"), llvm::StringLiteral("TimeoutError"), class_ids::of("builtins.OSError"),
      llvm::StringLiteral("builtins.TimeoutError")},
 };
 
@@ -185,11 +187,11 @@ struct BuiltinExceptionExtraEdge {
 };
 
 inline constexpr BuiltinExceptionExtraEdge kBuiltinExceptionExtraEdges[] = {
-    {102, 50}, // ExceptionGroup -> Exception
+    {class_ids::of("builtins.ExceptionGroup"), class_ids::of("builtins.Exception")}, // ExceptionGroup -> Exception
 };
 
 // OSError itself: the fallback for an errno with no dedicated subclass.
-inline constexpr std::int64_t kOSErrorClassId = 66;
+inline constexpr std::int64_t kOSErrorClassId = class_ids::of("builtins.OSError");
 
 // errno -> OSError-subclass mapping (CPython exceptions.c oserror_use_init
 // dispatch table). Values are per-libc: the common POSIX subset shares
@@ -222,24 +224,24 @@ struct OSErrorErrnoMapping {
 };
 
 inline constexpr OSErrorErrnoMapping kOSErrorErrnoMap[] = {
-    {llvm::StringLiteral("EPERM"), 1, 1, 63, 148},     // PermissionError
-    {llvm::StringLiteral("ENOENT"), 2, 2, 44, 67},     // FileNotFoundError
-    {llvm::StringLiteral("ESRCH"), 3, 3, 71, 149},     // ProcessLookupError
-    {llvm::StringLiteral("EINTR"), 4, 4, 27, 145},     // InterruptedError
-    {llvm::StringLiteral("ECHILD"), 10, 10, 12, 138},  // ChildProcessError
-    {llvm::StringLiteral("EACCES"), 13, 13, 2, 148},   // PermissionError
-    {llvm::StringLiteral("EEXIST"), 17, 17, 20, 144},  // FileExistsError
-    {llvm::StringLiteral("ENOTDIR"), 20, 20, 54, 147}, // NotADirectoryError
-    {llvm::StringLiteral("EISDIR"), 21, 21, 31, 146},  // IsADirectoryError
-    {llvm::StringLiteral("EPIPE"), 32, 32, 64, 140},   // BrokenPipeError
-    {llvm::StringLiteral("EAGAIN"), 35, 11, 6, 137},   // BlockingIOError
-    {llvm::StringLiteral("EINPROGRESS"), 36, 115, 26, 137},
-    {llvm::StringLiteral("EALREADY"), 37, 114, 7, 137},
-    {llvm::StringLiteral("ECONNABORTED"), 53, 103, 13, 141},
-    {llvm::StringLiteral("ECONNRESET"), 54, 104, 15, 143},
-    {llvm::StringLiteral("ESHUTDOWN"), 58, 108, 140, 140},
-    {llvm::StringLiteral("ETIMEDOUT"), 60, 110, 73, 150}, // TimeoutError
-    {llvm::StringLiteral("ECONNREFUSED"), 61, 111, 14, 142},
+    {llvm::StringLiteral("EPERM"), 1, 1, 63, class_ids::of("builtins.PermissionError")},     // PermissionError
+    {llvm::StringLiteral("ENOENT"), 2, 2, 44, class_ids::of("builtins.FileNotFoundError")},     // FileNotFoundError
+    {llvm::StringLiteral("ESRCH"), 3, 3, 71, class_ids::of("builtins.ProcessLookupError")},     // ProcessLookupError
+    {llvm::StringLiteral("EINTR"), 4, 4, 27, class_ids::of("builtins.InterruptedError")},     // InterruptedError
+    {llvm::StringLiteral("ECHILD"), 10, 10, 12, class_ids::of("builtins.ChildProcessError")},  // ChildProcessError
+    {llvm::StringLiteral("EACCES"), 13, 13, 2, class_ids::of("builtins.PermissionError")},   // PermissionError
+    {llvm::StringLiteral("EEXIST"), 17, 17, 20, class_ids::of("builtins.FileExistsError")},  // FileExistsError
+    {llvm::StringLiteral("ENOTDIR"), 20, 20, 54, class_ids::of("builtins.NotADirectoryError")}, // NotADirectoryError
+    {llvm::StringLiteral("EISDIR"), 21, 21, 31, class_ids::of("builtins.IsADirectoryError")},  // IsADirectoryError
+    {llvm::StringLiteral("EPIPE"), 32, 32, 64, class_ids::of("builtins.BrokenPipeError")},   // BrokenPipeError
+    {llvm::StringLiteral("EAGAIN"), 35, 11, 6, class_ids::of("builtins.BlockingIOError")},   // BlockingIOError
+    {llvm::StringLiteral("EINPROGRESS"), 36, 115, 26, class_ids::of("builtins.BlockingIOError")},
+    {llvm::StringLiteral("EALREADY"), 37, 114, 7, class_ids::of("builtins.BlockingIOError")},
+    {llvm::StringLiteral("ECONNABORTED"), 53, 103, 13, class_ids::of("builtins.ConnectionAbortedError")},
+    {llvm::StringLiteral("ECONNRESET"), 54, 104, 15, class_ids::of("builtins.ConnectionResetError")},
+    {llvm::StringLiteral("ESHUTDOWN"), 58, 108, 140, class_ids::of("builtins.BrokenPipeError")},
+    {llvm::StringLiteral("ETIMEDOUT"), 60, 110, 73, class_ids::of("builtins.TimeoutError")}, // TimeoutError
+    {llvm::StringLiteral("ECONNREFUSED"), 61, 111, 14, class_ids::of("builtins.ConnectionRefusedError")},
 };
 
 inline const BuiltinExceptionInfo *findByName(llvm::StringRef name) {
