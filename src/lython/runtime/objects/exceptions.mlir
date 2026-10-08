@@ -19,7 +19,7 @@ module attributes {
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @__ly_slot_word_is_immediate(%word: i64) -> i1
   func.func private @__ly_int_from_immediate(%word: i64) -> i64
-  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
+  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_FromI64(%value: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @__ly_unicode_width(%header: memref<2xi64>) -> i64
   func.func private @__ly_unicode_get(%bytes: memref<?xi8>, %width: i64, %i: index) -> i64
@@ -31,10 +31,10 @@ module attributes {
   func.func private @LyLong_AsI64(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__int__", ly.runtime.primitive = "unbox.i64"}
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "release_to_zero"}
   func.func private @LyObject_RetainBoxedPayloadArraySlotRaw(%payload: memref<?xi64>, %logical_index: i64)
-  func.func private @LyTuple_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.tuple", ly.runtime.initializer = "__new__", ly.runtime.result_contract = "builtins.tuple"}
+  func.func private @LyTuple_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.tuple", ly.runtime.initializer = "__new__", ly.runtime.result_contract = "builtins.tuple"}
   func.func private @LyUnicode_Concat(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__add__"}
   func.func private @LyUnicode_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.str", ly.runtime.deallocator}
-  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
+  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_Repr(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"}
   func.func private @Ly_IncRef(%header: memref<2xi64, strided<[1], offset: ?>> {ly.ownership.object_header}) attributes {ly.ownership.retain_args = [0], ly.runtime.primitive = "retain"}
   func.func private @__ly_box_word_count() -> i64
@@ -42,15 +42,15 @@ module attributes {
   func.func private @__ly_global_view_i64(%pointer: i64, %size: i64) -> memref<?xi64>
   func.func private @__ly_global_view_i8(%pointer: i64, %size: i64) -> memref<?xi8>
   func.func private @__ly_handle_retain_raw(%entity: i64)
-  func.func private @__ly_repr_boxed_by_contract(%box: !llvm.ptr, %class_id: i64) -> (memref<2xi64>, memref<?xi8>, i1) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
-  func.func private @__ly_repr_boxed_or_default(%box_ptr: !llvm.ptr, %class_id: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "repr_boxed_or_default", ly.runtime.result_contract = "builtins.str"}
+  func.func private @__ly_repr_boxed_by_contract(%box: !llvm.ptr, %class_word: i64) -> (memref<2xi64>, memref<?xi8>, i1) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
+  func.func private @__ly_repr_boxed_or_default(%box_ptr: !llvm.ptr, %class_word: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "repr_boxed_or_default", ly.runtime.result_contract = "builtins.str"}
   memref.global "private" constant @__ly_repr_comma : memref<2xi8>
   memref.global "private" constant @__ly_repr_lbracket : memref<1xi8>
   memref.global "private" constant @__ly_repr_lparen : memref<1xi8>
   memref.global "private" constant @__ly_repr_rbracket : memref<1xi8>
   memref.global "private" constant @__ly_repr_rparen : memref<1xi8>
   func.func private @__ly_slot_class(%word: i64) -> i64
-  func.func private @__ly_str_boxed_or_default(%box_ptr: !llvm.ptr, %class_id: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "str_boxed_or_default", ly.runtime.result_contract = "builtins.str"}
+  func.func private @__ly_str_boxed_or_default(%box_ptr: !llvm.ptr, %class_word: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "str_boxed_or_default", ly.runtime.result_contract = "builtins.str"}
   func.func private @__ly_tuple_items(%self: memref<5xi64>) -> memref<?xi64> attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.interior_word, ly.runtime.primitive = "items_view"}
   func.func private @__ly_unicode_alloc(%count: i64, %width: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.primitive = "alloc"}
   func.func private @__ly_unicode_count(%header: memref<2xi64>, %bytes: memref<?xi8>) -> i64
@@ -327,7 +327,7 @@ module attributes {
   // the exception entity for the block (the caller keeps its own reference).
   // Box layout mirrors objectPayloadHandleWords (BoxLayout.h): word 1 is the
   // header's layout word (5 = the shared BaseException dispatch class), the
-  // precise class id stays in the exception header itself.
+  // precise class word stays in the exception header itself.
   func.func private @__ly_exc_payload_store(%block_word: i64, %slot: i64, %eh: memref<3xi64>, %mh: memref<2xi64>, %mb: memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_store"} {
     %layout_slot = arith.constant 1 : index
     %layout = memref.load %eh[%layout_slot] : memref<3xi64>
@@ -392,7 +392,7 @@ module attributes {
   func.func private @__ly_exc_payload_store_unicode(%block: i64, %slot: i64, %eh: memref<2xi64> {ly.ownership.object_header}, %eb: memref<?xi8>) attributes {ly.ownership.transfer_args = [2]} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
-    %str_class = arith.constant {ly.class_id_of = "builtins.str"} 4 : i64
+    %str_class = arith.constant {ly.class_of = "builtins.str"} 4 : i64
     %hdr_idx = memref.extract_aligned_pointer_as_index %eh : memref<2xi64> -> index
     %hdr_ptr = arith.index_cast %hdr_idx : index to i64
     func.call @__ly_exc_payload_store_words(%block, %slot, %hdr_ptr) : (i64, i64, i64) -> ()
@@ -542,11 +542,11 @@ module attributes {
   }
 
   // Whether argument `slot` is an object of class `class_id`.
-  func.func private @__ly_exc_slot_is(%block: i64, %slot: i64, %class_id: i64) -> i1 {
+  func.func private @__ly_exc_slot_is(%block: i64, %slot: i64, %class_word: i64) -> i1 {
     %zero = arith.constant 0 : i64
     %word = func.call @__ly_exc_payload_box_word(%block, %slot, %zero) : (i64, i64, i64) -> i64
     %class = func.call @__ly_slot_class(%word) : (i64) -> i64
-    %is = arith.cmpi eq, %class, %class_id : i64
+    %is = arith.cmpi eq, %class, %class_word : i64
     func.return %is : i1
   }
 
@@ -554,7 +554,7 @@ module attributes {
   // "n" of the codec errors' __init__ format takes).
   func.func private @__ly_exc_slot_is_index(%block: i64, %slot: i64) -> i1 {
     %zero = arith.constant 0 : i64
-    %int_class = arith.constant {ly.class_id_of = "builtins.int"} 1 : i64
+    %int_class = arith.constant {ly.class_of = "builtins.int"} 1 : i64
     %false = arith.constant false
     %is_int = func.call @__ly_exc_slot_is(%block, %slot, %int_class) : (i64, i64, i64) -> i1
     %fits = scf.if %is_int -> (i1) {
@@ -581,17 +581,17 @@ module attributes {
     %three = arith.constant 3 : i64
     %four = arith.constant 4 : i64
     %five = arith.constant 5 : i64
-    %str_class = arith.constant {ly.class_id_of = "builtins.str"} 4 : i64
-    %bytes_class = arith.constant {ly.class_id_of = "builtins.bytes"} 70 : i64
-    %decode_root = arith.constant {ly.class_id_of = "builtins.UnicodeDecodeError"} 122 : i64
-    %encode_root = arith.constant {ly.class_id_of = "builtins.UnicodeEncodeError"} 123 : i64
-    %translate_root = arith.constant {ly.class_id_of = "builtins.UnicodeTranslateError"} 124 : i64
+    %str_class = arith.constant {ly.class_of = "builtins.str"} 4 : i64
+    %bytes_class = arith.constant {ly.class_of = "builtins.bytes"} 70 : i64
+    %decode_root = arith.constant {ly.class_of = "builtins.UnicodeDecodeError"} 122 : i64
+    %encode_root = arith.constant {ly.class_of = "builtins.UnicodeEncodeError"} 123 : i64
+    %translate_root = arith.constant {ly.class_of = "builtins.UnicodeTranslateError"} 124 : i64
     %false = arith.constant false
     %class_slot = arith.constant 2 : index
     %class = memref.load %header[%class_slot] : memref<3xi64>
-    %is_decode = func.call @LyEH_ClassIdMatches(%class, %decode_root) : (i64, i64) -> i1
-    %is_encode = func.call @LyEH_ClassIdMatches(%class, %encode_root) : (i64, i64) -> i1
-    %is_translate = func.call @LyEH_ClassIdMatches(%class, %translate_root) : (i64, i64) -> i1
+    %is_decode = func.call @LyType_IsSubtype(%class, %decode_root) : (i64, i64) -> i1
+    %is_encode = func.call @LyType_IsSubtype(%class, %encode_root) : (i64, i64) -> i1
+    %is_translate = func.call @LyType_IsSubtype(%class, %translate_root) : (i64, i64) -> i1
     %count = func.call @__ly_exc_payload_count(%block) : (i64) -> i64
     %five_args = arith.cmpi eq, %count, %five : i64
     %four_args = arith.cmpi eq, %count, %four : i64
@@ -955,8 +955,8 @@ module attributes {
     %three = arith.constant 3 : i64
     %four = arith.constant 4 : i64
     %five = arith.constant 5 : i64
-    %class_id = arith.constant {ly.class_id_of = "builtins.UnicodeDecodeError"} 122 : i64
-    %exception:3 = func.call @LyUnicodeDecodeError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %class_word = arith.constant {ly.class_of = "builtins.UnicodeDecodeError"} 122 : i64
+    %exception:3 = func.call @LyUnicodeDecodeError_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     %block = func.call @LyBaseExceptionGroup_MembersAlloc(%exception#0, %exception#1, %exception#2, %five) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, i64) -> i64
     func.call @__ly_exc_payload_store_unicode(%block, %zero, %encoding_h, %encoding_b) : (i64, i64, memref<2xi64>, memref<?xi8>) -> ()
     %object_index = memref.extract_aligned_pointer_as_index %object : memref<4xi64> -> index
@@ -999,8 +999,8 @@ module attributes {
     %sout:2 = scf.if %ssingle -> (memref<2xi64>, memref<?xi8>) {
       %sblock_ptr = llvm.inttoptr %sblock : i64 to !llvm.ptr
       %sbox_ptr = llvm.getelementptr %sblock_ptr[%sc1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %sclass_word = llvm.load %sbox_ptr : !llvm.ptr -> i64
-      %sclass_id = func.call @__ly_slot_class(%sclass_word) : (i64) -> i64
+      %sentity_word = llvm.load %sbox_ptr : !llvm.ptr -> i64
+      %sclass_word = func.call @__ly_slot_class(%sentity_word) : (i64) -> i64
       // ⛔ KeyError.__str__ IS repr(args[0]) IN CPYTHON, and it is inherited, so
       // the taxonomy walk decides rather than an equality test: routing a
       // non-str argument through the generic payload path would otherwise lose
@@ -1008,13 +1008,13 @@ module attributes {
       // `str(KeyError(p))` printed p's __str__ where CPython prints its __repr__.
       %sexc_class_slot = arith.constant 2 : index
       %sexc_class = memref.load %header[%sexc_class_slot] : memref<3xi64>
-      %skey_root = arith.constant {ly.class_id_of = "builtins.KeyError"} 54 : i64
-      %sis_key = func.call @LyEH_ClassIdMatches(%sexc_class, %skey_root) : (i64, i64) -> i1
+      %skey_root = arith.constant {ly.class_of = "builtins.KeyError"} 54 : i64
+      %sis_key = func.call @LyType_IsSubtype(%sexc_class, %skey_root) : (i64, i64) -> i1
       %spicked:2 = scf.if %sis_key -> (memref<2xi64>, memref<?xi8>) {
-        %krh, %krb = func.call @__ly_repr_boxed_or_default(%sbox_ptr, %sclass_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>)
+        %krh, %krb = func.call @__ly_repr_boxed_or_default(%sbox_ptr, %sclass_word) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>)
         scf.yield %krh, %krb : memref<2xi64>, memref<?xi8>
       } else {
-        %sh, %sb = func.call @__ly_str_boxed_or_default(%sbox_ptr, %sclass_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>)
+        %sh, %sb = func.call @__ly_str_boxed_or_default(%sbox_ptr, %sclass_word) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>)
         scf.yield %sh, %sb : memref<2xi64>, memref<?xi8>
       }
       scf.yield %spicked#0, %spicked#1 : memref<2xi64>, memref<?xi8>
@@ -1058,9 +1058,9 @@ module attributes {
       %box_off = arith.muli %i_i64, %sixteen : i64
       %box_base = arith.addi %box_off, %c1_i64 : i64
       %box_ptr = llvm.getelementptr %block_ptr[%box_base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %class_word = llvm.load %box_ptr : !llvm.ptr -> i64
-      %class_id = func.call @__ly_slot_class(%class_word) : (i64) -> i64
-      %erh, %erb, %ok = func.call @__ly_repr_boxed_by_contract(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
+      %entity_word = llvm.load %box_ptr : !llvm.ptr -> i64
+      %class_word = func.call @__ly_slot_class(%entity_word) : (i64) -> i64
+      %erh, %erb, %ok = func.call @__ly_repr_boxed_by_contract(%box_ptr, %class_word) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
       cf.assert %ok, "exception args: boxed value has no conforming __repr__"
       %nh, %nb = func.call @LyUnicode_Concat(%sep#0, %sep#1, %erh, %erb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
       func.call @LyUnicode_DecRef(%sep#0) : (memref<2xi64>) -> ()
@@ -1190,8 +1190,8 @@ module attributes {
   func.func private @__ly_exc_derive_group(%eh: memref<3xi64>, %mh: memref<2xi64>, %mb: memref<?xi8>, %count: i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>, i64) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "derive_group"} {
     %class_slot = arith.constant 2 : index
     %payload_slot = arith.constant 3 : i64
-    %class_id = memref.load %eh[%class_slot] : memref<3xi64>
-    %fresh:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %class_word = memref.load %eh[%class_slot] : memref<3xi64>
+    %fresh:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     // Adopt the original message: release the fresh empty one, retain ours.
     // ⛔ AND RECORD IT. This is a message producer like `__init__` is, and it
     // is the one that does not look like one -- it returns four values rather
@@ -1219,16 +1219,16 @@ module attributes {
     %c1 = arith.constant 1 : index
     %class_slot = arith.constant 2 : index
     %payload_slot = arith.constant 3 : i64
-    %group_root = arith.constant {ly.class_id_of = "builtins.BaseExceptionGroup"} 101 : i64
+    %group_root = arith.constant {ly.class_of = "builtins.BaseExceptionGroup"} 101 : i64
     %tuple_bit = arith.constant 4611686018427387904 : i64
     %dummy_h = memref.get_global @__ly_exc_dummy_header : memref<3xi64>
     %dummy_s = memref.get_global @__ly_exc_dummy_str : memref<2xi64>
     %dummy_b = memref.alloca(%c0) : memref<?xi8>
 
-    %class_id = memref.load %eh[%class_slot] : memref<3xi64>
+    %class_word = memref.load %eh[%class_slot] : memref<3xi64>
     %block = func.call @__ly_exc_ext_get(%eh, %payload_slot) : (memref<3xi64>, i64) -> i64
     %member_count = func.call @__ly_exc_payload_count(%block) : (i64) -> i64
-    %is_group = func.call @LyEH_ClassIdMatches(%class_id, %group_root) : (i64, i64) -> i1
+    %is_group = func.call @LyType_IsSubtype(%class_word, %group_root) : (i64, i64) -> i1
     %has_members = arith.cmpi sgt, %member_count, %zero : i64
     %grouped = arith.andi %is_group, %has_members : i1
 
@@ -1298,7 +1298,7 @@ module attributes {
       scf.yield %whole#0, %whole#1, %whole#2, %whole#3, %whole#4, %whole#5, %whole#6, %whole#7 : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
     } else {
       // Naked exception (or a group without members): all-or-nothing.
-      %matches = func.call @LyEH_ClassIdMatches(%class_id, %handler) : (i64, i64) -> i1
+      %matches = func.call @LyType_IsSubtype(%class_word, %handler) : (i64, i64) -> i1
       %naked:8 = scf.if %matches -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>) {
         // A matching leaf moves into the matched half as ITSELF; the
         // synthesized wrap applies only to a top-level naked exception
@@ -1330,27 +1330,27 @@ module attributes {
     %c0 = arith.constant 0 : index
     %class_slot = arith.constant 2 : index
     %payload_slot = arith.constant 3 : i64
-    %group_root = arith.constant {ly.class_id_of = "builtins.BaseExceptionGroup"} 101 : i64
-    %exception_root = arith.constant {ly.class_id_of = "builtins.Exception"} 50 : i64
-    %group_id = arith.constant {ly.class_id_of = "builtins.ExceptionGroup"} 102 : i64
-    %base_group_id = arith.constant {ly.class_id_of = "builtins.BaseExceptionGroup"} 101 : i64
+    %group_root = arith.constant {ly.class_of = "builtins.BaseExceptionGroup"} 101 : i64
+    %exception_root = arith.constant {ly.class_of = "builtins.Exception"} 50 : i64
+    %group_id = arith.constant {ly.class_of = "builtins.ExceptionGroup"} 102 : i64
+    %base_group_id = arith.constant {ly.class_of = "builtins.BaseExceptionGroup"} 101 : i64
     %tuple_bit = arith.constant 4611686018427387904 : i64
     %dummy_h = memref.get_global @__ly_exc_dummy_header : memref<3xi64>
     %dummy_s = memref.get_global @__ly_exc_dummy_str : memref<2xi64>
     %dummy_b = memref.alloca(%c0) : memref<?xi8>
-    %class_id = memref.load %eh[%class_slot] : memref<3xi64>
+    %class_word = memref.load %eh[%class_slot] : memref<3xi64>
     %block = func.call @__ly_exc_ext_get(%eh, %payload_slot) : (memref<3xi64>, i64) -> i64
     %member_count = func.call @__ly_exc_payload_count(%block) : (i64) -> i64
-    %is_group = func.call @LyEH_ClassIdMatches(%class_id, %group_root) : (i64, i64) -> i1
+    %is_group = func.call @LyType_IsSubtype(%class_word, %group_root) : (i64, i64) -> i1
     %has_members = arith.cmpi sgt, %member_count, %zero : i64
     %grouped = arith.andi %is_group, %has_members : i1
     %result:8 = scf.if %grouped -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>) {
       %sub:8 = func.call @__ly_exc_star_split_rec(%eh, %mh, %mb, %handler) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, i64) -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>)
       scf.yield %sub#0, %sub#1, %sub#2, %sub#3, %sub#4, %sub#5, %sub#6, %sub#7 : i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>
     } else {
-      %matches = func.call @LyEH_ClassIdMatches(%class_id, %handler) : (i64, i64) -> i1
+      %matches = func.call @LyType_IsSubtype(%class_word, %handler) : (i64, i64) -> i1
       %naked:8 = scf.if %matches -> (i1, memref<3xi64>, memref<2xi64>, memref<?xi8>, i1, memref<3xi64>, memref<2xi64>, memref<?xi8>) {
-        %is_exception = func.call @LyEH_ClassIdMatches(%class_id, %exception_root) : (i64, i64) -> i1
+        %is_exception = func.call @LyType_IsSubtype(%class_word, %exception_root) : (i64, i64) -> i1
         %wrap_id = arith.select %is_exception, %group_id, %base_group_id : i64
         %wrap:3 = func.call @LyBaseException_New(%wrap_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
         %wblock = func.call @__ly_exc_payload_alloc(%one) : (i64) -> i64
@@ -1381,9 +1381,9 @@ module attributes {
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %exception_root = arith.constant {ly.class_id_of = "builtins.Exception"} 50 : i64
-    %group_id = arith.constant {ly.class_id_of = "builtins.ExceptionGroup"} 102 : i64
-    %base_group_id = arith.constant {ly.class_id_of = "builtins.BaseExceptionGroup"} 101 : i64
+    %exception_root = arith.constant {ly.class_of = "builtins.Exception"} 50 : i64
+    %group_id = arith.constant {ly.class_of = "builtins.ExceptionGroup"} 102 : i64
+    %base_group_id = arith.constant {ly.class_of = "builtins.BaseExceptionGroup"} 101 : i64
     %payload_slot = arith.constant 3 : i64
     %res_inc = arith.extui %has_res : i1 to i64
     %total = arith.addi %count, %res_inc : i64
@@ -1415,15 +1415,15 @@ module attributes {
       %eh_slot = func.call @__ly_chain_node_part_field(%node_ptr, %part0, %field_aligned) : (!llvm.ptr, i64, i64) -> !llvm.ptr
       %eh_ptr = llvm.load %eh_slot : !llvm.ptr -> !llvm.ptr
       %class_slot = llvm.getelementptr %eh_ptr[%c2] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %class_id = llvm.load %class_slot : !llvm.ptr -> i64
-      %is_exc = func.call @LyEH_ClassIdMatches(%class_id, %exception_root) : (i64, i64) -> i1
+      %class_word = llvm.load %class_slot : !llvm.ptr -> i64
+      %is_exc = func.call @LyType_IsSubtype(%class_word, %exception_root) : (i64, i64) -> i1
       %next = arith.andi %acc, %is_exc : i1
       scf.yield %next : i1
     }
     %res_is_exc = scf.if %has_res -> (i1) {
       %class_slot_r = arith.constant 2 : index
       %res_class = memref.load %res_eh[%class_slot_r] : memref<3xi64>
-      %is_exc = func.call @LyEH_ClassIdMatches(%res_class, %exception_root) : (i64, i64) -> i1
+      %is_exc = func.call @LyType_IsSubtype(%res_class, %exception_root) : (i64, i64) -> i1
       scf.yield %is_exc : i1
     } else {
       scf.yield %true_v : i1
@@ -1472,7 +1472,7 @@ module attributes {
   func.func private @release_exception_extras(%header_ptr: !llvm.ptr)
   func.func private @release_payload_slot_ptr(%slot: !llvm.ptr)
   func.func private @__ly_chain_node_part_field(%node: !llvm.ptr, %section: i64, %field: i64) -> !llvm.ptr
-  func.func private @LyEH_ClassIdMatches(%raised: i64, %handler: i64) -> i1
+  func.func private @LyType_IsSubtype(%raised: i64, %handler: i64) -> i1
 
   func.func private @LyException_Shape() -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.Exception", ly.runtime.shape}
   func.func private @LyRuntimeError_Shape() -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.RuntimeError", ly.runtime.shape}
@@ -1685,10 +1685,10 @@ module attributes {
     func.return
   }
 
-  func.func @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"} {
+  func.func @LyBaseException_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"} {
     %one = arith.constant 1 : i64
     %zero = arith.constant 0 : i64
-    %layout_exception = arith.constant {ly.class_id_of = "builtins.BaseException"} 5 : i64
+    %layout_exception = arith.constant {ly.class_of = "builtins.BaseException"} 5 : i64
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
     %class_slot = arith.constant 2 : index
@@ -1719,7 +1719,7 @@ module attributes {
 
     memref.store %one, %header[%refcount_slot] : memref<3xi64>
     memref.store %layout_exception, %header[%layout_slot] : memref<3xi64>
-    memref.store %class_id, %header[%class_slot] : memref<3xi64>
+    memref.store %class_word, %header[%class_slot] : memref<3xi64>
     memref.store %zero, %extended[%payload_slot] : memref<7xi64>
     memref.store %zero, %extended[%fields_slot] : memref<7xi64>
     memref.store %zero, %extended[%code_slot] : memref<7xi64>
@@ -1728,91 +1728,91 @@ module attributes {
     func.return %header, %message_header, %message_bytes : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.Exception", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyException_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.Exception", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyRuntimeError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.RuntimeError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyRuntimeError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.RuntimeError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyTypeError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.TypeError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyTypeError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.TypeError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyValueError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.ValueError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyValueError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.ValueError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyArithmeticError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.ArithmeticError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyArithmeticError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.ArithmeticError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyLookupError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.LookupError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyLookupError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.LookupError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyZeroDivisionError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.ZeroDivisionError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyZeroDivisionError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.ZeroDivisionError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyKeyError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.KeyError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyKeyError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.KeyError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyIndexError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.IndexError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyIndexError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.IndexError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyAssertionError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.AssertionError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyAssertionError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.AssertionError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyStopIteration_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.StopIteration", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyStopIteration_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.StopIteration", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyStopAsyncIteration_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.StopAsyncIteration", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyStopAsyncIteration_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.StopAsyncIteration", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LySystemExit_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.SystemExit", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LySystemExit_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.SystemExit", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
-  func.func @LyGeneratorExit_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.GeneratorExit", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
-  }
-
-  func.func @LyOSError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.OSError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyGeneratorExit_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.GeneratorExit", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyFileNotFoundError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.FileNotFoundError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyOSError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.OSError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyFileNotFoundError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.FileNotFoundError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
   // Per-program builtin/user exception-class name table (synthesized by the
   // lowering's support builder; user-defined ids resolve through its
   // fallback hook). Returns a NUL-terminated ASCII name.
-  func.func private @exception_class_name(%class_id: i64) -> !llvm.ptr
+  func.func private @exception_class_name(%class_word: i64) -> !llvm.ptr
 
-  // ⭐ `type(e).__name__`, keyed by the DYNAMIC class id the way the repr below
+  // ⭐ `type(e).__name__`, keyed by the DYNAMIC class word the way the repr below
   // is: an instance caught through a base-class handler answers the class it
   // WAS RAISED AS, which is the one thing the emitter's static fold cannot do
   // for an exception (the handler's static class is the one caught).
@@ -1826,8 +1826,8 @@ module attributes {
     %c2 = arith.constant 2 : index
     %zero_i8 = arith.constant 0 : i8
     %cap = arith.constant 64 : index
-    %class_id = memref.load %header[%c2] : memref<3xi64>
-    %name_ptr = func.call @exception_class_name(%class_id) : (i64) -> !llvm.ptr
+    %class_word = memref.load %header[%c2] : memref<3xi64>
+    %name_ptr = func.call @exception_class_name(%class_word) : (i64) -> !llvm.ptr
     // The same bounded copy the repr does: taxonomy names are short ASCII, and
     // 64 caps a runaway pointer rather than a real name.
     %buffer = memref.alloca() : memref<64xi8>
@@ -1870,7 +1870,7 @@ module attributes {
     func.return %name_h, %name_b : memref<2xi64>, memref<?xi8>
   }
 
-  // repr(e) keyed by the DYNAMIC class id in the exception header, so an
+  // repr(e) keyed by the DYNAMIC class word in the exception header, so an
   // instance caught through a base-class handler (or a user subclass, once
   // the class hook resolves it) still renders its own class name.
   func.func private @__ly_exception_repr_by_id(%header: memref<3xi64>, %message_header: memref<2xi64>, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "repr_by_id", ly.ownership.owned_results = [0]} {
@@ -1879,8 +1879,8 @@ module attributes {
     %c2 = arith.constant 2 : index
     %zero_i8 = arith.constant 0 : i8
     %cap = arith.constant 64 : index
-    %class_id = memref.load %header[%c2] : memref<3xi64>
-    %name_ptr = func.call @exception_class_name(%class_id) : (i64) -> !llvm.ptr
+    %class_word = memref.load %header[%c2] : memref<3xi64>
+    %name_ptr = func.call @exception_class_name(%class_word) : (i64) -> !llvm.ptr
     // Copy the NUL-terminated name into a bounded local buffer (taxonomy
     // names are short ASCII; 64 caps runaway pointers, not real names).
     %buffer = memref.alloca() : memref<64xi8>
@@ -1924,10 +1924,10 @@ module attributes {
     // whose member block is absent) keeps the message-only form.
     %zero_i64 = arith.constant 0 : i64
     %payload_slot = arith.constant 3 : i64
-    %group_root = arith.constant {ly.class_id_of = "builtins.BaseExceptionGroup"} 101 : i64
+    %group_root = arith.constant {ly.class_of = "builtins.BaseExceptionGroup"} 101 : i64
     %block = func.call @__ly_exc_ext_get(%header, %payload_slot) : (memref<3xi64>, i64) -> i64
     %count = func.call @__ly_exc_payload_count(%block) : (i64) -> i64
-    %is_group = func.call @LyEH_ClassIdMatches(%class_id, %group_root) : (i64, i64) -> i1
+    %is_group = func.call @LyType_IsSubtype(%class_word, %group_root) : (i64, i64) -> i1
     %has_members = arith.cmpi sgt, %count, %zero_i64 : i64
     %grouped = arith.andi %is_group, %has_members : i1
     %result:2 = scf.if %grouped -> (memref<2xi64>, memref<?xi8>) {
@@ -2044,9 +2044,9 @@ module attributes {
           %abox_off = arith.muli %ai_i64, %asixteen : i64
           %abox_base = arith.addi %abox_off, %ac1 : i64
           %abox_ptr = llvm.getelementptr %ablock_ptr[%abox_base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-          %aclass_word = llvm.load %abox_ptr : !llvm.ptr -> i64
-          %aclass_id = func.call @__ly_slot_class(%aclass_word) : (i64) -> i64
-          %aer_h, %aer_b, %aok = func.call @__ly_repr_boxed_by_contract(%abox_ptr, %aclass_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
+          %aentity_word = llvm.load %abox_ptr : !llvm.ptr -> i64
+          %aclass_word = func.call @__ly_slot_class(%aentity_word) : (i64) -> i64
+          %aer_h, %aer_b, %aok = func.call @__ly_repr_boxed_by_contract(%abox_ptr, %aclass_word) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
           cf.assert %aok, "exception repr: boxed arg has no conforming __repr__"
           %anh, %anb = func.call @LyUnicode_Concat(%asep#0, %asep#1, %aer_h, %aer_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
           func.call @LyUnicode_DecRef(%asep#0) : (memref<2xi64>) -> ()
@@ -2126,11 +2126,11 @@ module attributes {
     %c16 = arith.index_cast %c16_words : i64 to index
     %class_slot = arith.constant 2 : index
     %payload_slot = arith.constant 3 : i64
-    %group_root = arith.constant {ly.class_id_of = "builtins.BaseExceptionGroup"} 101 : i64
-    %class_id = memref.load %header[%class_slot] : memref<3xi64>
+    %group_root = arith.constant {ly.class_of = "builtins.BaseExceptionGroup"} 101 : i64
+    %class_word = memref.load %header[%class_slot] : memref<3xi64>
     %block = func.call @__ly_exc_ext_get(%header, %payload_slot) : (memref<3xi64>, i64) -> i64
     %payload_count = func.call @__ly_exc_payload_count(%block) : (i64) -> i64
-    %is_group = func.call @LyEH_ClassIdMatches(%class_id, %group_root) : (i64, i64) -> i1
+    %is_group = func.call @LyType_IsSubtype(%class_word, %group_root) : (i64, i64) -> i1
     %true_c = arith.constant true
     %not_group = arith.xori %is_group, %true_c : i1
     %has_payload = arith.cmpi sgt, %payload_count, %zero : i64
@@ -2173,8 +2173,8 @@ module attributes {
     func.return %result : memref<5xi64>
   }
 
-  func.func @LyKeyboardInterrupt_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.KeyboardInterrupt", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyKeyboardInterrupt_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.KeyboardInterrupt", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2194,8 +2194,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyBaseExceptionGroup_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.BaseExceptionGroup", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyBaseExceptionGroup_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.BaseExceptionGroup", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2316,8 +2316,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyExceptionGroup_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.ExceptionGroup", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyExceptionGroup_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.ExceptionGroup", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2394,8 +2394,8 @@ module attributes {
     func.return %tuple : memref<5xi64>
   }
 
-  func.func @LyFloatingPointError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.FloatingPointError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyFloatingPointError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.FloatingPointError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2415,8 +2415,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyOverflowError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.OverflowError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyOverflowError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.OverflowError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2436,8 +2436,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyBufferError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.BufferError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyBufferError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.BufferError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2457,8 +2457,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyEOFError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.EOFError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyEOFError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.EOFError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2478,8 +2478,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyImportError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.ImportError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyImportError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.ImportError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2499,8 +2499,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyModuleNotFoundError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.ModuleNotFoundError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyModuleNotFoundError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.ModuleNotFoundError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2520,8 +2520,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyMemoryError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.MemoryError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyMemoryError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.MemoryError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2541,8 +2541,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyNameError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.NameError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyNameError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.NameError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2562,8 +2562,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyUnboundLocalError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.UnboundLocalError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyUnboundLocalError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.UnboundLocalError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2583,8 +2583,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyAttributeError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.AttributeError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyAttributeError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.AttributeError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2604,8 +2604,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyReferenceError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.ReferenceError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyReferenceError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.ReferenceError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2625,8 +2625,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyNotImplementedError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.NotImplementedError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyNotImplementedError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.NotImplementedError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2646,8 +2646,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyRecursionError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.RecursionError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyRecursionError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.RecursionError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2667,8 +2667,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyPythonFinalizationError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.PythonFinalizationError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyPythonFinalizationError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.PythonFinalizationError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2688,8 +2688,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LySyntaxError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.SyntaxError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LySyntaxError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.SyntaxError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2709,8 +2709,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyIndentationError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.IndentationError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyIndentationError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.IndentationError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2730,8 +2730,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyTabError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.TabError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyTabError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.TabError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2751,8 +2751,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LySystemError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.SystemError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LySystemError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.SystemError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2772,8 +2772,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyUnicodeError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.UnicodeError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyUnicodeError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.UnicodeError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2793,8 +2793,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyUnicodeDecodeError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.UnicodeDecodeError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyUnicodeDecodeError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.UnicodeDecodeError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2814,8 +2814,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyUnicodeEncodeError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.UnicodeEncodeError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyUnicodeEncodeError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.UnicodeEncodeError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2835,8 +2835,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyUnicodeTranslateError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.UnicodeTranslateError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyUnicodeTranslateError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.UnicodeTranslateError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2856,8 +2856,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.Warning", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyWarning_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.Warning", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2877,8 +2877,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyBytesWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.BytesWarning", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyBytesWarning_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.BytesWarning", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2898,8 +2898,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyDeprecationWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.DeprecationWarning", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyDeprecationWarning_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.DeprecationWarning", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2919,8 +2919,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyEncodingWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.EncodingWarning", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyEncodingWarning_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.EncodingWarning", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2940,8 +2940,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyFutureWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.FutureWarning", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyFutureWarning_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.FutureWarning", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2961,8 +2961,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyImportWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.ImportWarning", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyImportWarning_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.ImportWarning", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2982,8 +2982,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyPendingDeprecationWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.PendingDeprecationWarning", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyPendingDeprecationWarning_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.PendingDeprecationWarning", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -3003,8 +3003,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyResourceWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.ResourceWarning", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyResourceWarning_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.ResourceWarning", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -3024,8 +3024,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyRuntimeWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.RuntimeWarning", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyRuntimeWarning_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.RuntimeWarning", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -3045,8 +3045,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LySyntaxWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.SyntaxWarning", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LySyntaxWarning_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.SyntaxWarning", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -3066,8 +3066,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyUnicodeWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.UnicodeWarning", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyUnicodeWarning_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.UnicodeWarning", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -3087,8 +3087,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyUserWarning_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.UserWarning", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyUserWarning_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.UserWarning", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -3108,8 +3108,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyBlockingIOError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.BlockingIOError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyBlockingIOError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.BlockingIOError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -3129,8 +3129,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyChildProcessError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.ChildProcessError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyChildProcessError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.ChildProcessError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -3150,8 +3150,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyConnectionError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.ConnectionError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyConnectionError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.ConnectionError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -3171,8 +3171,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyBrokenPipeError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.BrokenPipeError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyBrokenPipeError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.BrokenPipeError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -3192,8 +3192,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyConnectionAbortedError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.ConnectionAbortedError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyConnectionAbortedError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.ConnectionAbortedError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -3213,8 +3213,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyConnectionRefusedError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.ConnectionRefusedError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyConnectionRefusedError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.ConnectionRefusedError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -3234,8 +3234,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyConnectionResetError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.ConnectionResetError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyConnectionResetError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.ConnectionResetError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -3255,8 +3255,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyFileExistsError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.FileExistsError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyFileExistsError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.FileExistsError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -3276,8 +3276,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyInterruptedError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.InterruptedError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyInterruptedError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.InterruptedError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -3297,8 +3297,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyIsADirectoryError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.IsADirectoryError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyIsADirectoryError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.IsADirectoryError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -3318,8 +3318,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyNotADirectoryError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.NotADirectoryError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyNotADirectoryError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.NotADirectoryError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -3339,8 +3339,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyPermissionError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.PermissionError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyPermissionError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.PermissionError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -3360,8 +3360,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyProcessLookupError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.ProcessLookupError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyProcessLookupError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.ProcessLookupError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -3381,8 +3381,8 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyTimeoutError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.TimeoutError", ly.runtime.initializer = "__new__"} {
-    %result:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func @LyTimeoutError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.TimeoutError", ly.runtime.initializer = "__new__"} {
+    %result:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 

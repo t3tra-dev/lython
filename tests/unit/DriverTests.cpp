@@ -1,4 +1,4 @@
-#include "ClassIds.h"
+#include "Common/TypeObjects.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include <fstream>
@@ -233,18 +233,20 @@ TEST(DriverTest, AJsHostExecutableKeepsItsExportsExternal) {
   }
 }
 
-// The functions a generated boxed hook calls directly, by name.
+// The functions a boxed hook's arms call directly, by name: a hook calls the
+// slot its class's type object holds, and each slot function is one arm
+// (`__ly_slot.<hook>.<arm>`, TypeObjects.h).
 std::vector<std::string> hookCallees(const llvm::Module &module,
                                      llvm::StringRef hookName) {
   std::vector<std::string> names;
-  const llvm::Function *hook = module.getFunction(hookName);
-  if (!hook)
-    return names;
-  for (const llvm::BasicBlock &block : *hook)
-    for (const llvm::Instruction &instruction : block)
-      if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
-        if (const llvm::Function *callee = call->getCalledFunction())
-          names.push_back(callee->getName().str());
+  std::string prefix = ("__ly_slot." + hookName + ".").str();
+  for (const llvm::Function &slot : module)
+    if (slot.getName().starts_with(prefix))
+      for (const llvm::BasicBlock &block : slot)
+        for (const llvm::Instruction &instruction : block)
+          if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+            if (const llvm::Function *callee = call->getCalledFunction())
+              names.push_back(callee->getName().str());
   return names;
 }
 
@@ -1605,10 +1607,11 @@ TEST(DriverTest, EveryLandingPadClauseIsAPythonClassOrCatchAll) {
           continue;
         auto *global = llvm::dyn_cast<llvm::GlobalVariable>(clause);
         ASSERT_NE(global, nullptr) << "a clause that is not a global";
-        EXPECT_TRUE(global->getName().starts_with("__ly_exc_type_"))
+        EXPECT_TRUE(
+            global->getName().starts_with(py::type_objects::kSymbolPrefix))
             << global->getName().str()
-            << " is not a Python class id record, and the personality would "
-               "read its first word as one";
+            << " is not a type object, and the personality would take its "
+               "address for a class";
         named.push_back(global->getName().str());
       }
     }
@@ -1645,7 +1648,7 @@ TEST(DriverTest, ShapesThatHandleMoreThanTheyNameStayCatchAll) {
 
 // A bare `except` DOES get a clause, and it is BaseException -- which is not an
 // exception to the rule above but the reason there is no exception to make:
-// `LyEH_ClassIdMatches` answers true for everything against it, so naming it is
+// `LyType_IsSubtype` answers true for everything against it, so naming it is
 // the same decision a catch-all makes, reached one call earlier.
 TEST(DriverTest, ABareExceptNamesBaseException) {
   CompileResult result = compileSource("def boom() -> int:\n"
@@ -1668,9 +1671,7 @@ TEST(DriverTest, ABareExceptNamesBaseException) {
           continue;
         ++typedClauses;
         EXPECT_EQ(clause->getName().str(),
-                  "__ly_exc_type_" +
-                      std::to_string(
-                          py::class_ids::of("builtins.BaseException")))
+                  py::type_objects::symbolFor("builtins.BaseException"))
             << "a bare except that names anything narrower than BaseException "
                "drops the exceptions it does not name";
       }

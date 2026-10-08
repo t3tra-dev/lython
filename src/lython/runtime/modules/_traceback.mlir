@@ -69,8 +69,8 @@ module attributes {
   ]
 } {
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
-  func.func private @LyLong_FromI64(%value: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
-  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
+  func.func private @LyLong_FromI64(%value: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
+  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
 
   func.func private @LyTraceback_FrameCount() -> i64
   func.func private @LyTraceback_FrameLine(i64) -> i64
@@ -145,7 +145,7 @@ module attributes {
   }
 
   // The last line of a traceback -- "ValueError: boom" -- for the exception
-  // being handled, or '' when there is none. Built from the class id the
+  // being handled, or '' when there is none. Built from the class word the
   // handler dispatched on and the message re-encoder the uncaught printer
   // uses, so the two cannot word it differently.
   func.func @LyTracebackMod_ExcLine() -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_traceback.exc_line", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "traceback_exc_line", ly.runtime.result_contract = "builtins.str"} {

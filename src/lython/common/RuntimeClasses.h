@@ -1,31 +1,25 @@
 #pragma once
-// The runtime classes, by the name that IS their identity. A class's number --
-// word 1 of its header, what every class test compares, what a raise names --
-// is its position in this list, so nothing spells a number of its own:
+// The runtime classes, by the name that IS their identity. An object's header
+// word 1 is the address of its class's type object (lowering/Common/
+// TypeObjects.h), which is named after the class: `__ly_type.builtins.int`.
+// Nothing numbers a class.
 //
-//   - the manifests write `ly.class_id_of = "builtins.ValueError"` on a
+//   - the manifests write `ly.class_of = "builtins.ValueError"` on a
 //     constant or a static header, and a constructor carries the
-//     `ly.runtime.class_id` marker beside its `ly.runtime.contract`; the
-//     runtime bytecode tool (RuntimeMlirBytecode.cpp) writes the numbers;
-//   - C++ asks `py::class_ids::of("builtins.int")`, a constant expression.
+//     `ly.runtime.class` marker beside its `ly.runtime.contract`; the
+//     lowering makes each the class's type-object address;
+//   - C++ asks `type_objects::classWord(builder, loc, "builtins.int")`.
 //
 // A class is added by adding its name. A name the manifests use that is not
-// here is refused when the runtime is built. Program classes are numbered from
-// 2^32 by the lowering (`runtimeClassIdForClass`), above all of these.
-//
-// 0 is None's (its object's class word, objects/object.mlir) and the end of
-// a base chain; no listed class has it.
+// here is refused when the runtime is built.
 
-#include <cstdint>
 #include <string_view>
 
-namespace py::class_ids {
-
-// None's class, and the end of a base chain.
-inline constexpr std::int64_t kNoClass = 0;
+namespace py::runtime_classes {
 
 inline constexpr std::string_view kRuntimeClasses[] = {
     "builtins.object",
+    "types.NoneType",
     "builtins.int",
     "builtins.float",
     "builtins.range",
@@ -128,33 +122,12 @@ inline constexpr std::string_view kRuntimeClasses[] = {
     "_js.JsProxy",
 };
 
-// The number of a runtime class, or -1 for a name this table does not list
-// (a constant expression wherever the name is one).
-constexpr std::int64_t lookup(std::string_view contract) {
-  std::int64_t position = 0;
-  for (std::string_view entry : kRuntimeClasses) {
-    if (entry == contract)
-      return position + 1;
-    ++position;
-  }
-  return -1;
-}
-
-// The same, for a name that must be listed: an unlisted one fails to compile
-// where the call is a constant expression.
-constexpr std::int64_t of(std::string_view contract) {
-  std::int64_t id = lookup(contract);
-  if (id < 0)
-    throw "not a runtime class";
-  return id;
-}
-
-// The name of a runtime class number, or empty.
-constexpr std::string_view contractOf(std::int64_t id) {
+// Whether a name is a runtime class.
+constexpr bool isListed(std::string_view contract) {
   for (std::string_view entry : kRuntimeClasses)
-    if (lookup(entry) == id)
-      return entry;
-  return {};
+    if (entry == contract)
+      return true;
+  return false;
 }
 
-} // namespace py::class_ids
+} // namespace py::runtime_classes

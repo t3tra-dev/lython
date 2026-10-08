@@ -426,7 +426,7 @@ void buildPythonCleanupBlock(llvm::CallInst &call, llvm::BasicBlock *unwindDest,
 
 // The Python classes a try's `except` arms test for, read back off the dispatch
 // chain the lowering already built: a run of blocks each holding one
-// `LyEH_CurrentExceptionMatches(<constant class id>)` and branching on it, ending
+// `LyEH_CurrentExceptionMatches(<constant class word>)` and branching on it, ending
 // in the re-raise that runs when no arm matched.
 //
 // ⛔ Returns nothing unless the whole chain reads that way. The clause list this
@@ -477,9 +477,9 @@ bool holdsOnly(llvm::BasicBlock &block,
   return true;
 }
 
-std::optional<llvm::SmallVector<std::int64_t, 4>>
-handledClassIds(llvm::BasicBlock *dispatch) {
-  llvm::SmallVector<std::int64_t, 4> ids;
+std::optional<llvm::SmallVector<llvm::GlobalVariable *, 4>>
+handledClasses(llvm::BasicBlock *dispatch) {
+  llvm::SmallVector<llvm::GlobalVariable *, 4> ids;
   llvm::SmallPtrSet<llvm::BasicBlock *, 8> seen;
   llvm::BasicBlock *block = dispatch;
   while (block && seen.insert(block).second) {
@@ -501,10 +501,15 @@ handledClassIds(llvm::BasicBlock *dispatch) {
       // in front of its dispatch is a frame that must be entered.
       if (!holdsOnly(*block, {test, branch}))
         return std::nullopt;
-      auto *classId = llvm::dyn_cast<llvm::ConstantInt>(test->getArgOperand(0));
-      if (!classId)
+      // The class word: a type object's address (TypeObjects.h).
+      auto *word = llvm::dyn_cast<llvm::ConstantExpr>(test->getArgOperand(0));
+      auto *type =
+          word && word->getOpcode() == llvm::Instruction::PtrToInt
+              ? llvm::dyn_cast<llvm::GlobalVariable>(word->getOperand(0))
+              : nullptr;
+      if (!type)
         return std::nullopt;
-      ids.push_back(classId->getSExtValue());
+      ids.push_back(type);
       block = branch->getSuccessor(1);
       continue;
     }
@@ -561,20 +566,6 @@ handledClassIds(llvm::BasicBlock *dispatch) {
   return std::nullopt;
 }
 
-// One global per class id, holding the id in its first word. The type table
-// entries in the LSDA point at these, and the personality loads the word.
-llvm::Constant *exceptionTypeGlobal(llvm::Module &module, std::int64_t classId) {
-  std::string name = ("__ly_exc_type_" + llvm::Twine(classId)).str();
-  if (llvm::GlobalVariable *existing = module.getNamedGlobal(name))
-    return existing;
-  llvm::Type *word = llvm::Type::getInt64Ty(module.getContext());
-  auto *global = new llvm::GlobalVariable(
-      module, word, /*isConstant=*/true, llvm::GlobalValue::InternalLinkage,
-      llvm::ConstantInt::get(word, classId), name);
-  global->setAlignment(llvm::Align(8));
-  return global;
-}
-
 // The pad for a try's catch dispatch. Naming the classes lets the personality
 // answer during the SEARCH phase, which is what keeps a frame that does not
 // handle this exception from being entered at all.
@@ -585,8 +576,8 @@ llvm::Constant *exceptionTypeGlobal(llvm::Module &module, std::int64_t classId) 
 // wrong answer rather than a slow one. The cleanup entry brings it back in the
 // second phase, where the selector tells the two apart.
 //
-// ⛔ ONLY UNDER THE PYTHON PERSONALITY. The clauses point at `__ly_exc_type_*`
-// words that only LyEH_Personality knows how to read; the C++ ABI's
+// ⛔ ONLY UNDER THE PYTHON PERSONALITY. The clauses point at type objects
+// that only LyEH_Personality knows how to read; the C++ ABI's
 // personality takes a clause for a `std::type_info` and calls into it --
 // ARM EHABI's `__cxa_type_match` faulted on the first `except ValueError`
 // a raise had to reach on armv7. Elsewhere every pad stays a catch-all.
@@ -597,9 +588,9 @@ llvm::LandingPadInst *createCatchLandingPad(llvm::IRBuilder<> &builder,
   llvm::LLVMContext &context = builder.getContext();
   llvm::StructType *landingPadType = llvm::StructType::get(
       llvm::PointerType::getUnqual(context), llvm::Type::getInt32Ty(context));
-  std::optional<llvm::SmallVector<std::int64_t, 4>> ids =
+  std::optional<llvm::SmallVector<llvm::GlobalVariable *, 4>> ids =
       py::runtime_library::usePythonPersonality(triple)
-          ? handledClassIds(dispatch)
+          ? handledClasses(dispatch)
           : std::nullopt;
   llvm::LandingPadInst *landingPad =
       builder.CreateLandingPad(landingPadType, ids ? ids->size() : 1, name);
@@ -608,9 +599,10 @@ llvm::LandingPadInst *createCatchLandingPad(llvm::IRBuilder<> &builder,
         llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(context)));
     return landingPad;
   }
-  llvm::Module &module = *builder.GetInsertBlock()->getModule();
-  for (std::int64_t classId : *ids)
-    landingPad->addClause(exceptionTypeGlobal(module, classId));
+  // A clause is the class's type object; the personality compares its
+  // address with the raised exception's MRO.
+  for (llvm::GlobalVariable *type : *ids)
+    landingPad->addClause(type);
   landingPad->setCleanup(true);
   return landingPad;
 }

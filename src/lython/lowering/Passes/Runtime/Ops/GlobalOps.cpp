@@ -1,4 +1,4 @@
-#include "ClassIds.h"
+#include "Common/TypeObjects.h"
 #include "Runtime/Core/Lowerer.h"
 #include "Runtime/Ctypes/Internal.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -358,17 +358,15 @@ RuntimeBundleLowerer::lowerObjectGlobalGet(py::GlobalGetOp op) {
                               .str();
     mlir::Value messageBuffer =
         RuntimeBundleLowerer::materializeByteBuffer(loc, message);
-    mlir::Value classId =
-        mlir::arith::ConstantIntOp::create(
-          builder, loc, py::class_ids::of("builtins.RuntimeError"), 64)
-          .getResult();
+    mlir::Value classWord =
+        type_objects::classWord(builder, loc, module, "builtins.RuntimeError");
     mlir::Value length =
         mlir::arith::ConstantIntOp::create(
             builder, loc, static_cast<std::int64_t>(message.size()), 64)
             .getResult();
     mlir::func::CallOp::create(
         builder, loc, raise,
-        mlir::ValueRange{classId, messageBuffer, length});
+        mlir::ValueRange{classWord, messageBuffer, length});
   }
 
   llvm::SmallVector<mlir::Value, 8> values;
@@ -476,7 +474,7 @@ RuntimeBundleLowerer::lowerObjectGlobalSet(py::GlobalSetOp op) {
   // class's lanes is boxed here, the box retaining it.
   // ⛔ Not stored as it stands: a float's one lane is a header pointer like
   // a box's, so the cell took it, and the read handed `LyObject_BoxedStr` a
-  // float to read a class id out of -- `x: object = 1.5; print(x)` was a
+  // float to read a class word out of -- `x: object = 1.5; print(x)` was a
   // SIGSEGV, and a str (two lanes) or None (none) was refused with a count.
   if (isBuiltinsObjectContract(type)) {
     const RuntimeBundle *concrete =

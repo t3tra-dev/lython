@@ -14,7 +14,7 @@ module {
   func.func private @__ly_long_operand_view(%meta: memref<2xi64>, %digits: memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
   func.func private @__ly_long_view_as_i64(%meta: memref<2xi64>, %digits: memref<?xi32>) -> i64
   func.func private @__ly_long_view_fits_i64(%meta: memref<2xi64>, %digits: memref<?xi32>) -> i1
-  func.func private @__ly_raise_static_message(%class_id: i64, %message: memref<?xi8>, %length: i64)
+  func.func private @__ly_raise_static_message(%class_word: i64, %message: memref<?xi8>, %length: i64)
   func.func private @__ly_slice_adjust(%len: i64, %start_in: i64, %stop_in: i64, %step: i64, %mask: i64) -> (i64, i64)
   func.func private @__ly_slice_raise_zero_step()
 
@@ -22,11 +22,11 @@ module {
   // counts with: an int past the word, of either sign.
   memref.global "private" constant @__ly_msg_index_overflow : memref<44xi8> = dense<[99, 97, 110, 110, 111, 116, 32, 102, 105, 116, 32, 39, 105, 110, 116, 39, 32, 105, 110, 116, 111, 32, 97, 110, 32, 105, 110, 100, 101, 120, 45, 115, 105, 122, 101, 100, 32, 105, 110, 116, 101, 103, 101, 114]>
   func.func private @__ly_raise_index_overflow() {
-    %class_id = arith.constant {ly.class_id_of = "builtins.OverflowError"} 104 : i64
+    %class_word = arith.constant {ly.class_of = "builtins.OverflowError"} 104 : i64
     %length = arith.constant 44 : i64
     %message_static = memref.get_global @__ly_msg_index_overflow : memref<44xi8>
     %message = memref.cast %message_static : memref<44xi8> to memref<?xi8>
-    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_word, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -183,7 +183,7 @@ module {
     func.return
   }
 
-  // Shared box-copy concatenation for list/tuple `+`. Parameterized by class id
+  // Shared box-copy concatenation for list/tuple `+`. Parameterized by class word
   // rather than duplicated per contract: both have the same (header, meta,
   // items) shape and the same 16-word element boxes, so only the id stamped
   // into the fresh header differs.
@@ -225,7 +225,7 @@ module {
     func.return
   }
 
-  // Shared box-copy repetition for list/tuple `*`, parameterized by class id
+  // Shared box-copy repetition for list/tuple `*`, parameterized by class word
   // for the same reason as __ly_sequence_concat.
   // Fill an already-sized destination with `n` copies of the source slots.
   func.func private @__ly_seq_fill_repeat(%dst_items: memref<?xi64>, %len: i64, %li: memref<?xi64>, %n: i64) {

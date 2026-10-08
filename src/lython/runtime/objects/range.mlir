@@ -19,18 +19,18 @@ module attributes {
   // ===== declared here, defined in another runtime file or built by the lowering =====
   func.func private @__ly_slice_unpack(%self: memref<5xi64>) -> (i64, i64, i64, i64)
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
-  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
+  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "release_to_zero"}
   func.func private @LyUnicode_Concat(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__add__"}
   func.func private @LyUnicode_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.str", ly.runtime.deallocator}
-  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
+  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_FromI64(%value: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @Ly_IncRef(%header: memref<2xi64, strided<[1], offset: ?>> {ly.ownership.object_header}) attributes {ly.ownership.retain_args = [0], ly.runtime.primitive = "retain"}
   func.func private @__ly_long_parts(%header: memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
   func.func private @__ly_long_raise_too_large()
   func.func private @__ly_long_view_as_i64(%meta: memref<2xi64>, %digits: memref<?xi32>) -> i64
   func.func private @__ly_long_view_fits_i64(%meta: memref<2xi64>, %digits: memref<?xi32>) -> i1
-  func.func private @__ly_raise_static_message(%class_id: i64, %message: memref<?xi8>, %length: i64)
+  func.func private @__ly_raise_static_message(%class_word: i64, %message: memref<?xi8>, %length: i64)
   func.func private @__ly_slice_indices(%len: i64, %start_in: i64, %stop_in: i64, %step: i64, %mask: i64) -> (i64, i64)
   func.func private @__ly_slice_raise_zero_step()
   memref.global "private" constant @__ly_repr_comma : memref<2xi8>
@@ -143,11 +143,11 @@ module attributes {
   memref.global "private" constant @__ly_range_msg_zero_step : memref<30xi8> = dense<[114, 97, 110, 103, 101, 40, 41, 32, 97, 114, 103, 32, 51, 32, 109, 117, 115, 116, 32, 110, 111, 116, 32, 98, 101, 32, 122, 101, 114, 111]>
 
   func.func private @__ly_range_raise_zero_step() {
-    %class_id = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
+    %class_word = arith.constant {ly.class_of = "builtins.ValueError"} 53 : i64
     %length = arith.constant 30 : i64
     %message_static = memref.get_global @__ly_range_msg_zero_step : memref<30xi8>
     %message = memref.cast %message_static : memref<30xi8> to memref<?xi8>
-    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_word, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -159,20 +159,20 @@ module attributes {
   // default is a value the caller can also pass, and INT64_MAX standing for
   // "absent" made `range(5, sys.maxsize)` the `range(5)` it is not, and
   // `range(0, 10, sys.maxsize)` a step-1 range of ten.
-  func.func @LyRange_New(%stop: i64) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.range", ly.runtime.initializer = "__new__"} {
+  func.func @LyRange_New(%stop: i64) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.range", ly.runtime.initializer = "__new__"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %self = func.call @__ly_range_alloc(%zero, %stop, %one) : (i64, i64, i64) -> memref<5xi64>
     func.return %self : memref<5xi64>
   }
 
-  func.func @LyRange_NewStart(%start: i64, %stop: i64) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.range", ly.runtime.initializer = "__new__"} {
+  func.func @LyRange_NewStart(%start: i64, %stop: i64) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.range", ly.runtime.initializer = "__new__"} {
     %one = arith.constant 1 : i64
     %self = func.call @__ly_range_alloc(%start, %stop, %one) : (i64, i64, i64) -> memref<5xi64>
     func.return %self : memref<5xi64>
   }
 
-  func.func @LyRange_NewStep(%start: i64, %stop: i64, %step: i64) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.range", ly.runtime.initializer = "__new__"} {
+  func.func @LyRange_NewStep(%start: i64, %stop: i64, %step: i64) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.range", ly.runtime.initializer = "__new__"} {
     %zero = arith.constant 0 : i64
     %step_zero = arith.cmpi eq, %step, %zero : i64
     cf.cond_br %step_zero, ^raise, ^make
@@ -197,7 +197,7 @@ module attributes {
     %block = memref.alloc(%block_bytes) {alignment = 16 : i64} : memref<?xi8>
     %self_offset = arith.constant 0 : index
     %self = memref.view %block[%self_offset][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<5xi64>
-    %layout_range = arith.constant {ly.class_id_of = "builtins.range"} 3 : i64
+    %layout_range = arith.constant {ly.class_of = "builtins.range"} 3 : i64
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
     %start_slot = arith.constant 2 : index
@@ -218,11 +218,11 @@ module attributes {
   memref.global "private" constant @__ly_range_msg_index_out_of_range : memref<31xi8> = dense<[114, 97, 110, 103, 101, 32, 111, 98, 106, 101, 99, 116, 32, 105, 110, 100, 101, 120, 32, 111, 117, 116, 32, 111, 102, 32, 114, 97, 110, 103, 101]>
 
   func.func private @__ly_range_raise_index_error() {
-    %class_id = arith.constant {ly.class_id_of = "builtins.IndexError"} 55 : i64
+    %class_word = arith.constant {ly.class_of = "builtins.IndexError"} 55 : i64
     %length = arith.constant 31 : i64
     %message_static = memref.get_global @__ly_range_msg_index_out_of_range : memref<31xi8>
     %message = memref.cast %message_static : memref<31xi8> to memref<?xi8>
-    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_word, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -285,11 +285,11 @@ module attributes {
   memref.global "private" constant @__ly_range_msg_too_long : memref<44xi8> = dense<[80, 121, 116, 104, 111, 110, 32, 105, 110, 116, 32, 116, 111, 111, 32, 108, 97, 114, 103, 101, 32, 116, 111, 32, 99, 111, 110, 118, 101, 114, 116, 32, 116, 111, 32, 67, 32, 115, 115, 105, 122, 101, 95, 116]>
 
   func.func private @__ly_range_raise_too_long() {
-    %class_id = arith.constant {ly.class_id_of = "builtins.OverflowError"} 104 : i64
+    %class_word = arith.constant {ly.class_of = "builtins.OverflowError"} 104 : i64
     %length = arith.constant 44 : i64
     %message_static = memref.get_global @__ly_range_msg_too_long : memref<44xi8>
     %message = memref.cast %message_static : memref<44xi8> to memref<?xi8>
-    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_word, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -554,7 +554,7 @@ module attributes {
   // the step after the last element can leave the word, and the wrapped value
   // compared as before the stop again -- `list(range(0, sys.maxsize,
   // sys.maxsize // 2 + 1))` never ended.
-  func.func private @__ly_range_iterator_alloc(%current: i64, %remaining: i64, %step: i64) -> memref<5xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.range_iterator"], ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.range_iterator", ly.runtime.primitive = "alloc"} {
+  func.func private @__ly_range_iterator_alloc(%current: i64, %remaining: i64, %step: i64) -> memref<5xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.range_iterator"], ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.range_iterator", ly.runtime.primitive = "alloc"} {
     // One entity, one handle; see LyRange_New for why the byte block and the
     // view are kept rather than allocating memref<5xi64> directly.
     %block_bytes = arith.constant 40 : index
@@ -562,7 +562,7 @@ module attributes {
     %self_offset = arith.constant 0 : index
     %self = memref.view %block[%self_offset][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<5xi64>
     %one = arith.constant 1 : i64
-    %layout_range_iterator = arith.constant {ly.class_id_of = "builtins.range_iterator"} 20 : i64
+    %layout_range_iterator = arith.constant {ly.class_of = "builtins.range_iterator"} 20 : i64
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
     %current_slot = arith.constant 2 : index

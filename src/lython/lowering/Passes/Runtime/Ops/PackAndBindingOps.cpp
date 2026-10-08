@@ -307,8 +307,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
       literalMayStoreWords(op))
     if (std::optional<RuntimeSymbol> fromStatic =
             manifest.primitive("builtins.tuple", "from_static"))
-      if (std::optional<std::int64_t> classId =
-              manifest.classId("builtins.tuple")) {
+      if (manifest.runtimeClass("builtins.tuple")) {
         llvm::SmallVector<std::int64_t, 8> items;
         std::string key;
         for (mlir::Value value : values) {
@@ -328,12 +327,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
         if (items.size() == values.size()) {
           builder.setInsertionPoint(op);
           llvm::SmallVector<std::int64_t, 8> words{
-              std::numeric_limits<std::int64_t>::max(), *classId,
+              std::numeric_limits<std::int64_t>::max(), 0,
               static_cast<std::int64_t>(items.size()),
               static_cast<std::int64_t>(items.size()), 0};
           words.append(items.begin(), items.end());
           mlir::Value address = materializeStaticObjectAddress(
-              op.getLoc(), "tuple", key, words, {{4u, 40}}, {});
+              op.getLoc(), "tuple", "builtins.tuple", key, words, {{4u, 40}},
+              {});
           mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
               op.getLoc(), *fromStatic, {address});
           RuntimeBundle bundle;

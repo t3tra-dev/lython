@@ -37,10 +37,10 @@ inline constexpr llvm::StringLiteral kManifestBuiltinSinkContractAttr{
 inline constexpr llvm::StringLiteral kManifestShapeAttr{"ly.runtime.shape"};
 inline constexpr llvm::StringLiteral kManifestDeallocatorAttr{
     "ly.runtime.deallocator"};
-inline constexpr llvm::StringLiteral kManifestClassIdAttr{
-    "ly.runtime.class_id"};
-inline constexpr llvm::StringLiteral kManifestClassIdArgumentAttr{
-    "ly.runtime.class_id_argument"};
+inline constexpr llvm::StringLiteral kManifestClassAttr{
+    "ly.runtime.class"};
+inline constexpr llvm::StringLiteral kManifestClassArgumentAttr{
+    "ly.runtime.class_argument"};
 inline constexpr llvm::StringLiteral kManifestDefaultI64Attr{
     "ly.runtime.default_i64"};
 // An i64 input that takes an int the way CPython reads an index with

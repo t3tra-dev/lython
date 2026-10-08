@@ -680,8 +680,8 @@ mlir::LogicalResult ClassTestOp::verify() {
   // while accepting the identical test against a source class. A source class
   // is a bare symbol, so the dot is what separates "not imported yet" from
   // "misspelled". The manifest's own check is not skipped, only moved:
-  // `runtimeClassIdsForNominalTarget` runs after the import and fails there if
-  // the contract declares no runtime class id.
+  // `runtimeClassesForNominalTarget` runs after the import and fails there if
+  // the contract declares no runtime class word.
   if (!type_object::lookup(getOperation(), *target) &&
       target->find('.') == std::string::npos)
     return emitOpError("target has no class schema '") << *target << "'";

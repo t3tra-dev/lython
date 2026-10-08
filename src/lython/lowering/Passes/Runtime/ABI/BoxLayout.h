@@ -35,7 +35,7 @@
 // struct types through the manifest surface, and the reason to do it would have
 // to be something other than the pointer words.
 
-#include "ClassIds.h"
+#include "Common/TypeObjects.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -53,7 +53,7 @@ namespace py::lowering::box_abi {
 // address for None (0 is a slot nothing was stored in), an immediate for an
 // int or float that has one (low two bits nonzero: int
 // `...1`, float `...10`; see `__ly_slot_word_is_immediate`), and otherwise the
-// address of the value's object -- whose header word 1 is its class id. So the
+// address of the value's object -- whose header word 1 is its class. So the
 // class is never stored beside the entity: `slotClassFromEntity` reads it the
 // way `__ly_slot_class` does in the manifest.
 //
@@ -65,7 +65,7 @@ namespace py::lowering::box_abi {
 // entry beside the key.
 //
 // A STANDALONE box (an `object` value, `memref<5xi64>`) is an object of its
-// own: refcount in word 0, class id in word 1, entity in word 2 (kBoxClassWord,
+// own: refcount in word 0, class in word 1, entity in word 2 (kBoxClassWord,
 // kBoxEntityWord), words 3 and 4 unused. A pointer to its word 2 is a slot.
 inline constexpr std::int64_t kWordsPerBox = 1;
 inline constexpr std::int64_t kEntityWord = 0;
@@ -87,8 +87,9 @@ inline mlir::MemRefType slotWordsType(mlir::Builder &builder) {
   return mlir::MemRefType::get({kWordsPerBox}, builder.getI64Type());
 }
 
-// The class id a slot's entity word names (`__ly_slot_class`): int or float
-// by an immediate's tag, else the object's header word 1 (0 for None's).
+// The class a slot's entity word names (`__ly_slot_class`), as its type
+// object's address: int or float by an immediate's tag, else the object's
+// header word 1; 0 for a slot nothing was stored in.
 inline mlir::Value slotClassFromEntity(mlir::OpBuilder &builder,
                                        mlir::Location loc, mlir::Value entity) {
   mlir::Type i64 = builder.getI64Type();
@@ -106,8 +107,9 @@ inline mlir::Value slotClassFromEntity(mlir::OpBuilder &builder,
   mlir::Value isInt = mlir::arith::CmpIOp::create(
       builder, loc, mlir::arith::CmpIPredicate::ne, intTag, zero);
   mlir::Value immediateClass = mlir::arith::SelectOp::create(
-      builder, loc, isInt, constant(py::class_ids::of("builtins.int")),
-      constant(py::class_ids::of("builtins.float")));
+      builder, loc, isInt,
+      py::type_objects::classWord(builder, loc, "builtins.int"),
+      py::type_objects::classWord(builder, loc, "builtins.float"));
   mlir::Value isNull = mlir::arith::CmpIOp::create(
       builder, loc, mlir::arith::CmpIPredicate::eq, entity, zero);
   // ⛔ A branch, not a select: the load must not run for None or an

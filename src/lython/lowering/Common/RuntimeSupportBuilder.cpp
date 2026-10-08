@@ -1,4 +1,3 @@
-#include "ClassIds.h"
 #include "Common/RuntimeSupportBuilder.h"
 
 #include "Common/SupportBuilder.h"
@@ -329,132 +328,82 @@ void buildIntRound(SupportBuilder &b) {
   b.emitTrap(b.i64());
 }
 
-// i64 exception_base_class_id(i64 class_id): one step up the builtin exception
-// hierarchy (class id -> its base class id), 0 for a root/unknown id. Pure
-// `cf.switch` over the fixed builtin exception class-id table; ids outside it
-// consult the per-program user-exception hook (source class ids live above
-// 2^32 and cannot be known when this module is built).
-void buildExceptionBaseClassId(SupportBuilder &b) {
-  auto fn = b.beginFunction("exception_base_class_id",
-                            b.builder.getFunctionType({b.i64()}, {b.i64()}),
-                            /*isPrivate=*/true);
-  mlir::Block *entry = fn.addEntryBlock();
-  mlir::Region &body = fn.getBody();
-  mlir::Value classId = entry->getArgument(0);
-
-  // One return block per distinct base class id in the shared taxonomy;
-  // unknown ids (the switch default) ask the user-exception hook, which
-  // returns the root (0) for anything it does not own.
-  llvm::SmallDenseMap<std::int64_t, mlir::Block *, 8> returnBlocks;
-  auto returnBlockFor = [&](std::int64_t value) {
-    mlir::Block *&block = returnBlocks[value];
-    if (!block) {
-      block = b.builder.createBlock(&body);
-      b.builder.setInsertionPointToEnd(block);
-      mlir::func::ReturnOp::create(b.builder, b.loc, b.iconst(value));
-    }
-    return block;
-  };
-  mlir::Block *toRoot;
-  {
-    toRoot = b.builder.createBlock(&body);
-    b.builder.setInsertionPointToEnd(toRoot);
-    auto userBase = mlir::func::CallOp::create(
-        b.builder, b.loc, "__ly_user_exception_base_class_id", b.i64(),
-        mlir::ValueRange{classId});
-    mlir::func::ReturnOp::create(b.builder, b.loc, userBase.getResult(0));
-  }
-
-  llvm::SmallVector<llvm::APInt, 16> caseValues;
-  llvm::SmallVector<mlir::Block *, 16> caseDests;
-  llvm::SmallVector<mlir::ValueRange, 16> caseOperands;
-  for (const py::exceptions::BuiltinExceptionInfo &info :
-       py::exceptions::kBuiltinExceptions) {
-    if (info.baseClassId == py::exceptions::kRootClassId)
-      continue;
-    caseValues.emplace_back(64, static_cast<std::uint64_t>(info.classId));
-    caseDests.push_back(returnBlockFor(info.baseClassId));
-    caseOperands.push_back(mlir::ValueRange{});
-  }
-
-  b.builder.setInsertionPointToEnd(entry);
-  mlir::cf::SwitchOp::create(b.builder, b.loc, classId, toRoot,
-                             mlir::ValueRange{}, caseValues, caseDests,
-                             caseOperands);
-}
-
-// i1 LyEH_ClassIdMatches(i64 raised, i64 handler): whether a raised exception's
-// class id is `handler` or a subclass of it, by walking base class ids up to
-// the root. Pure `cf` loop.
-void buildEHClassIdMatches(SupportBuilder &b) {
+// i1 LyType_IsSubtype(i64 class, i64 base): whether `base` is in the MRO of
+// `class` -- CPython's PyType_IsSubtype over tp_mro -- for two class words
+// (TypeObjects.h). A raised exception matches a handler by it, and
+// `isinstance` asks it. 0 (no class) matches nothing.
+void buildIsSubtype(SupportBuilder &b) {
   auto fn = b.beginFunction(
-      "LyEH_ClassIdMatches",
+      "LyType_IsSubtype",
       b.builder.getFunctionType({b.i64(), b.i64()}, {b.i1()}));
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
   mlir::Value raised = entry->getArgument(0);
   mlir::Value handler = entry->getArgument(1);
 
-  mlir::Block *loop = b.builder.createBlock(&body);
-  loop->addArgument(b.i64(), b.loc); // current class id
-  mlir::Block *checkHandler = b.builder.createBlock(&body);
-  mlir::Block *stepUp = b.builder.createBlock(&body);
+  mlir::Block *readMro = b.builder.createBlock(&body);
+  mlir::Block *loop = b.builder.createBlock(&body, {}, {b.i64()}, {b.loc});
+  mlir::Block *check = b.builder.createBlock(&body);
   mlir::Block *matched = b.builder.createBlock(&body);
   mlir::Block *exhausted = b.builder.createBlock(&body);
 
   b.builder.setInsertionPointToEnd(entry);
-  mlir::cf::BranchOp::create(b.builder, b.loc, loop, mlir::ValueRange{raised});
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::eq, raised, b.iconst(0)), exhausted,
+      mlir::ValueRange{}, readMro, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(readMro);
+  mlir::Value mro = b.intToPtr(
+      b.typeObjectWord(raised, py::type_objects::kMroWord));
+  mlir::cf::BranchOp::create(b.builder, b.loc, loop,
+                             mlir::ValueRange{b.iconst(0)});
 
   b.builder.setInsertionPointToEnd(loop);
-  mlir::Value current = loop->getArgument(0);
-  mlir::Value isRoot =
-      b.cmpi(mlir::arith::CmpIPredicate::eq, current, b.iconst(0));
-  mlir::cf::CondBranchOp::create(b.builder, b.loc, isRoot, exhausted,
-                                 mlir::ValueRange{}, checkHandler,
-                                 mlir::ValueRange{});
+  mlir::Value index = loop->getArgument(0);
+  mlir::Value entryWord = b.loadI64(b.gepI64(mro, index));
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::eq, entryWord, b.iconst(0)),
+      exhausted, mlir::ValueRange{}, check, mlir::ValueRange{});
 
-  b.builder.setInsertionPointToEnd(checkHandler);
-  mlir::Value hit =
-      b.cmpi(mlir::arith::CmpIPredicate::eq, current, handler);
-  // Multiple-inheritance extra edges (ExceptionGroup -> Exception): the
-  // chain walk only follows the primary base, so accept `handler` being any
-  // ancestor of an extra base when the walk passes through the edge's owner.
-  for (const py::exceptions::BuiltinExceptionExtraEdge &edge :
-       py::exceptions::kBuiltinExceptionExtraEdges) {
-    mlir::Value atEdgeOwner =
-        b.cmpi(mlir::arith::CmpIPredicate::eq, current, b.iconst(edge.classId));
-    std::int64_t ancestor = edge.extraBaseClassId;
-    while (ancestor != py::exceptions::kRootClassId) {
-      mlir::Value handlerIsAncestor = b.cmpi(mlir::arith::CmpIPredicate::eq,
-                                             handler, b.iconst(ancestor));
-      mlir::Value viaEdge = mlir::arith::AndIOp::create(
-          b.builder, b.loc, atEdgeOwner, handlerIsAncestor);
-      hit = mlir::arith::OrIOp::create(b.builder, b.loc, hit, viaEdge);
-      const py::exceptions::BuiltinExceptionInfo *info =
-          py::exceptions::findByClassId(ancestor);
-      ancestor = info ? info->baseClassId : py::exceptions::kRootClassId;
-    }
-  }
-  mlir::cf::CondBranchOp::create(b.builder, b.loc, hit, matched,
-                                 mlir::ValueRange{}, stepUp,
-                                 mlir::ValueRange{});
-
-  b.builder.setInsertionPointToEnd(stepUp);
-  auto base = mlir::func::CallOp::create(b.builder, b.loc,
-                                         "exception_base_class_id", b.i64(),
-                                         mlir::ValueRange{current});
-  mlir::cf::BranchOp::create(b.builder, b.loc, loop,
-                             mlir::ValueRange{base.getResult(0)});
+  b.builder.setInsertionPointToEnd(check);
+  mlir::Value next =
+      mlir::arith::AddIOp::create(b.builder, b.loc, index, b.iconst(1));
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::eq, entryWord, handler), matched,
+      mlir::ValueRange{}, loop, mlir::ValueRange{next});
 
   b.builder.setInsertionPointToEnd(matched);
-  mlir::Value trueVal =
-      mlir::arith::ConstantIntOp::create(b.builder, b.loc, b.i1(), 1);
-  mlir::func::ReturnOp::create(b.builder, b.loc, trueVal);
-
+  mlir::func::ReturnOp::create(b.builder, b.loc,
+                               mlir::ValueRange{b.iconst1(true)});
   b.builder.setInsertionPointToEnd(exhausted);
-  mlir::Value falseVal =
-      mlir::arith::ConstantIntOp::create(b.builder, b.loc, b.i1(), 0);
-  mlir::func::ReturnOp::create(b.builder, b.loc, falseVal);
+  mlir::func::ReturnOp::create(b.builder, b.loc,
+                               mlir::ValueRange{b.iconst1(false)});
+}
+
+// ptr LyType_Name(i64 class): the name a class's type object keeps
+// (word 3, NUL-terminated); null for 0, a word that names no class.
+void buildClassName(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyType_Name",
+                            b.builder.getFunctionType({b.i64()}, {b.ptr()}));
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Value word = entry->getArgument(0);
+  mlir::Block *read = b.builder.createBlock(&body);
+  mlir::Block *none = b.builder.createBlock(&body);
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc, b.cmpi(mlir::arith::CmpIPredicate::eq, word, b.iconst(0)),
+      none, mlir::ValueRange{}, read, mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(read);
+  mlir::func::ReturnOp::create(
+      b.builder, b.loc,
+      mlir::ValueRange{
+          b.intToPtr(b.typeObjectWord(word, py::type_objects::kNameWord))});
+  b.builder.setInsertionPointToEnd(none);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{b.nullPtr()});
 }
 
 // i1 raw_bytes_equal(i64 p1, i64 n1, i64 p2, i64 n2): byte-equality of two raw
@@ -1807,7 +1756,7 @@ void buildPrintBytes(SupportBuilder &b) {
 // needs no class dispatch at all -- so a release that leaves the count above
 // zero is the same load and store for every contract, and only the one that
 // takes it to zero needs to know what the object is. This used to dispatch
-// unconditionally: a call, a jump table over eighty-odd class ids, and the
+// unconditionally: a call, a jump table over eighty-odd class words, and the
 // deallocator's prologue, for a decrement.
 //
 // Slicing a hundred-element `list[int]` was the shape that showed it -- the
@@ -2153,10 +2102,10 @@ void emitLLVMTrap(SupportBuilder &b) {
   mlir::LLVM::UnreachableOp::create(b.builder, b.loc);
 }
 
-// i64 current_exception_class_id_unchecked(): class id word of the stored
+// i64 current_exception_class_unchecked(): class word word of the stored
 // exception header (aligned[offset + 2*stride]); aborts on a null header.
-void buildCurrentExceptionClassIdUnchecked(SupportBuilder &b) {
-  auto fn = b.beginFunction("current_exception_class_id_unchecked",
+void buildCurrentExceptionClassUnchecked(SupportBuilder &b) {
+  auto fn = b.beginFunction("current_exception_class_unchecked",
                             b.builder.getFunctionType({}, {b.i64()}),
                             /*isPrivate=*/true);
   mlir::Block *entry = fn.addEntryBlock();
@@ -2178,11 +2127,11 @@ void buildCurrentExceptionClassIdUnchecked(SupportBuilder &b) {
       mlir::arith::MulIOp::create(b.builder, b.loc, stride, b.iconst(2));
   mlir::Value index =
       mlir::arith::AddIOp::create(b.builder, b.loc, offset, scaled);
-  mlir::Value classId = b.loadI64(b.gepI64(aligned, index));
-  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{classId});
+  mlir::Value classWord = b.loadI64(b.gepI64(aligned, index));
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{classWord});
   b.builder.setInsertionPointToEnd(trap);
   // Named for the same reason the exception-table refusals are: this trap is
-  // reachable FROM THE PERSONALITY -- it asks the raised class id on every
+  // reachable FROM THE PERSONALITY -- it asks the raised class word on every
   // frame it walks -- so a stack that ends in abort under
   // `_Unwind_RaiseException` can be this rather than a table it could not
   // read, and the two want different repairs.
@@ -2446,8 +2395,8 @@ void buildBorrowCurrentException(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, poison);
 }
 
-void buildCurrentExceptionClassId(SupportBuilder &b) {
-  auto fn = b.beginFunction("LyEH_CurrentExceptionClassId",
+void buildCurrentExceptionClass(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyEH_CurrentExceptionClass",
                             b.builder.getFunctionType({}, {b.i64()}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
@@ -2460,9 +2409,9 @@ void buildCurrentExceptionClassId(SupportBuilder &b) {
   {
     mlir::OpBuilder::InsertionGuard guard(b.builder);
     b.builder.setInsertionPointToStart(&classIf.getThenRegion().front());
-    mlir::Value classId =
-        b.call("current_exception_class_id_unchecked", b.i64(), {}).front();
-    mlir::scf::YieldOp::create(b.builder, b.loc, mlir::ValueRange{classId});
+    mlir::Value classWord =
+        b.call("current_exception_class_unchecked", b.i64(), {}).front();
+    mlir::scf::YieldOp::create(b.builder, b.loc, mlir::ValueRange{classWord});
     b.builder.setInsertionPointToStart(&classIf.getElseRegion().front());
     mlir::scf::YieldOp::create(b.builder, b.loc, mlir::ValueRange{b.iconst(0)});
   }
@@ -2476,9 +2425,9 @@ void buildCurrentExceptionMatches(SupportBuilder &b) {
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value raised =
-      b.call("LyEH_CurrentExceptionClassId", b.i64(), {}).front();
+      b.call("LyEH_CurrentExceptionClass", b.i64(), {}).front();
   mlir::Value matches =
-      b.call("LyEH_ClassIdMatches", b.i1(),
+      b.call("LyType_IsSubtype", b.i1(),
              mlir::ValueRange{raised, entry->getArgument(0)})
           .front();
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{matches});
@@ -3156,7 +3105,7 @@ void buildRunPythonMain(SupportBuilder &b) {
         mlir::LLVM::AddOp::create(b.builder, b.loc, offset, scaled);
     return b.loadI64(b.gepI64(aligned, index));
   };
-  mlir::Value classId = headerWord(2);
+  mlir::Value classWord = headerWord(2);
   // The two words SystemExit answers with: the payload block (absent means the
   // exception was raised with no argument at all) and the exit code, biased by
   // one so that a zero slot is "no int code" rather than "exit 0".
@@ -3187,15 +3136,15 @@ void buildRunPythonMain(SupportBuilder &b) {
         mlir::ValueRange{takenHeader, takenMessageHeader, takenMessageData});
   };
   mlir::Value isSystemExit =
-      b.cmpi(mlir::arith::CmpIPredicate::eq, classId,
-             b.iconst(py::class_ids::of("builtins.SystemExit")));
+      b.cmpi(mlir::arith::CmpIPredicate::eq, classWord,
+             b.classWord("builtins.SystemExit"));
   mlir::LLVM::CondBrOp::create(b.builder, b.loc, isSystemExit, systemExit,
                                printTraceback);
 
   b.builder.setInsertionPointToEnd(printTraceback);
   mlir::func::CallOp::create(
       b.builder, b.loc, "LyTraceback_PrintMessage", mlir::TypeRange{},
-      mlir::ValueRange{classId, aligned, messageHeader, messageData,
+      mlir::ValueRange{classWord, aligned, messageHeader, messageData,
                        messageOffset, messageLen, messageStride});
   mlir::func::CallOp::create(b.builder, b.loc, "release_current_chain",
                              mlir::TypeRange{}, mlir::ValueRange{});
@@ -3720,10 +3669,12 @@ void buildEHActionWalk(SupportBuilder &b) {
                        typedClause->getArgument(1)});
 
   b.builder.setInsertionPointToEnd(decodeType);
-  mlir::Value classId = b.loadI64(b.loadPtrVal(decodeType->getArgument(0)));
+  // The entry is the class's type object itself (EH.cpp): its address is
+  // the class word.
+  mlir::Value classWord = b.ptrToInt(b.loadPtrVal(decodeType->getArgument(0)));
   mlir::cf::CondBranchOp::create(
       b.builder, b.loc,
-      b.call("LyEH_ClassIdMatches", b.i1(), mlir::ValueRange{raised, classId})
+      b.call("LyType_IsSubtype", b.i1(), mlir::ValueRange{raised, classWord})
           .front(),
       yes, mlir::ValueRange{}, nextAction,
       mlir::ValueRange{decodeType->getArgument(1)});
@@ -3740,9 +3691,9 @@ void buildEHActionWalk(SupportBuilder &b) {
       mlir::ValueRange{b.gepI8(nextAction->getArgument(0), link[0])});
 }
 
-// ⭐ THE TYPE TABLE HOLDS PYTHON CLASS IDS, NOT C++ RTTI. A landing pad's
-// clauses name the exception classes its `except` arms test for, as globals
-// whose first word is the class id, so the SEARCH phase can answer "does this
+// ⭐ THE TYPE TABLE HOLDS PYTHON TYPE OBJECTS, NOT C++ RTTI. A landing pad's
+// clauses name the exception classes its `except` arms test for, as the
+// classes' type objects, so the SEARCH phase can answer "does this
 // frame handle this exception" -- which is the question that decides whether
 // the frame is entered at all.
 //
@@ -3753,7 +3704,7 @@ void buildEHActionWalk(SupportBuilder &b) {
 // the frame that does not handle it. That difference is a whole raise.
 //
 // `__gxx_personality_v0` could not have been given this: a Python class match is
-// `LyEH_ClassIdMatches` walking an MRO, not a `std::type_info::can_catch`, so
+// `LyType_IsSubtype` walking an MRO, not a `std::type_info::can_catch`, so
 // the predicate has to be ours even though the table format is not.
 //
 // The reading of the tables is `ly_eh_lookup_site` and `ly_eh_action_walk`,
@@ -3842,7 +3793,7 @@ void buildPythonPersonality(SupportBuilder &b) {
       b.call("ly_eh_action_walk", b.i1(),
              mlir::ValueRange{
                  actionStart, action, typeTableBase,
-                 b.call("LyEH_CurrentExceptionClassId", b.i64(), {}).front(),
+                 b.call("LyEH_CurrentExceptionClass", b.i64(), {}).front(),
                  b.iconst1(false)})
           .front());
   mlir::func::ReturnOp::create(
@@ -4180,20 +4131,12 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   support.declareExternal(
       "__ly_release_boxed_by_contract",
       builder.getFunctionType({support.ptr(), support.i64()}, {support.i1()}));
-  // Per-program user-exception hooks (source-class exception hierarchy and
-  // names); same link-time resolution scheme.
-  support.declareExternal(
-      "__ly_user_exception_base_class_id",
-      builder.getFunctionType({support.i64()}, {support.i64()}));
-  support.declareExternal(
-      "__ly_user_exception_class_name",
-      builder.getFunctionType({support.i64()}, {support.ptr()}));
 
   buildFloatRoundToI64(support);
   buildFloatRound(support);
   buildIntRound(support);
-  buildExceptionBaseClassId(support);
-  buildEHClassIdMatches(support);
+  buildIsSubtype(support);
+  buildClassName(support);
   buildRawBytesEqual(support);
   buildBoxedSlotPtr(support);
   buildBoxedLoadI64(support);
@@ -4235,7 +4178,7 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
 
     buildPythonPersonality(support);
   }
-  buildCurrentExceptionClassIdUnchecked(support);
+  buildCurrentExceptionClassUnchecked(support);
   buildCarrierCleanup(support);
   buildTakeCarrier(support);
   buildEndNativeCatchIfActive(support);
@@ -4243,7 +4186,7 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   buildThrowException(support);
   buildBeginCatch(support);
   buildBorrowCurrentException(support);
-  buildCurrentExceptionClassId(support);
+  buildCurrentExceptionClass(support);
   buildCurrentExceptionMatches(support);
   buildDiscardCurrentException(support);
   buildDiscardCurrentExceptionPlain(support);

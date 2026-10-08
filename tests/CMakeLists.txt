@@ -120,6 +120,8 @@ target_include_directories(lython_unit_tests
     # EntityHeaderPrefixTests includes Runtime/ABI/EntityHeaderPrefix.h, whose
     # include root is the lowering pass tree.
     ${CMAKE_SOURCE_DIR}/src/lython/lowering/Passes
+    # DriverTests names type objects (Common/TypeObjects.h).
+    ${CMAKE_SOURCE_DIR}/src/lython/lowering
     ${CMAKE_BINARY_DIR}/src/lython/dialects
     ${CMAKE_CURRENT_BINARY_DIR}
 )

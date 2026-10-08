@@ -948,7 +948,7 @@ mlir::LogicalResult RuntimeBundleLowerer::eraseLoweredPyOps() {
   for (mlir::Operation *op : llvm::reverse(erase)) {
     if (!erased.insert(op).second)
       continue;
-    // Class metadata (method symbols, source-class ids) feeds the boxed-method
+    // Class metadata (method symbols, source-class words) feeds the boxed-method
     // hooks generated at the end of the pass; lowerModule erases the class ops
     // after the hooks are built.
     if (mlir::isa<py::ClassOp>(op))

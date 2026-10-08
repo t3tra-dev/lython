@@ -255,7 +255,7 @@ void applyExceptionUnwindOptions(llvm::TargetOptions &options,
 //
 // A DWARF target picks its LSDA `@TType` encoding from BOTH of them, and
 // `ly_eh_lookup_site` reads exactly one encoding -- the personality has to
-// turn a type-table entry into a class id, and the forms differ by a
+// turn a type-table entry into a class word, and the forms differ by a
 // pc-relative add, a load, and an entry width. Measured on x86-64 ELF:
 //
 //     Reloc::Static, any code model ... `udata4`               (0x03)

@@ -194,7 +194,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerClassName(py::ClassNameOp op) {
       methodReceiver.contract = ancestorType;
       methodReceiver.objectValue.contract = ancestorType;
     } else if (!manifest.primitive(methodReceiver.contractName(), "raise")) {
-      // ⭐ NOT AN EXCEPTION: read the class id out of the instance header --
+      // ⭐ NOT AN EXCEPTION: read the class word out of the instance header --
       // word 1, the word `isinstance` reads -- and look the name up in the
       // per-program table. This is the only answer available for a value whose
       // static class has subclasses, which is exactly when the emitter cannot
@@ -211,7 +211,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerClassName(py::ClassNameOp op) {
       // type-erased ValueError answered "BaseException". The shared read knows
       // where each kind keeps its exact class.
       mlir::FailureOr<mlir::Value> exact =
-          RuntimeBundleLowerer::exactRuntimeClassId(op, methodReceiver);
+          RuntimeBundleLowerer::exactRuntimeClassWord(op, methodReceiver);
       if (mlir::failed(exact))
         return mlir::failure();
       mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
@@ -226,7 +226,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerClassName(py::ClassNameOp op) {
     }
     // ⛔ A manifest EXCEPTION contract (the taxonomy) keeps the manifest path:
     // it has no exception ANCESTOR to redirect to because it is one, and its
-    // header carries the class id in a different word than a source instance's
+    // header carries the class word in a different word than a source instance's
     // -- reading word 1 there looked up an id nothing declares and printed
     // "object" for a caught ValueError.
   }
@@ -2164,7 +2164,7 @@ RuntimeBundleLowerer::lowerListRuntimeNext(py::NextOp op,
     // ⛔ On the exhausted branch `safe` is 0, so these are slot 0's words --
     // in bounds by the payload's own invariant, and never used: the loop reads
     // the element only where `valid` says there is one. An EMPTY payload's
-    // slot 0 is zeroed, whose class id matches no member, so every lane takes
+    // slot 0 is zeroed, whose class word matches no member, so every lane takes
     // its dead arm and nothing is dereferenced.
     mlir::Value entityWord = box_abi::loadContainerBoxWord(
         builder, loc, *itemsView, base, box_abi::kEntityWord);

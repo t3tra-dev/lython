@@ -64,10 +64,10 @@ void createDeadContinuation(mlir::OpBuilder &builder, mlir::Operation *op) {
   mlir::cf::BranchOp::create(builder, op->getLoc(), dead);
 }
 
-mlir::func::FuncOp getOrCreateClassIdMatches(mlir::ModuleOp module,
+mlir::func::FuncOp getOrCreateIsSubtype(mlir::ModuleOp module,
                                              mlir::OpBuilder &builder) {
   return getOrCreatePrivateFunction(
-      module, builder, "LyEH_ClassIdMatches",
+      module, builder, "LyType_IsSubtype",
       builder.getFunctionType({builder.getI64Type(), builder.getI64Type()},
                               {builder.getI1Type()}));
 }
@@ -93,9 +93,9 @@ mlir::func::FuncOp getOrCreateTracebackPush(mlir::ModuleOp module,
 
 } // namespace
 
-mlir::FailureOr<std::int64_t>
-RuntimeBundleLowerer::handlerClassId(mlir::Operation *op,
-                                     mlir::Type handler) const {
+mlir::FailureOr<std::string>
+RuntimeBundleLowerer::handlerClass(mlir::Operation *op,
+                                   mlir::Type handler) const {
   auto handlerType = mlir::dyn_cast<py::TypeType>(handler);
   if (!handlerType)
     return op->emitError() << "exception handler must be type[T]";
@@ -103,14 +103,13 @@ RuntimeBundleLowerer::handlerClassId(mlir::Operation *op,
       mlir::dyn_cast<py::ContractType>(handlerType.getInstanceType());
   if (!handlerContract)
     return op->emitError() << "exception handler must name a manifest contract";
-  // Manifest exceptions and source exception classes both resolve here (the
-  // latter through their compiler-assigned ids).
-  std::optional<std::int64_t> classId =
-      RuntimeBundleLowerer::runtimeClassIdForContract(handlerContract);
-  if (!classId)
-    return op->emitError() << "runtime manifest has no class id for exception "
+  // Manifest exceptions and source exception classes both resolve here.
+  std::optional<std::string> runtimeClass =
+      RuntimeBundleLowerer::runtimeClassForContract(handlerContract);
+  if (!runtimeClass)
+    return op->emitError() << "runtime manifest has no class for exception "
                            << "handler " << handlerContract.getContractName();
-  return *classId;
+  return *runtimeClass;
 }
 
 mlir::LogicalResult
@@ -351,7 +350,7 @@ RuntimeBundleLowerer::emitSetCurrentCause(mlir::Operation *op,
                               values.front().getType());
   if (values.size() != 3 || !headerType || headerType.getRank() != 1 ||
       !headerType.getElementType().isInteger(64) ||
-      !manifest.classId(cause.contractName()))
+      !manifest.runtimeClass(cause.contractName()))
     return op->emitError()
            << "raise ... from cause must be a runtime exception instance, got "
            << cause.contractName();
@@ -522,9 +521,9 @@ RuntimeBundleLowerer::lowerExceptMatch(py::ExceptMatchOp op) {
     return op.emitError() << "except.match exception has no lowered runtime "
                              "bundle";
 
-  mlir::FailureOr<std::int64_t> handlerClassIdValue =
-      handlerClassId(op.getOperation(), op.getHandler());
-  if (mlir::failed(handlerClassIdValue))
+  mlir::FailureOr<std::string> handler =
+      handlerClass(op.getOperation(), op.getHandler());
+  if (mlir::failed(handler))
     return mlir::failure();
 
   llvm::ArrayRef<mlir::Value> values = exception->physicalValues();
@@ -540,18 +539,17 @@ RuntimeBundleLowerer::lowerExceptMatch(py::ExceptMatchOp op) {
   builder.setInsertionPoint(op);
   mlir::Value classSlot =
       mlir::arith::ConstantIndexOp::create(builder, op.getLoc(), 2).getResult();
-  mlir::Value exceptionClassId =
+  mlir::Value exceptionClass =
       mlir::memref::LoadOp::create(builder, op.getLoc(), values.front(),
                                    mlir::ValueRange{classSlot})
           .getResult();
-  mlir::Value handlerId = mlir::arith::ConstantIntOp::create(
-                              builder, op.getLoc(), *handlerClassIdValue, 64)
-                              .getResult();
-  mlir::func::FuncOp classIdMatches =
-      getOrCreateClassIdMatches(module, builder);
+  mlir::Value handlerId =
+      type_objects::classWord(builder, op.getLoc(), module, *handler);
+  mlir::func::FuncOp isSubtype =
+      getOrCreateIsSubtype(module, builder);
   auto call =
-      mlir::func::CallOp::create(builder, op.getLoc(), classIdMatches,
-                                 mlir::ValueRange{exceptionClassId, handlerId});
+      mlir::func::CallOp::create(builder, op.getLoc(), isSubtype,
+                                 mlir::ValueRange{exceptionClass, handlerId});
   op.getResult().replaceAllUsesWith(call.getResult(0));
   erase.push_back(op);
   return mlir::success();
@@ -559,15 +557,14 @@ RuntimeBundleLowerer::lowerExceptMatch(py::ExceptMatchOp op) {
 
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerExceptCurrentMatch(py::ExceptCurrentMatchOp op) {
-  mlir::FailureOr<std::int64_t> handlerId =
-      handlerClassId(op.getOperation(), op.getHandler());
+  mlir::FailureOr<std::string> handlerId =
+      handlerClass(op.getOperation(), op.getHandler());
   if (mlir::failed(handlerId))
     return mlir::failure();
 
   builder.setInsertionPoint(op);
   mlir::Value handler =
-      mlir::arith::ConstantIntOp::create(builder, op.getLoc(), *handlerId, 64)
-          .getResult();
+      type_objects::classWord(builder, op.getLoc(), module, *handlerId);
   mlir::func::FuncOp currentMatches =
       getOrCreateCurrentExceptionMatches(module, builder);
   auto call = mlir::func::CallOp::create(builder, op.getLoc(), currentMatches,
@@ -617,8 +614,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStarBegin(py::StarBeginOp op) {
 
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerExceptStarMatch(py::ExceptStarMatchOp op) {
-  mlir::FailureOr<std::int64_t> handlerId =
-      handlerClassId(op.getOperation(), op.getHandler());
+  mlir::FailureOr<std::string> handlerId =
+      handlerClass(op.getOperation(), op.getHandler());
   if (mlir::failed(handlerId))
     return mlir::failure();
   std::optional<RuntimeSymbol> split =
@@ -662,8 +659,7 @@ RuntimeBundleLowerer::lowerExceptStarMatch(py::ExceptStarMatchOp op) {
     mlir::func::CallOp parts = mlir::func::CallOp::create(
         builder, loc, residualParts, mlir::ValueRange{op.getFrame()});
     mlir::Value handler =
-        mlir::arith::ConstantIntOp::create(builder, loc, *handlerId, 64)
-            .getResult();
+        type_objects::classWord(builder, loc, module, *handlerId);
     mlir::func::CallOp splitCall = RuntimeBundleLowerer::createRuntimeCall(
         loc, *split,
         {parts.getResult(0), parts.getResult(1), parts.getResult(2), handler});
@@ -841,8 +837,8 @@ RuntimeBundleLowerer::lowerStarFinish(py::StarFinishOp op) {
 
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerExceptCurrentValue(py::ExceptCurrentValueOp op) {
-  mlir::FailureOr<std::int64_t> handlerId =
-      handlerClassId(op.getOperation(), op.getHandler());
+  mlir::FailureOr<std::string> handlerId =
+      handlerClass(op.getOperation(), op.getHandler());
   if (mlir::failed(handlerId))
     return mlir::failure();
 

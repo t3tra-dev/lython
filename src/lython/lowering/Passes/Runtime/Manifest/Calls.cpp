@@ -1,4 +1,4 @@
-#include "ClassIds.h"
+#include "Common/TypeObjects.h"
 #include "Runtime/Core/Lowerer.h"
 
 #include "PyProtocols.h"
@@ -71,7 +71,7 @@ mlir::FailureOr<RuntimeSymbol> RuntimeBundleLowerer::selectManifestMethod(
   if (methods.empty()) {
     // User exception receivers share their builtin ancestor's methods
     // (__init__/__str__/...): same physical shape, subclass-specific
-    // identity only in the header's class id.
+    // identity only in the header's class word.
     if (std::optional<std::string> ancestor =
             RuntimeBundleLowerer::exceptionAncestorContractFor(
                 runtimeContractType(context, receiverContract)))
@@ -434,7 +434,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNew(py::NewOp op) {
     if (py::ClassOp classOp = RuntimeBundleLowerer::classForContract(
             op.getInstance().getType())) {
       // User exception classes construct through the builtin exception
-      // ancestor's initializer; the class-id argument channel stamps the
+      // ancestor's initializer; the class-word argument channel stamps the
       // source class's own id into the header.
       if (std::optional<std::string> ancestor =
               RuntimeBundleLowerer::exceptionAncestorContract(classOp))
@@ -870,7 +870,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
     for (auto [memberIndex, member] : llvm::enumerate(groupMembers)) {
       bool exceptionShaped =
           member.values.size() == 3 &&
-          (manifest.classId(runtimeContractName(member.contract)) ||
+          (manifest.runtimeClass(runtimeContractName(member.contract)) ||
            RuntimeBundleLowerer::exceptionAncestorContractFor(member.contract));
       if (!exceptionShaped || !derivesFrom(member.contract, requiredBase))
         return op.emitError()
@@ -966,10 +966,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
                << "runtime manifest has no BaseException ext_set primitive";
       mlir::Value classSlot =
           mlir::arith::ConstantIntOp::create(builder, loc, 2, 64).getResult();
-      mlir::Value exceptionGroupId =
-          mlir::arith::ConstantIntOp::create(
-              builder, loc, py::class_ids::of("builtins.ExceptionGroup"), 64)
-              .getResult();
+      mlir::Value exceptionGroupId = type_objects::classWord(
+          builder, loc, module, "builtins.ExceptionGroup");
       llvm::ArrayRef<mlir::Type> extInputs =
           extSet->function.getFunctionType().getInputs();
       if (extInputs.size() != 3)

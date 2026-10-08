@@ -23,7 +23,7 @@
 namespace py::lowering::container_abi {
 
 inline constexpr std::int64_t kRefcountWord = 0;
-inline constexpr std::int64_t kClassIdWord = 1;
+inline constexpr std::int64_t kClassWord = 1;
 inline constexpr std::int64_t kLengthWord = 2;
 inline constexpr std::int64_t kCapacityWord = 3;
 // Primary array: `items` for a sequence, `keys` for a mapping.

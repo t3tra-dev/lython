@@ -273,10 +273,15 @@ int main(int argc, char **argv) {
       return;
     function.setLinkage(mlir::LLVM::Linkage::Internal);
   });
+  // ⛔ Not a `linkonce_odr` definition: that is one every module carries
+  // identically on purpose -- a type object, the None object -- and its
+  // ADDRESS is the identity the program compares. The link keeps one;
+  // internalizing would make this module's classes and None other ones.
   module.walk([&](mlir::LLVM::GlobalOp global) {
     bool isDefinition =
         global.getValueOrNull() || !global.getInitializerRegion().empty();
-    if (!isDefinition || exportedNames.contains(global.getSymName()))
+    if (!isDefinition || exportedNames.contains(global.getSymName()) ||
+        global.getLinkage() == mlir::LLVM::Linkage::LinkonceODR)
       return;
     global.setLinkage(mlir::LLVM::Linkage::Internal);
   });

@@ -100,9 +100,9 @@ verifyRuntimeRequiredClass(py::ClassOp classOp,
                         << " has no ABI shape";
     verified.fail();
   }
-  if (!manifest.classId(contractName)) {
+  if (!manifest.runtimeClass(contractName)) {
     classOp.emitError() << "runtime-required contract " << contractName
-                        << " has no runtime class id";
+                        << " has no runtime class word";
     verified.fail();
   }
 

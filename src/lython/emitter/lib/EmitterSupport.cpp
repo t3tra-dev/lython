@@ -413,7 +413,7 @@ std::optional<mlir::Type> isinstanceTargetType(const parser::Node *node,
       if (auto contract = mlir::dyn_cast<py::ContractType>(annotated))
         if (annotated != types.object()) {
           // ⛔ A BARE CONTAINER SPELLING IS THE CONTAINER OF `object`. The
-          // class id compares the same either way, but the NARROWED value has
+          // class word compares the same either way, but the NARROWED value has
           // to be a type with methods on it: an argument-less
           // `!py.contract<"builtins.list">` answered "does not provide
           // '__len__'" on the arm that had just proved it was a list. What the
@@ -649,7 +649,7 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
   };
 
   // ⛔ A host class is answered here and nowhere below: the tests below
-  // compare Lython class ids, and every JavaScript value has one class id,
+  // compare Lython class words, and every JavaScript value has one class word,
   // `_js.JsProxy`'s -- a class test would say yes or no about nothing.
   if (isJsHostType(analysis.targetType, types)) {
     if (isJsHostType(analysis.sourceType, types)) {
@@ -758,7 +758,7 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
 
   if (containsObjectTop(analysis.sourceType, types)) {
     // ⭐ `object` ITSELF IS A CLASS TEST, not dynamic inspection. The value is
-    // a handle and word 1 of every header is the class id, so
+    // a handle and word 1 of every header is the class word, so
     // `isinstance(o, A)` is the SAME load-and-compare a source-class receiver
     // gets -- the target names a statically closed set of ids, and nothing is
     // asked of the value that its header does not already say.
@@ -772,7 +772,7 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
         sourceContract.getContractName() == "builtins.object" &&
         mlir::isa<py::ContractType>(analysis.targetType)) {
       // ⛔ THE SUBCLASSES ARE ENUMERATED HERE AND NOWHERE LOWER. The test is an
-      // exact class-id compare, so `isinstance(o, Exception)` has to name every
+      // exact class-word compare, so `isinstance(o, Exception)` has to name every
       // class that answers yes -- and the taxonomy that says which those are is
       // `py.class`, which the emitter consumes: no phase after this one has a
       // single one of them left to walk. Leaving it to the lowering answered
@@ -798,7 +798,7 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
       // outside the exception taxonomy, is named from the rule that defines it.
       //
       // Why NOT the exceptions too: the test compares ids through
-      // `LyEH_ClassIdMatches`, which walks that taxonomy at RUNTIME and covers
+      // `LyType_IsSubtype`, which walks that taxonomy at RUNTIME and covers
       // user exception classes as well. Naming them here would be 80 redundant
       // compares in front of a walk that already answers.
       mlir::MLIRContext *context = analysis.targetType.getContext();
@@ -912,7 +912,7 @@ IsInstanceAnalysis analyzeIsInstanceAny(mlir::Type sourceType,
 
   // ⛔ EVERY ELEMENT A CLASS TEST IS ONE MERGED CLASS TEST, which is what a
   // type-erased subject always produces: the tests are independent compares of
-  // the same class-id word, so their OR is the answer. Refusing them together
+  // the same class-word word, so their OR is the answer. Refusing them together
   // meant `isinstance(o, (list, tuple))` had to be written as two `if`s.
   //
   // ⛔ NO NARROWING out of a merged test. The subject is one of several

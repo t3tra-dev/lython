@@ -941,7 +941,7 @@
 #
 # ⛔ The table's generator must REPLACE the manifest's external declaration of
 # the symbol rather than treat it as "already generated": builtins.mlir declares
-# __ly_source_class_name because it calls it, so the naive "if the symbol exists,
+# LyType_Name because it calls it, so the naive "if the symbol exists,
 # return" left nothing defined and the JIT said "Symbols not found".
 #
 # ⛔ A manifest EXCEPTION contract keeps the manifest __class_name__ path. Its

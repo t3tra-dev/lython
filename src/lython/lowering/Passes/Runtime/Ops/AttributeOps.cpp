@@ -1253,9 +1253,9 @@ RuntimeBundleLowerer::raiseIfFieldUnset(py::AttrGetOp op,
     return op.emitError() << "runtime manifest has no raise_unset_field";
   mlir::Location loc = op.getLoc();
   builder.setInsertionPoint(op);
-  mlir::FailureOr<mlir::Value> classId =
-      RuntimeBundleLowerer::exactRuntimeClassId(op, object);
-  if (mlir::failed(classId))
+  mlir::FailureOr<mlir::Value> classWord =
+      RuntimeBundleLowerer::exactRuntimeClassWord(op, object);
+  if (mlir::failed(classWord))
     return mlir::failure();
   builder.setInsertionPoint(op);
   auto check =
@@ -1274,7 +1274,7 @@ RuntimeBundleLowerer::raiseIfFieldUnset(py::AttrGetOp op,
     mlir::Value length = mlir::arith::ConstantIntOp::create(
         builder, loc, static_cast<std::int64_t>(bytes.size()), 64);
     RuntimeBundleLowerer::createRuntimeCall(
-        loc, *raiser, mlir::ValueRange{*classId, text, length});
+        loc, *raiser, mlir::ValueRange{*classWord, text, length});
   }
   builder.setInsertionPoint(op);
   return mlir::success();
@@ -2349,7 +2349,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
       // are rebuilt from the entity under that test, and the inactive ones get
       // the immortal dead placeholder every producer of a union gives them.
       // The optional arm above is the specialization whose tag is `entity != 0`
-      // and needs no class id at all.
+      // and needs no class word at all.
       builder.setInsertionPoint(op);
       mlir::Location loc = op.getLoc();
       mlir::Value entityIndex = mlir::arith::AddIOp::create(
@@ -2499,7 +2499,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
 // ⛔ AN EXCEPTION KEEPS ITS EXACT CLASS ONE WORD FURTHER IN. Word 1 is the
 // LAYOUT, and every exception shares BaseException's -- `LyBaseException_New`
 // writes 5 there and the caller's own id into word 2, which is the word
-// `LyEH_ClassIdMatches` is given when a handler dispatches. Reading word 1
+// `LyType_IsSubtype` is given when a handler dispatches. Reading word 1
 // made `isinstance(e, ValueError)` compare 5 against 53 and answer False for
 // an actual ValueError, and `type(e).__name__` answer "BaseException".
 //
@@ -2512,7 +2512,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
 // spelling of it; a third would have been the argument for sharing, so it is
 // shared at the second.
 mlir::FailureOr<mlir::Value>
-RuntimeBundleLowerer::exactRuntimeClassId(mlir::Operation *op,
+RuntimeBundleLowerer::exactRuntimeClassWord(mlir::Operation *op,
                                           const RuntimeBundle &object) {
   mlir::FailureOr<mlir::Value> header =
       RuntimeBundleLowerer::objectPhysicalHeader(op, object.objectValue);
@@ -2527,8 +2527,6 @@ RuntimeBundleLowerer::exactRuntimeClassId(mlir::Operation *op,
         mlir::memref::CastOp::create(builder, loc, dynamicHeaderType, storage)
             .getResult();
 
-  const std::int64_t kExceptionLayout =
-      py::exceptions::findByName("BaseException")->classId;
   const bool inputIsBox =
       runtimeContractName(object.objectValue.contract) == "builtins.object";
   auto contractIsException = [&](mlir::Type contract) {
@@ -2542,14 +2540,14 @@ RuntimeBundleLowerer::exactRuntimeClassId(mlir::Operation *op,
         .has_value();
   };
 
-  mlir::Value classIdSlot = mlir::arith::ConstantIndexOp::create(
+  mlir::Value classSlot = mlir::arith::ConstantIndexOp::create(
       builder, loc,
       !inputIsBox && contractIsException(object.objectValue.contract) ? 2 : 1);
-  mlir::Value classId =
-      mlir::memref::LoadOp::create(builder, loc, storage, classIdSlot)
+  mlir::Value classWord =
+      mlir::memref::LoadOp::create(builder, loc, storage, classSlot)
           .getResult();
   if (!inputIsBox)
-    return classId;
+    return classWord;
 
   mlir::Value entityWord =
       mlir::memref::LoadOp::create(
@@ -2558,20 +2556,20 @@ RuntimeBundleLowerer::exactRuntimeClassId(mlir::Operation *op,
                                                box_abi::kBoxEntityWord)
               .getResult())
           .getResult();
-  return RuntimeBundleLowerer::exactClassIdFromWords(op, classId, entityWord);
+  return RuntimeBundleLowerer::exactClassWordFromWords(op, classWord, entityWord);
 }
 
 // The same question asked of a box's two WORDS rather than of a bundle: a
 // container element is addressed by an interior view, not by a value.
-mlir::Value RuntimeBundleLowerer::exactClassIdFromWords(mlir::Operation *op,
+mlir::Value RuntimeBundleLowerer::exactClassWordFromWords(mlir::Operation *op,
                                                         mlir::Value classWord,
                                                         mlir::Value entityWord) {
-  const std::int64_t kExceptionLayout =
-      py::exceptions::findByName("BaseException")->classId;
   mlir::Location loc = op->getLoc();
+  // A box of an exception names the layout, BaseException; the exact class
+  // is the exception's own word 2.
   mlir::Value isException = mlir::arith::CmpIOp::create(
       builder, loc, mlir::arith::CmpIPredicate::eq, classWord,
-      mlir::arith::ConstantIntOp::create(builder, loc, kExceptionLayout, 64));
+      type_objects::classWord(builder, loc, module, "builtins.BaseException"));
   auto exact = mlir::scf::IfOp::create(
       builder, loc, isException,
       [&](mlir::OpBuilder &nested, mlir::Location nestedLoc) {
@@ -2600,7 +2598,7 @@ mlir::Value RuntimeBundleLowerer::exactClassIdFromWords(mlir::Operation *op,
 
 // ⭐ A UNION OUT OF A BOX. Its physical form is a TAG plus every member's lanes
 // side by side, so building one from an erased element is: find which member
-// the box's class id names, and give that member its lanes while the others
+// the box's class word names, and give that member its lanes while the others
 // take the dead values an inactive member always carries.
 //
 // ⛔ EACH MEMBER'S LANES ARE GUARDED. `lanesFromBoxEntity` asks the contract's
@@ -2654,22 +2652,41 @@ RuntimeBundleLowerer::retainUnionMemberValues(
   return retained;
 }
 
+// Whether an object of class `actual` is a `target` for a class test.
+//
+// ⛔ Not the MRO for every target, only an exception's. The targets a test
+// names already include every program class deriving from it, so for those
+// the MRO adds nothing; what it would add is bool under int -- and a value
+// tested as an int is then read as an int's lanes, which a bool's box does not
+// have. An exception's subclasses are the manifest's eighty-odd classes,
+// which no `py.class` lists; for those the type object's MRO decides.
+mlir::Value RuntimeBundleLowerer::classTestMatches(mlir::Location loc,
+                                                   mlir::Value actual,
+                                                   llvm::StringRef target) {
+  mlir::Value expected = type_objects::classWord(builder, loc, module, target);
+  if (!py::exceptions::findByContract(target))
+    return mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::eq, actual, expected);
+  mlir::func::FuncOp isSubtype = getOrCreatePrivateFunction(
+      module, builder, "LyType_IsSubtype",
+      builder.getFunctionType({builder.getI64Type(), builder.getI64Type()},
+                              {builder.getI1Type()}));
+  return mlir::func::CallOp::create(builder, loc, isSubtype,
+                                    mlir::ValueRange{actual, expected})
+      .getResult(0);
+}
+
 mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::unionTagFromBoxWords(
     mlir::Operation *op, py::UnionType unionType, mlir::Value classWord,
     mlir::Value entityWord, llvm::SmallVectorImpl<mlir::Value> *matchesOut) {
   mlir::Location loc = op->getLoc();
   mlir::Value exact =
-      RuntimeBundleLowerer::exactClassIdFromWords(op, classWord, entityWord);
+      RuntimeBundleLowerer::exactClassWordFromWords(op, classWord, entityWord);
   llvm::SmallVector<mlir::Value, 4> matches;
-  mlir::func::FuncOp classIdMatches = getOrCreatePrivateFunction(
-      module, builder, "LyEH_ClassIdMatches",
-      builder.getFunctionType({builder.getI64Type(), builder.getI64Type()},
-                              {builder.getI1Type()}));
   // ⭐ THE LANE-LESS MEMBER IS THE DEFAULT TAG, NOT A MATCH. `None` has no
-  // physical lanes and no manifest class id, so asking
-  // `runtimeClassIdsForNominalTarget` about it is an error ("no class schema:
-  // types.NoneType") and there is no id to compare against anyway. It is also
-  // the only member a box can hold that no other member's id claims, so the
+  // physical lanes, so asking `runtimeClassesForNominalTarget` about it is an
+  // error ("no class schema: types.NoneType"). It is also the only member a
+  // box can hold that no other member's class claims, so the
   // tag starts there and every identified member overwrites it. Leaving the
   // tag at 0 instead decoded a `None` element of a `list[int | None]` as an
   // int -- the same wrong-default the dead materializer records.
@@ -2690,19 +2707,13 @@ mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::unionTagFromBoxWords(
     mlir::Value matched =
         mlir::arith::ConstantIntOp::create(builder, loc, 0, 1).getResult();
     if (static_cast<std::int64_t>(index) != laneLessTag.value_or(-1)) {
-      mlir::FailureOr<llvm::SmallVector<std::int64_t, 8>> ids =
-          RuntimeBundleLowerer::runtimeClassIdsForNominalTarget(op, member);
-      if (mlir::failed(ids))
+      mlir::FailureOr<llvm::SmallVector<std::string, 8>> classes =
+          RuntimeBundleLowerer::runtimeClassesForNominalTarget(op, member);
+      if (mlir::failed(classes))
         return mlir::failure();
-      for (std::int64_t id : *ids) {
+      for (const std::string &runtimeClass : *classes) {
         mlir::Value one =
-            mlir::func::CallOp::create(
-                builder, loc, classIdMatches,
-                mlir::ValueRange{
-                    exact, mlir::arith::ConstantIntOp::create(builder, loc, id,
-                                                              64)
-                               .getResult()})
-                .getResult(0);
+            RuntimeBundleLowerer::classTestMatches(loc, exact, runtimeClass);
         matched = mlir::arith::OrIOp::create(builder, loc, matched, one);
       }
     }
@@ -2888,9 +2899,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerClassTest(py::ClassTestOp op) {
   if (!object || object->kind != RuntimeBundle::Kind::Object)
     return op.emitError() << "class.test input has no lowered object bundle";
 
-  mlir::FailureOr<llvm::SmallVector<std::int64_t, 8>> targetIds =
-      RuntimeBundleLowerer::runtimeClassIdsForNominalTarget(op, op.getTarget());
-  if (mlir::failed(targetIds))
+  mlir::FailureOr<llvm::SmallVector<std::string, 8>> targets =
+      RuntimeBundleLowerer::runtimeClassesForNominalTarget(op, op.getTarget());
+  if (mlir::failed(targets))
     return mlir::failure();
 
   mlir::FailureOr<mlir::Value> header =
@@ -2906,29 +2917,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerClassTest(py::ClassTestOp op) {
   builder.setInsertionPoint(op);
   mlir::Location loc = op.getLoc();
   mlir::FailureOr<mlir::Value> actual =
-      RuntimeBundleLowerer::exactRuntimeClassId(op, *object);
+      RuntimeBundleLowerer::exactRuntimeClassWord(op, *object);
   if (mlir::failed(actual))
     return mlir::failure();
-  mlir::Value actualClassId = *actual;
+  mlir::Value actualClassWord = *actual;
 
-  // ⭐ `LyEH_ClassIdMatches` AND NOT AN EQUALITY, because the taxonomy is what
-  // decides for the one family whose subclasses this lowering cannot see: the
-  // manifest declares 80-odd exception contracts and none of them reaches here
-  // as a `py.class`. It walks the chain, so `isinstance(e, Exception)` answers
-  // for every one of them -- and for a non-exception id the walk terminates
-  // immediately, which is exactly the equality the compare used to be.
-  mlir::func::FuncOp classIdMatches = getOrCreatePrivateFunction(
-      module, builder, "LyEH_ClassIdMatches",
-      builder.getFunctionType({builder.getI64Type(), builder.getI64Type()},
-                              {builder.getI1Type()}));
   mlir::Value result = mlir::arith::ConstantIntOp::create(builder, loc, 0, 1);
-  for (std::int64_t targetId : *targetIds) {
-    mlir::Value expected =
-        mlir::arith::ConstantIntOp::create(builder, loc, targetId, 64);
+  for (const std::string &target : *targets) {
     mlir::Value match =
-        mlir::func::CallOp::create(builder, loc, classIdMatches,
-                                   mlir::ValueRange{actualClassId, expected})
-            .getResult(0);
+        RuntimeBundleLowerer::classTestMatches(loc, actualClassWord, target);
     result = mlir::arith::OrIOp::create(builder, loc, result, match);
   }
 

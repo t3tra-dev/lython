@@ -7,7 +7,7 @@
 //
 // A value whose static type is `object` or a union lives in a box: the class
 // id and the payload's handle words, laid out once here (`__ly_box_*`). The
-// box's methods dispatch on the class id through hooks the lowering generates
+// box's methods dispatch on the class word through hooks the lowering generates
 // per program (`__ly_*_boxed_by_contract`, Runtime/ABI/RuntimeABI.cpp), as
 // PyObject_Repr / PyObject_RichCompare / PyObject_Hash dispatch through the
 // type's slots; so do the errors those raise when nothing answers ("'<' not
@@ -28,15 +28,15 @@ module attributes {
   func.func private @LyFloat_SlotWordAsF64(%word: i64) -> f64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.primitive = "slot_word_as_f64"}
   func.func private @LyLong_SlotWordAsI64(%word: i64) -> (i64, i1) attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "slot_word_as_i64"}
   func.func private @LyLong_TryAsI64(%header: memref<2xi64> {ly.ownership.object_header}) -> (i64, i1) attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "try_unbox.i64"}
-  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
+  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @__ly_float_immediate_fits(%bits: i64) -> i1
   func.func private @__ly_float_to_immediate(%bits: i64) -> i64
   func.func private @__ly_hash_fixup(%h: i64) -> i64
   func.func private @__ly_int_from_immediate(%word: i64) -> i64
   func.func private @__ly_int_immediate_fits(%value: i64) -> i1
   func.func private @__ly_int_to_immediate(%value: i64) -> i64
-  func.func private @__ly_raise_static_message(%class_id: i64, %message: memref<?xi8>, %length: i64)
-  func.func private @__ly_str_boxed_by_contract(%box: !llvm.ptr, %class_id: i64) -> (memref<2xi64>, memref<?xi8>, i1)
+  func.func private @__ly_raise_static_message(%class_word: i64, %message: memref<?xi8>, %length: i64)
+  func.func private @__ly_str_boxed_by_contract(%box: !llvm.ptr, %class_word: i64) -> (memref<2xi64>, memref<?xi8>, i1)
   func.func private @release_payload_slot_ptr(%slot: !llvm.ptr)
   py.class @object attributes {
     ly.typing.abstract,
@@ -75,7 +75,7 @@ module attributes {
 
   func.func private @LyObject_Shape() -> memref<5xi64> attributes {ly.runtime.contract = "builtins.object", ly.runtime.shape}
 
-  func.func @LyObject_Init(%header: memref<5xi64> {ly.ownership.object_header}) attributes {ly.runtime.class_id, ly.runtime.contract = "builtins.object", ly.runtime.method = "__init__"} {
+  func.func @LyObject_Init(%header: memref<5xi64> {ly.ownership.object_header}) attributes {ly.runtime.class, ly.runtime.contract = "builtins.object", ly.runtime.method = "__init__"} {
     func.return
   }
 
@@ -107,9 +107,9 @@ module attributes {
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
     %zero = arith.constant 0 : i64
-    %class_id = memref.load %box[%c1] : memref<5xi64>
+    %class_word = memref.load %box[%c1] : memref<5xi64>
     %entity = memref.load %box[%c2] : memref<5xi64>
-    %class_zero = arith.cmpi eq, %class_id, %zero : i64
+    %class_zero = func.call @__ly_class_is_none(%class_word) : (i64) -> i1
     cf.cond_br %class_zero, ^zero_class, ^try_hook
 
   ^zero_class:
@@ -129,11 +129,11 @@ module attributes {
     %box_base_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
     // The box's word 2 reads as a slot (BoxLayout.h).
     %box_ptr = llvm.getelementptr %box_base_ptr[2] : (!llvm.ptr) -> !llvm.ptr, i64
-    %hooked:3 = func.call @__ly_repr_boxed_by_contract(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
+    %hooked:3 = func.call @__ly_repr_boxed_by_contract(%box_ptr, %class_word) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
     cf.cond_br %hooked#2, ^done(%hooked#0, %hooked#1 : memref<2xi64>, memref<?xi8>), ^default
 
   ^default:
-    // ⭐ The BOX carries the class id in the same word an instance header does,
+    // ⭐ The BOX carries the class word in the same word an instance header does,
     // so the erased path names the real class too. It used to pass the static
     // "<object object at 0x" prefix, which is why an instance handed to an
     // `object` parameter printed <object object ...> where CPython prints its
@@ -154,8 +154,8 @@ module attributes {
   // for the hook result on the path that does not use it. The hook's miss
   // returns ub.poison, so that release freed garbage and the program aborted in
   // malloc. Every hand-written helper that returns an OWNED result needs one.
-  func.func private @__ly_repr_boxed_or_default(%box_ptr: !llvm.ptr, %class_id: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "repr_boxed_or_default", ly.runtime.result_contract = "builtins.str"} {
-    %h, %b, %ok = func.call @__ly_repr_boxed_by_contract(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
+  func.func private @__ly_repr_boxed_or_default(%box_ptr: !llvm.ptr, %class_word: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "repr_boxed_or_default", ly.runtime.result_contract = "builtins.str"} {
+    %h, %b, %ok = func.call @__ly_repr_boxed_by_contract(%box_ptr, %class_word) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
     cf.cond_br %ok, ^hooked, ^fallback
 
   ^hooked:
@@ -163,7 +163,7 @@ module attributes {
 
   ^fallback:
     %addr = llvm.ptrtoint %box_ptr : !llvm.ptr to i64
-    %dh, %db = func.call @__ly_default_repr_dynamic_from_addr(%addr, %class_id) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    %dh, %db = func.call @__ly_default_repr_dynamic_from_addr(%addr, %class_word) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
     func.return %dh, %db : memref<2xi64>, memref<?xi8>
   }
 
@@ -174,8 +174,8 @@ module attributes {
   func.func @LyObject_BoxedStr(%box: memref<5xi64>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.method = "__str__", ly.runtime.result_contract = "builtins.str"} {
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64
-    %class_id = memref.load %box[%c1] : memref<5xi64>
-    %class_zero = arith.cmpi eq, %class_id, %zero : i64
+    %class_word = memref.load %box[%c1] : memref<5xi64>
+    %class_zero = func.call @__ly_class_is_none(%class_word) : (i64) -> i1
     cf.cond_br %class_zero, ^fallback, ^try_hook
 
   ^try_hook:
@@ -184,7 +184,7 @@ module attributes {
     %box_base_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
     // The box's word 2 reads as a slot (BoxLayout.h).
     %box_ptr = llvm.getelementptr %box_base_ptr[2] : (!llvm.ptr) -> !llvm.ptr, i64
-    %hooked:3 = func.call @__ly_str_boxed_by_contract(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
+    %hooked:3 = func.call @__ly_str_boxed_by_contract(%box_ptr, %class_word) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
     cf.cond_br %hooked#2, ^done(%hooked#0, %hooked#1 : memref<2xi64>, memref<?xi8>), ^fallback
 
   ^fallback:
@@ -200,16 +200,16 @@ module attributes {
   // (__ly_box_equal / __ly_box_hash) rather than open-coding an address
   // compare, so `a == b` and "a and b land in the same dict slot" cannot
   // disagree -- and a subclass that does define __eq__/__hash__ is still
-  // reached, because those dispatchers consult the per-class-id hook before
+  // reached, because those dispatchers consult the per-class-word hook before
   // falling back to identity (CPython's object.__eq__ / object.__hash__).
-  // None inside an erased box: class 0 and the None object's word.
+  // None inside an erased box: NoneType's class and the None object's word.
   func.func @LyObject_IsNone(%box: memref<5xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.method = "__ly_is_none__"} {
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
     %zero = arith.constant 0 : i64
-    %class_id = memref.load %box[%c1] : memref<5xi64>
+    %class_word = memref.load %box[%c1] : memref<5xi64>
     %entity = memref.load %box[%c2] : memref<5xi64>
-    %no_class = arith.cmpi eq, %class_id, %zero : i64
+    %no_class = func.call @__ly_class_is_none(%class_word) : (i64) -> i1
     %no_entity = func.call @__ly_word_is_none(%entity) : (i64) -> i1
     %is_none = arith.andi %no_class, %no_entity : i1
     func.return %is_none : i1
@@ -458,22 +458,22 @@ module attributes {
   // Per-program class-name table (synthesized by the lowering, one entry per
   // class the program declares, keyed by the id its instances carry in header
   // word 1). Null for an id the program does not know.
-  func.func private @__ly_source_class_name(%class_id: i64) -> !llvm.ptr
+  func.func private @LyType_Name(%class_word: i64) -> !llvm.ptr
 
   // ⭐ `type(v).__name__` FOR A VALUE WHOSE STATIC CLASS IS NOT ITS OWN. The
-  // header's word 1 is the class id -- the word `isinstance` reads -- so the
+  // header's word 1 is the class word -- the word `isinstance` reads -- so the
   // dynamic name is a table lookup, and the only thing that has to happen here
   // is turning a NUL-terminated pointer into a str.
   //
   // ⛔ A null pointer is not an error: it is an id this program never declared
   // (a manifest object reaching here), and "object" is what CPython would print
   // for it.
-  func.func @LyObject_ClassNameFromId(%class_id: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "class_name_from_id", ly.runtime.result_contract = "builtins.str"} {
+  func.func @LyObject_ClassNameFromId(%class_word: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "class_name_from_id", ly.runtime.result_contract = "builtins.str"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %zero_i8 = arith.constant 0 : i8
     %cap = arith.constant 64 : index
-    %name_ptr = func.call @__ly_source_class_name(%class_id) : (i64) -> !llvm.ptr
+    %name_ptr = func.call @LyType_Name(%class_word) : (i64) -> !llvm.ptr
     %null = llvm.mlir.zero : !llvm.ptr
     %is_null = llvm.icmp "eq" %name_ptr, %null : !llvm.ptr
     cf.cond_br %is_null, ^unknown, ^known
@@ -538,21 +538,21 @@ module attributes {
     %c1_slot = arith.constant 1 : index
     %ptr_index_outer = memref.extract_aligned_pointer_as_index %header : memref<2xi64, strided<[1], offset: ?>> -> index
     %ptr_outer = arith.index_cast %ptr_index_outer : index to i64
-    %class_id_outer = memref.load %header[%c1_slot] : memref<2xi64, strided<[1], offset: ?>>
-    %h_outer, %b_outer = func.call @__ly_default_repr_dynamic_from_addr(%ptr_outer, %class_id_outer) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    %class_word_outer = memref.load %header[%c1_slot] : memref<2xi64, strided<[1], offset: ?>>
+    %h_outer, %b_outer = func.call @__ly_default_repr_dynamic_from_addr(%ptr_outer, %class_word_outer) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
     func.return %h_outer, %b_outer : memref<2xi64>, memref<?xi8>
   }
 
   // The address-keyed core, callable from paths that hold only a raw box
   // pointer (a container rendering its elements).
-  func.func private @__ly_default_repr_dynamic_from_addr(%ptr: i64, %class_id: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "default_repr_dynamic_addr", ly.runtime.result_contract = "builtins.str"} {
+  func.func private @__ly_default_repr_dynamic_from_addr(%ptr: i64, %class_word: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "default_repr_dynamic_addr", ly.runtime.result_contract = "builtins.str"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c6 = arith.constant 6 : index
     %c13 = arith.constant 13 : index
     %c64 = arith.constant 64 : index
     %zero_i8 = arith.constant 0 : i8
-    %name_ptr = func.call @__ly_source_class_name(%class_id) : (i64) -> !llvm.ptr
+    %name_ptr = func.call @LyType_Name(%class_word) : (i64) -> !llvm.ptr
     %buffer = memref.alloca() : memref<128xi8>
     %null = llvm.mlir.zero : !llvm.ptr
     %is_null = llvm.icmp "eq" %name_ptr, %null : !llvm.ptr
@@ -637,15 +637,15 @@ module attributes {
   }
 
   // The class a slot word names: int or float for an immediate by its tag,
-  // and otherwise the class id every object keeps in its header's word 1 --
+  // and otherwise the class word every object keeps in its header's word 1 --
   // 0 for the None object. A 0 word (nothing stored) answers 0 as well,
   // without a load.
   func.func private @__ly_slot_class(%word: i64) -> i64 {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %three = arith.constant 3 : i64
-    %int_class = arith.constant {ly.class_id_of = "builtins.int"} 1 : i64
-    %float_class = arith.constant {ly.class_id_of = "builtins.float"} 2 : i64
+    %int_class = arith.constant {ly.class_of = "builtins.int"} 1 : i64
+    %float_class = arith.constant {ly.class_of = "builtins.float"} 2 : i64
     %tag = arith.andi %word, %three : i64
     %is_object = arith.cmpi eq, %tag, %zero : i64
     %is_null = arith.cmpi eq, %word, %zero : i64
@@ -679,9 +679,9 @@ module attributes {
   // are two objects -- `nan in [nan * 1.0]` is False in CPython.
   func.func @LyObject_IdentityKey(%word: i64) -> i64 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "identity_key"} {
     %zero = arith.constant 0 : i64
-    %one = arith.constant {ly.class_id_of = "builtins.int"} 1 : i64
+    %one = arith.constant {ly.class_of = "builtins.int"} 1 : i64
     %two = arith.constant 2 : i64
-    %float_class = arith.constant {ly.class_id_of = "builtins.float"} 2 : i64
+    %float_class = arith.constant {ly.class_of = "builtins.float"} 2 : i64
     %three = arith.constant 3 : i64
     %immediate = func.call @__ly_slot_word_is_immediate(%word) : (i64) -> i1
     // None is one identity whichever word holds it.
@@ -748,14 +748,16 @@ module attributes {
   // 32-bit target the view kept the low half, zero-extended; an immediate
   // there is a sign-extended 32-bit word, so the sign is put back.
   // ⭐ None IS ONE IMMORTAL OBJECT, as CPython's is. A slot or a box holds
-  // its address; 0 is left to mean "nothing stored". Its class word is 0,
-  // the number every None test reads (ClassIds.h), and its refcount is the
-  // immortal marker, so retain and release pass it by.
+  // its address; 0 is left to mean "nothing stored". Its class word is
+  // NoneType's type object, and its refcount is the immortal marker, so
+  // retain and release pass it by. `ly.static.shared`: every runtime module
+  // that carries it carries the same one, or `is None` would depend on which
+  // module made the None.
   //
   // ⛔ Writable, like the bool singletons: a generic retain reads the
   // refcount before deciding, and read-only data is not where an object
   // header lives.
-  memref.global "private" @__ly_none_object : memref<5xi64> = dense<[9223372036854775807, 0, 0, 0, 0]>
+  memref.global "private" @__ly_none_object : memref<5xi64> = dense<[9223372036854775807, 0, 0, 0, 0]> {ly.class_of = "types.NoneType", ly.static.shared}
 
   // The slot word None is written as.
   func.func @__ly_none_word() -> i64 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "none_word"} {
@@ -774,6 +776,17 @@ module attributes {
     func.return %is_none : i1
   }
 
+  // Whether a class word is None's: NoneType's type object. A 0 -- the class
+  // of a box nothing was stored in -- reads as None too, as it always has.
+  func.func private @__ly_class_is_none(%class: i64) -> i1 {
+    %zero = arith.constant 0 : i64
+    %none_class = arith.constant {ly.class_of = "types.NoneType"} 0 : i64
+    %is_zero = arith.cmpi eq, %class, %zero : i64
+    %is_none = arith.cmpi eq, %class, %none_class : i64
+    %either = arith.ori %is_zero, %is_none : i1
+    func.return %either : i1
+  }
+
   func.func private @__ly_slot_word_from_view_address(%address: i64) -> i64 {
     %wide = func.call @__ly_addresses_are_word_wide() : () -> i1
     %thirty_two = arith.constant 32 : i64
@@ -790,10 +803,10 @@ module attributes {
   }
 
   // Uniform per-element hash/eq dispatch, generated per program by the
-  // lowering (class id -> the manifest __hash__ / __eq__); resolved at link.
-  func.func private @__ly_hash_boxed_by_contract(%box: !llvm.ptr, %class_id: i64) -> (i64, i1)
+  // lowering (class word -> the manifest __hash__ / __eq__); resolved at link.
+  func.func private @__ly_hash_boxed_by_contract(%box: !llvm.ptr, %class_word: i64) -> (i64, i1)
   func.func private @__ly_tuple_hash_as(%self: memref<5xi64>, %role: i64, %key_class: i64) -> i64
-  func.func private @__ly_eq_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_id: i64, %rhs_class_id: i64) -> (i1, i1)
+  func.func private @__ly_eq_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_word: i64, %rhs_class_word: i64) -> (i1, i1)
 
   // PyObject_Hash's refusal, and what dict and set make of it in 3.14
   // (dictobject.c's dict_unhashable_type, setobject.c's set_unhashable_type):
@@ -806,7 +819,7 @@ module attributes {
   memref.global "private" constant @__ly_hash_msg_as_set_element : memref<20xi8> = dense<[39, 32, 97, 115, 32, 97, 32, 115, 101, 116, 32, 101, 108, 101, 109, 101, 110, 116, 32, 40]>
   memref.global "private" constant @__ly_hash_msg_unhashable : memref<18xi8> = dense<[117, 110, 104, 97, 115, 104, 97, 98, 108, 101, 32, 116, 121, 112, 101, 58, 32, 39]>
 
-  func.func private @__ly_hash_raise_unhashable(%class_id: i64, %role: i64, %key_class: i64) {
+  func.func private @__ly_hash_raise_unhashable(%class_word: i64, %role: i64, %key_class: i64) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c0_i64 = arith.constant 0 : i64
@@ -844,7 +857,7 @@ module attributes {
     %uh = memref.cast %uh_static : memref<18xi8> to memref<?xi8>
     %uh_len = arith.constant 18 : index
     %b1 = func.call @__ly_msg_append(%buffer, %opened, %uh, %uh_len) : (memref<?xi8>, index, memref<?xi8>, index) -> (index)
-    %b2 = func.call @__ly_msg_append_class_name(%buffer, %b1, %class_id) : (memref<?xi8>, index, i64) -> (index)
+    %b2 = func.call @__ly_msg_append_class_name(%buffer, %b1, %class_word) : (memref<?xi8>, index, i64) -> (index)
     memref.store %quote, %buffer[%b2] : memref<?xi8>
     %b3 = arith.addi %b2, %c1 : index
     %end = scf.if %keyed -> (index) {
@@ -855,13 +868,13 @@ module attributes {
       scf.yield %b3 : index
     }
     %length = arith.index_cast %end : index to i64
-    %type_error = arith.constant {ly.class_id_of = "builtins.TypeError"} 52 : i64
+    %type_error = arith.constant {ly.class_of = "builtins.TypeError"} 52 : i64
     func.call @__ly_raise_static_message(%type_error, %buffer, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
   // Hash of an arbitrary boxed value (16-word payload handle). Dispatches on
-  // the class id: singletons inline, manifest/user `__hash__` through the
+  // the class word: singletons inline, manifest/user `__hash__` through the
   // generated hook, identity hash for classes without `__hash__` (R6), and a
   // TypeError for the builtin mutable containers.
   // ===== the payload box's layout, stated once =====
@@ -889,7 +902,7 @@ module attributes {
     func.return %words : i64
   }
 
-  // A standalone `object` box: refcount, class id, entity, and two words the
+  // A standalone `object` box: refcount, class word, entity, and two words the
   // box does not use (BoxLayout.h, kStandaloneBoxWords). A pointer to its
   // word 2 reads as a slot.
   func.func private @__ly_box_standalone_word_count() -> i64 {
@@ -923,9 +936,9 @@ module attributes {
   // block they described.
   // The box owns its entity exactly when the entity is an address: not 0
   // (None) and not an immediate (bit 0 set). There is no flag to disagree.
-  // ⛔ %class_id is not stored: a slot's class is its entity's
+  // ⛔ %class_word is not stored: a slot's class is its entity's
   // (`__ly_slot_class`). The callers name it so they read as what they store.
-  func.func private @__ly_box_store_entity(%items: memref<?xi64>, %slot: i64, %class_id: i64, %entity: i64) {
+  func.func private @__ly_box_store_entity(%items: memref<?xi64>, %slot: i64, %class_word: i64, %entity: i64) {
     %base_i64 = func.call @__ly_box_slot_base(%slot) : (i64) -> i64
     %entity_word = func.call @__ly_box_entity_word(%base_i64) : (i64) -> i64
     %entity_slot = arith.index_cast %entity_word : i64 to index
@@ -961,33 +974,33 @@ module attributes {
     %c1_i64 = arith.constant 1 : i64
     %c2_i64 = arith.constant 2 : i64
     %slot_word = llvm.load %box : !llvm.ptr -> i64
-    %class_id = func.call @__ly_slot_class(%slot_word) : (i64) -> i64
-    %is_none = arith.cmpi eq, %class_id, %zero : i64
+    %class_word = func.call @__ly_slot_class(%slot_word) : (i64) -> i64
+    %is_none = func.call @__ly_class_is_none(%class_word) : (i64) -> i1
     %result = scf.if %is_none -> (i64) {
       // hash(None): the CPython 3.12+ constant.
       %none_hash = arith.constant 4238894112 : i64
       scf.yield %none_hash : i64
     } else {
-      %c10 = arith.constant {ly.class_id_of = "builtins.list"} 10 : i64
-      %c12 = arith.constant {ly.class_id_of = "builtins.dict"} 12 : i64
-      %c21 = arith.constant {ly.class_id_of = "builtins.set"} 21 : i64
-      %is_list = arith.cmpi eq, %class_id, %c10 : i64
-      %is_dict = arith.cmpi eq, %class_id, %c12 : i64
-      %is_set = arith.cmpi eq, %class_id, %c21 : i64
-      %c26 = arith.constant {ly.class_id_of = "builtins.bytearray"} 26 : i64
-      %is_bytearray = arith.cmpi eq, %class_id, %c26 : i64
+      %c10 = arith.constant {ly.class_of = "builtins.list"} 10 : i64
+      %c12 = arith.constant {ly.class_of = "builtins.dict"} 12 : i64
+      %c21 = arith.constant {ly.class_of = "builtins.set"} 21 : i64
+      %is_list = arith.cmpi eq, %class_word, %c10 : i64
+      %is_dict = arith.cmpi eq, %class_word, %c12 : i64
+      %is_set = arith.cmpi eq, %class_word, %c21 : i64
+      %c26 = arith.constant {ly.class_of = "builtins.bytearray"} 26 : i64
+      %is_bytearray = arith.cmpi eq, %class_word, %c26 : i64
       %mut0 = arith.ori %is_list, %is_dict : i1
       %mut1 = arith.ori %mut0, %is_set : i1
       %unhashable = arith.ori %mut1, %is_bytearray : i1
       scf.if %unhashable {
-        func.call @__ly_hash_raise_unhashable(%class_id, %role, %key_class) : (i64, i64, i64) -> ()
+        func.call @__ly_hash_raise_unhashable(%class_word, %role, %key_class) : (i64, i64, i64) -> ()
       }
       // ⭐ An immediate int hashes from its value, with no object made for
       // the hook to read: CPython's long_hash, v mod (2^61 - 1) with the sign
       // carried over, on a value that fits a word.
       %entity0 = llvm.load %box : !llvm.ptr -> i64
-      %int_class = arith.constant {ly.class_id_of = "builtins.int"} 1 : i64
-      %is_int = arith.cmpi eq, %class_id, %int_class : i64
+      %int_class = arith.constant {ly.class_of = "builtins.int"} 1 : i64
+      %is_int = arith.cmpi eq, %class_word, %int_class : i64
       %is_immediate = func.call @__ly_slot_word_is_immediate(%entity0) : (i64) -> i1
       %int_immediate = arith.andi %is_int, %is_immediate : i1
       %h, %handled = scf.if %int_immediate -> (i64, i1) {
@@ -1002,8 +1015,8 @@ module attributes {
         %true_h = arith.constant true
         scf.yield %signed, %true_h : i64, i1
       } else {
-        %tuple_class = arith.constant {ly.class_id_of = "builtins.tuple"} 11 : i64
-        %is_tuple = arith.cmpi eq, %class_id, %tuple_class : i64
+        %tuple_class = arith.constant {ly.class_of = "builtins.tuple"} 11 : i64
+        %is_tuple = arith.cmpi eq, %class_word, %tuple_class : i64
         %keyed = arith.cmpi ne, %role, %zero : i64
         %keyed_tuple = arith.andi %is_tuple, %keyed : i1
         %th, %td = scf.if %keyed_tuple -> (i64, i1) {
@@ -1014,7 +1027,7 @@ module attributes {
           %true_t = arith.constant true
           scf.yield %tuple_hash, %true_t : i64, i1
         } else {
-          %hh, %hd = func.call @__ly_hash_boxed_by_contract(%box, %class_id) : (!llvm.ptr, i64) -> (i64, i1)
+          %hh, %hd = func.call @__ly_hash_boxed_by_contract(%box, %class_word) : (!llvm.ptr, i64) -> (i64, i1)
           scf.yield %hh, %hd : i64, i1
         }
         scf.yield %th, %td : i64, i1
@@ -1258,8 +1271,8 @@ module attributes {
   // generated hook. Distinct classes outside the tower compare unequal.
   // A bytes (70) and a bytearray (26), in either order.
   func.func private @__ly_box_bytes_like_pair(%lhs_class: i64, %rhs_class: i64) -> i1 {
-    %bytes_class = arith.constant {ly.class_id_of = "builtins.bytes"} 70 : i64
-    %bytearray_class = arith.constant {ly.class_id_of = "builtins.bytearray"} 26 : i64
+    %bytes_class = arith.constant {ly.class_of = "builtins.bytes"} 70 : i64
+    %bytearray_class = arith.constant {ly.class_of = "builtins.bytearray"} 26 : i64
     %lhs_bytes = arith.cmpi eq, %lhs_class, %bytes_class : i64
     %lhs_bytearray = arith.cmpi eq, %lhs_class, %bytearray_class : i64
     %rhs_bytes = arith.cmpi eq, %rhs_class, %bytes_class : i64
@@ -1298,16 +1311,16 @@ module attributes {
     %result = scf.if %identical -> (i1) {
       scf.yield %true : i1
     } else {
-      %lhs_none = arith.cmpi eq, %lhs_class, %zero : i64
-      %rhs_none = arith.cmpi eq, %rhs_class, %zero : i64
+      %lhs_none = func.call @__ly_class_is_none(%lhs_class) : (i64) -> i1
+      %rhs_none = func.call @__ly_class_is_none(%rhs_class) : (i64) -> i1
       %either_none = arith.ori %lhs_none, %rhs_none : i1
       %outer = scf.if %either_none -> (i1) {
         %both_none = arith.andi %lhs_none, %rhs_none : i1
         scf.yield %both_none : i1
       } else {
-        %int_class = arith.constant {ly.class_id_of = "builtins.int"} 1 : i64
-        %float_class = arith.constant {ly.class_id_of = "builtins.float"} 2 : i64
-        %bool_class = arith.constant {ly.class_id_of = "builtins.bool"} 22 : i64
+        %int_class = arith.constant {ly.class_of = "builtins.int"} 1 : i64
+        %float_class = arith.constant {ly.class_of = "builtins.float"} 2 : i64
+        %bool_class = arith.constant {ly.class_of = "builtins.bool"} 22 : i64
         %lhs_int = arith.cmpi eq, %lhs_class, %int_class : i64
         %lhs_float = arith.cmpi eq, %lhs_class, %float_class : i64
         %lhs_bool = arith.cmpi eq, %lhs_class, %bool_class : i64
@@ -1353,7 +1366,7 @@ module attributes {
           %r = func.call @__ly_box_equal_numeric(%lhs, %lhs_class, %rhs, %rhs_class) : (!llvm.ptr, i64, !llvm.ptr, i64) -> i1
           scf.yield %r : i1
         } else {
-          // ⭐ A SUBCLASS SHARES ITS BASE'S IMPLEMENTATION, so "same class id"
+          // ⭐ A SUBCLASS SHARES ITS BASE'S IMPLEMENTATION, so "same class word"
           // was the wrong gate: `P(1) in [Q(1)]` compared a P against a Q,
           // found the ids unequal, and answered False without asking anything.
           // The hook decides now -- it accepts a right-hand class that resolves
@@ -1410,9 +1423,9 @@ module attributes {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %false = arith.constant false
-    %int_class = arith.constant {ly.class_id_of = "builtins.int"} 1 : i64
-    %float_class = arith.constant {ly.class_id_of = "builtins.float"} 2 : i64
-    %bool_class = arith.constant {ly.class_id_of = "builtins.bool"} 22 : i64
+    %int_class = arith.constant {ly.class_of = "builtins.int"} 1 : i64
+    %float_class = arith.constant {ly.class_of = "builtins.float"} 2 : i64
+    %bool_class = arith.constant {ly.class_of = "builtins.bool"} 22 : i64
     %lhs_is_float = arith.cmpi eq, %lhs_class, %float_class : i64
     %rhs_is_float = arith.cmpi eq, %rhs_class, %float_class : i64
     %either_float = arith.ori %lhs_is_float, %rhs_is_float : i1
@@ -1477,33 +1490,33 @@ module attributes {
     func.return %result : i1
   }
 
-  func.func private @__ly_lt_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_id: i64, %rhs_class_id: i64) -> (i1, i1)
-  func.func private @__ly_le_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_id: i64, %rhs_class_id: i64) -> (i1, i1)
-  func.func private @__ly_gt_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_id: i64, %rhs_class_id: i64) -> (i1, i1)
-  func.func private @__ly_ge_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_id: i64, %rhs_class_id: i64) -> (i1, i1)
+  func.func private @__ly_lt_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_word: i64, %rhs_class_word: i64) -> (i1, i1)
+  func.func private @__ly_le_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_word: i64, %rhs_class_word: i64) -> (i1, i1)
+  func.func private @__ly_gt_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_word: i64, %rhs_class_word: i64) -> (i1, i1)
+  func.func private @__ly_ge_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_word: i64, %rhs_class_word: i64) -> (i1, i1)
 
   // The four ordering hooks under CPython's op numbers (Py_LT 0, Py_LE 1,
   // Py_GT 4, Py_GE 5): the method `op` names, called on the LEFT box's class.
-  func.func private @__ly_order_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_id: i64, %rhs_class_id: i64, %op: i64) -> (i1, i1) {
+  func.func private @__ly_order_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_word: i64, %rhs_class_word: i64, %op: i64) -> (i1, i1) {
     %c0 = arith.constant 0 : i64
     %c1 = arith.constant 1 : i64
     %c4 = arith.constant 4 : i64
     %is_lt = arith.cmpi eq, %op, %c0 : i64
     %r:2 = scf.if %is_lt -> (i1, i1) {
-      %v, %h = func.call @__ly_lt_boxed_by_contract(%lhs, %rhs, %class_id, %rhs_class_id) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
+      %v, %h = func.call @__ly_lt_boxed_by_contract(%lhs, %rhs, %class_word, %rhs_class_word) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
       scf.yield %v, %h : i1, i1
     } else {
       %is_le = arith.cmpi eq, %op, %c1 : i64
       %r1:2 = scf.if %is_le -> (i1, i1) {
-        %v, %h = func.call @__ly_le_boxed_by_contract(%lhs, %rhs, %class_id, %rhs_class_id) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
+        %v, %h = func.call @__ly_le_boxed_by_contract(%lhs, %rhs, %class_word, %rhs_class_word) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
         scf.yield %v, %h : i1, i1
       } else {
         %is_gt = arith.cmpi eq, %op, %c4 : i64
         %r2:2 = scf.if %is_gt -> (i1, i1) {
-          %v, %h = func.call @__ly_gt_boxed_by_contract(%lhs, %rhs, %class_id, %rhs_class_id) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
+          %v, %h = func.call @__ly_gt_boxed_by_contract(%lhs, %rhs, %class_word, %rhs_class_word) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
           scf.yield %v, %h : i1, i1
         } else {
-          %v, %h = func.call @__ly_ge_boxed_by_contract(%lhs, %rhs, %class_id, %rhs_class_id) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
+          %v, %h = func.call @__ly_ge_boxed_by_contract(%lhs, %rhs, %class_word, %rhs_class_word) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
           scf.yield %v, %h : i1, i1
         }
         scf.yield %r2#0, %r2#1 : i1, i1
@@ -1519,14 +1532,14 @@ module attributes {
   // whose slot no store has filled -- CPython's lookup finds nothing in the
   // instance and nothing on the class. The class is the instance's own, as
   // CPython's message names type(obj).
-  func.func @LyObject_RaiseUnsetField(%class_id: i64, %name: memref<?xi8>, %name_length: i64) attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "raise_unset_field"} {
+  func.func @LyObject_RaiseUnsetField(%class_word: i64, %name: memref<?xi8>, %name_length: i64) attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "raise_unset_field"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %quote = arith.constant 39 : i8
     %buffer_static = memref.alloca() : memref<512xi8>
     %buffer = memref.cast %buffer_static : memref<512xi8> to memref<?xi8>
     memref.store %quote, %buffer[%c0] : memref<?xi8>
-    %a1 = func.call @__ly_msg_append_class_name(%buffer, %c1, %class_id) : (memref<?xi8>, index, i64) -> (index)
+    %a1 = func.call @__ly_msg_append_class_name(%buffer, %c1, %class_word) : (memref<?xi8>, index, i64) -> (index)
     %middle_static = memref.get_global @__ly_attr_msg_object_has_no : memref<27xi8>
     %middle = memref.cast %middle_static : memref<27xi8> to memref<?xi8>
     %middle_length = arith.constant 27 : index
@@ -1539,14 +1552,25 @@ module attributes {
     memref.store %quote, %buffer[%a3] : memref<?xi8>
     %end = arith.addi %a3, %c1 : index
     %length = arith.index_cast %end : index to i64
-    %attribute_error = arith.constant {ly.class_id_of = "builtins.AttributeError"} 112 : i64
+    %attribute_error = arith.constant {ly.class_of = "builtins.AttributeError"} 112 : i64
     func.call @__ly_raise_static_message(%attribute_error, %buffer, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
-  // Strict-subclass table over class ids, synthesized per program by the
+  // Strict-subclass table over class words, synthesized per program by the
   // lowering from the source classes' bases (RuntimeABI.cpp).
-  func.func private @__ly_class_derives_strictly(%sub_class: i64, %base_class: i64) -> i1
+  func.func private @LyType_IsSubtype(%class: i64, %base: i64) -> i1
+
+  // Whether a class strictly derives from another: the base is in its MRO
+  // and is not the class itself (CPython's PyType_IsSubtype, TypeObjects.h).
+  func.func private @__ly_class_derives_strictly(%sub_class: i64, %base_class: i64) -> i1 {
+    %true = arith.constant true
+    %same = arith.cmpi eq, %sub_class, %base_class : i64
+    %differs = arith.xori %same, %true : i1
+    %in_mro = func.call @LyType_IsSubtype(%sub_class, %base_class) : (i64, i64) -> i1
+    %derives = arith.andi %differs, %in_mro : i1
+    func.return %derives : i1
+  }
 
   memref.global "private" constant @__ly_cmp_msg_between : memref<38xi8> = dense<[39, 32, 110, 111, 116, 32, 115, 117, 112, 112, 111, 114, 116, 101, 100, 32, 98, 101, 116, 119, 101, 101, 110, 32, 105, 110, 115, 116, 97, 110, 99, 101, 115, 32, 111, 102, 32, 39]>
   memref.global "private" constant @__ly_cmp_msg_and : memref<7xi8> = dense<[39, 32, 97, 110, 100, 32, 39]>
@@ -1567,14 +1591,14 @@ module attributes {
   // Append a class's name -- the leaf of the table's qualified entry, at most
   // 100 bytes as CPython's "%.100s" -- or "object" for an id the program did
   // not declare (`LyObject_ClassNameFromId`'s rule).
-  func.func private @__ly_msg_append_class_name(%buffer: memref<?xi8>, %at: index, %class_id: i64) -> index {
+  func.func private @__ly_msg_append_class_name(%buffer: memref<?xi8>, %at: index, %class_word: i64) -> index {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %cap = arith.constant 256 : index
     %most = arith.constant 100 : index
     %zero_i8 = arith.constant 0 : i8
     %dot = arith.constant 46 : i8
-    %name_ptr = func.call @__ly_source_class_name(%class_id) : (i64) -> !llvm.ptr
+    %name_ptr = func.call @LyType_Name(%class_word) : (i64) -> !llvm.ptr
     %null = llvm.mlir.zero : !llvm.ptr
     %is_null = llvm.icmp "eq" %name_ptr, %null : !llvm.ptr
     %end = scf.if %is_null -> (index) {
@@ -1665,23 +1689,23 @@ module attributes {
     memref.store %quote, %buffer[%a4] : memref<?xi8>
     %end = arith.addi %a4, %c1 : index
     %length = arith.index_cast %end : index to i64
-    %type_error = arith.constant {ly.class_id_of = "builtins.TypeError"} 52 : i64
+    %type_error = arith.constant {ly.class_of = "builtins.TypeError"} 52 : i64
     func.call @__ly_raise_static_message(%type_error, %buffer, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
   // Boxed int as f64 (30-bit limb accumulation; values beyond 2^53 round,
   // matching a float(int) conversion for comparison purposes).
-  func.func private @__ly_boxed_num_as_f64(%box: !llvm.ptr, %class_id: i64) -> f64 {
+  func.func private @__ly_boxed_num_as_f64(%box: !llvm.ptr, %class_word: i64) -> f64 {
     %long_scratch = memref.alloca() : memref<3xi32>
-    %float_class = arith.constant {ly.class_id_of = "builtins.float"} 2 : i64
-    %bool_class = arith.constant {ly.class_id_of = "builtins.bool"} 22 : i64
-    %is_float = arith.cmpi eq, %class_id, %float_class : i64
+    %float_class = arith.constant {ly.class_of = "builtins.float"} 2 : i64
+    %bool_class = arith.constant {ly.class_of = "builtins.bool"} 22 : i64
+    %is_float = arith.cmpi eq, %class_word, %float_class : i64
     %result = scf.if %is_float -> (f64) {
       %v = func.call @__ly_boxed_float_value(%box) : (!llvm.ptr) -> f64
       scf.yield %v : f64
     } else {
-      %is_bool = arith.cmpi eq, %class_id, %bool_class : i64
+      %is_bool = arith.cmpi eq, %class_word, %bool_class : i64
       %num = scf.if %is_bool -> (f64) {
         %bv = func.call @__ly_boxed_bool_value(%box) : (!llvm.ptr) -> i64
         %bf = arith.sitofp %bv : i64 to f64
@@ -1737,9 +1761,9 @@ module attributes {
     %rhs_word = llvm.load %rhs : !llvm.ptr -> i64
     %lhs_class = func.call @__ly_slot_class(%lhs_word) : (i64) -> i64
     %rhs_class = func.call @__ly_slot_class(%rhs_word) : (i64) -> i64
-    %int_class = arith.constant {ly.class_id_of = "builtins.int"} 1 : i64
-    %float_class = arith.constant {ly.class_id_of = "builtins.float"} 2 : i64
-    %bool_class = arith.constant {ly.class_id_of = "builtins.bool"} 22 : i64
+    %int_class = arith.constant {ly.class_of = "builtins.int"} 1 : i64
+    %float_class = arith.constant {ly.class_of = "builtins.float"} 2 : i64
+    %bool_class = arith.constant {ly.class_of = "builtins.bool"} 22 : i64
     %lhs_int = arith.cmpi eq, %lhs_class, %int_class : i64
     %lhs_float = arith.cmpi eq, %lhs_class, %float_class : i64
     %lhs_bool = arith.cmpi eq, %lhs_class, %bool_class : i64
@@ -1923,10 +1947,10 @@ module attributes {
       %entity_word = func.call @__ly_box_entity_word(%base_i64) : (i64) -> i64
       %entity_index = arith.index_cast %entity_word : i64 to index
       %entity = memref.load %items[%entity_index] : memref<?xi64>
-      %class_id = func.call @__ly_slot_class(%entity) : (i64) -> i64
+      %class_word = func.call @__ly_slot_class(%entity) : (i64) -> i64
       %class_slot = arith.constant 1 : index
       %box_entity_slot = arith.constant 2 : index
-      memref.store %class_id, %box[%class_slot] : memref<5xi64>
+      memref.store %class_word, %box[%class_slot] : memref<5xi64>
       memref.store %entity, %box[%box_entity_slot] : memref<5xi64>
       // Skips a null or immediate entity, which is exactly what the box then
       // does not own (`release_payload_slot_ptr` asks the same question).
@@ -1948,9 +1972,9 @@ module attributes {
   }
 
   // Uniform per-element repr dispatch, generated per program by the lowering
-  // (class id -> the manifest __repr__); resolved at link. Returns an owned str
+  // (class word -> the manifest __repr__); resolved at link. Returns an owned str
   // (header, bytes) plus a handled flag.
-  func.func private @__ly_repr_boxed_by_contract(%box: !llvm.ptr, %class_id: i64) -> (memref<2xi64>, memref<?xi8>, i1) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
+  func.func private @__ly_repr_boxed_by_contract(%box: !llvm.ptr, %class_word: i64) -> (memref<2xi64>, memref<?xi8>, i1) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
 
   memref.global "private" constant @__ly_repr_lbracket : memref<1xi8> = dense<91>
   memref.global "private" constant @__ly_repr_rbracket : memref<1xi8> = dense<93>

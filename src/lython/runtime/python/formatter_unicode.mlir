@@ -5,7 +5,7 @@ module {
   // ===== declared here, defined in another runtime file or built by the lowering =====
   func.func private @__ly_check_alloc_count(%count: i64, %element_bytes: i64, %extra: i64)
   func.func private @__ly_long_bit_length(%meta: memref<2xi64>, %digits: memref<?xi32>) -> i64
-  func.func private @__ly_raise_static_message(%class_id: i64, %message: memref<?xi8>, %length: i64)
+  func.func private @__ly_raise_static_message(%class_word: i64, %message: memref<?xi8>, %length: i64)
   func.func private @__ly_unicode_alloc(%count: i64, %width: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.primitive = "alloc"}
   func.func private @__ly_unicode_count(%header: memref<2xi64>, %bytes: memref<?xi8>) -> i64
   func.func private @__ly_unicode_get(%bytes: memref<?xi8>, %width: i64, %i: index) -> i64
@@ -156,7 +156,7 @@ module {
   }
 
   func.func private @__ly_fmt_raise_bytes(%message: memref<?xi8>, %length: i64) {
-    %value_error = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
+    %value_error = arith.constant {ly.class_of = "builtins.ValueError"} 53 : i64
     func.call @__ly_raise_static_message(%value_error, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }

@@ -1922,8 +1922,8 @@ bool isRefcountMaintenanceSymbol(llvm::StringRef name) {
 bool isNonRaisingRuntimeSymbol(llvm::StringRef name) {
   if (isRefcountMaintenanceSymbol(name))
     return true;
-  return name == "LyEH_BeginCatch" || name == "LyEH_ClassIdMatches" ||
-         name == "LyEH_CurrentExceptionClassId" ||
+  return name == "LyEH_BeginCatch" || name == "LyType_IsSubtype" ||
+         name == "LyEH_CurrentExceptionClass" ||
          name == "LyEH_CurrentExceptionMatches" ||
          name == "LyEH_DiscardCurrentException" ||
          name == "LyEH_StashCurrentAsContext" ||

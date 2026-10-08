@@ -99,10 +99,10 @@ module attributes {
   func.func private @release_payload_slot_ptr(%slot: !llvm.ptr)
   func.func private @__ly_box_word_count() -> i64
 
-  func.func @LyGenerator_New(%target_id: i64) -> memref<64xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "types.GeneratorType", ly.runtime.initializer = "__new__"} {
+  func.func @LyGenerator_New(%target_id: i64) -> memref<64xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "types.GeneratorType", ly.runtime.initializer = "__new__"} {
     %one = arith.constant 1 : i64
     %zero = arith.constant 0 : i64
-    %layout_generator = arith.constant {ly.class_id_of = "types.GeneratorType"} 63 : i64
+    %layout_generator = arith.constant {ly.class_of = "types.GeneratorType"} 63 : i64
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
     %state_slot = arith.constant 2 : index
@@ -226,10 +226,10 @@ module attributes {
   }
 
   // ===== impls: coroutine =====
-  func.func @LyCoroutine_New(%target_id: i64) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "types.CoroutineType", ly.runtime.initializer = "__new__"} {
+  func.func @LyCoroutine_New(%target_id: i64) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "types.CoroutineType", ly.runtime.initializer = "__new__"} {
     %one = arith.constant 1 : i64
     %zero = arith.constant 0 : i64
-    %layout_coroutine = arith.constant {ly.class_id_of = "types.CoroutineType"} 9 : i64
+    %layout_coroutine = arith.constant {ly.class_of = "types.CoroutineType"} 9 : i64
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
     %state_slot = arith.constant 2 : index
@@ -320,7 +320,7 @@ module attributes {
 
   func.func @LyCoroutine_Await(%storage: memref<5xi64> {ly.ownership.object_header}) -> (memref<3xi64>, memref<5xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "types.CoroutineType", ly.runtime.method = "__await__", ly.runtime.result_contract = "types.CoroutineAwaitIterator"} {
     %one = arith.constant 1 : i64
-    %layout_await_iter = arith.constant {ly.class_id_of = "types.CoroutineAwaitIterator"} 18 : i64
+    %layout_await_iter = arith.constant {ly.class_of = "types.CoroutineAwaitIterator"} 18 : i64
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
     %consumed_slot = arith.constant 2 : index
@@ -469,9 +469,9 @@ module attributes {
     func.return
   }
 
-  func.func @LyFunction_New(%target_id: i64, %defaults: i64, %kwdefaults: i64, %closure: i64, %annotations: i64, %module: i64) -> memref<8xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.function", ly.runtime.initializer = "__new__"} {
+  func.func @LyFunction_New(%target_id: i64, %defaults: i64, %kwdefaults: i64, %closure: i64, %annotations: i64, %module: i64) -> memref<8xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.function", ly.runtime.initializer = "__new__"} {
     %one = arith.constant 1 : i64
-    %layout_function = arith.constant {ly.class_id_of = "builtins.function"} 6 : i64
+    %layout_function = arith.constant {ly.class_of = "builtins.function"} 6 : i64
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
     %target_slot = arith.constant 2 : index

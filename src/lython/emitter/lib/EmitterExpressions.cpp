@@ -2156,7 +2156,7 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
   }
 
   // ⭐ THE ERASED SIDE HAS TO BE THE RECEIVER, and == / != are the two operators
-  // where putting it there costs nothing: both dispatch on the box's class id,
+  // where putting it there costs nothing: both dispatch on the box's class word,
   // and both are symmetric under that dispatch. `xs[0] == 1` over a
   // list[object] resolved object.__eq__ and worked; `1 == xs[0]` resolved
   // int.__eq__ and was refused with "cannot adapt builtins.object to runtime
@@ -2236,7 +2236,7 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
     // that supplies only __eq__ (a user definition, a dataclass or an enum)
     // gets != for free. Derived here rather than left to the boxed __ne__:
     // that dispatcher reaches a source __eq__ only through the uniform
-    // class-id hook, which admits at most five memref operands — a two-field
+    // class-word hook, which admits at most five memref operands — a two-field
     // dataclass's __eq__ takes six, so it was missed and `!=` silently
     // answered identity (`Point(1,2) != Point(1,2)` was True).
     if (!lookupClassMethod(lhs.type, "__ne__") &&
@@ -2470,7 +2470,7 @@ ModuleEmitter::tryEmitReflectedBinary(const parser::Node &anchor,
 
 // The check half of a guard spent at a READ, shared by the two storages that
 // are RE-READ rather than held: a field and a CELL. A union member is tested by
-// its tag; a subclass of the read's own contract by its runtime class id. Both
+// its tag; a subclass of the read's own contract by its runtime class word. Both
 // are the same shape of proof and the same check.
 //
 // ⛔ The message describes what HAPPENED, not what CPython would have said
@@ -2923,7 +2923,7 @@ Value ModuleEmitter::emitMethodObject(const parser::Node &anchor, Value object,
 // handler the static class is the one CAUGHT and CPython prints the one RAISED,
 // so the fold `type(x)` uses is unavailable -- and refusing the whole idiom left
 // the commonest use of type() with no spelling at all. An exception instance
-// carries its dynamic class id in its header (it is what the traceback and the
+// carries its dynamic class word in its header (it is what the traceback and the
 // repr already read), so this one case has a runtime answer.
 //
 // ⛔ Intercepted BEFORE the receiver is emitted, because `type(...)` on a
@@ -3049,11 +3049,11 @@ ModuleEmitter::tryEmitDynamicClassName(const parser::Node &expr) {
   if (!contract)
     return std::nullopt;
   // ⛔ A SOURCE CLASS TOO, not only an exception: its instances carry the same
-  // class-id word, and this is the only answer available when the static class
+  // class-word word, and this is the only answer available when the static class
   // has subclasses -- which is exactly when tryEmitTypeCall refuses to fold.
   // A manifest contract keeps the fold: `type(5)` is int by construction, and
-  // an int's header word 1 is not a class id.
-  // ⭐ AND A TYPE-ERASED VALUE, whose class id is the one thing it does carry.
+  // an int's header word 1 is not a class word.
+  // ⭐ AND A TYPE-ERASED VALUE, whose class word is the one thing it does carry.
   // `type(v).__name__` over a `list[object]` was refused outright ("would need
   // the runtime class"); the runtime class is word 1 of the box, which is what
   // this op reads.

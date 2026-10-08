@@ -16,7 +16,7 @@ module attributes {
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "release_to_zero"}
   func.func private @LyUnicode_Concat(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__add__"}
   func.func private @LyUnicode_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.str", ly.runtime.deallocator}
-  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
+  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @__ly_box_equal(%lhs: !llvm.ptr, %rhs: !llvm.ptr) -> i1
   func.func private @__ly_box_hash_key(%box: !llvm.ptr, %role: i64) -> i64
   func.func private @__ly_box_move_slot(%dst: memref<?xi64>, %d: i64, %src: memref<?xi64>, %s: i64)
@@ -24,7 +24,7 @@ module attributes {
   func.func private @__ly_dict_raise_missing_key(%key_box: !llvm.ptr) attributes {ly.runtime.contract = "builtins.dict", ly.runtime.primitive = "raise_missing_key_ptr"}
   func.func private @__ly_global_view_i64(%pointer: i64, %size: i64) -> memref<?xi64>
   func.func private @__ly_handle_retain_raw(%entity: i64)
-  func.func private @__ly_repr_boxed_or_default(%box_ptr: !llvm.ptr, %class_id: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "repr_boxed_or_default", ly.runtime.result_contract = "builtins.str"}
+  func.func private @__ly_repr_boxed_or_default(%box_ptr: !llvm.ptr, %class_word: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "repr_boxed_or_default", ly.runtime.result_contract = "builtins.str"}
   memref.global "private" constant @__ly_repr_comma : memref<2xi8>
   memref.global "private" constant @__ly_repr_frozenset_empty : memref<11xi8>
   memref.global "private" constant @__ly_repr_frozenset_open : memref<11xi8>
@@ -185,9 +185,9 @@ module attributes {
       }
       %off = arith.muli %i_i64, %c16_i64 : i64
       %box_ptr = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %class_word = llvm.load %box_ptr : !llvm.ptr -> i64
-      %class_id = func.call @__ly_slot_class(%class_word) : (i64) -> i64
-      %erh, %erb = func.call @__ly_repr_boxed_or_default(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>)
+      %entity_word = llvm.load %box_ptr : !llvm.ptr -> i64
+      %class_word = func.call @__ly_slot_class(%entity_word) : (i64) -> i64
+      %erh, %erb = func.call @__ly_repr_boxed_or_default(%box_ptr, %class_word) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>)
       %nh, %nb = func.call @LyUnicode_Concat(%sep#0, %sep#1, %erh, %erb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
       func.call @LyUnicode_DecRef(%sep#0) : (memref<2xi64>) -> ()
       func.call @LyUnicode_DecRef(%erh) : (memref<2xi64>) -> ()
@@ -275,7 +275,7 @@ module attributes {
   // Two contracts, one physical layout, `memref<9xi64>`:
   //
   //   word 0  refcount            word 5  table base address
-  //   word 1  class id (21 / 23)  word 6  table mask (size - 1)
+  //   word 1  class word (21 / 23)  word 6  table mask (size - 1)
   //   word 2  used (live entries) word 7  fill (live + dummies)
   //   word 3  capacity            word 8  order flag (__ly_set_raw_reorder)
   //   word 4  items base address
@@ -1065,7 +1065,7 @@ module attributes {
 
   // Allocate the items array and publish words 0..7. The caller has already
   // zeroed its own dead words, which is the only part that knows the width.
-  func.func private @__ly_set_raw_init(%self: memref<?xi64>, %class_id: i64, %length: i64) {
+  func.func private @__ly_set_raw_init(%self: memref<?xi64>, %class_word: i64, %length: i64) {
     %one = arith.constant 1 : i64
     %zero = arith.constant 0 : i64
     // PySet_MINSIZE, matching the table's own floor below. It was 64 while the
@@ -1095,7 +1095,7 @@ module attributes {
     %items_word = arith.index_cast %items_index : index to i64
 
     memref.store %one, %self[%refcount_slot] : memref<?xi64>
-    memref.store %class_id, %self[%layout_slot] : memref<?xi64>
+    memref.store %class_word, %self[%layout_slot] : memref<?xi64>
     memref.store %length, %self[%length_slot] : memref<?xi64>
     memref.store %capacity, %self[%capacity_slot] : memref<?xi64>
     memref.store %items_word, %self[%items_slot] : memref<?xi64>
@@ -1655,7 +1655,7 @@ module attributes {
 
   func.func private @__ly_set_alloc(%length: i64) -> memref<9xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.set"], ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
-    %class_id = arith.constant {ly.class_id_of = "builtins.set"} 21 : i64
+    %class_word = arith.constant {ly.class_of = "builtins.set"} 21 : i64
     %order_slot = arith.constant 8 : index
     %handle_bytes = arith.constant 72 : index
     %handle_block = memref.alloc(%handle_bytes) {alignment = 16 : i64} : memref<?xi8>
@@ -1663,7 +1663,7 @@ module attributes {
     %self = memref.view %handle_block[%handle_at][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<9xi64>
     memref.store %zero, %self[%order_slot] : memref<9xi64>
     %raw = memref.cast %self : memref<9xi64> to memref<?xi64>
-    func.call @__ly_set_raw_init(%raw, %class_id, %length) : (memref<?xi64>, i64, i64) -> ()
+    func.call @__ly_set_raw_init(%raw, %class_word, %length) : (memref<?xi64>, i64, i64) -> ()
     func.return %self : memref<9xi64>
   }
 
@@ -1693,7 +1693,7 @@ module attributes {
     func.return %self : memref<9xi64>
   }
 
-  func.func @LySet_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.set", ly.runtime.initializer = "__new__", ly.runtime.result_contract = "builtins.set"} {
+  func.func @LySet_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.set", ly.runtime.initializer = "__new__", ly.runtime.result_contract = "builtins.set"} {
     %self = func.call @__ly_set_alloc(%length) : (i64) -> memref<9xi64>
     func.return %self : memref<9xi64>
   }
@@ -2061,7 +2061,7 @@ module attributes {
   }
 
   // ===== impls: frozenset =====
-  // Physically a set (dense insertion-ordered boxed slots) with class id 23
+  // Physically a set (dense insertion-ordered boxed slots) with class word 23
   // and no mutators. The wrappers delegate to the shared core rather than to
   // the LySet_* wrappers: a frozenset is not a set, and the LySet_* wrappers
   // name `builtins.set` in their contracts. Hashing is CPython's frozenset_hash
@@ -2071,7 +2071,7 @@ module attributes {
 
   func.func private @__ly_frozenset_alloc(%length: i64) -> memref<9xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.frozenset"], ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
-    %class_id = arith.constant {ly.class_id_of = "builtins.frozenset"} 23 : i64
+    %class_word = arith.constant {ly.class_of = "builtins.frozenset"} 23 : i64
     %order_slot = arith.constant 8 : index
     %handle_bytes = arith.constant 72 : index
     %handle_block = memref.alloc(%handle_bytes) {alignment = 16 : i64} : memref<?xi8>
@@ -2079,7 +2079,7 @@ module attributes {
     %self = memref.view %handle_block[%handle_at][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<9xi64>
     memref.store %zero, %self[%order_slot] : memref<9xi64>
     %raw = memref.cast %self : memref<9xi64> to memref<?xi64>
-    func.call @__ly_set_raw_init(%raw, %class_id, %length) : (memref<?xi64>, i64, i64) -> ()
+    func.call @__ly_set_raw_init(%raw, %class_word, %length) : (memref<?xi64>, i64, i64) -> ()
     func.return %self : memref<9xi64>
   }
 
@@ -2094,7 +2094,7 @@ module attributes {
   // source arrives as a count and an items array rather than as a contract's
   // shape, because it is polymorphic over all four sequence contracts and
   // their shapes no longer agree.
-  func.func @LyFrozenSet_FromElements(%olen: i64, %oi: memref<?xi64>) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.frozenset", ly.runtime.initializer = "__new__", ly.runtime.result_contract = "builtins.frozenset"} {
+  func.func @LyFrozenSet_FromElements(%olen: i64, %oi: memref<?xi64>) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.frozenset", ly.runtime.initializer = "__new__", ly.runtime.result_contract = "builtins.frozenset"} {
     %zero = arith.constant 0 : i64
     %self = func.call @__ly_frozenset_alloc(%zero) : (i64) -> memref<9xi64>
     %raw = memref.cast %self : memref<9xi64> to memref<?xi64>

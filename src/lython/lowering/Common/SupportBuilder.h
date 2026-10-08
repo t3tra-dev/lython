@@ -5,6 +5,7 @@
 
 #include "Common/ExceptionABI.h"
 #include "Common/MemRef1D.h"
+#include "Common/TypeObjects.h"
 #include "Common/UnwindABI.h"
 #include "ExceptionTaxonomy.h"
 
@@ -202,6 +203,14 @@ struct SupportBuilder {
   mlir::Value loadI64(mlir::Value pointer) {
     return mlir::LLVM::LoadOp::create(builder, loc, i64(), pointer,
                                       /*alignment=*/8);
+  }
+  // A class's word: its type object's address (TypeObjects.h).
+  mlir::Value classWord(llvm::StringRef qualifiedName) {
+    return py::type_objects::classWord(builder, loc, qualifiedName);
+  }
+  // Word `index` of the type object a class word names (`kBaseWord`, ...).
+  mlir::Value typeObjectWord(mlir::Value classWord, std::int64_t index) {
+    return loadI64(gepI64(intToPtr(classWord), iconst(index)));
   }
 
   mlir::Value fconst(double value) {

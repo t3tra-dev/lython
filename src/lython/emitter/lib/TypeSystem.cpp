@@ -1880,7 +1880,7 @@ void TypeSystem::seedBuiltins() {
   bindClass("complex", contract("builtins.complex"));
   bindClass("frozenset", contract("builtins.frozenset"));
   // The whole builtin exception taxonomy binds from the shared table so the
-  // emitter's name surface cannot drift from the class-id hierarchy the
+  // emitter's name surface cannot drift from the class-word hierarchy the
   // runtime matches against. Non-builtins members (asyncio.CancelledError,
   // _io.UnsupportedOperation) bind through their module imports instead.
   for (const py::exceptions::BuiltinExceptionInfo &info :
@@ -3906,7 +3906,7 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           // ⭐ A @property is neither a field nor a manifest method, so this
           // walk used to fall past it to `object()` below. That answer is what
           // `str(x)` reads to choose its dispatch, and an erased object routes
-          // to the manifest `object.__str__`, which reads a payload class id a
+          // to the manifest `object.__str__`, which reads a payload class word a
           // source instance's header does not carry -- `str(Path("/x").parent)`
           // SEGFAULTED. The emitter already resolves the read itself, which is
           // why binding it to a name first worked and using it directly did
