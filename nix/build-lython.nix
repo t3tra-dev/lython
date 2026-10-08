@@ -46,6 +46,9 @@ stdenv.mkDerivation {
   meta = {
     description = "An LLVM/MLIR 23 based Python compiler toolchain";
     homepage = "https://github.com/t3tra-dev/lython";
+    # Without this `nix run` looks for bin/lython (the pname) and fails; the
+    # installed binary is lyc.
+    mainProgram = "lyc";
     platforms = [ "x86_64-linux" ];
   };
 }

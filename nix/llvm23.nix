@@ -71,7 +71,6 @@ stdenv.mkDerivation (finalAttrs: {
     (lib.cmakeBool "LLVM_INSTALL_TOOLCHAIN_ONLY" false)
   ];
 
-
   # A bare clang in Nix cannot find the C++ runtime: it does not probe the
   # gcc on PATH (that gcc is a wrapper script, and glibc lives in its own
   # store path anyway), so AOT linking fails on crt1.o / libstdc++. The
