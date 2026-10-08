@@ -37,11 +37,11 @@ module attributes {
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "release_to_zero"}
   func.func private @LyUnicode_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.str", ly.runtime.deallocator}
   func.func private @__ly_box_equal(%lhs: !llvm.ptr, %rhs: !llvm.ptr) -> i1
-  func.func private @__ly_box_store_entity(%items: memref<?xi64>, %slot: i64, %class_id: i64, %entity: i64)
+  func.func private @__ly_box_store_entity(%items: memref<?xi64>, %slot: i64, %class_word: i64, %entity: i64)
   func.func private @__ly_global_view_i64(%pointer: i64, %size: i64) -> memref<?xi64>
   func.func private @__ly_handle_retain_raw(%entity: i64)
   func.func private @__ly_int_from_immediate(%word: i64) -> i64
-  func.func private @__ly_repr_boxed_or_default(%box_ptr: !llvm.ptr, %class_id: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "repr_boxed_or_default", ly.runtime.result_contract = "builtins.str"}
+  func.func private @__ly_repr_boxed_or_default(%box_ptr: !llvm.ptr, %class_word: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "repr_boxed_or_default", ly.runtime.result_contract = "builtins.str"}
   memref.global "private" constant @__ly_repr_comma : memref<2xi8>
   memref.global "private" constant @__ly_repr_rparen : memref<1xi8>
   func.func private @__ly_slot_class(%word: i64) -> i64
@@ -51,12 +51,12 @@ module attributes {
   func.func private @__ly_xxhash_slot_lanes(%items: !llvm.ptr, %count: i64, %role: i64, %key_class: i64) -> i64
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
-  func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
+  func.func private @LyBaseException_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
   func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "raise"}
-  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
+  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
   func.func private @LyLong_Str(%header: memref<2xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__str__", ly.runtime.result_contract = "builtins.str"}
   func.func private @LyUnicode_Concat(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__add__"}
-  func.func private @__ly_raise_static_message(%class_id: i64, %message: memref<?xi8>, %length: i64)
+  func.func private @__ly_raise_static_message(%class_word: i64, %message: memref<?xi8>, %length: i64)
 
   // The bounds are `int | None`: typeshed's `slice[_StartT, _StopT, _StepT]`
   // is generic over any objects, which a slice of a sequence never holds.
@@ -96,11 +96,11 @@ module attributes {
 
   // ValueError("slice step cannot be zero") -- shared by every __getslice__.
   func.func private @__ly_slice_raise_zero_step() {
-    %class_id = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
+    %class_word = arith.constant {ly.class_of = "builtins.ValueError"} 53 : i64
     %length = arith.constant 25 : i64
     %message_static = memref.get_global @__ly_slice_msg_zero_step : memref<25xi8>
     %message = memref.cast %message_static : memref<25xi8> to memref<?xi8>
-    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_word, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -178,7 +178,7 @@ module attributes {
   // the prefix naming what was assigned -- "attempt to assign sequence of
   // size " for list_ass_subscript, "... bytes of size " for bytearray's.
   func.func private @__ly_slice_raise_extended_mismatch(%prefix: memref<?xi8>, %prefix_len: i64, %src_len: i64, %slice_len: i64) {
-    %class_id = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
+    %class_word = arith.constant {ly.class_of = "builtins.ValueError"} 53 : i64
     %start = arith.constant 0 : index
     %middle_static = memref.get_global @__ly_slice_msg_extended_middle : memref<27xi8>
     %middle = memref.cast %middle_static : memref<27xi8> to memref<?xi8>
@@ -192,7 +192,7 @@ module attributes {
     %cnt_int = func.call @LyLong_FromI64(%slice_len) : (i64) -> memref<2xi64>
     %cnt_str:2 = func.call @LyLong_Str(%cnt_int) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi8>)
     %m3:2 = func.call @LyUnicode_Concat(%m2#0, %m2#1, %cnt_str#0, %cnt_str#1) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
-    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %exception:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %m3#0, %m3#1) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
     func.return
@@ -243,7 +243,7 @@ module attributes {
     %block = memref.alloc(%block_bytes) {alignment = 16 : i64} : memref<?xi8>
     %self_offset = arith.constant 0 : index
     %self = memref.view %block[%self_offset][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<5xi64>
-    %class_slice = arith.constant {ly.class_id_of = "builtins.slice"} 25 : i64
+    %class_slice = arith.constant {ly.class_of = "builtins.slice"} 25 : i64
     %refcount_slot = arith.constant 0 : index
     %class_slot = arith.constant 1 : index
     %start_slot = arith.constant 2 : index
@@ -260,14 +260,14 @@ module attributes {
   // slice(stop), slice(start, stop), slice(start, stop, step): one
   // initializer per arity, as slice_new reads one to three arguments; an
   // absent start or step is None.
-  func.func @LySlice_New(%stop: memref<?xi64>) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.slice", ly.runtime.initializer = "__new__"} {
+  func.func @LySlice_New(%stop: memref<?xi64>) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.slice", ly.runtime.initializer = "__new__"} {
     %none = func.call @__ly_none_word() : () -> i64
     %stop_word = func.call @__ly_slice_word_of(%stop) : (memref<?xi64>) -> i64
     %self = func.call @__ly_slice_alloc(%none, %stop_word, %none) : (i64, i64, i64) -> memref<5xi64>
     func.return %self : memref<5xi64>
   }
 
-  func.func @LySlice_NewStart(%start: memref<?xi64>, %stop: memref<?xi64>) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.slice", ly.runtime.initializer = "__new__"} {
+  func.func @LySlice_NewStart(%start: memref<?xi64>, %stop: memref<?xi64>) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.slice", ly.runtime.initializer = "__new__"} {
     %none = func.call @__ly_none_word() : () -> i64
     %start_word = func.call @__ly_slice_word_of(%start) : (memref<?xi64>) -> i64
     %stop_word = func.call @__ly_slice_word_of(%stop) : (memref<?xi64>) -> i64
@@ -275,7 +275,7 @@ module attributes {
     func.return %self : memref<5xi64>
   }
 
-  func.func @LySlice_NewStep(%start: memref<?xi64>, %stop: memref<?xi64>, %step: memref<?xi64>) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.slice", ly.runtime.initializer = "__new__"} {
+  func.func @LySlice_NewStep(%start: memref<?xi64>, %stop: memref<?xi64>, %step: memref<?xi64>) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.slice", ly.runtime.initializer = "__new__"} {
     %start_word = func.call @__ly_slice_word_of(%start) : (memref<?xi64>) -> i64
     %stop_word = func.call @__ly_slice_word_of(%stop) : (memref<?xi64>) -> i64
     %step_word = func.call @__ly_slice_word_of(%step) : (memref<?xi64>) -> i64
@@ -395,7 +395,7 @@ module attributes {
   func.func @LySlice_Indices(%self: memref<5xi64> {ly.ownership.object_header}, %length: memref<2xi64> {ly.ownership.object_header}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.slice", ly.runtime.method = "indices", ly.runtime.result_contract = "builtins.tuple"} {
     %zero = arith.constant 0 : i64
     %three = arith.constant 3 : i64
-    %int_class = arith.constant {ly.class_id_of = "builtins.int"} 1 : i64
+    %int_class = arith.constant {ly.class_of = "builtins.int"} 1 : i64
     %c0 = arith.constant 0 : i64
     %c1 = arith.constant 1 : i64
     %c2 = arith.constant 2 : i64
@@ -405,11 +405,11 @@ module attributes {
     func.call @LyLong_DecRef(%zero_h) : (memref<2xi64>) -> ()
     %negative = arith.cmpi slt, %sign, %zero : i64
     scf.if %negative {
-      %class_id = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
+      %class_word = arith.constant {ly.class_of = "builtins.ValueError"} 53 : i64
       %message_len = arith.constant 29 : i64
       %message_static = memref.get_global @__ly_slice_msg_negative_length : memref<29xi8>
       %message = memref.cast %message_static : memref<29xi8> to memref<?xi8>
-      func.call @__ly_raise_static_message(%class_id, %message, %message_len) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%class_word, %message, %message_len) : (i64, memref<?xi8>, i64) -> ()
     }
     %start_raw, %stop_raw, %step, %mask = func.call @__ly_slice_unpack(%self) : (memref<5xi64>) -> (i64, i64, i64, i64)
     %step_held = memref.load %self[%step_slot] : memref<5xi64>

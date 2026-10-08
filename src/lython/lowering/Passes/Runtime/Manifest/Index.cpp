@@ -94,12 +94,11 @@ RuntimeManifestIndex::valueShape(llvm::StringRef contract) const {
   return &found->second;
 }
 
-std::optional<std::int64_t>
-RuntimeManifestIndex::classId(llvm::StringRef contract) const {
-  auto found = classIds.find(contract);
-  if (found == classIds.end())
+std::optional<std::string>
+RuntimeManifestIndex::runtimeClass(llvm::StringRef contract) const {
+  if (!classContracts.contains(contract))
     return std::nullopt;
-  return found->second;
+  return contract.str();
 }
 
 mlir::LogicalResult RuntimeManifestIndex::verify() {
@@ -174,16 +173,6 @@ mlir::LogicalResult RuntimeManifestIndex::verify() {
     verified.fail();
   }
 
-  for (RuntimeClassIdDefinition &definition : classIdDefinitions) {
-    std::optional<std::int64_t> expected = classId(definition.contract);
-    if (!expected || *expected == definition.classId)
-      continue;
-    definition.function.emitError()
-        << "runtime class id for " << definition.contract << " is "
-        << definition.classId << ", but canonical class id is " << *expected;
-    verified.fail();
-  }
-
   for (auto &entry : symbolSets)
     for (RuntimeSymbol &symbol : entry.second)
       verified.check(verifySymbol(symbol));
@@ -241,16 +230,10 @@ void RuntimeManifestIndex::recordResultShape(mlir::func::FuncOp function,
   recordValueShape(contract, types, source);
 }
 
-void RuntimeManifestIndex::recordClassId(mlir::func::FuncOp function,
+void RuntimeManifestIndex::recordRuntimeClass(mlir::func::FuncOp function,
                                          llvm::StringRef contract) {
-  auto attr = function->getAttrOfType<mlir::IntegerAttr>(kManifestClassIdAttr);
-  if (!attr)
-    return;
-  std::int64_t classIdValue = attr.getInt();
-  classIdDefinitions.push_back(
-      RuntimeClassIdDefinition{function, contract.str(), classIdValue});
-  if (classIds.find(contract) == classIds.end())
-    classIds[contract] = classIdValue;
+  if (function->hasAttr(kManifestClassAttr))
+    classContracts.insert(contract);
 }
 
 void RuntimeManifestIndex::record(mlir::func::FuncOp function,
@@ -291,12 +274,12 @@ void RuntimeManifestIndex::record(mlir::func::FuncOp function,
           kManifestValidResultIndexAttr))
     validResultIndex = static_cast<unsigned>(attr.getInt());
 
-  llvm::SmallVector<unsigned, 1> classIdArgumentIndices;
+  llvm::SmallVector<unsigned, 1> classArgumentIndices;
   llvm::SmallVector<RuntimeDefaultArgument, 2> defaultArguments;
   for (unsigned index = 0, end = function.getFunctionType().getNumInputs();
        index < end; ++index) {
-    if (function.getArgAttr(index, kManifestClassIdArgumentAttr))
-      classIdArgumentIndices.push_back(index);
+    if (function.getArgAttr(index, kManifestClassArgumentAttr))
+      classArgumentIndices.push_back(index);
     if (mlir::Attribute attr =
             function.getArgAttr(index, kManifestDefaultI64Attr))
       defaultArguments.push_back(RuntimeDefaultArgument{
@@ -347,7 +330,7 @@ void RuntimeManifestIndex::record(mlir::func::FuncOp function,
                        stringAttr(kManifestBuiltinMethodAttr),
                        stringAttr(kManifestBuiltinSinkContractAttr),
                        std::move(resultEvidenceSlots),
-                       std::move(classIdArgumentIndices),
+                       std::move(classArgumentIndices),
                        std::move(defaultArguments),
                        validResultIndex};
   std::string key = runtimeKey(contract, role, name);
@@ -407,7 +390,7 @@ void RuntimeManifestIndex::build(mlir::ModuleOp module) {
       recordResultShape(function, contract.getValue());
     if (function->hasAttr(kManifestDeallocatorAttr))
       recordDeallocatorShape(function, contract.getValue());
-    recordClassId(function, contract.getValue());
+    recordRuntimeClass(function, contract.getValue());
   });
 
   // Contracts whose only shape witness is the deallocator (no shape function
@@ -548,34 +531,34 @@ RuntimeManifestIndex::verifyNextResultPartition(RuntimeSymbol &symbol) {
 }
 
 mlir::LogicalResult
-RuntimeManifestIndex::verifyClassIdArguments(RuntimeSymbol &symbol) {
-  if (symbol.classIdArgumentIndices.empty())
+RuntimeManifestIndex::verifyClassArguments(RuntimeSymbol &symbol) {
+  if (symbol.classArgumentIndices.empty())
     return mlir::success();
   if (symbol.role != "initializer")
     return symbol.function.emitError()
-           << "runtime class id arguments are only supported on initializers";
+           << "runtime class word arguments are only supported on initializers";
 
   VerificationResult verified;
   mlir::FunctionType functionType = symbol.function.getFunctionType();
-  for (unsigned inputIndex : symbol.classIdArgumentIndices) {
+  for (unsigned inputIndex : symbol.classArgumentIndices) {
     if (inputIndex >= functionType.getNumInputs()) {
-      symbol.function.emitError() << "runtime class id argument index "
+      symbol.function.emitError() << "runtime class word argument index "
                                   << inputIndex << " is outside the input list";
       verified.fail();
       continue;
     }
     if (!functionType.getInput(inputIndex).isInteger(64)) {
       symbol.function.emitError()
-          << "runtime class id argument " << inputIndex << " for "
+          << "runtime class word argument " << inputIndex << " for "
           << symbol.contract << "." << symbol.name
           << " must be an i64 input, got " << functionType.getInput(inputIndex);
       verified.fail();
     }
   }
-  if (!classId(symbol.contract)) {
+  if (!runtimeClass(symbol.contract)) {
     symbol.function.emitError()
-        << "runtime class id argument for " << symbol.contract
-        << " requires a ly.runtime.class_id declaration";
+        << "runtime class word argument for " << symbol.contract
+        << " requires a ly.runtime.class declaration";
     verified.fail();
   }
   return verified.get();
@@ -708,7 +691,7 @@ mlir::LogicalResult RuntimeManifestIndex::verifySymbol(RuntimeSymbol &symbol) {
 
   verified.check(verifyBuiltinCallable(symbol));
   verified.check(verifyDefaultArguments(symbol));
-  verified.check(verifyClassIdArguments(symbol));
+  verified.check(verifyClassArguments(symbol));
   if (symbol.role == "initializer")
     verified.check(
         verifyResultShape(symbol, symbol.contract, "initializer result"));

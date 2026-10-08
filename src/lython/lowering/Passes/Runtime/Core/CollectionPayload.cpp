@@ -1,4 +1,4 @@
-#include "ClassIds.h"
+#include "Common/TypeObjects.h"
 #include "Runtime/Core/Lowerer.h"
 #include "ArithBuilders.h"
 
@@ -467,7 +467,7 @@ RuntimeBundleLowerer::collectionInitialCapacity(std::uint64_t arity) const {
   return arity;
 }
 
-// The class id and entity word a value is boxed with: a slot keeps only the
+// The class word and entity word a value is boxed with: a slot keeps only the
 // entity (BoxLayout.h); a standalone `object` box keeps both.
 mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
 RuntimeBundleLowerer::objectPayloadClassEntity(mlir::Operation *op,
@@ -486,7 +486,8 @@ RuntimeBundleLowerer::objectPayloadClassEntity(mlir::Operation *op,
   // so the two uses agree on 1 and disagreed only on 0.
   //
   // ⭐ AND None's ENTITY IS THE None OBJECT (`none_word`), not 0: 0 is a slot
-  // nothing was stored in, which a field read refuses where None answers.
+  // nothing was stored in, which a field read refuses where None answers. Its
+  // class is NoneType's, the word the None object's header holds.
   auto emptyHandle = [&]() -> llvm::SmallVector<mlir::Value, 4> {
     mlir::Value none = zero;
     if (std::optional<RuntimeSymbol> noneWord =
@@ -494,7 +495,8 @@ RuntimeBundleLowerer::objectPayloadClassEntity(mlir::Operation *op,
       none = RuntimeBundleLowerer::createRuntimeCall(loc, *noneWord,
                                                      mlir::ValueRange{})
                  .getResult(0);
-    return llvm::SmallVector<mlir::Value, 4>{zero, none};
+    return llvm::SmallVector<mlir::Value, 4>{
+        type_objects::classWord(builder, loc, module, "types.NoneType"), none};
   };
 
   const RuntimeBundle *concrete =
@@ -613,7 +615,7 @@ RuntimeBundleLowerer::objectPayloadClassEntity(mlir::Operation *op,
                            concrete->primitiveI64->valid,
                            concrete->deferredObject});
       return llvm::SmallVector<mlir::Value, 4>{
-          constantI64(builder, loc, py::class_ids::of("builtins.int")),
+          type_objects::classWord(builder, loc, module, "builtins.int"),
           call.getResult(0)};
     }
   if (concrete->storeAsSlotWord && concrete->physicalValues().size() == 1)
@@ -625,19 +627,19 @@ RuntimeBundleLowerer::objectPayloadClassEntity(mlir::Operation *op,
         mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
             loc, *takingRef, mlir::ValueRange{handle});
         return llvm::SmallVector<mlir::Value, 4>{
-            constantI64(builder, loc,
-                        concrete->contractName() == "builtins.int"
-                            ? py::class_ids::of("builtins.int")
-                            : py::class_ids::of("builtins.float")),
+            type_objects::classWord(builder, loc, module,
+                                    concrete->contractName() == "builtins.int"
+                                        ? "builtins.int"
+                                        : "builtins.float"),
             call.getResult(0)};
       }
     }
   if (concrete->payloadSlotWord)
     return llvm::SmallVector<mlir::Value, 4>{
-        constantI64(builder, loc,
-                    concrete->contractName() == "builtins.float"
-                        ? py::class_ids::of("builtins.float")
-                        : py::class_ids::of("builtins.int")),
+        type_objects::classWord(builder, loc, module,
+                                concrete->contractName() == "builtins.float"
+                                    ? "builtins.float"
+                                    : "builtins.int"),
         concrete->payloadSlotWord};
   if (concrete->physicalValues().empty())
     return op->emitError()

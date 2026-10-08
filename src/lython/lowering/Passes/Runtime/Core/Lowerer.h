@@ -13,6 +13,8 @@
 // verifiers instead of a ConversionTarget.
 
 #include "Common/PythonSourceRange.h"
+#include "Common/TypeObjects.h"
+#include "RuntimeClasses.h"
 #include "ArithBuilders.h"
 #include "Ownership.h"
 #include "Runtime/Manifest/Index.h"
@@ -129,28 +131,24 @@ private:
   std::optional<std::string>
   exceptionAncestorContract(py::ClassOp classOp) const;
   std::optional<std::string> exceptionAncestorContractFor(mlir::Type type) const;
-  // Class id of the next exception class after `classOp` in its MRO (a user
-  // exception base's source id, else the builtin ancestor's manifest id).
-  std::optional<std::int64_t>
-  userExceptionParentClassId(py::ClassOp classOp) const;
-  // Per-program hooks the native support module links against:
-  // __ly_user_exception_base_class_id (id -> parent id, 0 unknown) and
-  // __ly_user_exception_class_name (id -> C-string ptr, null unknown).
-  mlir::LogicalResult synthesizeUserExceptionHooks();
-  mlir::LogicalResult synthesizeSourceClassNameHook();
-  // __ly_class_derives_strictly (sub id, base id -> i1) for the ordering
-  // dispatch's reflected-first rule.
-  mlir::LogicalResult synthesizeClassDerivesHook();
-  llvm::SmallVector<std::int64_t, 8>
-  classAncestorIds(py::ClassOp classOp) const;
-  // Class id of an except-clause handler type (manifest or source class).
-  mlir::FailureOr<std::int64_t> handlerClassId(mlir::Operation *op,
-                                               mlir::Type handler) const;
-  std::optional<std::int64_t> runtimeClassIdForClass(py::ClassOp classOp) const;
-  std::optional<std::int64_t> runtimeClassIdForContract(mlir::Type type) const;
-  mlir::FailureOr<llvm::SmallVector<std::int64_t, 8>>
-  runtimeClassIdsForNominalTarget(mlir::Operation *op,
-                                  mlir::Type targetType) const;
+  // The next exception class after `classOp` in its MRO (a user exception
+  // base, else the builtin ancestor).
+  std::optional<std::string>
+  userExceptionParentClass(py::ClassOp classOp) const;
+  // Records every class of the module for its type object (TypeObjects.h).
+  mlir::LogicalResult recordSourceTypeObjects();
+  std::optional<std::string> runtimeClassForName(py::ClassOp from,
+                                                 llvm::StringRef name) const;
+  llvm::SmallVector<std::string, 8> classAncestors(py::ClassOp classOp) const;
+  // The class of an except-clause handler type (manifest or source class).
+  mlir::FailureOr<std::string> handlerClass(mlir::Operation *op,
+                                            mlir::Type handler) const;
+  // A class's qualified name: the name of its type object.
+  std::optional<std::string> runtimeClassForClass(py::ClassOp classOp) const;
+  std::optional<std::string> runtimeClassForContract(mlir::Type type) const;
+  mlir::FailureOr<llvm::SmallVector<std::string, 8>>
+  runtimeClassesForNominalTarget(mlir::Operation *op,
+                                 mlir::Type targetType) const;
   bool classDefinesMethod(mlir::Type type, llvm::StringRef name) const;
   std::optional<std::string> classMethodSymbol(py::ClassOp classOp,
                                                llvm::StringRef name) const;
@@ -679,9 +677,10 @@ private:
   // `contentKey`: `words` (a word listed in `selfAddressWords` holds the
   // image's own address plus the paired byte offset -- a relocation) and then
   // `tail` bytes. The object reads back through a `from_static` primitive.
+  // `runtimeClass` names the class whose type object word 1 points at.
   mlir::Value materializeStaticObjectAddress(
-      mlir::Location loc, llvm::StringRef kind, llvm::StringRef contentKey,
-      llvm::ArrayRef<std::int64_t> words,
+      mlir::Location loc, llvm::StringRef kind, llvm::StringRef runtimeClass,
+      llvm::StringRef contentKey, llvm::ArrayRef<std::int64_t> words,
       llvm::ArrayRef<std::pair<unsigned, std::int64_t>> selfAddressWords,
       llvm::ArrayRef<std::int8_t> tail);
   mlir::LogicalResult materializeStringObject(mlir::Operation *op,
@@ -701,7 +700,7 @@ private:
                                                 const RuntimeBundle &object,
                                                 RuntimeBundle &result);
   // Erased (`builtins.object`) receivers dispatch `__repr__` through the boxed
-  // repr hook on their class id, trapping when no conforming __repr__ exists.
+  // repr hook on their class word, trapping when no conforming __repr__ exists.
   mlir::LogicalResult emitBoxedReprHookCall(mlir::Operation *op,
                                             const RuntimeBundle &object,
                                             RuntimeBundle &result);
@@ -781,7 +780,7 @@ private:
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
   objectPayloadHandleWords(mlir::Operation *op, const RuntimeBundle &value,
                            bool ownsPayload = true);
-  // {class id, entity word}: what a standalone `object` box holds.
+  // {class word, entity word}: what a standalone `object` box holds.
   static mlir::Value borrowedBoxOfSlotEntity(mlir::OpBuilder &builder,
                                              mlir::Location loc,
                                              mlir::Value entity,
@@ -1056,12 +1055,12 @@ private:
                      llvm::StringRef contract, mlir::Operation *reporter,
                      bool ownedRead = false);
   std::optional<RuntimeSymbol> laneWordsPrimitiveFor(llvm::StringRef contract) const;
-  // Per-program release hook: dispatches a boxed slot's class id to the
+  // Per-program release hook: dispatches a boxed slot's class word to the
   // matching manifest deallocator (the single release implementation).
   mlir::LogicalResult generateBoxedReleaseHook();
   // Uniform boxed-object method dispatch. Builds a per-program hook
-  // `(ptr box, i64 class_id) -> (calleeResults..., i1 handled)` that dispatches
-  // the class id to the matching manifest function GENERICALLY — no per-type
+  // `(ptr box, i64 class) -> (calleeResults..., i1 handled)` that dispatches
+  // the class word to the matching manifest function GENERICALLY — no per-type
   // special-casing — reconstructing its memref arguments from the shared box
   // word layout (slot words (4+i, 9+i) = physical value i, so a compiled
   // source-class method taking (self box, field views...) conforms as-is).
@@ -1095,13 +1094,13 @@ private:
       llvm::StringRef hookName, llvm::StringRef methodName,
       mlir::TypeRange calleeResultTypes);
   void stampBoxedStrHookResult(llvm::StringRef hookName);
-  // repr instance of the uniform dispatch: class id -> the manifest `__repr__`
+  // repr instance of the uniform dispatch: class word -> the manifest `__repr__`
   // returning a `builtins.str`, for container __repr__ over erased elements.
   mlir::LogicalResult generateBoxedReprHook();
   // str instance of the uniform dispatch (print's conversion over erased
   // boxes).
   mlir::LogicalResult generateBoxedStrHook();
-  // hash instance of the uniform dispatch: class id -> the manifest
+  // hash instance of the uniform dispatch: class word -> the manifest
   // `__hash__` returning the i64 hash word (dict/set probing over erased
   // keys).
   mlir::LogicalResult generateBoxedHashHook();
@@ -1110,7 +1109,7 @@ private:
   // i64 dispatch cannot call directly.
   mlir::LogicalResult synthesizeSourceClassHashAdapters();
   // Binary (same-class two-receiver) variant of the uniform dispatch:
-  // `(ptr lhs, ptr rhs, i64 class_id) -> (results..., i1 handled)`; callees
+  // `(ptr lhs, ptr rhs, i64 class) -> (results..., i1 handled)`; callees
   // take their self shape twice.
   mlir::LogicalResult generateBoxedBinaryMethodHook(
       llvm::StringRef hookName,
@@ -1119,10 +1118,22 @@ private:
       llvm::StringRef sourceClassMethodName = "",
       llvm::function_ref<bool(llvm::StringRef)> keepsContract = nullptr);
   // The trap a hook ends with when it pruned classes: those ids assert.
-  mlir::LogicalResult endWithPrunedClassTrap(
-      mlir::func::FuncOp hook, mlir::Block *check, mlir::Block *miss,
-      mlir::Value classValue, llvm::ArrayRef<std::int64_t> prunedIds,
-      llvm::StringRef hookName);
+  mlir::FunctionType slotFunctionType(const type_objects::SlotHook &hook,
+                                      mlir::TypeRange calleeResultTypes);
+  mlir::FailureOr<std::string> slotFunction(
+      llvm::StringRef hookName, llvm::StringRef arm, mlir::FunctionType type,
+      llvm::function_ref<mlir::LogicalResult(mlir::OpBuilder &,
+                                             mlir::func::FuncOp)>
+          body);
+  void returnSlotHit(mlir::OpBuilder &builder, mlir::Location loc,
+                     mlir::ValueRange results);
+  void returnSlotMiss(mlir::OpBuilder &builder, mlir::Location loc,
+                      mlir::TypeRange results);
+  mlir::LogicalResult
+  recordUnreachableSlots(llvm::StringRef hookName,
+                         const type_objects::SlotHook &hook,
+                         mlir::FunctionType slotType,
+                         llvm::ArrayRef<std::string> pruned);
   // eq instance of the binary dispatch (dict/set key equality over erased
   // keys).
   mlir::LogicalResult generateBoxedEqHook();
@@ -1529,11 +1540,13 @@ private:
   mlir::LogicalResult lowerUnionWrap(py::UnionWrapOp op);
   mlir::LogicalResult lowerUnionTest(py::UnionTestOp op);
   mlir::LogicalResult lowerUnionUnwrap(py::UnionUnwrapOp op);
-  // The instance's EXACT class id, from a header or from a box. Shared,
+  // The instance's EXACT class word, from a header or from a box. Shared,
   // because a box and an exception each move the word.
-  mlir::FailureOr<mlir::Value> exactRuntimeClassId(mlir::Operation *op,
+  mlir::Value classTestMatches(mlir::Location loc, mlir::Value actual,
+                               llvm::StringRef target);
+  mlir::FailureOr<mlir::Value> exactRuntimeClassWord(mlir::Operation *op,
                                                    const RuntimeBundle &object);
-  mlir::Value exactClassIdFromWords(mlir::Operation *op, mlir::Value classWord,
+  mlir::Value exactClassWordFromWords(mlir::Operation *op, mlir::Value classWord,
                                     mlir::Value entityWord);
   // A union's physical values -- tag plus every member's lanes -- built from a
   // box that some container owns.
@@ -2013,10 +2026,6 @@ private:
       settledDeallocators;
   // findRetainFunction's answer once it has one.
   mutable mlir::func::FuncOp retainFunctionMemo;
-  // The ids runtimeClassIdForClass numbers source classes with, by class op;
-  // built on the first question.
-  mutable std::optional<llvm::DenseMap<mlir::Operation *, std::int64_t>>
-      sourceClassIds;
   // The module's class ops by name, for classForContract; built on the first
   // question.
   mutable std::optional<llvm::StringMap<py::ClassOp>> classesByName;

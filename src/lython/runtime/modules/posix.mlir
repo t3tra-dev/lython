@@ -26,7 +26,7 @@
 //   one syscall per field read.
 // - error reporting is split: the calls that must fail loudly raise from
 //   here through `_raise_errno`, which maps errno to the OSError subclass
-//   with the compiler's own kOSErrorErrnoMap table (LyHost_OSErrorClassId)
+//   with the compiler's own kOSErrorErrnoMap table (LyHost_OSErrorClass)
 //   and formats CPython's "[Errno %d] %s: '%s'" message; the predicate-shaped
 //   calls return `-errno` and let os.py decide.
 // - `mkdir` takes no `dir_fd`, `unlink` no `dir_fd`, `access` no
@@ -122,15 +122,15 @@ module attributes {
   ly.typing.int_constant_values = [0 : i64, 4 : i64, 2 : i64, 1 : i64]
 } {
   // --- shared runtime entry points -----------------------------------------
-  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
-  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
+  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
+  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_Encode(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "encode", ly.runtime.result_contract = "builtins.bytes"}
   func.func private @LyBytes_DecRef(%header: memref<4xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.deallocator}
   func.func private @__ly_bytes_payload(%self: memref<4xi64>) -> memref<?xi8> attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.interior_word, ly.runtime.primitive = "payload_view"}
   func.func private @__ly_list_items(%self: memref<5xi64>) -> memref<?xi64> attributes {ly.runtime.contract = "builtins.list", ly.runtime.interior_word, ly.runtime.primitive = "items_view"}
   func.func private @__ly_unicode_store_item(%items: memref<?xi64>, %slot: i64, %eh: memref<2xi64> {ly.ownership.object_header}, %eb: memref<?xi8>) attributes {ly.ownership.transfer_args = [2]}
-  func.func private @LyList_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.list", ly.runtime.initializer = "__new__"}
-  func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
+  func.func private @LyList_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.list", ly.runtime.initializer = "__new__"}
+  func.func private @LyBaseException_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
   func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "raise"}
 
@@ -142,7 +142,7 @@ module attributes {
   func.func private @LyHost_GetGid() -> i64
   func.func private @LyHost_GetEGid() -> i64
   func.func private @LyHost_Errno() -> i32
-  func.func private @LyHost_OSErrorClassId(i32) -> i64
+  func.func private @LyHost_OSErrorClass(i32) -> i64
   func.func private @LyHost_OSErrorMessagePath(i32, memref<?xi8>, i64, memref<?xi8>, i64) -> i64
   func.func private @LyHost_OSErrorMessagePath2(i32, memref<?xi8>, i64, memref<?xi8>, i64, memref<?xi8>, i64) -> i64
   func.func private @LyHost_Strerror(i32, memref<?xi8>, i64) -> i64
@@ -168,8 +168,8 @@ module attributes {
   // --- internal helpers ----------------------------------------------------
 
   // Raises the OSError subclass errno maps to, with CPython's message. The
-  // class id comes from the compiler's kOSErrorErrnoMap through
-  // LyHost_OSErrorClassId, so `except FileNotFoundError` matches here exactly
+  // class word comes from the compiler's kOSErrorErrnoMap through
+  // LyHost_OSErrorClass, so `except FileNotFoundError` matches here exactly
   // as it does for a hand-raised one.
   // One place where a posix errno failure becomes a thrown OSError subclass.
   //
@@ -182,16 +182,16 @@ module attributes {
   // Not marked with an ownership attribute: `%buffer` is scratch, not an entity --
   // no header, no refcount, one `memref.alloc` with no interior. The attributes
   // describe objects.
-  func.func private @__ly_raise_message_object(%class_id: i64, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>)
+  func.func private @__ly_raise_message_object(%class_word: i64, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>)
 
   // Not the shared static-message raise: this one OWNS the formatted buffer,
   // and the free has to happen between building the str and the throw, since
   // a throw does not return.
-  func.func private @__ly_posix_throw_message(%class_id: i64, %buffer: memref<?xi8>, %len: i64) {
+  func.func private @__ly_posix_throw_message(%class_word: i64, %buffer: memref<?xi8>, %len: i64) {
     %c0 = arith.constant 0 : index
     %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     memref.dealloc %buffer : memref<?xi8>
-    func.call @__ly_raise_message_object(%class_id, %message_header, %message_bytes) : (i64, memref<2xi64>, memref<?xi8>) -> ()
+    func.call @__ly_raise_message_object(%class_word, %message_header, %message_bytes) : (i64, memref<2xi64>, memref<?xi8>) -> ()
     func.return
   }
 
@@ -219,14 +219,14 @@ module attributes {
     %c0 = arith.constant 0 : index
     %cap_index = arith.constant 1024 : index
     %cap = arith.constant 1024 : i64
-    %class_id = func.call @LyHost_OSErrorClassId(%err) : (i32) -> i64
+    %class_word = func.call @LyHost_OSErrorClass(%err) : (i32) -> i64
     %path = func.call @__ly_bytes_payload(%path_object) : (memref<4xi64>) -> memref<?xi8>
     %path_dim = memref.dim %path, %c0 : memref<?xi8>
     %path_len = arith.index_cast %path_dim : index to i64
     %buffer = memref.alloc(%cap_index) : memref<?xi8>
     %len = func.call @LyHost_OSErrorMessagePath(%err, %path, %path_len, %buffer, %cap) : (i32, memref<?xi8>, i64, memref<?xi8>, i64) -> i64
     func.call @LyBytes_DecRef(%path_object) : (memref<4xi64>) -> ()
-    func.call @__ly_posix_throw_message(%class_id, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_posix_throw_message(%class_word, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -236,7 +236,7 @@ module attributes {
     %c0 = arith.constant 0 : index
     %cap_index = arith.constant 1024 : index
     %cap = arith.constant 1024 : i64
-    %class_id = func.call @LyHost_OSErrorClassId(%err) : (i32) -> i64
+    %class_word = func.call @LyHost_OSErrorClass(%err) : (i32) -> i64
     %src = func.call @__ly_bytes_payload(%src_object) : (memref<4xi64>) -> memref<?xi8>
     %src_dim = memref.dim %src, %c0 : memref<?xi8>
     %src_len = arith.index_cast %src_dim : index to i64
@@ -247,7 +247,7 @@ module attributes {
     %len = func.call @LyHost_OSErrorMessagePath2(%err, %src, %src_len, %dst, %dst_len, %buffer, %cap) : (i32, memref<?xi8>, i64, memref<?xi8>, i64, memref<?xi8>, i64) -> i64
     func.call @LyBytes_DecRef(%src_object) : (memref<4xi64>) -> ()
     func.call @LyBytes_DecRef(%dst_object) : (memref<4xi64>) -> ()
-    func.call @__ly_posix_throw_message(%class_id, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_posix_throw_message(%class_word, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -258,13 +258,13 @@ module attributes {
     %zero = arith.constant 0 : i64
     %cap_index = arith.constant 1024 : index
     %cap = arith.constant 1024 : i64
-    %class_id = func.call @LyHost_OSErrorClassId(%err) : (i32) -> i64
+    %class_word = func.call @LyHost_OSErrorClass(%err) : (i32) -> i64
     %empty_index = arith.constant 0 : index
     %empty = memref.alloc(%empty_index) : memref<?xi8>
     %buffer = memref.alloc(%cap_index) : memref<?xi8>
     %len = func.call @LyHost_OSErrorMessagePath(%err, %empty, %zero, %buffer, %cap) : (i32, memref<?xi8>, i64, memref<?xi8>, i64) -> i64
     memref.dealloc %empty : memref<?xi8>
-    func.call @__ly_posix_throw_message(%class_id, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_posix_throw_message(%class_word, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 

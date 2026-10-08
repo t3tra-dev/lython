@@ -221,8 +221,8 @@ manifestLinearization(llvm::StringRef contractName) {
   chain.push_back(contractName.str());
   const py::exceptions::BuiltinExceptionInfo *entry =
       taxonomyEntryForContract(contractName);
-  while (entry && entry->baseClassId != py::exceptions::kRootClassId) {
-    entry = py::exceptions::findByClassId(entry->baseClassId);
+  while (entry && !entry->baseContract.empty()) {
+    entry = py::exceptions::findByContract(entry->baseContract);
     if (!entry)
       break;
     chain.push_back(std::string(entry->contract));
@@ -3430,7 +3430,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   mlir::OperationState state(loc(classDef), py::ClassOp::getOperationName());
   state.addAttribute(mlir::SymbolTable::getSymbolAttrName(),
                      builder.getStringAttr(contractName));
-  // ⭐ THIS CLASS IS THE PROGRAM'S, and the class-id assignment has to know.
+  // ⭐ THIS CLASS IS THE PROGRAM'S, and the class-word assignment has to know.
   // A manifest `py.class` carries its contract in its SYMBOL's leaf
   // (`py.class @Task` for `_asyncio.Task`), so the lowering finds a manifest
   // id by trying `builtins.`/`types.`/`_asyncio.`/`asyncio.`/`contextlib.` in
@@ -5539,7 +5539,7 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
                                             mlir::Type instanceType) {
   // `object()` is refused at the earliest static boundary rather than lowered.
   // ⛔ No longer for a representation conflict -- object has its own class
-  // number and None is an object of its own (ClassIds.h) -- but because a
+  // type object and None is an object of its own (TypeObjects.h) -- but because a
   // bare object has nothing to be: an `object` value is a box around an
   // entity, and there is no manifest `__new__` that allocates a header-only
   // entity nor a deallocator its release would dispatch to.

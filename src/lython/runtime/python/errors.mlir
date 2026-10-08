@@ -1,4 +1,4 @@
-// Raising -- CPython's Python/errors.c: PyErr_SetString (a class id and a
+// Raising -- CPython's Python/errors.c: PyErr_SetString (a class word and a
 // message, `__ly_raise_static_message`) and PyErr_NoMemory.
 
 module {
@@ -10,17 +10,17 @@ module {
   func.func private @LyFrozenSet_DecRef(%self: memref<9xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.frozenset", ly.runtime.deallocator}
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
-  func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
+  func.func private @LyBaseException_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
   func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "raise"}
-  func.func private @LyMemoryError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.MemoryError", ly.runtime.initializer = "__new__"}
+  func.func private @LyMemoryError_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.MemoryError", ly.runtime.initializer = "__new__"}
   func.func private @LyMemoryError_Raise(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.MemoryError", ly.runtime.primitive = "raise"}
-  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
+  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
 
   // Raise `class_id` carrying an already-built str. The other manifests reach
   // this one: posix must free its formatted buffer between building the str
   // and throwing, and _time raises a strftime message it computed.
-  func.func private @__ly_raise_message_object(%class_id: i64, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) {
-    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+  func.func private @__ly_raise_message_object(%class_word: i64, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) {
+    %exception:3 = func.call @LyBaseException_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
     func.return
@@ -31,10 +31,10 @@ module {
   // written twice (once as `__ly_long_raise_message`, once as
   // `__ly_unicode_raise`) and inlined again in five argument-less helpers;
   // every runtime file declares this one instead.
-  func.func private @__ly_raise_static_message(%class_id: i64, %message: memref<?xi8>, %length: i64) {
+  func.func private @__ly_raise_static_message(%class_word: i64, %message: memref<?xi8>, %length: i64) {
     %start = arith.constant 0 : index
     %message_header, %message_bytes = func.call @__ly_unicode_from_valid_utf8(%message, %start, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
-    func.call @__ly_raise_message_object(%class_id, %message_header, %message_bytes) : (i64, memref<2xi64>, memref<?xi8>) -> ()
+    func.call @__ly_raise_message_object(%class_word, %message_header, %message_bytes) : (i64, memref<2xi64>, memref<?xi8>) -> ()
     func.return
   }
 
@@ -180,8 +180,8 @@ module {
   // size the program computes past the allocator's reach raises
   // (`__ly_check_alloc_count`, the repeats).
   func.func private @LyErr_NoMemory() attributes {ly.runtime.contract = "builtins.MemoryError"} {
-    %class_id = arith.constant {ly.class_id_of = "builtins.MemoryError"} 109 : i64
-    %exception:3 = func.call @LyMemoryError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %class_word = arith.constant {ly.class_of = "builtins.MemoryError"} 109 : i64
+    %exception:3 = func.call @LyMemoryError_New(%class_word) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.call @LyMemoryError_Raise(%exception#0, %exception#1, %exception#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
     func.return
   }

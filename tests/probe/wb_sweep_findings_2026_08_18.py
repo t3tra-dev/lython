@@ -2063,7 +2063,7 @@ them in.
 #    why `str(ValueError(42))` is "42" and not "(42,)".
 #
 #    ⛔ KeyError.__str__ IS repr(args[0]) and it is INHERITED, so the renderer
-#    asks the class taxonomy (LyEH_ClassIdMatches) rather than comparing one
+#    asks the class taxonomy (LyType_IsSubtype) rather than comparing one
 #    class id. The str path kept that override inside LyKeyError_Init; routing
 #    the non-str argument through the generic block would have lost it, and
 #    `str(KeyError(p))` printed p's __str__ where CPython prints its __repr__.

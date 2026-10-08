@@ -37,15 +37,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
   // Before the list is settled: the hooks also name the program's exception
   // classes as released by BaseException's deallocator, and the list reads
   // those names.
-  if (mlir::failed(synthesizeUserExceptionHooks()))
+  if (mlir::failed(recordSourceTypeObjects()))
     return mlir::failure();
   // Nothing after this makes a deallocator, so the py-op lowering reads one
   // list instead of walking the module for every slot it releases.
   settledDeallocators = ownership::collectRuntimeDeallocators(module);
-  if (mlir::failed(synthesizeSourceClassNameHook()))
-    return mlir::failure();
-  if (mlir::failed(synthesizeClassDerivesHook()))
-    return mlir::failure();
   if (mlir::failed(lowerStructuredTryOps()))
     return mlir::failure();
 
@@ -138,7 +134,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
                   "functions with eraseLoweredFunction";
   }
   // Class ops survive eraseLoweredPyOps so the hooks above can resolve
-  // source-class ids and method symbols; drop them now that dispatch is built.
+  // source-class words and method symbols; drop them now that dispatch is built.
   llvm::SmallVector<py::ClassOp, 8> classOps;
   module.walk([&](py::ClassOp classOp) { classOps.push_back(classOp); });
   for (py::ClassOp classOp : classOps)

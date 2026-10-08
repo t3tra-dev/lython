@@ -292,19 +292,15 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
 
   if (source.kind == RuntimeBundle::Kind::TypeObject &&
       expected.isInteger(64)) {
-    std::optional<std::int64_t> id =
-        manifest.classId(source.instanceContractName());
-    if (!id)
-      // Source classes (user exceptions constructed through a builtin
-      // exception initializer) carry compiler-assigned ids.
-      id = RuntimeBundleLowerer::runtimeClassIdForContract(
-          source.instanceContract);
-    if (!id)
-      return op->emitError() << "type object has no runtime class id for "
+    // Source classes too: user exceptions constructed through a builtin
+    // exception initializer.
+    std::optional<std::string> runtimeClass =
+        RuntimeBundleLowerer::runtimeClassForContract(source.instanceContract);
+    if (!runtimeClass)
+      return op->emitError() << "type object has no runtime class for "
                              << source.instanceContractName();
     mlir::Value value =
-        mlir::arith::ConstantIntOp::create(builder, op->getLoc(), *id, 64)
-            .getResult();
+        type_objects::classWord(builder, op->getLoc(), module, *runtimeClass);
     operands.push_back(value);
     ++inputIndex;
     return mlir::success();
@@ -561,9 +557,7 @@ bool RuntimeBundleLowerer::canAppendRuntimeSource(
 
   if (source.kind == RuntimeBundle::Kind::TypeObject &&
       expected.isInteger(64) &&
-      (manifest.classId(source.instanceContractName()) ||
-       RuntimeBundleLowerer::runtimeClassIdForContract(
-           source.instanceContract))) {
+      RuntimeBundleLowerer::runtimeClassForContract(source.instanceContract)) {
     ++inputIndex;
     return true;
   }
@@ -681,7 +675,7 @@ bool RuntimeBundleLowerer::canBuildRuntimeCallOperands(
   unsigned inputIndex = 0;
   unsigned sourceIndex = 0;
   while (inputIndex < functionType.getNumInputs()) {
-    if (symbol.hasClassIdArgument(inputIndex)) {
+    if (symbol.hasClassArgument(inputIndex)) {
       if (!classObject)
         return false;
       if (!canAppendRuntimeSource(symbol, functionType, inputIndex,
@@ -713,10 +707,10 @@ mlir::LogicalResult RuntimeBundleLowerer::buildRuntimeCallOperands(
   unsigned inputIndex = 0;
   unsigned sourceIndex = 0;
   while (inputIndex < functionType.getNumInputs()) {
-    if (symbol.hasClassIdArgument(inputIndex)) {
+    if (symbol.hasClassArgument(inputIndex)) {
       if (!classObject)
         return op->emitError()
-               << "runtime class id input " << inputIndex << " for "
+               << "runtime class word input " << inputIndex << " for "
                << symbol.contract << "." << symbol.name
                << " has no lowered class object source";
       if (mlir::failed(appendRuntimeSource(op, symbol, functionType, inputIndex,

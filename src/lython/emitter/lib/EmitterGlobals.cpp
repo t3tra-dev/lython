@@ -210,7 +210,7 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
     // The cost is the cell's own benefit: such a global is not readable from a
     // function, exactly as no container global was before it had cells. The
     // real repair is the runtime read learning to build a union from the
-    // slot's payload class id, which would also close the second-read case
+    // slot's payload class word, which would also close the second-read case
     // (tests/probe/wb_grid_leftovers_2026_08_16.py).
     if (storageBacked)
       if (auto contract = mlir::dyn_cast<py::ContractType>(annotated))

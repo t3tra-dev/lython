@@ -10,8 +10,8 @@ module attributes {
   // ===== declared here, defined in another runtime file or built by the lowering =====
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyLong_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.int", ly.runtime.deallocator}
-  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
-  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
+  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
+  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   memref.global "private" constant @__ly_fmt_msg_name_bool : memref<4xi8>
   func.func private @__ly_fmt_parse_spec(%spec_h: memref<2xi64>, %spec_b: memref<?xi8>, %out: memref<?xi64>) -> i1
   func.func private @__ly_fmt_raise_invalid_spec(%spec_h: memref<2xi64>, %spec_b: memref<?xi8>, %name: memref<?xi8>, %name_len: i64)
@@ -65,11 +65,11 @@ module attributes {
   // Layout follows the shared header contract: [refcount, class_id, value].
   // The refcount starts at the immortal marker; generic retains/releases may
   // drift it but it never reaches zero, and the deallocator is a no-op.
-  memref.global "private" @__ly_bool_box_true : memref<3xi64> = dense<[9223372036854775807, 22, 1]> {ly.class_id_of = "builtins.bool"}
-  memref.global "private" @__ly_bool_box_false : memref<3xi64> = dense<[9223372036854775807, 22, 0]> {ly.class_id_of = "builtins.bool"}
+  memref.global "private" @__ly_bool_box_true : memref<3xi64> = dense<[9223372036854775807, 22, 1]> {ly.class_of = "builtins.bool"}
+  memref.global "private" @__ly_bool_box_false : memref<3xi64> = dense<[9223372036854775807, 22, 0]> {ly.class_of = "builtins.bool"}
 
   // box: canonical i1 -> the boxed singleton (no allocation).
-  func.func @LyBool_Box(%value: i1) -> memref<3xi64> attributes {ly.runtime.class_id, ly.runtime.contract = "builtins.bool", ly.runtime.primitive = "box"} {
+  func.func @LyBool_Box(%value: i1) -> memref<3xi64> attributes {ly.runtime.class, ly.runtime.contract = "builtins.bool", ly.runtime.primitive = "box"} {
     %true_box = memref.get_global @__ly_bool_box_true : memref<3xi64>
     %false_box = memref.get_global @__ly_bool_box_false : memref<3xi64>
     %box = arith.select %value, %true_box, %false_box : memref<3xi64>

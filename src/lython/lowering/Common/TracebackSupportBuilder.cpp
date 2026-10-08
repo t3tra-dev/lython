@@ -1,4 +1,3 @@
-#include "ClassIds.h"
 #include "Common/SupportBuilder.h"
 #include "ExceptionTaxonomy.h"
 #include "Runtime/ABI/BoxLayout.h"
@@ -152,9 +151,7 @@ void declareTracebackSupport(SupportBuilder &b) {
   b.stringGlobal(".tb_fmt_invalid", "%s: <invalid>\n");
   b.stringGlobal(".tb_fmt_unknown", "%s: <unknown>\n");
   b.stringGlobal(".tb_fmt_message", "%s: %s\n");
-  for (const py::exceptions::BuiltinExceptionInfo &info :
-       py::exceptions::kBuiltinExceptions)
-    b.stringGlobal((llvm::Twine(".tb_class.") + info.name).str(), info.name);
+  b.stringGlobal(".tb_class.Exception", "Exception");
 }
 
 // ptr copy_cstr(ptr cstr): malloc'd NUL-terminated copy ("" for null input).
@@ -946,7 +943,7 @@ void buildTracebackFrameNameCopy(SupportBuilder &b, llvm::StringRef symbol,
 }
 
 // ptr exc_line_cstr(): a malloc'd "Label" or "Label: message" for the exception
-// being handled, or null when there is none. The label comes from the class id
+// being handled, or null when there is none. The label comes from the class word
 // the handler dispatches on and the message from the same re-encoder the
 // uncaught printer uses, so `traceback.format_exc()` and a traceback printed by
 // the runtime cannot word the last line differently.
@@ -961,7 +958,7 @@ void buildExcLineCStr(SupportBuilder &b) {
 
   // ⭐ THE VIEW ANSWERS FIRST. `format_exception` renders a chained exception
   // by selecting its node, and its last line has to come from that node's
-  // payload -- the class id in word 2 of the exception object it owns, and
+  // payload -- the class word in word 2 of the exception object it owns, and
   // the message beside it -- not from the exception being handled.
   mlir::Block *viewed = b.builder.createBlock(&fn.getBody());
   mlir::Block *live = b.builder.createBlock(&fn.getBody());
@@ -1005,13 +1002,13 @@ void buildExcLineCStr(SupportBuilder &b) {
       b.builder, b.loc, ready,
       mlir::ValueRange{
           b.addrOf("g_current_parts"),
-          b.call("LyEH_CurrentExceptionClassId", b.i64(), {}).front()});
+          b.call("LyEH_CurrentExceptionClass", b.i64(), {}).front()});
 
   b.builder.setInsertionPointToEnd(ready);
   mlir::Value parts = ready->getArgument(0);
-  mlir::Value classId = ready->getArgument(1);
+  mlir::Value classWord = ready->getArgument(1);
   mlir::Value label =
-      b.call("exception_class_name", b.ptr(), mlir::ValueRange{classId})
+      b.call("exception_class_name", b.ptr(), mlir::ValueRange{classWord})
           .front();
   mlir::Value labelLen =
       b.call("strlen", b.i64(), mlir::ValueRange{label}).front();
@@ -1651,36 +1648,57 @@ void buildReadSourceLine(SupportBuilder &b) {
   b.emitTrap(b.ptr());
 }
 
-// ptr exception_class_name(i64 class_id): builtin exception-class name table
-// (value selection; unknown ids display as "Exception").
+// ptr exception_class_name(i64 class): the name the class's type object keeps
+// (TypeObjects.h) as CPython's traceback prints it -- module-qualified, except
+// that `__main__.` is left off, as traceback.py leaves off `__main__` and
+// `builtins`; "Exception" for 0, a word that names no class.
 void buildExceptionClassName(SupportBuilder &b) {
   auto fn = b.beginFunction(
       "exception_class_name",
       b.builder.getFunctionType({b.i64()}, {b.ptr()}), /*isPrivate=*/true);
   mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Value word = entry->getArgument(0);
+  mlir::Block *read = b.builder.createBlock(&body);
+  mlir::Block *compare = b.builder.createBlock(&body);
+  mlir::Block *done = b.builder.createBlock(&body, body.end(), {b.ptr()}, {b.loc});
+  mlir::Block *none = b.builder.createBlock(&body);
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value classId = entry->getArgument(0);
-  mlir::Value name = b.addrOf(".tb_class.Exception");
-  for (const py::exceptions::BuiltinExceptionInfo &info :
-       py::exceptions::kBuiltinExceptions) {
-    mlir::Value matches =
-        b.cmpi(mlir::arith::CmpIPredicate::eq, classId, b.iconst(info.classId));
-    name = mlir::arith::SelectOp::create(
-        b.builder, b.loc, matches,
-        b.addrOf((llvm::Twine(".tb_class.") + info.name).str()), name);
-  }
-  // Source exception classes: the per-program hook owns their names (null
-  // for ids it does not know, which keeps the builtin selection).
-  auto userName = mlir::func::CallOp::create(
-      b.builder, b.loc, "__ly_user_exception_class_name", b.ptr(),
-      mlir::ValueRange{classId});
-  mlir::Value null = mlir::LLVM::ZeroOp::create(b.builder, b.loc, b.ptr());
-  mlir::Value missing = mlir::LLVM::ICmpOp::create(
-      b.builder, b.loc, mlir::LLVM::ICmpPredicate::eq, userName.getResult(0),
-      null);
-  name = mlir::arith::SelectOp::create(b.builder, b.loc, missing, name,
-                                       userName.getResult(0));
-  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{name});
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc, b.cmpi(mlir::arith::CmpIPredicate::eq, word, b.iconst(0)),
+      none, mlir::ValueRange{}, read, mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(read);
+  mlir::Value name =
+      b.intToPtr(b.typeObjectWord(word, py::type_objects::kNameWord));
+  constexpr llvm::StringLiteral kMain = "__main__.";
+  // Word 4 is the name's length: the prefix is read only where it fits.
+  mlir::Value length =
+      b.typeObjectWord(word, py::type_objects::kNameLengthWord);
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::sgt, length,
+             b.iconst(static_cast<std::int64_t>(kMain.size()))),
+      compare, mlir::ValueRange{}, done, mlir::ValueRange{name});
+  b.builder.setInsertionPointToEnd(compare);
+  mlir::Value isMain = b.iconst1(true);
+  for (unsigned at = 0; at < kMain.size(); ++at)
+    isMain = mlir::arith::AndIOp::create(
+        b.builder, b.loc, isMain,
+        b.cmpi(mlir::arith::CmpIPredicate::eq,
+               b.loadI8(b.gepI8(name, b.iconst(at))),
+               b.iconst8(static_cast<std::int8_t>(kMain[at]))));
+  mlir::Value bare = b.gepI8(name, b.iconst(kMain.size()));
+  mlir::cf::BranchOp::create(
+      b.builder, b.loc, done,
+      mlir::ValueRange{mlir::arith::SelectOp::create(b.builder, b.loc, isMain,
+                                                     bare, name)
+                           .getResult()});
+  b.builder.setInsertionPointToEnd(done);
+  mlir::func::ReturnOp::create(b.builder, b.loc,
+                               mlir::ValueRange{done->getArgument(0)});
+  b.builder.setInsertionPointToEnd(none);
+  mlir::func::ReturnOp::create(b.builder, b.loc,
+                               mlir::ValueRange{b.addrOf(".tb_class.Exception")});
 }
 
 // i64 leading_whitespace(ptr line): count of leading spaces/tabs.
@@ -2151,7 +2169,7 @@ void buildWritePrefix(SupportBuilder &b) {
 // one payload block, shared by a group's members and by a plain exception's
 // multi-value args, so "the block is non-empty" alone is not "this is a
 // group". Two of the three callers already paired the count with
-// LyEH_ClassIdMatches; the nested-member recursion did not, and a
+// LyType_IsSubtype; the nested-member recursion did not, and a
 // `KeyError('k')` inside a group -- which carries its key as one payload arg
 // -- opened a "+-+--- 1 ---" section under itself.
 void buildExceptionGroupMemberCount(SupportBuilder &b) {
@@ -2171,10 +2189,10 @@ void buildExceptionGroupMemberCount(SupportBuilder &b) {
                                  mlir::ValueRange{}, classCheck,
                                  mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(classCheck);
-  mlir::Value classId =
+  mlir::Value classWord =
       b.loadI64(b.gepI64(entry->getArgument(0), b.iconst(2)));
-  mlir::Value isGroup = b.call("LyEH_ClassIdMatches", b.i1(),
-                               mlir::ValueRange{classId, b.iconst(py::class_ids::of("builtins.BaseExceptionGroup"))})
+  mlir::Value isGroup = b.call("LyType_IsSubtype", b.i1(),
+                               mlir::ValueRange{classWord, b.classWord("builtins.BaseExceptionGroup")})
                             .front();
   mlir::cf::CondBranchOp::create(b.builder, b.loc, isGroup, load,
                                  mlir::ValueRange{}, zero, mlir::ValueRange{});
@@ -2283,7 +2301,7 @@ void buildPrintGroupMembers(SupportBuilder &b) {
     mlir::Value mhWord = messageLanes[0];
     mlir::Value mbWord = messageLanes[2];
     mlir::Value mbLen = messageLanes[3];
-    mlir::Value classId =
+    mlir::Value classWord =
         b.loadI64(b.gepI64(ehPtr, b.iconst(2)));
 
     // Separator: the first section carries the parent connector ("+-+" at
@@ -2319,7 +2337,7 @@ void buildPrintGroupMembers(SupportBuilder &b) {
     mlir::LLVM::StoreOp::create(b.builder, b.loc, childMargin, prefixSlot,
                                 /*alignment=*/8);
     b.call("print_exception_summary", mlir::TypeRange{},
-           mlir::ValueRange{classId, ehPtr, b.intToPtr(mhWord),
+           mlir::ValueRange{classWord, ehPtr, b.intToPtr(mhWord),
                             b.intToPtr(mbWord), b.iconst(0), mbLen,
                             b.iconst(1)});
     mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(-1), prefixSlot,
@@ -2728,7 +2746,7 @@ void buildUtf8MessageCStr(SupportBuilder &b) {
   b.emitTrap(b.ptr());
 }
 
-// void print_exception_summary(i64 class_id, ptr exc, ptr msg_header,
+// void print_exception_summary(i64 class, ptr exc, ptr msg_header,
 // message view): the final "Class: message" line (or the class-only /
 // invalid / unknown forms). The message is re-encoded from code units to
 // UTF-8 for display. An exception group appends CPython's
@@ -2748,7 +2766,7 @@ void buildPrintExceptionSummary(SupportBuilder &b) {
   mlir::Block *classOnly = b.builder.createBlock(&body);
   mlir::Block *invalid = b.builder.createBlock(&body);
   mlir::Block *unknown = b.builder.createBlock(&body);
-  mlir::Value classId = entry->getArgument(0);
+  mlir::Value classWord = entry->getArgument(0);
   mlir::Value excPtr = entry->getArgument(1);
   mlir::Value msgHeader = entry->getArgument(2);
   mlir::Value data = entry->getArgument(3);
@@ -2766,13 +2784,13 @@ void buildPrintExceptionSummary(SupportBuilder &b) {
                                          mlir::LLVM::GEPArg(0)},
       mlir::LLVM::GEPNoWrapFlags::inbounds);
   mlir::Value className =
-      b.call("exception_class_name", b.ptr(), mlir::ValueRange{classId})
+      b.call("exception_class_name", b.ptr(), mlir::ValueRange{classWord})
           .front();
   mlir::Value memberCount = b.call("exception_group_member_count", b.i64(),
                                    mlir::ValueRange{excPtr})
                                 .front();
-  mlir::Value isGroupClass = b.call("LyEH_ClassIdMatches", b.i1(),
-                                    mlir::ValueRange{classId, b.iconst(py::class_ids::of("builtins.BaseExceptionGroup"))})
+  mlir::Value isGroupClass = b.call("LyType_IsSubtype", b.i1(),
+                                    mlir::ValueRange{classWord, b.classWord("builtins.BaseExceptionGroup")})
                                  .front();
   mlir::Value groupSuffix = mlir::arith::AndIOp::create(
       b.builder, b.loc, isGroupClass,
@@ -2970,15 +2988,15 @@ void buildPrintChainNode(SupportBuilder &b) {
       b.builder, b.loc, offset0,
       mlir::arith::MulIOp::create(b.builder, b.loc, stride0, b.iconst(2))
           .getResult());
-  mlir::Value classId = b.loadI64(b.gepI64(aligned, classIndex));
+  mlir::Value classWord = b.loadI64(b.gepI64(aligned, classIndex));
   // Chained exception groups keep CPython's group rendering: the group
   // header (when a traceback exists), the "| " gutter, and the member tree.
   mlir::Value chainMembers = b.call("exception_group_member_count", b.i64(),
                                     mlir::ValueRange{aligned})
                                  .front();
   mlir::Value chainIsGroupClass =
-      b.call("LyEH_ClassIdMatches", b.i1(),
-             mlir::ValueRange{classId, b.iconst(py::class_ids::of("builtins.BaseExceptionGroup"))})
+      b.call("LyType_IsSubtype", b.i1(),
+             mlir::ValueRange{classWord, b.classWord("builtins.BaseExceptionGroup")})
           .front();
   mlir::Value chainGroup = mlir::arith::AndIOp::create(
       b.builder, b.loc, chainIsGroupClass,
@@ -3041,7 +3059,7 @@ void buildPrintChainNode(SupportBuilder &b) {
   mlir::Value msgLen = b.loadI64(nodePartsField(b, node, 2, 3));
   mlir::Value msgStride = b.loadI64(nodePartsField(b, node, 2, 4));
   b.call("print_exception_summary", mlir::TypeRange{},
-         mlir::ValueRange{classId, aligned, msgHeader, msgData, msgOffset,
+         mlir::ValueRange{classWord, aligned, msgHeader, msgData, msgOffset,
                           msgLen, msgStride});
   mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(-1),
                               b.addrOf("g_tb_prefix_spaces"),
@@ -3601,7 +3619,7 @@ void buildStarDiscardSplit(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-// LyTraceback_PrintMessage(i64 class_id, ptr exc, ptr msg_header,
+// LyTraceback_PrintMessage(i64 class, ptr exc, ptr msg_header,
 // message view): chained sections (cause/context, innermost first) + header
 // + frames (most recent last, printed from the top of the stack downwards)
 // + summary line, on stderr. An exception group renders CPython's group
@@ -3662,8 +3680,8 @@ void buildTracebackPrintMessage(SupportBuilder &b) {
                                    mlir::ValueRange{entry->getArgument(1)})
                                 .front();
   mlir::Value isGroupClass =
-      b.call("LyEH_ClassIdMatches", b.i1(),
-             mlir::ValueRange{entry->getArgument(0), b.iconst(py::class_ids::of("builtins.BaseExceptionGroup"))})
+      b.call("LyType_IsSubtype", b.i1(),
+             mlir::ValueRange{entry->getArgument(0), b.classWord("builtins.BaseExceptionGroup")})
           .front();
   mlir::Value groupDisplay = mlir::arith::AndIOp::create(
       b.builder, b.loc, isGroupClass,

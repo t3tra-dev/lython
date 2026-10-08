@@ -151,7 +151,7 @@ RuntimeBundleLowerer::classMethodSymbol(py::ClassOp classOp,
   //
   // aborted with "repr: boxed element has no conforming __repr__". `Kid`
   // declares no methods of its own, so the boxed-method dispatch had no entry
-  // for its class id and the container's repr found nothing to call --
+  // for its class word and the container's repr found nothing to call --
   // `repr(Kid())` written directly was fine, because that path resolves
   // through the emitter's MRO walk rather than through this one.
   //
@@ -202,15 +202,15 @@ RuntimeBundleLowerer::runtimeValueTypesFor(mlir::Operation *op, mlir::Type type,
   // observe beyond WHICH class it is, and that is in the type -- so its
   // physical shape is EMPTY, and a parameter, a field, a return and a
   // suspension lane all carry it for free. Constructing through it stays
-  // statically resolved, which is the whole point: an i64 class id in a
+  // statically resolved, which is the whole point: an i64 class word in a
   // parameter would make `t(3)` a dispatch on a runtime value, and this
   // compiler has no dynamic dispatch to fall back to.
   //
-  // ⛔ Why NOT the i64 class id, which is what three earlier attempts built
+  // ⛔ Why NOT the i64 class word, which is what three earlier attempts built
   // and reverted: each moved the refusal one layer down (no contract -> bad
   // object header -> no unbox.i64 primitive -> the bundle is not a
   // TypeObject) and the fourth layer is where it stops being a wiring
-  // question. `t(3)` on a parameter-held class id has to pick a constructor
+  // question. `t(3)` on a parameter-held class word has to pick a constructor
   // at run time, and every ancestor of that decision -- the ABI, the field
   // slot, the operand -- was being built to support a dispatch that would
   // then have to be refused anyway.
@@ -282,7 +282,7 @@ RuntimeBundleLowerer::runtimeValueTypesFor(mlir::Operation *op, mlir::Type type,
 
   if (py::ClassOp classOp = RuntimeBundleLowerer::classForContract(type)) {
     // Exception-backed source classes use the runtime exception object's
-    // shape (their identity lives in the header's class id, not the layout),
+    // shape (their identity lives in the header's class word, not the layout),
     // so raise/borrow/str flow through the builtin exception machinery.
     if (std::optional<std::string> ancestor =
             RuntimeBundleLowerer::exceptionAncestorContract(classOp)) {

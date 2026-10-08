@@ -54,7 +54,7 @@
 // (`LYTHON_OWNERSHIP_TRACE_RETAIN_OMISSIONS`) rather than an over-retain.
 //
 // Why NOT ask this of `materializeByteBuffer`'s block or any other constant
-// data: those are `NonObject` -- no refcount word, no class id, no deallocator
+// data: those are `NonObject` -- no refcount word, no class word, no deallocator
 // (ABI/ConstantData.h) -- and their element type is i8, so the layout half
 // already excludes them. They are not in this predicate's population at all.
 
@@ -76,7 +76,7 @@ namespace py::lowering::entity_header {
 // id. The same pair ContainerLayout.h names for its own contracts, stated once
 // here for contracts that have no layout header of their own.
 inline constexpr std::int64_t kRefcountWord = 0;
-inline constexpr std::int64_t kClassIdWord = 1;
+inline constexpr std::int64_t kClassWord = 1;
 inline constexpr std::int64_t kPrefixWordCount = 2;
 
 // LAYOUT half. Delegated rather than re-spelled: `isObjectHeaderLikeType` is

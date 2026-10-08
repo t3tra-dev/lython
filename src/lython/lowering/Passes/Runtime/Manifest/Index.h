@@ -45,11 +45,11 @@ struct RuntimeSymbol {
   std::string builtinMethod;
   std::string builtinSinkContract;
   llvm::SmallVector<RuntimeResultEvidenceSlot, 2> resultEvidenceSlots;
-  llvm::SmallVector<unsigned, 1> classIdArgumentIndices;
+  llvm::SmallVector<unsigned, 1> classArgumentIndices;
   llvm::SmallVector<RuntimeDefaultArgument, 2> defaultArguments;
   std::optional<unsigned> validResultIndex;
 
-  bool hasClassIdArgument(unsigned inputIndex) const;
+  bool hasClassArgument(unsigned inputIndex) const;
   const RuntimeDefaultArgument *defaultArgument(unsigned inputIndex) const;
 };
 
@@ -68,12 +68,6 @@ struct RuntimeShapeDefinition {
   // than the full shape: the object is one entity and interior views add no
   // information to its release.
   bool prefixOfShape = false;
-};
-
-struct RuntimeClassIdDefinition {
-  mlir::func::FuncOp function;
-  std::string contract;
-  std::int64_t classId = 0;
 };
 
 struct RuntimeSymbolDuplicate {
@@ -114,13 +108,9 @@ public:
                                          llvm::StringRef name) const;
   std::optional<RuntimeSymbol> builtinCallable(llvm::StringRef name) const;
   const RuntimeValueShape *valueShape(llvm::StringRef contract) const;
-  std::optional<std::int64_t> classId(llvm::StringRef contract) const;
-  // Every (contract, class id) the manifests declare. The per-program
-  // class-NAME table needs them: it is built from the `py.class` ops in the
-  // module, and by that phase those are the source classes only.
-  llvm::ArrayRef<RuntimeClassIdDefinition> classIdDeclarations() const {
-    return classIdDefinitions;
-  }
+  // The contract itself when a manifest constructs objects of it (its
+  // `ly.runtime.class` marker): a class with a type object of its own.
+  std::optional<std::string> runtimeClass(llvm::StringRef contract) const;
   mlir::LogicalResult verify();
 
 private:
@@ -131,7 +121,7 @@ private:
   void recordDeallocatorShape(mlir::func::FuncOp function,
                               llvm::StringRef contract);
   void recordResultShape(mlir::func::FuncOp function, llvm::StringRef contract);
-  void recordClassId(mlir::func::FuncOp function, llvm::StringRef contract);
+  void recordRuntimeClass(mlir::func::FuncOp function, llvm::StringRef contract);
   void record(mlir::func::FuncOp function, llvm::StringRef contract,
               llvm::StringRef role, llvm::StringRef name);
   void recordBuiltin(const RuntimeSymbol &symbol);
@@ -149,7 +139,7 @@ private:
                                         llvm::StringRef resultContract,
                                         llvm::StringRef label);
   mlir::LogicalResult verifyNextResultPartition(RuntimeSymbol &symbol);
-  mlir::LogicalResult verifyClassIdArguments(RuntimeSymbol &symbol);
+  mlir::LogicalResult verifyClassArguments(RuntimeSymbol &symbol);
   mlir::LogicalResult verifyDefaultArguments(RuntimeSymbol &symbol);
   mlir::LogicalResult verifyBuiltinCallable(RuntimeSymbol &symbol);
   mlir::LogicalResult verifySymbol(RuntimeSymbol &symbol);
@@ -159,9 +149,8 @@ private:
   llvm::StringMap<RuntimeSymbol> builtinCallables;
   llvm::StringMap<RuntimeValueShape> valueShapes;
   llvm::StringSet<> declaredContracts;
-  llvm::StringMap<std::int64_t> classIds;
+  llvm::StringSet<> classContracts;
   llvm::SmallVector<RuntimeShapeDefinition, 8> shapeDefinitions;
-  llvm::SmallVector<RuntimeClassIdDefinition, 8> classIdDefinitions;
   llvm::SmallVector<RuntimeSymbolDuplicate, 8> duplicateSymbols;
   llvm::SmallVector<RuntimeBuiltinDuplicate, 8> duplicateBuiltins;
   mlir::ModuleOp module;

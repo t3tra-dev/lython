@@ -38,8 +38,8 @@ mlir::Type runtimeContractType(mlir::MLIRContext *context,
   return py::ContractType::get(context, contract);
 }
 
-bool RuntimeSymbol::hasClassIdArgument(unsigned inputIndex) const {
-  return llvm::is_contained(classIdArgumentIndices, inputIndex);
+bool RuntimeSymbol::hasClassArgument(unsigned inputIndex) const {
+  return llvm::is_contained(classArgumentIndices, inputIndex);
 }
 
 const RuntimeDefaultArgument *

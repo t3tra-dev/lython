@@ -8,6 +8,7 @@
 #include "Common/Instrumentation.h"
 #include "Common/RuntimeLibrary.h"
 #include "Common/RuntimeSupport.h"
+#include "Common/TypeObjects.h"
 #include "Passes/Runtime/Arch/Arm/AppleAMX.h"
 #include "Passes/Runtime/Arch/Arm/ArmSME.h"
 #include "Passes/Runtime/Cleanup/Transforms.h"
@@ -467,6 +468,10 @@ LogicalResult runLoweringPipeline(ModuleOp module,
     PerfScope perf("lowering.runtime-objects");
     if (failed(runtime_library::embedObjectModules(module)))
       return failure();
+    // Before anything folds: a manifest's class word is a placeholder
+    // constant until here.
+    if (failed(type_objects::resolveManifestClassWords(module)))
+      return failure();
   }
   dumpMLIRForPass(irDump, "runtime-objects", module);
 
@@ -639,6 +644,12 @@ LogicalResult runLoweringPipeline(ModuleOp module,
 
   // Phase 14: final lowering to LLVM dialect.
   {
+    // A static object's class word is an address its dense initializer cannot
+    // spell; recorded here, written once the global is an LLVM global.
+    FailureOr<type_objects::StaticClassWords> staticClassWords =
+        type_objects::collectStaticClassWords(module);
+    if (failed(staticClassWords))
+      return failure();
     LoweredSafetyContracts finalSafetyContracts;
     if (options.enableVerifiers) {
       PerfScope perf("lowering.collect-final-safety-contracts");
@@ -683,6 +694,17 @@ LogicalResult runLoweringPipeline(ModuleOp module,
     {
       PerfScope perf("lowering.final-llvm-cleanup");
       optimizer::pipeline::finalLLVMCleanup(module);
+    }
+    {
+      PerfScope perf("lowering.type-objects");
+      unsigned pointerBits = type_objects::pointerBitsOf(module);
+      if (failed(type_objects::patchStaticClassWords(module, *staticClassWords,
+                                                     pointerBits)))
+        return failure();
+      if (failed(type_objects::defineSlotHooks(module)))
+        return failure();
+      if (failed(type_objects::defineDeclared(module, pointerBits)))
+        return failure();
     }
   }
   dumpMLIRForPass(irDump, "convert-to-llvm", module);

@@ -219,12 +219,6 @@ std::string generatorLaneKey(mlir::Type type) {
   return runtimeContractName(type);
 }
 
-std::int64_t exceptionClassId(llvm::StringRef name) {
-  const py::exceptions::BuiltinExceptionInfo *info =
-      py::exceptions::findByName(name);
-  return info ? info->classId : 0;
-}
-
 // Number of logical extra lanes before the frame slots: state, sent, inject.
 constexpr unsigned kResumeControlLanes = 3;
 // Number of logical result lanes before the frame slots:
@@ -3296,7 +3290,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFullFunction(
       builder.getFunctionType({builder.getI64Type()}, {builder.getI1Type()}));
   auto isStopIteration = mlir::func::CallOp::create(
       builder, loc, currentMatches,
-      mlir::ValueRange{i64Const(exceptionClassId("StopIteration"))});
+      mlir::ValueRange{type_objects::classWord(builder, loc, module, "builtins.StopIteration")});
   mlir::Block *pep479Block = builder.createBlock(&body);
   mlir::Block *rethrowBlock = builder.createBlock(&body);
   builder.setInsertionPointToEnd(catchBlock);
@@ -3671,16 +3665,22 @@ RuntimeBundleLowerer::getOrCreateGeneratorAdvanceFunction(
   // ⭐ A RETURNED UNION THAT IS None AT RUN TIME RAISES A BARE StopIteration,
   // as CPython does for a None return value (`str(e)` is '', not 'None').
   // The return is a value of the union type either way, so only the box
-  // knows; None's box has no class.
+  // knows: None's box has NoneType's class (or none at all, a box nothing
+  // was stored in).
   if (info.returnLane.contract == "builtins.object") {
     mlir::Value classWord =
         mlir::memref::LoadOp::create(
             builder, loc, returnSpan.front(),
             constantIndex(builder, loc, box_abi::kBoxClassWord))
             .getResult();
-    mlir::Value notNone = mlir::arith::CmpIOp::create(
-        builder, loc, mlir::arith::CmpIPredicate::ne, classWord,
-        constantI64(builder, loc, 0));
+    mlir::Value notNone = mlir::arith::AndIOp::create(
+        builder, loc,
+        mlir::arith::CmpIOp::create(builder, loc,
+                                    mlir::arith::CmpIPredicate::ne, classWord,
+                                    constantI64(builder, loc, 0)),
+        mlir::arith::CmpIOp::create(
+            builder, loc, mlir::arith::CmpIPredicate::ne, classWord,
+            type_objects::classWord(builder, loc, module, "types.NoneType")));
     carriesValue =
         mlir::arith::AndIOp::create(builder, loc, carriesValue, notNone);
   }
@@ -4076,7 +4076,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
   builder.setInsertionPointToEnd(raiseBlock);
   mlir::func::CallOp exitObject = RuntimeBundleLowerer::createRuntimeCall(
       loc, *exitNew,
-      mlir::ValueRange{i64Const(exceptionClassId("GeneratorExit"))});
+      mlir::ValueRange{type_objects::classWord(builder, loc, module, "builtins.GeneratorExit")});
   mlir::func::CallOp::create(builder, loc, getOrCreateTryCallSiteMarker(),
                              mlir::ValueRange{i64Const(stageId)});
   RuntimeBundleLowerer::createRuntimeCall(loc, *exitRaise,
@@ -4160,7 +4160,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
       builder.getFunctionType({builder.getI64Type()}, {builder.getI1Type()}));
   auto isExit = mlir::func::CallOp::create(
       builder, loc, currentMatches,
-      mlir::ValueRange{i64Const(exceptionClassId("GeneratorExit"))});
+      mlir::ValueRange{type_objects::classWord(builder, loc, module, "builtins.GeneratorExit")});
   mlir::Block *discardBlock = builder.createBlock(&body);
   mlir::Block *rethrowBlock = builder.createBlock(&body);
   builder.setInsertionPointToEnd(swallowBlock);

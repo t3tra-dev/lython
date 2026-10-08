@@ -1,4 +1,5 @@
 #include "Common/RuntimeLibrary.h"
+#include "Common/TypeObjects.h"
 
 #include "Common/Instrumentation.h"
 
@@ -382,9 +383,26 @@ mlir::LogicalResult buildNativeRuntimeModule(llvm::Module &llvmModule) {
       [&](mlir::ModuleOp nativeModule,
           llvm::StringRef label) -> mlir::LogicalResult {
     py::collectCtypesForeignSymbols(nativeModule, ctypesSymbols);
+    // The type objects this module names, defined in it as every module
+    // defines them (TypeObjects.h).
+    mlir::FailureOr<py::type_objects::StaticClassWords> staticClassWords =
+        py::type_objects::collectStaticClassWords(nativeModule);
+    if (mlir::failed(staticClassWords) ||
+        mlir::failed(py::type_objects::resolveManifestClassWords(nativeModule)))
+      return mlir::failure();
     if (mlir::failed(lowerNativeRuntimeModule(nativeModule))) {
       llvm::errs() << "error: failed to lower native runtime module '" << label
                    << "'\n";
+      return mlir::failure();
+    }
+    unsigned pointerBits = llvmModule.getDataLayout().getPointerSizeInBits();
+    if (mlir::failed(py::type_objects::patchStaticClassWords(
+            nativeModule, *staticClassWords, pointerBits)) ||
+        mlir::failed(
+            py::type_objects::defineDeclared(nativeModule, pointerBits))) {
+      llvm::errs() << "error: failed to define the type objects of native "
+                      "runtime module '"
+                   << label << "'\n";
       return mlir::failure();
     }
     // ⛔ The layout goes on BEFORE translation, not after. Translating folds

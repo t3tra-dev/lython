@@ -23,7 +23,7 @@
 
 #include "PyDialect.h.inc"
 
-#include "ClassIds.h"
+#include "RuntimeClasses.h"
 
 #include <system_error>
 
@@ -58,88 +58,36 @@ int main(int argc, char **argv) {
   }
 
   // ⭐ A RUNTIME CLASS IS NAMED, NOT NUMBERED, in the manifests: a constant
-  // that is a class number says whose (`ly.class_id_of = "builtins.ValueError"`)
-  // and a function that constructs one marks it (`ly.runtime.class_id`, beside
-  // its `ly.runtime.contract`). Both are given their number here, from
-  // ClassIds.h, so every image of the runtime agrees on it.
+  // that is a class word says whose (`ly.class_of = "builtins.ValueError"`),
+  // so does a static object's header, and a function that constructs one is
+  // marked (`ly.runtime.class`, beside its `ly.runtime.contract`). The
+  // lowering makes each the class's type-object address (TypeObjects.h); here
+  // every name is only checked against RuntimeClasses.h, so a misspelled class
+  // fails the build rather than a program.
   bool resolved = true;
   module->walk([&](mlir::Operation *op) {
-    // A static object's header is a dense table; its word 1 is the class.
-    if (auto global = mlir::dyn_cast<mlir::memref::GlobalOp>(op))
-      if (auto name = op->getAttrOfType<mlir::StringAttr>("ly.class_id_of")) {
-        std::int64_t id = py::class_ids::lookup(name.getValue());
-        auto initial = mlir::dyn_cast_if_present<mlir::DenseIntElementsAttr>(
-            global.getInitialValueAttr());
-        // A byte image (a str's, laid out as LyUnicode_FromStatic reads it)
-        // keeps word 1 in bytes 8..15, little-endian, once per record of
-        // `ly.class_id_stride` bytes (the whole image when absent).
-        if (id >= 0 && initial &&
-            initial.getElementType().isInteger(8)) {
-          llvm::SmallVector<llvm::APInt, 64> bytes(
-              initial.getValues<llvm::APInt>());
-          std::int64_t stride = static_cast<std::int64_t>(bytes.size());
-          if (auto given =
-                  op->getAttrOfType<mlir::IntegerAttr>("ly.class_id_stride"))
-            stride = given.getInt();
-          if (stride < 16 || bytes.size() % stride != 0) {
-            op->emitError() << "ly.class_id_of on a byte image needs records "
-                               "of at least 16 bytes";
-            resolved = false;
-            return;
-          }
-          for (std::size_t record = 0; record < bytes.size();
-               record += static_cast<std::size_t>(stride))
-            for (unsigned byte = 0; byte < 8; ++byte)
-              bytes[record + 8 + byte] = llvm::APInt(
-                  8, (static_cast<std::uint64_t>(id) >> (8 * byte)) & 0xff);
-          global.setInitialValueAttr(
-              mlir::DenseIntElementsAttr::get(initial.getType(), bytes));
-          op->removeAttr("ly.class_id_of");
-          op->removeAttr("ly.class_id_stride");
-          return;
-        }
-        if (id < 0 || !initial || initial.getNumElements() < 2) {
-          op->emitError() << "ly.class_id_of on a global needs a runtime class "
-                             "name and a dense i64 header";
-          resolved = false;
-          return;
-        }
-        llvm::SmallVector<llvm::APInt, 8> words(initial.getValues<llvm::APInt>());
-        words[1] = llvm::APInt(64, static_cast<std::uint64_t>(id), true);
-        global.setInitialValueAttr(
-            mlir::DenseIntElementsAttr::get(initial.getType(), words));
-        op->removeAttr("ly.class_id_of");
-        return;
-      }
-    if (auto name = op->getAttrOfType<mlir::StringAttr>("ly.class_id_of")) {
-      std::int64_t id = py::class_ids::lookup(name.getValue());
-      auto constant = mlir::dyn_cast<mlir::arith::ConstantOp>(op);
-      if (id < 0 || !constant || !constant.getType().isInteger(64)) {
-        op->emitError() << "ly.class_id_of names '" << name.getValue()
-                        << "', which is not a runtime class (ClassIds.h), on "
-                           "something that is not an i64 constant";
+    if (auto name = op->getAttrOfType<mlir::StringAttr>("ly.class_of")) {
+      bool placed = mlir::isa<mlir::memref::GlobalOp>(op) ||
+                    (mlir::isa<mlir::arith::ConstantOp>(op) &&
+                     op->getResult(0).getType().isInteger(64));
+      if (!py::runtime_classes::isListed(name.getValue()) || !placed) {
+        op->emitError() << "ly.class_of names '" << name.getValue()
+                        << "'; it must be a runtime class (RuntimeClasses.h), "
+                           "on an i64 constant or a static object";
         resolved = false;
-        return;
       }
-      constant.setValueAttr(mlir::IntegerAttr::get(constant.getType(), id));
-      op->removeAttr("ly.class_id_of");
     }
     if (auto function = mlir::dyn_cast<mlir::func::FuncOp>(op))
-      if (mlir::Attribute marker = function->getAttr("ly.runtime.class_id")) {
+      if (mlir::Attribute marker = function->getAttr("ly.runtime.class")) {
         auto contract =
             function->getAttrOfType<mlir::StringAttr>("ly.runtime.contract");
-        std::int64_t id =
-            contract ? py::class_ids::lookup(contract.getValue()) : -1;
-        if (id < 0 || !mlir::isa<mlir::UnitAttr>(marker)) {
+        if (!contract || !py::runtime_classes::isListed(contract.getValue()) ||
+            !mlir::isa<mlir::UnitAttr>(marker)) {
           function.emitError()
-              << "ly.runtime.class_id is a marker beside a ly.runtime.contract "
-                 "that ClassIds.h lists; the number comes from the table";
+              << "ly.runtime.class is a marker beside a ly.runtime.contract "
+                 "that RuntimeClasses.h lists";
           resolved = false;
-          return;
         }
-        function->setAttr("ly.runtime.class_id",
-                          mlir::IntegerAttr::get(
-                              mlir::IntegerType::get(&context, 64), id));
       }
   });
   if (!resolved)

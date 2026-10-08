@@ -103,7 +103,7 @@ mlir::LogicalResult RuntimeBundleLowerer::emitBoxedReprHookCall(
   mlir::Location loc = op->getLoc();
   mlir::Value classSlot =
       mlir::arith::ConstantIndexOp::create(builder, loc, 1).getResult();
-  mlir::Value classId =
+  mlir::Value classWord =
       mlir::memref::LoadOp::create(builder, loc, *header, classSlot)
           .getResult();
   mlir::Value pointerIndex =
@@ -118,7 +118,7 @@ mlir::LogicalResult RuntimeBundleLowerer::emitBoxedReprHookCall(
           builder, loc, mlir::LLVM::LLVMPointerType::get(context), pointerWord)
           .getResult();
   mlir::func::CallOp call = mlir::func::CallOp::create(
-      builder, loc, hook, mlir::ValueRange{boxPointer, classId});
+      builder, loc, hook, mlir::ValueRange{boxPointer, classWord});
   // The hook consumed only a raw pointer word: pin the box's liveness past
   // the call with an explicit touch use (the liveness analysis cannot see
   // raw-pointer uses).
@@ -354,7 +354,7 @@ RuntimeBundleLowerer::lowerBuiltinMethodSinkCall(py::CallOp op,
   RuntimeBundle printable = *sinkArgument;
   // User exception classes have no manifest methods of their own but share
   // the taxonomy exception shape, and the manifest __str__/__repr__ resolve
-  // the display name by DYNAMIC class id (which the instance header holds),
+  // the display name by DYNAMIC class word (which the instance header holds),
   // so rendering through the ancestor keeps the user class's name.
   if (printable.kind == RuntimeBundle::Kind::Object &&
       printable.physicalValues().size() == 3 &&

@@ -319,9 +319,11 @@ entryArgumentSlice(mlir::Block &entry, unsigned offset, unsigned count) {
   return values;
 }
 
+// `classWord` is the class's type-object address (TypeObjects.h); null writes
+// 0, the word of a header no class owns yet.
 void initializeObjectHeader(mlir::OpBuilder &builder, mlir::Location loc,
                             mlir::Value header, std::int64_t refcount,
-                            std::int64_t classId) {
+                            mlir::Value classWord) {
   auto memref = mlir::dyn_cast<mlir::MemRefType>(header.getType());
   if (!memref || memref.getRank() != 1)
     return;
@@ -335,10 +337,12 @@ void initializeObjectHeader(mlir::OpBuilder &builder, mlir::Location loc,
   mlir::Value oneIndex = mlir::arith::ConstantIndexOp::create(builder, loc, 1);
   mlir::Value refcountValue =
       mlir::arith::ConstantIntOp::create(builder, loc, refcount, 64);
-  mlir::Value classIdValue =
-      mlir::arith::ConstantIntOp::create(builder, loc, classId, 64);
+  mlir::Value classWordValue =
+      classWord ? classWord
+                : mlir::arith::ConstantIntOp::create(builder, loc, 0, 64)
+                      .getResult();
   mlir::memref::StoreOp::create(builder, loc, refcountValue, header, zeroIndex);
-  mlir::memref::StoreOp::create(builder, loc, classIdValue, header, oneIndex);
+  mlir::memref::StoreOp::create(builder, loc, classWordValue, header, oneIndex);
   if (!memref.hasStaticShape() || memref.getDimSize(0) >= 4) {
     mlir::Value zeroValue =
         mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
@@ -381,8 +385,8 @@ RuntimeBundleLowerer::exceptionAncestorContractFor(mlir::Type type) const {
       RuntimeBundleLowerer::classForContract(type));
 }
 
-std::optional<std::int64_t>
-RuntimeBundleLowerer::userExceptionParentClassId(py::ClassOp classOp) const {
+std::optional<std::string>
+RuntimeBundleLowerer::userExceptionParentClass(py::ClassOp classOp) const {
   if (!classOp)
     return std::nullopt;
   auto mroNames = classOp->getAttrOfType<mlir::ArrayAttr>("mro_names");
@@ -395,46 +399,146 @@ RuntimeBundleLowerer::userExceptionParentClassId(py::ClassOp classOp) const {
     if (py::ClassOp baseOp = RuntimeBundleLowerer::classForContract(
             runtimeContractType(context, name.getValue()))) {
       if (RuntimeBundleLowerer::exceptionAncestorContract(baseOp))
-        return RuntimeBundleLowerer::runtimeClassIdForClass(baseOp);
+        return RuntimeBundleLowerer::runtimeClassForClass(baseOp);
       continue;
     }
     if (manifest.primitive(name.getValue(), "raise"))
-      return manifest.classId(name.getValue());
+      return manifest.runtimeClass(name.getValue());
   }
   return std::nullopt;
 }
 
-mlir::LogicalResult RuntimeBundleLowerer::synthesizeUserExceptionHooks() {
-  struct Entry {
-    std::int64_t classId;
-    std::int64_t parentId;
-    std::string name;
-  };
-  llvm::SmallVector<Entry, 8> entries;
+// The class a base or MRO entry names: a class of this module, or a runtime
+// class under the name the program wrote (`int` is `builtins.int`).
+std::optional<std::string>
+RuntimeBundleLowerer::runtimeClassForName(py::ClassOp from,
+                                          llvm::StringRef name) const {
+  py::ClassOp base = RuntimeBundleLowerer::classForContract(
+      runtimeContractType(from->getContext(), name));
+  if (base && base != from)
+    return RuntimeBundleLowerer::runtimeClassForClass(base);
+  if (std::optional<std::string> runtime = manifest.runtimeClass(name))
+    return runtime;
+  if (std::optional<std::string> runtime =
+          manifest.runtimeClass(("builtins." + name).str()))
+    return runtime;
+  if (py::runtime_classes::isListed(name))
+    return name.str();
+  return std::nullopt;
+}
+
+// The classes `classOp` strictly derives from: its source bases'
+// transitively, and the runtime class a source base chain ends at.
+llvm::SmallVector<std::string, 8>
+RuntimeBundleLowerer::classAncestors(py::ClassOp classOp) const {
+  llvm::SmallVector<std::string, 8> ancestors;
+  llvm::SmallVector<py::ClassOp, 8> worklist{classOp};
+  llvm::SmallPtrSet<mlir::Operation *, 8> visited;
+  while (!worklist.empty()) {
+    py::ClassOp current = worklist.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    auto bases = current->getAttrOfType<mlir::ArrayAttr>("base_names");
+    if (!bases)
+      continue;
+    for (mlir::Attribute attr : bases) {
+      auto name = mlir::dyn_cast<mlir::StringAttr>(attr);
+      if (!name)
+        continue;
+      std::optional<std::string> base =
+          RuntimeBundleLowerer::runtimeClassForName(current, name.getValue());
+      if (base && !llvm::is_contained(ancestors, *base))
+        ancestors.push_back(*base);
+      if (py::ClassOp baseOp = RuntimeBundleLowerer::classForContract(
+              runtimeContractType(classOp->getContext(), name.getValue())))
+        if (baseOp != current)
+          worklist.push_back(baseOp);
+    }
+  }
+  return ancestors;
+}
+
+// ⭐ EVERY CLASS OF THE PROGRAM IS A TYPE OBJECT (TypeObjects.h), defined
+// from what is recorded here while the `py.class` ops still exist: the name a
+// default repr prints, the base, and the MRO -- what isinstance-free questions
+// at run time read (an exception handler's match, the ordering dispatch's
+// "is the right operand a subclass"). An exception class's base is the next
+// exception class of its MRO, the chain an `except` walks.
+mlir::LogicalResult RuntimeBundleLowerer::recordSourceTypeObjects() {
   llvm::SmallVector<mlir::NamedAttribute, 8> exceptionAliases;
   mlir::Builder builder0(context);
   mlir::LogicalResult collected = mlir::success();
   module.walk([&](py::ClassOp classOp) {
     if (mlir::failed(collected))
       return;
-    if (!RuntimeBundleLowerer::exceptionAncestorContract(classOp))
+    std::optional<std::string> qualified =
+        RuntimeBundleLowerer::runtimeClassForClass(classOp);
+    if (!qualified)
       return;
-    std::optional<std::int64_t> classId =
-        RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
-    std::optional<std::int64_t> parentId =
-        RuntimeBundleLowerer::userExceptionParentClassId(classOp);
-    if (!classId || !parentId) {
-      classOp.emitError() << "user exception class has no resolvable class "
-                             "id chain";
+    // A class the runtime defines is defined from the runtime's table.
+    if (!classOp->hasAttr("ly.class.source") &&
+        py::runtime_classes::isListed(*qualified))
+      return;
+    if (py::runtime_classes::isListed(*qualified)) {
+      classOp.emitError() << "class '" << classOp.getSymName()
+                          << "' has the qualified name of the runtime class '"
+                          << *qualified << "'";
       collected = mlir::failure();
       return;
     }
-    entries.push_back(Entry{
-        *classId, *parentId,
-        py::contracts::displayClassNameForContract(classOp.getSymName())});
-    exceptionAliases.push_back(
-        mlir::NamedAttribute(builder0.getStringAttr(classOp.getSymName()),
-                             builder0.getStringAttr("builtins.BaseException")));
+    type_objects::Definition definition;
+    definition.qualifiedName = *qualified;
+    definition.name = defaultReprTypeName(classOp.getSymName());
+    bool exception =
+        RuntimeBundleLowerer::exceptionAncestorContract(classOp).has_value();
+    if (exception) {
+      std::optional<std::string> parent =
+          RuntimeBundleLowerer::userExceptionParentClass(classOp);
+      if (!parent) {
+        classOp.emitError() << "user exception class has no resolvable base";
+        collected = mlir::failure();
+        return;
+      }
+      definition.base = *parent;
+      exceptionAliases.push_back(mlir::NamedAttribute(
+          builder0.getStringAttr(classOp.getSymName()),
+          builder0.getStringAttr("builtins.BaseException")));
+    } else {
+      definition.base = "builtins.object";
+      if (auto bases = classOp->getAttrOfType<mlir::ArrayAttr>("base_names"))
+        for (mlir::Attribute attr : bases)
+          if (auto name = mlir::dyn_cast<mlir::StringAttr>(attr))
+            if (std::optional<std::string> base =
+                    RuntimeBundleLowerer::runtimeClassForName(classOp,
+                                                              name.getValue())) {
+              definition.base = *base;
+              break;
+            }
+    }
+    if (auto mroNames = classOp->getAttrOfType<mlir::ArrayAttr>("mro_names"))
+      for (mlir::Attribute attr : llvm::drop_begin(mroNames.getValue()))
+        if (auto name = mlir::dyn_cast<mlir::StringAttr>(attr))
+          if (std::optional<std::string> entry =
+                  RuntimeBundleLowerer::runtimeClassForName(classOp,
+                                                            name.getValue()))
+            if (!llvm::is_contained(definition.mro, *entry))
+              definition.mro.push_back(*entry);
+    // The MRO the emitter wrote ends at the first runtime class it names;
+    // that class's own ancestors follow, as C3 would put them.
+    for (std::string ancestor = definition.mro.empty() ? definition.base
+                                                       : definition.mro.back();
+         !ancestor.empty();) {
+      std::optional<type_objects::Definition> runtime =
+          type_objects::runtimeDefinition(ancestor);
+      if (!runtime)
+        break;
+      if (!llvm::is_contained(definition.mro, ancestor))
+        definition.mro.push_back(ancestor);
+      ancestor = runtime->base;
+    }
+    if (!llvm::is_contained(definition.mro, definition.base))
+      definition.mro.insert(definition.mro.begin(), definition.base);
+    type_objects::recordSource(module, definition);
   });
   if (mlir::failed(collected))
     return mlir::failure();
@@ -449,332 +553,46 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeUserExceptionHooks() {
     module->setAttr(own::kDeallocatorAliasesAttr,
                     builder0.getDictionaryAttr(merged));
   }
-
-  mlir::OpBuilder builder(context);
-  builder.setInsertionPointToEnd(module.getBody());
-  mlir::Location loc = module.getLoc();
-  mlir::Type i64 = builder.getI64Type();
-
-  {
-    auto fn = mlir::func::FuncOp::create(
-        builder, loc, "__ly_user_exception_base_class_id",
-        builder.getFunctionType({i64}, {i64}));
-    mlir::Block *entry = fn.addEntryBlock();
-    mlir::OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointToStart(entry);
-    mlir::Value classId = entry->getArgument(0);
-    mlir::Value result =
-        mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
-    for (const Entry &hookEntry : entries) {
-      mlir::Value expected = mlir::arith::ConstantIntOp::create(
-          builder, loc, hookEntry.classId, 64);
-      mlir::Value parent = mlir::arith::ConstantIntOp::create(
-          builder, loc, hookEntry.parentId, 64);
-      mlir::Value matches = mlir::arith::CmpIOp::create(
-          builder, loc, mlir::arith::CmpIPredicate::eq, classId, expected);
-      result = mlir::arith::SelectOp::create(builder, loc, matches, parent,
-                                             result);
-    }
-    mlir::func::ReturnOp::create(builder, loc, mlir::ValueRange{result});
-  }
-
-  {
-    auto ptrType = mlir::LLVM::LLVMPointerType::get(context);
-    auto fn = mlir::func::FuncOp::create(
-        builder, loc, "__ly_user_exception_class_name",
-        builder.getFunctionType({i64}, {ptrType}));
-    mlir::Block *entry = fn.addEntryBlock();
-    mlir::OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointToStart(entry);
-    mlir::Value classId = entry->getArgument(0);
-    mlir::Value result = mlir::LLVM::ZeroOp::create(builder, loc, ptrType);
-    for (auto [index, hookEntry] : llvm::enumerate(entries)) {
-      std::string text = hookEntry.name + '\0';
-      std::string symbol =
-          ".ly_user_exc_name." + std::to_string(hookEntry.classId);
-      if (!module.lookupSymbol(symbol)) {
-        mlir::OpBuilder::InsertionGuard globalGuard(builder);
-        builder.setInsertionPointToEnd(module.getBody());
-        auto arrayType = mlir::LLVM::LLVMArrayType::get(
-            mlir::IntegerType::get(context, 8), text.size());
-        mlir::LLVM::GlobalOp::create(builder, loc, arrayType,
-                                     /*isConstant=*/true,
-                                     mlir::LLVM::Linkage::Private, symbol,
-                                     builder.getStringAttr(text));
-      }
-      mlir::Value address = mlir::LLVM::AddressOfOp::create(
-          builder, loc, ptrType, mlir::FlatSymbolRefAttr::get(context, symbol));
-      mlir::Value expected = mlir::arith::ConstantIntOp::create(
-          builder, loc, hookEntry.classId, 64);
-      mlir::Value matches = mlir::arith::CmpIOp::create(
-          builder, loc, mlir::arith::CmpIPredicate::eq, classId, expected);
-      result = mlir::arith::SelectOp::create(builder, loc, matches, address,
-                                             result);
-    }
-    mlir::func::ReturnOp::create(builder, loc, mlir::ValueRange{result});
-  }
   return mlir::success();
 }
 
-// ⭐ THE NAME OF EVERY CLASS THE PROGRAM HAS, keyed by the id its instances
-// carry in header word 1 -- the same word `isinstance` reads. Without it the
-// only class name available at run time was the exception taxonomy's, so
-// `type(v).__name__` could answer nothing a base-typed variable holds, and the
-// default repr printed the STATIC class ("<__main__.A object at ...>" where
-// CPython prints B).
-//
-// ⛔ Built like the user-exception name hook next to it, and separately from
-// it: that one keys the taxonomy's parent chain as well and is consumed by the
-// traceback printer, which must keep working whether or not anything asks for a
-// class name.
-mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassNameHook() {
-  struct Entry {
-    std::int64_t classId;
-    std::string name;
-  };
-  llvm::SmallVector<Entry, 16> entries;
-  llvm::SmallDenseSet<std::int64_t, 16> seen;
-  module.walk([&](py::ClassOp classOp) {
-    std::optional<std::int64_t> classId =
-        RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
-    if (!classId || !seen.insert(*classId).second)
-      return;
-    // ⭐ THE QUALIFIED name, not the leaf. The one table answers two
-    // questions -- the default repr's class name and `type(v).__name__` --
-    // and only the repr wants the module. Storing the leaf forced the repr to
-    // paste "__main__." back on, which is wrong for an imported class; the
-    // name reader strips back to the leaf instead, which is right for both.
-    entries.push_back(Entry{*classId, defaultReprTypeName(classOp.getSymName())});
-  });
-  // ⭐ AND THE MANIFEST'S OWN CLASSES. The walk above sees `py.class` ops, and
-  // by this phase those are the SOURCE classes only -- so `type(v).__name__`
-  // over a type-erased value answered "object" for every builtin, which is the
-  // table's miss fallback and reads like an answer. The ids the manifests
-  // declare are the same word the instance carries.
-  // ⭐ AND `None`, whose id is the ZERO a box's class word holds when there is
-  // no object -- the same zero `__ly_box_hash` reads as None. It has no
-  // initializer to declare an id, so nothing else would put it in the table
-  // and `type(None).__name__` came back "object".
-  if (seen.insert(0).second)
-    entries.push_back(Entry{0, "NoneType"});
-  for (const RuntimeClassIdDefinition &declaration :
-       manifest.classIdDeclarations()) {
-    if (!seen.insert(declaration.classId).second)
-      continue;
-    entries.push_back(
-        Entry{declaration.classId,
-              py::contracts::displayClassNameForContract(declaration.contract)});
-  }
-
-  mlir::OpBuilder builder(context);
-  builder.setInsertionPointToEnd(module.getBody());
-  mlir::Location loc = module.getLoc();
-  mlir::Type i64 = builder.getI64Type();
-  auto ptrType = mlir::LLVM::LLVMPointerType::get(context);
-  // ⛔ The manifest DECLARES this symbol (objects/object.mlir calls it), so
-  // the existing lookup is an external declaration and has to be replaced,
-  // not treated as "already generated" -- that mistake linked nothing and the
-  // JIT reported "Symbols not found: ___ly_source_class_name".
-  if (auto existing =
-          module.lookupSymbol<mlir::func::FuncOp>("__ly_source_class_name")) {
-    if (!existing.isExternal())
-      return mlir::success();
-    existing.erase();
-  }
-  auto fn = mlir::func::FuncOp::create(
-      builder, loc, "__ly_source_class_name",
-      builder.getFunctionType({i64}, {ptrType}));
-  mlir::Block *entry = fn.addEntryBlock();
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(entry);
-  mlir::Value classId = entry->getArgument(0);
-  mlir::Value result = mlir::LLVM::ZeroOp::create(builder, loc, ptrType);
-  for (const Entry &hookEntry : entries) {
-    std::string text = hookEntry.name + '\0';
-    std::string symbol = ".ly_class_name." + std::to_string(hookEntry.classId);
-    if (!module.lookupSymbol(symbol)) {
-      mlir::OpBuilder::InsertionGuard globalGuard(builder);
-      builder.setInsertionPointToEnd(module.getBody());
-      auto arrayType = mlir::LLVM::LLVMArrayType::get(
-          mlir::IntegerType::get(context, 8), text.size());
-      mlir::LLVM::GlobalOp::create(builder, loc, arrayType, /*isConstant=*/true,
-                                   mlir::LLVM::Linkage::Private, symbol,
-                                   builder.getStringAttr(text));
-    }
-    mlir::Value address = mlir::LLVM::AddressOfOp::create(
-        builder, loc, ptrType, mlir::FlatSymbolRefAttr::get(context, symbol));
-    mlir::Value expected =
-        mlir::arith::ConstantIntOp::create(builder, loc, hookEntry.classId, 64);
-    mlir::Value matches = mlir::arith::CmpIOp::create(
-        builder, loc, mlir::arith::CmpIPredicate::eq, classId, expected);
-    result =
-        mlir::arith::SelectOp::create(builder, loc, matches, address, result);
-  }
-  mlir::func::ReturnOp::create(builder, loc, mlir::ValueRange{result});
-  return mlir::success();
-}
-
-// The class ids `classOp` strictly derives from: its source bases'
-// transitively, and the manifest class a source base chain ends at.
-llvm::SmallVector<std::int64_t, 8>
-RuntimeBundleLowerer::classAncestorIds(py::ClassOp classOp) const {
-  llvm::SmallDenseSet<std::int64_t, 8> ancestors;
-  llvm::SmallVector<py::ClassOp, 8> worklist{classOp};
-  llvm::SmallPtrSet<mlir::Operation *, 8> visited;
-  while (!worklist.empty()) {
-    py::ClassOp current = worklist.pop_back_val();
-    if (!visited.insert(current).second)
-      continue;
-    auto bases = current->getAttrOfType<mlir::ArrayAttr>("base_names");
-    if (!bases)
-      continue;
-    for (mlir::Attribute attr : bases) {
-      auto name = mlir::dyn_cast<mlir::StringAttr>(attr);
-      if (!name)
-        continue;
-      py::ClassOp base = RuntimeBundleLowerer::classForContract(
-          runtimeContractType(classOp->getContext(), name.getValue()));
-      if (base && base != current) {
-        if (std::optional<std::int64_t> baseId =
-                RuntimeBundleLowerer::runtimeClassIdForClass(base))
-          ancestors.insert(*baseId);
-        worklist.push_back(base);
-        continue;
-      }
-      std::optional<std::int64_t> manifestId =
-          manifest.classId(name.getValue());
-      if (!manifestId)
-        manifestId = manifest.classId(("builtins." + name.getValue()).str());
-      if (manifestId)
-        ancestors.insert(*manifestId);
-    }
-  }
-  return llvm::SmallVector<std::int64_t, 8>(ancestors.begin(), ancestors.end());
-}
-
-// ⭐ WHICH CLASS IDS STRICTLY DERIVE FROM WHICH, for the one question the
-// ordering dispatch asks of two boxes: do_richcompare tries the RIGHT operand's
-// reflected method first when its class is a strict subclass of the left's, so
-// a subclass's override decides `base < sub` as it decides `sub > base`.
-// A source class's ancestors are its bases' transitively; a manifest base
-// ends the walk, since no manifest class below `object` derives from another
-// in a way an ordering can tell (bool orders as int on the numeric path).
-mlir::LogicalResult RuntimeBundleLowerer::synthesizeClassDerivesHook() {
-  constexpr llvm::StringLiteral kHook = "__ly_class_derives_strictly";
-  auto existing = module.lookupSymbol<mlir::func::FuncOp>(kHook);
-  if (!existing || !existing.isExternal())
-    return mlir::success();
-  existing.erase();
-  llvm::SmallVector<std::pair<std::int64_t, std::int64_t>, 16> pairs;
-  module.walk([&](py::ClassOp classOp) {
-    std::optional<std::int64_t> subId =
-        RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
-    if (!subId)
-      return;
-    for (std::int64_t ancestor :
-         RuntimeBundleLowerer::classAncestorIds(classOp))
-      if (ancestor != *subId)
-        pairs.emplace_back(*subId, ancestor);
-  });
-
-  mlir::OpBuilder builder(context);
-  builder.setInsertionPointToEnd(module.getBody());
-  mlir::Location loc = module.getLoc();
-  mlir::Type i64 = builder.getI64Type();
-  mlir::Type i1 = builder.getI1Type();
-  auto fn = mlir::func::FuncOp::create(
-      builder, loc, kHook, builder.getFunctionType({i64, i64}, {i1}));
-  fn.setPrivate();
-  mlir::Block *entry = fn.addEntryBlock();
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(entry);
-  mlir::Value sub = entry->getArgument(0);
-  mlir::Value base = entry->getArgument(1);
-  mlir::Value result = mlir::arith::ConstantIntOp::create(builder, loc, 0, 1);
-  for (auto [subId, baseId] : pairs) {
-    auto equals = [&](mlir::Value value, std::int64_t id) {
-      return mlir::arith::CmpIOp::create(
-          builder, loc, mlir::arith::CmpIPredicate::eq, value,
-          mlir::arith::ConstantIntOp::create(builder, loc, id, 64));
-    };
-    mlir::Value both = mlir::arith::AndIOp::create(
-        builder, loc, equals(sub, subId), equals(base, baseId));
-    result = mlir::arith::OrIOp::create(builder, loc, result, both);
-  }
-  mlir::func::ReturnOp::create(builder, loc, mlir::ValueRange{result});
-  return mlir::success();
-}
-
-std::optional<std::int64_t>
-RuntimeBundleLowerer::runtimeClassIdForClass(py::ClassOp classOp) const {
+// A class's qualified name -- the name of its type object. A runtime class
+// (a manifest's) is its contract; a program's is its module's name and its
+// own, as CPython's `__module__` + `__qualname__`.
+std::optional<std::string>
+RuntimeBundleLowerer::runtimeClassForClass(py::ClassOp classOp) const {
   if (!classOp)
     return std::nullopt;
-
   llvm::StringRef className = classOp.getSymName();
   // ⛔ NOT for a class the program declared. The candidate list guesses a
   // manifest namespace in front of a bare name, which is how a manifest
   // `py.class @GeneratorType` finds `types.GeneratorType` -- and how
-  // `class GeneratorType` in a program would take that id, tagging its
+  // `class GeneratorType` in a program would take that class, tagging its
   // instances as generators.
-  bool sourceClass = classOp->hasAttr("ly.class.source");
-  if (!sourceClass)
+  if (!classOp->hasAttr("ly.class.source"))
     for (const std::string &candidate : classContractCandidates(className))
-      if (std::optional<std::int64_t> classId = manifest.classId(candidate))
-        return classId;
-
-  if (auto attr =
-          classOp->getAttrOfType<mlir::IntegerAttr>(kManifestClassIdAttr))
-    return attr.getValue().getSExtValue();
-
-  // Numbered once, by the same walk in the same order: no class op is made
-  // or erased, and no class's id attribute or source mark changes, while the
-  // lowering runs (the class ops are erased after it).
-  // ⛔ Not walked per question: the walk visits every operation in the
-  // module, and the question is asked for every instance a program makes.
-  if (!sourceClassIds) {
-    constexpr std::int64_t kSourceClassIdBase = 1LL << 32;
-    sourceClassIds.emplace();
-    mlir::ModuleOp mutableModule =
-        const_cast<RuntimeBundleLowerer *>(this)->module;
-    std::int64_t ordinal = 0;
-    mutableModule.walk([&](py::ClassOp current) {
-      bool hasDeclaredRuntimeId = current->getAttrOfType<mlir::IntegerAttr>(
-                                      kManifestClassIdAttr) != nullptr;
-      // Same question as above, asked while NUMBERING: a source class never
-      // counts as having a manifest id, or the ordinals would shift under it.
-      if (!current->hasAttr("ly.class.source"))
-        for (const std::string &candidate :
-             classContractCandidates(current.getSymName())) {
-          if (manifest.classId(candidate)) {
-            hasDeclaredRuntimeId = true;
-            break;
-          }
-        }
-      sourceClassIds->try_emplace(current.getOperation(),
-                                  kSourceClassIdBase + ordinal);
-      if (!hasDeclaredRuntimeId)
-        ++ordinal;
-    });
-  }
-  auto found = sourceClassIds->find(classOp.getOperation());
-  if (found == sourceClassIds->end())
-    return std::nullopt;
-  return found->second;
+      if (std::optional<std::string> runtime = manifest.runtimeClass(candidate))
+        return runtime;
+  // A program class's symbol is unique in its module, and carries the
+  // module's name when the class was imported ("lib.Base").
+  if (className.contains('.'))
+    return className.str();
+  return ("__main__." + className).str();
 }
 
-std::optional<std::int64_t>
-RuntimeBundleLowerer::runtimeClassIdForContract(mlir::Type type) const {
+std::optional<std::string>
+RuntimeBundleLowerer::runtimeClassForContract(mlir::Type type) const {
   std::string contract = runtimeContractName(type);
   if (!contract.empty())
-    if (std::optional<std::int64_t> classId = manifest.classId(contract))
-      return classId;
+    if (std::optional<std::string> runtime = manifest.runtimeClass(contract))
+      return runtime;
   if (py::ClassOp classOp = RuntimeBundleLowerer::classForContract(type))
-    return RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
+    return RuntimeBundleLowerer::runtimeClassForClass(classOp);
   return std::nullopt;
 }
 
-mlir::FailureOr<llvm::SmallVector<std::int64_t, 8>>
-RuntimeBundleLowerer::runtimeClassIdsForNominalTarget(
+mlir::FailureOr<llvm::SmallVector<std::string, 8>>
+RuntimeBundleLowerer::runtimeClassesForNominalTarget(
     mlir::Operation *op, mlir::Type targetType) const {
   std::optional<std::string> targetName =
       nominalClassSymbolName(op, targetType);
@@ -782,25 +600,25 @@ RuntimeBundleLowerer::runtimeClassIdsForNominalTarget(
     return op->emitError() << "class test target has no nominal class: "
                            << targetType;
   // ⛔ A BUILTIN TARGET HAS NO `py.class` IN SCOPE and does not need one: its
-  // class id is declared by the manifest (`ly.runtime.class_id`), which is the
+  // class is declared by the manifest (`ly.runtime.class`), which is the
   // same word this test compares. Requiring a schema refused
   // `isinstance(o, int)` on an object-typed value while accepting the
   // identical question about a source class, whose schema IS here.
   const bool hasSchema = py::type_object::lookup(op, *targetName) != nullptr;
   if (!hasSchema &&
-      !RuntimeBundleLowerer::runtimeClassIdForContract(targetType))
+      !RuntimeBundleLowerer::runtimeClassForContract(targetType))
     return op->emitError() << "class test target has no class schema: "
                            << *targetName;
 
-  llvm::SmallVector<std::int64_t, 8> ids;
-  auto appendId = [&](std::int64_t id) {
-    if (!llvm::is_contained(ids, id))
-      ids.push_back(id);
+  llvm::SmallVector<std::string, 8> classes;
+  auto append = [&](const std::string &name) {
+    if (!llvm::is_contained(classes, name))
+      classes.push_back(name);
   };
 
-  if (std::optional<std::int64_t> direct =
-          RuntimeBundleLowerer::runtimeClassIdForContract(targetType))
-    appendId(*direct);
+  if (std::optional<std::string> direct =
+          RuntimeBundleLowerer::runtimeClassForContract(targetType))
+    append(*direct);
 
   mlir::LogicalResult status = mlir::success();
   mlir::ModuleOp mutableModule =
@@ -809,7 +627,7 @@ RuntimeBundleLowerer::runtimeClassIdsForNominalTarget(
   // -- which asks `isSubclassOf` about every declared class -- has nothing to
   // find and would error on the missing schema instead.
   if (!hasSchema)
-    return ids;
+    return classes;
   mutableModule.walk([&](py::ClassOp classOp) {
     if (mlir::failed(status))
       return;
@@ -827,23 +645,23 @@ RuntimeBundleLowerer::runtimeClassIdsForNominalTarget(
     if (!matches)
       return;
 
-    std::optional<std::int64_t> classId =
-        RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
-    if (!classId) {
+    std::optional<std::string> runtime =
+        RuntimeBundleLowerer::runtimeClassForClass(classOp);
+    if (!runtime) {
       op->emitError() << "class schema '" << classOp.getSymName()
-                      << "' has no runtime class id";
+                      << "' has no runtime class";
       status = mlir::failure();
       return;
     }
-    appendId(*classId);
+    append(*runtime);
   });
 
   if (mlir::failed(status))
     return mlir::failure();
-  if (ids.empty())
-    return op->emitError() << "class test target has no runtime class ids: "
+  if (classes.empty())
+    return op->emitError() << "class test target has no runtime classes: "
                            << *targetName;
-  return ids;
+  return classes;
 }
 
 RuntimeValue RuntimeValue::object(mlir::Type contract, mlir::ValueRange values,
@@ -1213,10 +1031,10 @@ mlir::Value RuntimeBundleLowerer::borrowedBoxOfSlotEntity(
     box = mlir::memref::CastOp::create(builder, loc, boxType, box).getResult();
   mlir::Value zero = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
   mlir::Value one = mlir::arith::ConstantIntOp::create(builder, loc, 1, 64);
-  mlir::Value classId = box_abi::slotClassFromEntity(builder, loc, entity);
+  mlir::Value classWord = box_abi::slotClassFromEntity(builder, loc, entity);
   llvm::SmallVector<mlir::Value, 5> words(box_abi::kStandaloneBoxWords, zero);
   words[0] = one;
-  words[box_abi::kBoxClassWord] = classId;
+  words[box_abi::kBoxClassWord] = classWord;
   words[box_abi::kBoxEntityWord] = entity;
   for (auto [index, word] : llvm::enumerate(words)) {
     mlir::Value slot = mlir::arith::ConstantIndexOp::create(
@@ -1300,7 +1118,7 @@ RuntimeBundleLowerer::objectPhysicalHeader(mlir::Operation *op,
   if (headerType.hasStaticShape() && headerType.getDimSize(0) < 2)
     return op->emitError() << value.contractName()
                            << " runtime object header must expose refcount "
-                              "and class-id slots, got "
+                              "and class-word slots, got "
                            << header.getType();
   return header;
 }
@@ -1554,7 +1372,7 @@ RuntimeBundleLowerer::materializeDeadObjectValueImpl(
   if (!values.empty() && storage == DeadObjectStorage::OwningHeap &&
       own::isObjectHeaderLikeType(values.front().getType())) {
     initializeObjectHeader(builder, op->getLoc(), values.front(),
-                           /*refcount=*/1, /*classId=*/0);
+                           /*refcount=*/1, /*classWord=*/mlir::Value());
     // ⭐ AND SAY SO. The header is written HERE, not at the `memref.alloc`
     // above, so nothing about the allocation proves the refcount word exists
     // -- and `prefixIsInitializedAtDefinition` is right to refuse it, because
@@ -1642,7 +1460,7 @@ mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeClassObjectValue(
   // holds used to be a malloc EACH.
   //
   // ⭐ THE BODY STARTS AT WORD 3, inside the handle's type. An instance uses
-  // three of the `builtins.object` handle's five words -- refcount, class id,
+  // three of the `builtins.object` handle's five words -- refcount, class word,
   // body address -- and the last two were 16 bytes of every instance that
   // nothing reads. The handle keeps its type (it is the contract's shape, and
   // P6 of docs/object-abi.md is where widths stop selecting deallocators), so
@@ -1690,13 +1508,14 @@ mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeClassObjectValue(
       return mlir::failure();
   }
 
-  std::optional<std::int64_t> classId =
-      RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
-  if (!classId)
+  std::optional<std::string> runtimeClass =
+      RuntimeBundleLowerer::runtimeClassForClass(classOp);
+  if (!runtimeClass)
     return op->emitError() << "class " << classOp.getSymName()
-                           << " has no runtime class id for " << purpose;
-  initializeObjectHeader(builder, loc, header, /*refcount=*/1,
-                         /*classId=*/*classId);
+                           << " has no runtime class for " << purpose;
+  initializeObjectHeader(
+      builder, loc, header, /*refcount=*/1,
+      type_objects::classWord(builder, loc, module, *runtimeClass));
 
   // The body address is a WORD of the header, so every reader reaches the
   // fields the way a container reaches its items -- a load off the handle,
@@ -1898,7 +1717,7 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
     // ⛔ A finalizer that stored its object somewhere is not supported, and
     // says so at run time: CPython keeps the resurrected object and never
     // finalizes it again, and an instance has no word left to remember that
-    // in (word 1 is the whole class id, 3 and 4 hold int fields).
+    // in (word 1 is the whole class word, 3 and 4 hold int fields).
     mlir::Block *afterRelease = deallocBlock;
     if (std::optional<std::string> finalizer =
             RuntimeBundleLowerer::classMethodSymbol(plan.classOp,
@@ -1940,7 +1759,7 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
 
     // Every box-fronted field is a slot of the body, so the release is the
     // container's: hand the block and the slot to the shared helper, which
-    // dispatches the box's class id to the manifest deallocator.
+    // dispatches the box's class word to the manifest deallocator.
     //
     // ⛔ GUARDED ON A NULL BODY. A dead placeholder instance (a union member's
     // zeroed lane) has a header and no block, so the address is 0 and the walk
@@ -2037,7 +1856,7 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
 // Empty when `text` is not strict UTF-8, which the runtime decoder rejects and
 // so is left to it.
 static std::optional<llvm::SmallVector<std::int8_t, 64>>
-staticStrImage(llvm::StringRef text, std::int64_t classId) {
+staticStrImage(llvm::StringRef text) {
   llvm::SmallVector<std::uint32_t, 64> points;
   std::size_t i = 0;
   while (i < text.size()) {
@@ -2079,7 +1898,9 @@ staticStrImage(llvm::StringRef text, std::int64_t classId) {
       image.push_back(static_cast<std::int8_t>((value >> (8 * k)) & 0xFF));
   };
   word(static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()));
-  word(static_cast<std::uint64_t>(classId));
+  // The class word: the type object's address, written into the global
+  // once it is an LLVM global (`ly.class_of`, TypeObjects.h).
+  word(0);
   word((dataBytes << 3) | width);
   word(dataBytes);
   for (std::uint32_t point : points)
@@ -2103,9 +1924,9 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeByteBackedObject(
   if (contractName == "builtins.str")
     if (std::optional<RuntimeSymbol> fromStatic =
             manifest.primitive("builtins.str", "from_static"))
-      if (std::optional<std::int64_t> classId = manifest.classId("builtins.str"))
+      if (manifest.runtimeClass("builtins.str"))
         if (std::optional<llvm::SmallVector<std::int8_t, 64>> image =
-                staticStrImage(data, *classId)) {
+                staticStrImage(data)) {
           auto elements = mlir::DenseElementsAttr::get(
               mlir::RankedTensorType::get(
                   {static_cast<std::int64_t>(image->size())},
@@ -2114,6 +1935,14 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeByteBackedObject(
           mlir::Value block = constant_data::internReadOnlyBlock(
               module, builder, loc, "str_object", data, elements,
               /*alignment=*/16);
+          mlir::Value read = block;
+          if (auto cast = read.getDefiningOp<mlir::memref::CastOp>())
+            read = cast.getSource();
+          if (auto global = read.getDefiningOp<mlir::memref::GetGlobalOp>())
+            if (mlir::Operation *image =
+                    module.lookupSymbol(global.getNameAttr()))
+              image->setAttr("ly.class_of",
+                             builder.getStringAttr("builtins.str"));
           mlir::func::CallOp call =
               RuntimeBundleLowerer::createRuntimeCall(loc, *fromStatic, {block});
           return RuntimeBundleLowerer::bundleRuntimeResults(
@@ -2124,14 +1953,13 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeByteBackedObject(
   if (contractName == "builtins.bytes")
     if (std::optional<RuntimeSymbol> fromStatic =
             manifest.primitive("builtins.bytes", "from_static"))
-      if (std::optional<std::int64_t> classId =
-              manifest.classId("builtins.bytes")) {
+      if (manifest.runtimeClass("builtins.bytes")) {
         llvm::SmallVector<std::int64_t, 4> words{
-            std::numeric_limits<std::int64_t>::max(), *classId, 0,
+            std::numeric_limits<std::int64_t>::max(), 0, 0,
             static_cast<std::int64_t>(data.size())};
         llvm::SmallVector<std::int8_t, 32> tail(data.begin(), data.end());
         mlir::Value address = materializeStaticObjectAddress(
-            loc, "bytes", data, words, {{2u, 32}}, tail);
+            loc, "bytes", "builtins.bytes", data, words, {{2u, 32}}, tail);
         mlir::func::CallOp call =
             RuntimeBundleLowerer::createRuntimeCall(loc, *fromStatic, {address});
         return RuntimeBundleLowerer::bundleRuntimeResults(
@@ -2178,7 +2006,7 @@ bool RuntimeBundleLowerer::needsDefaultObjectRepr(
   if (!manifest.methodCandidates(contract, "__repr__").empty())
     return false;
   // User exception classes render through their taxonomy ancestor's
-  // __repr__ (ClassName(...) with the DYNAMIC class id's name), never the
+  // __repr__ (ClassName(...) with the DYNAMIC class word's name), never the
   // address-based default.
   if (std::optional<std::string> ancestor =
           RuntimeBundleLowerer::exceptionAncestorContractFor(
@@ -2208,9 +2036,9 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultObjectRepr(
   // The prefix below is baked from the STATIC contract, so `x: A = B()` printed
   // `<__main__.A object at ...>` where CPython prints B -- and nothing could
   // see it, because the address differs anyway and no output comparison reads
-  // the class name. The id in header word 1 is what the value really is.
+  // the class name. The class in header word 1 is what the value really is.
   //
-  // ⛔ Source classes only. A manifest object's header word 1 is not a class id,
+  // ⛔ Source classes only. A manifest object's header word 1 is not a class word,
   // and the manifest contracts that reach here have no subclass to be wrong
   // about.
   if (RuntimeBundleLowerer::classForContract(object.contract)) {
@@ -2258,46 +2086,110 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultObjectRepr(
       op, runtimeContractType(context, "builtins.str"), call, bundle);
 }
 
-// Per-program boxed-slot release hook. The native slot dispatcher
-// (release_payload_slot_ptr in RuntimeSupportBuilder) tries this FIRST: each
-// merged contract's manifest deallocator is the single implementation of
-// decref, child releases, and the block free. The hook is generated here —
-// not in the always-loaded native library — because runtime object modules
-// are merged per contract on demand, so only the lowering knows which
-// deallocators exist (including generated source-class deallocators).
+// A slot function's signature (TypeObjects.h): the hook's, without the class
+// words it reads its slot off -- `(ptr slot) -> (results..., i1 hit)`, or for
+// a binary hook `(ptr lhs, ptr rhs, i64 rhs class) -> (results..., i1)`.
+mlir::FunctionType RuntimeBundleLowerer::slotFunctionType(
+    const type_objects::SlotHook &hook, mlir::TypeRange calleeResultTypes) {
+  mlir::Builder b(context);
+  auto ptrType = mlir::LLVM::LLVMPointerType::get(context);
+  llvm::SmallVector<mlir::Type, 4> results(calleeResultTypes.begin(),
+                                           calleeResultTypes.end());
+  results.push_back(b.getI1Type());
+  if (hook.binary)
+    return b.getFunctionType({ptrType, ptrType, b.getI64Type()}, results);
+  return b.getFunctionType({ptrType}, results);
+}
+
+// One slot function, `__ly_slot.<hook>.<arm>`, made once and shared by every
+// class whose arm it is. The type objects that will hold it are written after
+// the module's symbols are pruned, so until then the HOOK names it (its
+// `ly.slots`): a slot lives exactly as long as something calls its hook.
+// ⛔ Not public: a public slot kept itself alive, and through its callee the
+// hook that calls it -- str's repr, hash and orderings in a program that
+// prints one str. Public only for a hook the runtime calls, which the
+// program cannot see called.
+mlir::FailureOr<std::string> RuntimeBundleLowerer::slotFunction(
+    llvm::StringRef hookName, llvm::StringRef arm, mlir::FunctionType type,
+    llvm::function_ref<mlir::LogicalResult(mlir::OpBuilder &,
+                                           mlir::func::FuncOp)>
+        body) {
+  std::string name = ("__ly_slot." + hookName + "." + arm).str();
+  if (module.lookupSymbol(name))
+    return name;
+  mlir::OpBuilder builder(context);
+  builder.setInsertionPointToEnd(module.getBody());
+  auto function =
+      mlir::func::FuncOp::create(builder, module.getLoc(), name, type);
+  mlir::Block *entry = function.addEntryBlock();
+  builder.setInsertionPointToStart(entry);
+  if (mlir::failed(body(builder, function)))
+    return mlir::failure();
+  // What the hook says of its results its slots say too: the refcount planner
+  // reads an owned str off the function that returns it.
+  auto hook = module.lookupSymbol<mlir::func::FuncOp>(hookName);
+  if (hook)
+    for (llvm::StringRef attr :
+         {"ly.ownership.owned_results", "ly.runtime.result_contract"})
+      if (mlir::Attribute value = hook->getAttr(attr))
+        function->setAttr(attr, value);
+  const type_objects::SlotHook *slotHook = type_objects::slotHookNamed(hookName);
+  if (hook && slotHook && !slotHook->calledByRuntime) {
+    function.setPrivate();
+    llvm::SmallVector<mlir::Attribute, 8> slots;
+    if (auto existing = hook->getAttrOfType<mlir::ArrayAttr>("ly.slots"))
+      slots.append(existing.begin(), existing.end());
+    slots.push_back(mlir::FlatSymbolRefAttr::get(context, name));
+    hook->setAttr("ly.slots", mlir::ArrayAttr::get(context, slots));
+  }
+  return name;
+}
+
+void RuntimeBundleLowerer::returnSlotHit(mlir::OpBuilder &builder,
+                                         mlir::Location loc,
+                                         mlir::ValueRange results) {
+  llvm::SmallVector<mlir::Value, 4> hit(results.begin(), results.end());
+  hit.push_back(mlir::arith::ConstantIntOp::create(builder, loc, 1, 1));
+  mlir::func::ReturnOp::create(builder, loc, hit);
+}
+
+void RuntimeBundleLowerer::returnSlotMiss(mlir::OpBuilder &builder,
+                                          mlir::Location loc,
+                                          mlir::TypeRange results) {
+  llvm::SmallVector<mlir::Value, 4> missed;
+  for (mlir::Type type : results.drop_back())
+    missed.push_back(mlir::ub::PoisonOp::create(builder, loc, type, nullptr));
+  missed.push_back(mlir::arith::ConstantIntOp::create(builder, loc, 0, 1));
+  mlir::func::ReturnOp::create(builder, loc, missed);
+}
+
 // ⛔ A pruned class does not MISS. A miss is an answer -- repr's caller prints
 // the default `<X object at 0x...>`, eq's says "not equal", lt's raises
 // TypeError -- and for a class that has the method it is the wrong one.
-// Reaching a pruned id means the closure the pruning trusted was wrong: stop,
-// saying so.
-mlir::LogicalResult RuntimeBundleLowerer::endWithPrunedClassTrap(
-    mlir::func::FuncOp hook, mlir::Block *check, mlir::Block *miss,
-    mlir::Value classValue, llvm::ArrayRef<std::int64_t> prunedIds,
-    llvm::StringRef hookName) {
-  mlir::Location loc = hook.getLoc();
-  mlir::Block *trap = hook.addBlock();
-  {
-    mlir::OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointToStart(trap);
-    mlir::Value never = mlir::arith::ConstantIntOp::create(builder, loc, 0, 1);
-    mlir::cf::AssertOp::create(
-        builder, loc, never,
-        (hookName + ": a class judged unreachable by this program's types "
-                    "reached it")
-            .str());
-    mlir::cf::BranchOp::create(builder, loc, miss);
-  }
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToEnd(check);
-  llvm::SmallVector<llvm::APInt, 16> cases;
-  for (std::int64_t id : prunedIds)
-    cases.push_back(
-        llvm::APInt(64, static_cast<std::uint64_t>(id), /*isSigned=*/true));
-  llvm::SmallVector<mlir::Block *, 16> destinations(prunedIds.size(), trap);
-  llvm::SmallVector<mlir::ValueRange, 16> operands(prunedIds.size(),
-                                                   mlir::ValueRange{});
-  mlir::cf::SwitchOp::create(builder, loc, classValue, miss, mlir::ValueRange{},
-                             cases, destinations, operands);
+// Reaching a pruned class means the closure the pruning trusted was wrong:
+// its slot stops, saying so.
+mlir::LogicalResult RuntimeBundleLowerer::recordUnreachableSlots(
+    llvm::StringRef hookName, const type_objects::SlotHook &hook,
+    mlir::FunctionType slotType, llvm::ArrayRef<std::string> pruned) {
+  if (pruned.empty())
+    return mlir::success();
+  mlir::FailureOr<std::string> slot = RuntimeBundleLowerer::slotFunction(
+      hookName, "unreachable", slotType,
+      [&](mlir::OpBuilder &b, mlir::func::FuncOp function) {
+        mlir::Location loc = function.getLoc();
+        mlir::Value never = mlir::arith::ConstantIntOp::create(b, loc, 0, 1);
+        mlir::cf::AssertOp::create(
+            b, loc, never,
+            (hookName + ": a class judged unreachable by this program's types "
+                        "reached it")
+                .str());
+        RuntimeBundleLowerer::returnSlotMiss(b, loc, slotType.getResults());
+        return mlir::success();
+      });
+  if (mlir::failed(slot))
+    return mlir::failure();
+  for (const std::string &name : pruned)
+    type_objects::recordSlot(module, name, hook, *slot);
   return mlir::success();
 }
 
@@ -2307,47 +2199,50 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
     mlir::TypeRange calleeResultTypes, bool shareExceptionSubclasses,
     llvm::StringRef sourceClassMethodName,
     llvm::function_ref<bool(llvm::StringRef)> keepsContract) {
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(hookName)) {
-    // A definition already exists (idempotent); an external declaration (from a
-    // merged manifest caller) is replaced by the generated body below.
+  // ⭐ THE HOOK IS THE CLASS'S SLOT, CALLED. Each arm below becomes a slot
+  // function its class's type object holds (TypeObjects.h), and the hook's
+  // body -- written once the module is in the LLVM dialect, where a function
+  // can be called through its address -- reads the slot off the class word
+  // and calls it. The external declaration a manifest caller merged in stays
+  // until then.
+  // ⛔ Not a compare per class: a class word is an address, which no
+  // `cf.switch` can take, and the chain the compares made ran in every
+  // dict probe.
+  const type_objects::SlotHook *slotHook = type_objects::slotHookNamed(hookName);
+  if (!slotHook)
+    return module.emitError() << hookName << " has no slot word (TypeObjects.h)";
+  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(hookName))
     if (!existing.isExternal())
       return mlir::success();
-    existing.erase();
-  }
 
   struct HookEntry {
-    std::int64_t classId;
+    // The class the arm answers for (TypeObjects.h).
+    std::string runtimeClass;
     mlir::func::FuncOp callee;
     // The contract the BOX holds, which is not always the callee's: the
-    // exception taxonomy dispatches 71 class ids to one BaseException callee,
+    // exception taxonomy dispatches 71 classes to one BaseException callee,
     // and a source class's method carries no manifest contract at all.
     std::string contract;
   };
   llvm::SmallVector<HookEntry, 16> entries;
-  llvm::SmallDenseSet<std::int64_t, 16> seenIds;
+  llvm::StringSet<> seen;
   // Classes keepsContract says no value of the program can have: no arm, and
   // a trap rather than a miss if one turns up anyway (below).
-  llvm::SmallVector<std::int64_t, 16> prunedIds;
+  llvm::SmallVector<std::string, 16> pruned;
   // The callee's arguments are reconstructed uniformly from the box word
   // layout (slot words (4+i, 9+i) hold physical value i), so every selected
   // function must take only rank-1 memrefs and share the hook's callee result
   // shape (no per-type special-casing).
-  // ⛔ Class 0 is not a class, it is the box's "no class" reading, and the
-  // arguments a dispatch entry gets are rebuilt from the box's handle words --
-  // slot word 4 is a POINTER to the entity. A box with no class has nothing
-  // there, so an entry for 0 receives a null and dereferences it:
+  // ⛔ `builtins.object`'s methods take the BOX rather than an entity behind
+  // it, and the arguments a dispatch entry gets are rebuilt from the slot's
+  // entity -- so an object arm handed None (the one class with no methods of
+  // its own here) dereferenced what it was not given:
   //
   //     print([None])        # SIGSEGV in LyObject_BoxedRepr, reading box[1]
   //                          # off address 0
   //
-  // `builtins.object`'s methods take the BOX rather than an entity behind it,
-  // which is why they alone break the reconstruction. The str hook already
-  // knew this and said it as a name -- "LyObject_BoxedStr must not join" --
-  // so the repr hook, which never had that line, drove straight into it. Said
-  // as the class id instead, both are covered and neither needs naming.
-  auto dispatchable = [](std::int64_t classId) { return classId != 0; };
-  // The class-0 candidate is not dropped, it is moved to the end: it takes the
-  // BOX, so it is the arm that can answer when nothing else does.
+  // The object candidate is not dropped, it is moved to the end as None's
+  // arm: it takes the BOX, so it is the arm that can answer for None.
   mlir::func::FuncOp objectFallback;
   auto conforms = [&](mlir::func::FuncOp function) {
     mlir::FunctionType type = function.getFunctionType();
@@ -2371,36 +2266,34 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
         contracts::kManifestContractAttr);
     if (!contractAttr)
       return;
-    std::optional<std::int64_t> classId =
-        manifest.classId(contractAttr.getValue());
-    if (!classId) {
+    std::optional<std::string> runtimeClass =
+        manifest.runtimeClass(contractAttr.getValue());
+    if (!runtimeClass) {
       py::ClassOp classOp = RuntimeBundleLowerer::classForContract(
           runtimeContractType(context, contractAttr.getValue()));
       if (classOp)
-        classId = RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
+        runtimeClass = RuntimeBundleLowerer::runtimeClassForClass(classOp);
     }
-    // Conformance decides before the id is consumed: a non-conforming
+    // Conformance decides before the class is consumed: a non-conforming
     // candidate (e.g. bool's primitive-i1 __repr__) must not shadow a
     // conforming boxed one for the same class.
-    if (!classId || !conforms(function))
+    if (!runtimeClass || !conforms(function))
       return;
-    // `builtins.object`'s method takes the BOX, so it is the class-0 (None)
-    // arm below, never an arm rebuilt from a slot -- chosen by name, since
-    // object's own number is no longer 0.
-    if (contractAttr.getValue() == "builtins.object" ||
-        !dispatchable(*classId)) {
+    // `builtins.object`'s method takes the BOX, so it is None's arm below,
+    // never an arm rebuilt from a slot.
+    if (contractAttr.getValue() == "builtins.object") {
       if (!objectFallback && function.getFunctionType().getNumInputs() == 1)
         objectFallback = function;
       return;
     }
-    if (!seenIds.insert(*classId).second)
+    if (!seen.insert(*runtimeClass).second)
       return;
     if (keepsContract && !keepsContract(contractAttr.getValue())) {
-      prunedIds.push_back(*classId);
+      pruned.push_back(*runtimeClass);
       return;
     }
     entries.push_back(
-        HookEntry{*classId, function, contractAttr.getValue().str()});
+        HookEntry{*runtimeClass, function, contractAttr.getValue().str()});
   });
 
   // Compiled source-class methods share the physical-value slot convention
@@ -2416,17 +2309,17 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
       auto function = module.lookupSymbol<mlir::func::FuncOp>(*symbol);
       if (!function || function.isExternal() || !conforms(function))
         return;
-      std::optional<std::int64_t> classId =
-          RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
-      if (!classId || !seenIds.insert(*classId).second)
+      std::optional<std::string> runtimeClass =
+          RuntimeBundleLowerer::runtimeClassForClass(classOp);
+      if (!runtimeClass || !seen.insert(*runtimeClass).second)
         return;
       entries.push_back(
-          HookEntry{*classId, function, classOp.getSymName().str()});
+          HookEntry{*runtimeClass, function, classOp.getSymName().str()});
     });
   }
 
   // Exception subclasses share BaseException's shape and (for release) its
-  // deallocator but carry their own class ids; without these entries a boxed
+  // deallocator but carry their own class words; without these entries a boxed
   // subclass would miss the hook. Only used where subclasses share one callee.
   if (shareExceptionSubclasses) {
     mlir::func::FuncOp baseCallee;
@@ -2443,172 +2336,115 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
       module.walk([&](mlir::func::FuncOp function) {
         auto contractAttr = function->getAttrOfType<mlir::StringAttr>(
             contracts::kManifestContractAttr);
-        auto classIdAttr = function->getAttrOfType<mlir::IntegerAttr>(
-            contracts::kManifestClassIdAttr);
-        if (!contractAttr || !classIdAttr ||
-            !seenIds.insert(classIdAttr.getInt()).second)
+        if (!contractAttr || !function->hasAttr(contracts::kManifestClassAttr) ||
+            !seen.insert(contractAttr.getValue()).second)
           return;
         if (!table.isManifestSubclassOf(
                 runtimeContractType(context, contractAttr.getValue()),
                 "builtins.BaseException"))
           return;
-        entries.push_back(HookEntry{classIdAttr.getInt(), baseCallee,
-                                    contractAttr.getValue().str()});
+        // Every exception's box is BaseException's layout, so one slot
+        // function serves the family.
+        entries.push_back(HookEntry{contractAttr.getValue().str(), baseCallee,
+                                    "builtins.BaseException"});
       });
-      // Source exception classes: same shared callee, compiler-assigned ids.
+      // Source exception classes: the same shared callee.
       module.walk([&](py::ClassOp classOp) {
         if (!RuntimeBundleLowerer::exceptionAncestorContract(classOp))
           return;
-        std::optional<std::int64_t> classId =
-            RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
-        if (!classId || !seenIds.insert(*classId).second)
+        std::optional<std::string> runtimeClass =
+            RuntimeBundleLowerer::runtimeClassForClass(classOp);
+        if (!runtimeClass || !seen.insert(*runtimeClass).second)
           return;
-        if (dispatchable(*classId))
-          entries.push_back(HookEntry{*classId, baseCallee,
-                                      classOp.getSymName().str()});
+        entries.push_back(HookEntry{*runtimeClass, baseCallee,
+                                    "builtins.BaseException"});
       });
     }
   }
 
   mlir::OpBuilder builder(context);
-  builder.setInsertionPointToEnd(module.getBody());
   auto ptrType = mlir::LLVM::LLVMPointerType::get(context);
   mlir::Type i64 = builder.getI64Type();
-  mlir::Type i1 = builder.getI1Type();
   mlir::Location loc = module.getLoc();
-  llvm::SmallVector<mlir::Type, 4> hookResultTypes(calleeResultTypes.begin(),
-                                                   calleeResultTypes.end());
-  hookResultTypes.push_back(i1);
-  auto hook = mlir::func::FuncOp::create(
-      builder, loc, hookName,
-      builder.getFunctionType({ptrType, i64}, hookResultTypes));
+  mlir::FunctionType slotType =
+      RuntimeBundleLowerer::slotFunctionType(*slotHook, calleeResultTypes);
 
-  mlir::Block *entry = hook.addEntryBlock();
-  mlir::Value slot = entry->getArgument(0);
-  mlir::Value classValue = entry->getArgument(1);
-
-  mlir::Block *miss = hook.addBlock();
-  {
-    mlir::OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointToStart(miss);
-    llvm::SmallVector<mlir::Value, 4> missResults;
-    for (mlir::Type resultType : calleeResultTypes)
-      missResults.push_back(
-          mlir::ub::PoisonOp::create(builder, loc, resultType, nullptr));
-    missResults.push_back(
-        mlir::arith::ConstantIntOp::create(builder, loc, 0, 1));
-    mlir::func::ReturnOp::create(builder, loc, missResults);
-  }
-
-  auto loadWord = [&](mlir::OpBuilder &b, std::int64_t index) -> mlir::Value {
-    mlir::Value gep = mlir::LLVM::GEPOp::create(
-        b, loc, ptrType, i64, slot,
-        llvm::ArrayRef<mlir::LLVM::GEPArg>{
-            mlir::LLVM::GEPArg(static_cast<std::int32_t>(index))});
-    return mlir::LLVM::LoadOp::create(b, loc, i64, gep).getResult();
-  };
-
-  mlir::Block *check = entry;
   for (const HookEntry &hookEntry : entries) {
-    mlir::Block *handle = hook.addBlock();
-    mlir::Block *next = hook.addBlock();
-    {
-      mlir::OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToEnd(check);
-      mlir::Value expected = mlir::arith::ConstantIntOp::create(
-          builder, loc, hookEntry.classId, 64);
-      mlir::Value matches = mlir::arith::CmpIOp::create(
-          builder, loc, mlir::arith::CmpIPredicate::eq, classValue, expected);
-      mlir::cf::CondBranchOp::create(builder, loc, matches, handle,
-                                     mlir::ValueRange{}, next,
-                                     mlir::ValueRange{});
-    }
-    {
-      mlir::OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToStart(handle);
-      mlir::func::FuncOp callee = hookEntry.callee;
-      mlir::FunctionType type = callee.getFunctionType();
-      mlir::Value entityWord = loadWord(builder, box_abi::kEntityWord);
-      mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
-          RuntimeBundleLowerer::lanesFromBoxEntity(
-              builder, loc, entityWord, type.getInputs(), hookEntry.contract,
-              callee,
-              /*ownedRead=*/!callee->hasAttr(contracts::kManifestDeallocatorAttr));
-      if (mlir::failed(lanes))
-        return mlir::failure();
-      llvm::SmallVector<mlir::Value, 6> operands(lanes->begin(), lanes->end());
-      mlir::func::CallOp call =
-          mlir::func::CallOp::create(builder, loc, callee, operands);
-      llvm::SmallVector<mlir::Value, 4> hitResults(call.getResults().begin(),
-                                                   call.getResults().end());
-      hitResults.push_back(
-          mlir::arith::ConstantIntOp::create(builder, loc, 1, 1));
-      mlir::func::ReturnOp::create(builder, loc, hitResults);
-    }
-    check = next;
+    mlir::func::FuncOp callee = hookEntry.callee;
+    mlir::FailureOr<std::string> slot = RuntimeBundleLowerer::slotFunction(
+        hookName, (callee.getSymName() + "." + hookEntry.contract).str(),
+        slotType, [&](mlir::OpBuilder &b, mlir::func::FuncOp function) {
+          mlir::FunctionType type = callee.getFunctionType();
+          mlir::Value entityWord =
+              mlir::LLVM::LoadOp::create(b, loc, i64, function.getArgument(0))
+                  .getResult();
+          mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
+              RuntimeBundleLowerer::lanesFromBoxEntity(
+                  b, loc, entityWord, type.getInputs(), hookEntry.contract,
+                  callee,
+                  /*ownedRead=*/
+                  !callee->hasAttr(contracts::kManifestDeallocatorAttr));
+          if (mlir::failed(lanes))
+            return mlir::failure();
+          llvm::SmallVector<mlir::Value, 6> operands(lanes->begin(),
+                                                     lanes->end());
+          mlir::func::CallOp call =
+              mlir::func::CallOp::create(b, loc, callee, operands);
+          RuntimeBundleLowerer::returnSlotHit(b, loc, call.getResults());
+          return mlir::success();
+        });
+    if (mlir::failed(slot))
+      return mlir::failure();
+    type_objects::recordSlot(module, hookEntry.runtimeClass, *slotHook, *slot);
   }
   if (objectFallback) {
-    // ⭐ Class 0 answered by the box itself.
+    // ⭐ None answered by the box itself.
     //
-    // Every other arm rebuilds its operand from the box's handle words, where
-    // slot word 4 points at the entity. A box with no class has no entity
-    // there, so that reconstruction hands a null to a function that reads it
-    // -- `print([None])` was a SIGSEGV inside `LyObject_BoxedRepr`. The
-    // `builtins.object` methods want the box, and the box is exactly what this
-    // hook was passed.
+    // Every other arm rebuilds its operand from the slot's entity. None has
+    // no methods of its own to rebuild one for -- `print([None])` was a
+    // SIGSEGV inside `LyObject_BoxedRepr`. The `builtins.object` methods want
+    // the box, and the box is exactly what this hook was passed.
     //
-    // ⛔ Class 0 only, not a universal fallback: `LyObject_BoxedRepr` calls
-    // this hook for any OTHER class id, so answering everything here would
-    // make the two call each other without end. An unmatched class still
-    // misses, which is what its caller's assert is for.
-    mlir::Block *handle = hook.addBlock();
-    mlir::Block *next = hook.addBlock();
-    {
-      mlir::OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToEnd(check);
-      mlir::Value zero = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
-      mlir::Value matches = mlir::arith::CmpIOp::create(
-          builder, loc, mlir::arith::CmpIPredicate::eq, classValue, zero);
-      mlir::cf::CondBranchOp::create(builder, loc, matches, handle,
-                                     mlir::ValueRange{}, next,
-                                     mlir::ValueRange{});
-    }
-    {
-      mlir::OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToStart(handle);
-      auto boxType = mlir::cast<mlir::MemRefType>(
-          objectFallback.getFunctionType().getInput(0));
-      // Class 0 in a slot is None (its entity is the None object), and the
-      // `builtins.object` method wants a standalone box: one is built on the
-      // stack around the slot's entity (see `borrowedBoxOfSlotEntity`).
-      mlir::Value entity =
-          mlir::LLVM::LoadOp::create(builder, loc, i64, hook.getArgument(0))
-              .getResult();
-      mlir::Value box = RuntimeBundleLowerer::borrowedBoxOfSlotEntity(
-          builder, loc, entity, boxType);
-      mlir::func::CallOp call =
-          mlir::func::CallOp::create(builder, loc, objectFallback, box);
-      llvm::SmallVector<mlir::Value, 4> hitResults(call.getResults().begin(),
-                                                   call.getResults().end());
-      hitResults.push_back(
-          mlir::arith::ConstantIntOp::create(builder, loc, 1, 1));
-      mlir::func::ReturnOp::create(builder, loc, hitResults);
-    }
-    check = next;
+    // ⛔ None only, not a universal fallback: `LyObject_BoxedRepr` calls this
+    // hook for any class it does not answer itself, so answering everything
+    // here would make the two call each other without end. An unmatched class
+    // still misses, which is what its caller's assert is for.
+    mlir::FailureOr<std::string> slot = RuntimeBundleLowerer::slotFunction(
+        hookName, "None", slotType,
+        [&](mlir::OpBuilder &b, mlir::func::FuncOp function) {
+          auto boxType = mlir::cast<mlir::MemRefType>(
+              objectFallback.getFunctionType().getInput(0));
+          // The `builtins.object` method wants a standalone box: one is
+          // built on the stack around the slot's entity (see
+          // `borrowedBoxOfSlotEntity`).
+          mlir::Value entity =
+              mlir::LLVM::LoadOp::create(b, loc, i64, function.getArgument(0))
+                  .getResult();
+          mlir::Value box = RuntimeBundleLowerer::borrowedBoxOfSlotEntity(
+              b, loc, entity, boxType);
+          mlir::func::CallOp call =
+              mlir::func::CallOp::create(b, loc, objectFallback, box);
+          RuntimeBundleLowerer::returnSlotHit(b, loc, call.getResults());
+          return mlir::success();
+        });
+    if (mlir::failed(slot))
+      return mlir::failure();
+    type_objects::recordSlot(module, "types.NoneType", *slotHook, *slot);
   }
-  if (!prunedIds.empty())
-    return endWithPrunedClassTrap(hook, check, miss, classValue, prunedIds,
-                                  hookName);
-  {
-    mlir::OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointToEnd(check);
-    mlir::cf::BranchOp::create(builder, loc, miss);
-  }
-  return mlir::success();
+  (void)ptrType;
+  return RuntimeBundleLowerer::recordUnreachableSlots(hookName, *slotHook,
+                                                      slotType, pruned);
 }
 
+// Per-program boxed-slot release hook. The native slot dispatcher
+// (release_payload_slot_ptr in RuntimeSupportBuilder) tries this FIRST: each
+// merged contract's manifest deallocator is the single implementation of
+// decref, child releases, and the block free. Its slots are made here -- not
+// in the always-loaded native library -- because runtime object modules are
+// merged per contract on demand, so only the lowering knows which
+// deallocators exist (including generated source-class deallocators).
 mlir::LogicalResult RuntimeBundleLowerer::generateBoxedReleaseHook() {
-  // Release is one instance of the uniform boxed-method dispatch: class id ->
+  // Release is one instance of the uniform boxed-method dispatch: class word ->
   // the manifest deallocator (which returns void). Exception subclasses share
   // BaseException's deallocator.
   // ⛔ The exception family is never pruned here: its subclasses' arms are
@@ -2632,13 +2468,17 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedReleaseHook() {
 // Both string-shaped hooks hand back an owned `builtins.str`; the refcount
 // planner reads that off the hook, not off its callees.
 void RuntimeBundleLowerer::stampBoxedStrHookResult(llvm::StringRef hookName) {
-  auto hook = module.lookupSymbol<mlir::func::FuncOp>(hookName);
-  if (!hook)
-    return;
   mlir::OpBuilder attrBuilder(context);
-  hook->setAttr("ly.ownership.owned_results", attrBuilder.getI64ArrayAttr({0}));
-  hook->setAttr("ly.runtime.result_contract",
-                attrBuilder.getStringAttr("builtins.str"));
+  std::string slotPrefix = ("__ly_slot." + hookName + ".").str();
+  for (auto function : module.getOps<mlir::func::FuncOp>()) {
+    if (function.getSymName() != hookName &&
+        !function.getSymName().starts_with(slotPrefix))
+      continue;
+    function->setAttr("ly.ownership.owned_results",
+                      attrBuilder.getI64ArrayAttr({0}));
+    function->setAttr("ly.runtime.result_contract",
+                      attrBuilder.getStringAttr("builtins.str"));
+  }
 }
 
 // Demand-driven: the external declaration merged in from the manifest is what
@@ -2684,7 +2524,7 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHookFor(
 }
 
 // ⭐ WHAT A BOX IN THIS PROGRAM CAN HOLD, ASKED OF ITS TYPES. The repr and str
-// hooks dispatch on a box's class id, and written for every class the
+// hooks dispatch on a box's class word, and written for every class the
 // manifest knows they carry float's shortest-digit printer, range's, dict's,
 // complex's and every exception's into a program that prints a list[str] --
 // half of a small wasm module. A value of class K exists only where the
@@ -3026,7 +2866,7 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedHashHook() {
 }
 
 // Binary variant of the uniform boxed-method dispatch, for same-class binary
-// methods (`__eq__`): `(ptr lhs, ptr rhs, i64 class_id) -> (results..., i1
+// methods (`__eq__`): `(ptr lhs, ptr rhs, i64 class) -> (results..., i1
 // handled)`. A callee conforms when its inputs are 2N rank-1 memrefs whose
 // second half repeats the first (self shape twice); the first half is
 // reconstructed from the lhs box words, the second from the rhs box words.
@@ -3035,17 +2875,19 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
     llvm::function_ref<bool(mlir::func::FuncOp)> selects,
     mlir::TypeRange calleeResultTypes, llvm::StringRef sourceClassMethodName,
     llvm::function_ref<bool(llvm::StringRef)> keepsContract) {
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(hookName)) {
+  // The hook is the class's slot, called (see generateBoxedMethodHook).
+  const type_objects::SlotHook *slotHook = type_objects::slotHookNamed(hookName);
+  if (!slotHook)
+    return module.emitError() << hookName << " has no slot word (TypeObjects.h)";
+  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(hookName))
     if (!existing.isExternal())
       return mlir::success();
-    existing.erase();
-  }
 
   struct HookEntry {
-    std::int64_t classId;
+    std::string runtimeClass;
     mlir::func::FuncOp callee;
     // The contract the BOX holds, which is not always the callee's: the
-    // exception taxonomy dispatches 71 class ids to one BaseException callee,
+    // exception taxonomy dispatches 71 class words to one BaseException callee,
     // and a source class's method carries no manifest contract at all.
     std::string contract;
     // ⛔ `def __eq__(self, other: object)` -- the spelling Python's own
@@ -3054,7 +2896,7 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
     bool otherIsBox = false;
     // ⭐ WHICH RIGHT-HAND CLASSES THIS ENTRY MAY BE HANDED. The callee takes
     // the other side as its own contract's LANES, so the box on the right has
-    // to have that layout -- which is what the caller's "same class id" gate
+    // to have that layout -- which is what the caller's "same class word" gate
     // was standing in for, and what made a SUBCLASS answer wrong:
     //
     //     class P:
@@ -3067,19 +2909,19 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
     // Two objects may take this entry when they resolve the SAME
     // implementation: that is exactly when both have the declaring class in
     // their MRO, so both boxes carry its lanes. Empty means "this entry's own
-    // id only", which is every manifest class.
-    llvm::SmallVector<std::int64_t, 4> acceptedRightIds;
+    // class only", which is every manifest class.
+    llvm::SmallVector<std::string, 4> acceptedRight;
     // The resolved implementation, used only to compute the set above.
     std::string calleeSymbol;
   };
   llvm::SmallVector<HookEntry, 16> entries;
-  llvm::SmallDenseSet<std::int64_t, 16> seenIds;
-  llvm::SmallVector<std::int64_t, 16> prunedIds;
+  llvm::StringSet<> seen;
+  llvm::SmallVector<std::string, 16> pruned;
   // ⛔ WHAT THE SECOND PARAMETER IS, ASKED OF THE DECLARATION AND NOT OF ITS
   // SHAPE. The shapes decided it until a class with three body words met
   // `object`: both are five i64 words, so `__eq__(self: K, other: object)`
   // looked symmetric, and the hook handed over the box's ENTITY where a BOX
-  // was expected. Inside, `isinstance(other, K)` read K's own class id out of
+  // was expected. Inside, `isinstance(other, K)` read K's own class word out of
   // word 1 and agreed, and the field read that followed took word 2 -- a field
   // handle -- for an entity pointer: intermittent SIGSEGV, and `False` on the
   // runs that did not crash.
@@ -3124,21 +2966,22 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
         contracts::kManifestContractAttr);
     if (!contractAttr)
       return;
-    std::optional<std::int64_t> classId =
-        manifest.classId(contractAttr.getValue());
-    if (!classId) {
+    std::optional<std::string> runtimeClass =
+        manifest.runtimeClass(contractAttr.getValue());
+    if (!runtimeClass) {
       py::ClassOp classOp = RuntimeBundleLowerer::classForContract(
           runtimeContractType(context, contractAttr.getValue()));
       if (classOp)
-        classId = RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
+        runtimeClass = RuntimeBundleLowerer::runtimeClassForClass(classOp);
     }
-    if (!classId || !conforms(function) || !seenIds.insert(*classId).second)
+    if (!runtimeClass || !conforms(function) ||
+        !seen.insert(*runtimeClass).second)
       return;
     if (keepsContract && !keepsContract(contractAttr.getValue())) {
-      prunedIds.push_back(*classId);
+      pruned.push_back(*runtimeClass);
       return;
     }
-    entries.push_back(HookEntry{*classId, function,
+    entries.push_back(HookEntry{*runtimeClass, function,
                                 contractAttr.getValue().str(),
                                 declaredOtherIsObject(function)});
   });
@@ -3152,11 +2995,11 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
       auto function = module.lookupSymbol<mlir::func::FuncOp>(*symbol);
       if (!function || function.isExternal() || !conforms(function))
         return;
-      std::optional<std::int64_t> classId =
-          RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
-      if (!classId || !seenIds.insert(*classId).second)
+      std::optional<std::string> runtimeClass =
+          RuntimeBundleLowerer::runtimeClassForClass(classOp);
+      if (!runtimeClass || !seen.insert(*runtimeClass).second)
         return;
-      entries.push_back(HookEntry{*classId, function,
+      entries.push_back(HookEntry{*runtimeClass, function,
                                   classOp.getSymName().str(),
                                   declaredOtherIsObject(function),
                                   {},
@@ -3166,26 +3009,27 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
 
   // ⭐ A source entry accepts on the right every class that derives from the
   // class its OTHER parameter declares: those boxes carry that class's lanes,
-  // which is what the callee reads. A manifest entry keeps its own id alone.
+  // which is what the callee reads. A manifest entry keeps its own class
+  // alone.
   //
   // ⛔ Not "every entry resolving the same implementation", which stood here
   // and is the same set only while the parameter names the declaring class.
   // A subclass's reflected override -- `class B(A): def __gt__(self, other:
   // A)` -- was refused an A on the right, so `[A(1)] < [B(2)]` answered from
   // `A.__lt__` where CPython asks `B.__gt__` first.
-  llvm::SmallVector<std::pair<std::int64_t, llvm::SmallVector<std::int64_t, 8>>,
+  llvm::SmallVector<std::pair<std::string, llvm::SmallVector<std::string, 8>>,
                     16>
       sourceAncestry;
   module.walk([&](py::ClassOp classOp) {
-    if (std::optional<std::int64_t> id =
-            RuntimeBundleLowerer::runtimeClassIdForClass(classOp))
+    if (std::optional<std::string> runtimeClass =
+            RuntimeBundleLowerer::runtimeClassForClass(classOp))
       sourceAncestry.push_back(
-          {*id, RuntimeBundleLowerer::classAncestorIds(classOp)});
+          {*runtimeClass, RuntimeBundleLowerer::classAncestors(classOp)});
   });
   for (HookEntry &hookEntry : entries) {
     if (hookEntry.calleeSymbol.empty())
       continue;
-    std::optional<std::int64_t> declaredOther;
+    std::optional<std::string> declaredOther;
     if (auto attr =
             hookEntry.callee->getAttrOfType<mlir::TypeAttr>("callable_type"))
       if (auto callable = mlir::dyn_cast<py::CallableType>(attr.getValue()))
@@ -3193,162 +3037,113 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
           if (py::ClassOp declared = RuntimeBundleLowerer::classForContract(
                   callable.getPositionalTypes()[1]))
             declaredOther =
-                RuntimeBundleLowerer::runtimeClassIdForClass(declared);
+                RuntimeBundleLowerer::runtimeClassForClass(declared);
     if (!declaredOther) {
       for (const HookEntry &other : entries)
         if (other.calleeSymbol == hookEntry.calleeSymbol)
-          hookEntry.acceptedRightIds.push_back(other.classId);
+          hookEntry.acceptedRight.push_back(other.runtimeClass);
       continue;
     }
-    for (const auto &[id, ancestors] : sourceAncestry)
-      if (id == *declaredOther || llvm::is_contained(ancestors, *declaredOther))
-        hookEntry.acceptedRightIds.push_back(id);
+    for (const auto &[name, ancestors] : sourceAncestry)
+      if (name == *declaredOther ||
+          llvm::is_contained(ancestors, *declaredOther))
+        hookEntry.acceptedRight.push_back(name);
   }
 
   mlir::OpBuilder builder(context);
-  builder.setInsertionPointToEnd(module.getBody());
-  auto ptrType = mlir::LLVM::LLVMPointerType::get(context);
   mlir::Type i64 = builder.getI64Type();
-  mlir::Type i1 = builder.getI1Type();
   mlir::Location loc = module.getLoc();
-  llvm::SmallVector<mlir::Type, 4> hookResultTypes(calleeResultTypes.begin(),
-                                                   calleeResultTypes.end());
-  hookResultTypes.push_back(i1);
-  auto hook = mlir::func::FuncOp::create(
-      builder, loc, hookName,
-      builder.getFunctionType({ptrType, ptrType, i64, i64}, hookResultTypes));
+  mlir::FunctionType slotType =
+      RuntimeBundleLowerer::slotFunctionType(*slotHook, calleeResultTypes);
 
-  mlir::Block *entry = hook.addEntryBlock();
-  mlir::Value lhsSlot = entry->getArgument(0);
-  mlir::Value rhsSlot = entry->getArgument(1);
-  mlir::Value classValue = entry->getArgument(2);
-  mlir::Value rightClassValue = entry->getArgument(3);
-
-  mlir::Block *miss = hook.addBlock();
-  {
-    mlir::OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointToStart(miss);
-    llvm::SmallVector<mlir::Value, 4> missResults;
-    for (mlir::Type resultType : calleeResultTypes)
-      missResults.push_back(
-          mlir::ub::PoisonOp::create(builder, loc, resultType, nullptr));
-    missResults.push_back(
-        mlir::arith::ConstantIntOp::create(builder, loc, 0, 1));
-    mlir::func::ReturnOp::create(builder, loc, missResults);
-  }
-
-  auto loadWord = [&](mlir::OpBuilder &b, mlir::Value slot,
-                      std::int64_t index) -> mlir::Value {
-    mlir::Value gep = mlir::LLVM::GEPOp::create(
-        b, loc, ptrType, i64, slot,
-        llvm::ArrayRef<mlir::LLVM::GEPArg>{
-            mlir::LLVM::GEPArg(static_cast<std::int32_t>(index))});
-    return mlir::LLVM::LoadOp::create(b, loc, i64, gep).getResult();
-  };
-
-  mlir::Block *check = entry;
   for (const HookEntry &hookEntry : entries) {
-    mlir::Block *handle = hook.addBlock();
-    mlir::Block *next = hook.addBlock();
-    {
-      mlir::OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToEnd(check);
-      mlir::Value expected = mlir::arith::ConstantIntOp::create(
-          builder, loc, hookEntry.classId, 64);
-      mlir::Value matches = mlir::arith::CmpIOp::create(
-          builder, loc, mlir::arith::CmpIPredicate::eq, classValue, expected);
-      // The right-hand box has to carry the callee's lanes; see the note on
-      // `acceptedRightIds`. A callee that takes the other side as a BOX asks
-      // nothing of its class.
-      if (!hookEntry.otherIsBox) {
-        llvm::SmallVector<std::int64_t, 4> accepted =
-            hookEntry.acceptedRightIds;
-        if (accepted.empty())
-          accepted.push_back(hookEntry.classId);
-        mlir::Value rightMatches;
-        for (std::int64_t acceptedId : accepted) {
-          mlir::Value candidate =
-              mlir::arith::ConstantIntOp::create(builder, loc, acceptedId, 64);
-          mlir::Value isCandidate = mlir::arith::CmpIOp::create(
-              builder, loc, mlir::arith::CmpIPredicate::eq, rightClassValue,
-              candidate);
-          rightMatches =
-              rightMatches ? mlir::arith::OrIOp::create(builder, loc,
-                                                        rightMatches,
-                                                        isCandidate)
-                                 .getResult()
-                           : isCandidate;
-        }
-        if (rightMatches)
-          matches =
-              mlir::arith::AndIOp::create(builder, loc, matches, rightMatches)
-                  .getResult();
-      }
-      mlir::cf::CondBranchOp::create(builder, loc, matches, handle,
-                                     mlir::ValueRange{}, next,
-                                     mlir::ValueRange{});
-    }
-    {
-      mlir::OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToStart(handle);
-      llvm::SmallVector<mlir::Value, 8> operands;
-      mlir::func::FuncOp callee = hookEntry.callee;
-      mlir::FunctionType type = callee.getFunctionType();
-      unsigned half = hookEntry.otherIsBox ? 1u : type.getNumInputs() / 2;
-      auto appendLanesFrom = [&](mlir::Value slot) -> mlir::LogicalResult {
-        mlir::Value entityWord = loadWord(builder, slot, box_abi::kEntityWord);
-        mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
-            RuntimeBundleLowerer::lanesFromBoxEntity(
-                builder, loc, entityWord, type.getInputs().take_front(half),
-                hookEntry.contract, callee, /*ownedRead=*/true);
-        if (mlir::failed(lanes))
-          return mlir::failure();
-        operands.append(lanes->begin(), lanes->end());
-        return mlir::success();
-      };
-      if (mlir::failed(appendLanesFrom(lhsSlot)))
-        return mlir::failure();
-      if (hookEntry.otherIsBox) {
-        auto boxType = mlir::dyn_cast<mlir::MemRefType>(type.getInput(1));
-        if (!boxType || !boxType.hasStaticShape() ||
-            boxType.getDimSize(0) != box_abi::kStandaloneBoxWords)
-          return callee.emitError()
-                 << "a boxed dispatch whose other operand is declared "
-                    "builtins.object needs the "
-                 << box_abi::kStandaloneBoxWords << "-word box as its second "
-                 << "parameter, got " << type.getInput(1);
-        // ⭐ A BORROWED BOX ON THE STACK. The callee reads a standalone
-        // box's class and entity words, and a slot is the entity alone
-        // (BoxLayout.h), so the two words are written into a box the size of
-        // one: refcount 1 (never released -- the slot keeps the reference),
-        // class from the entity, entity copied.
-        mlir::Value entity = mlir::LLVM::LoadOp::create(
-                                 builder, loc, i64, rhsSlot)
-                                 .getResult();
-        operands.push_back(RuntimeBundleLowerer::borrowedBoxOfSlotEntity(
-            builder, loc, entity, boxType));
-      } else if (mlir::failed(appendLanesFrom(rhsSlot))) {
-        return mlir::failure();
-      }
-      mlir::func::CallOp call =
-          mlir::func::CallOp::create(builder, loc, callee, operands);
-      llvm::SmallVector<mlir::Value, 4> hitResults(call.getResults().begin(),
-                                                   call.getResults().end());
-      hitResults.push_back(
-          mlir::arith::ConstantIntOp::create(builder, loc, 1, 1));
-      mlir::func::ReturnOp::create(builder, loc, hitResults);
-    }
-    check = next;
+    mlir::func::FuncOp callee = hookEntry.callee;
+    // The right-hand box has to carry the callee's lanes; see the note on
+    // `acceptedRight`. A callee that takes the other side as a BOX asks
+    // nothing of its class.
+    llvm::SmallVector<std::string, 4> accepted = hookEntry.acceptedRight;
+    if (accepted.empty())
+      accepted.push_back(hookEntry.runtimeClass);
+    // One slot per class: the classes it accepts on the right are its own.
+    mlir::FailureOr<std::string> slot = RuntimeBundleLowerer::slotFunction(
+        hookName, hookEntry.runtimeClass, slotType,
+        [&](mlir::OpBuilder &b,
+            mlir::func::FuncOp function) -> mlir::LogicalResult {
+          mlir::Value lhsSlot = function.getArgument(0);
+          mlir::Value rhsSlot = function.getArgument(1);
+          mlir::Value rightClassValue = function.getArgument(2);
+          if (!hookEntry.otherIsBox) {
+            mlir::Value rightMatches;
+            for (const std::string &acceptedClass : accepted) {
+              mlir::Value isCandidate = mlir::arith::CmpIOp::create(
+                  b, loc, mlir::arith::CmpIPredicate::eq, rightClassValue,
+                  type_objects::classWord(b, loc, module, acceptedClass));
+              rightMatches =
+                  rightMatches
+                      ? mlir::arith::OrIOp::create(b, loc, rightMatches,
+                                                   isCandidate)
+                            .getResult()
+                      : isCandidate;
+            }
+            mlir::Block *call = function.addBlock();
+            mlir::Block *refuse = function.addBlock();
+            mlir::cf::CondBranchOp::create(b, loc, rightMatches, call,
+                                           mlir::ValueRange{}, refuse,
+                                           mlir::ValueRange{});
+            b.setInsertionPointToStart(refuse);
+            RuntimeBundleLowerer::returnSlotMiss(b, loc, slotType.getResults());
+            b.setInsertionPointToStart(call);
+          }
+          llvm::SmallVector<mlir::Value, 8> operands;
+          mlir::FunctionType type = callee.getFunctionType();
+          unsigned half = hookEntry.otherIsBox ? 1u : type.getNumInputs() / 2;
+          auto appendLanesFrom = [&](mlir::Value slot) -> mlir::LogicalResult {
+            mlir::Value entityWord =
+                mlir::LLVM::LoadOp::create(b, loc, i64, slot).getResult();
+            mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
+                RuntimeBundleLowerer::lanesFromBoxEntity(
+                    b, loc, entityWord, type.getInputs().take_front(half),
+                    hookEntry.contract, callee, /*ownedRead=*/true);
+            if (mlir::failed(lanes))
+              return mlir::failure();
+            operands.append(lanes->begin(), lanes->end());
+            return mlir::success();
+          };
+          if (mlir::failed(appendLanesFrom(lhsSlot)))
+            return mlir::failure();
+          if (hookEntry.otherIsBox) {
+            auto boxType = mlir::dyn_cast<mlir::MemRefType>(type.getInput(1));
+            if (!boxType || !boxType.hasStaticShape() ||
+                boxType.getDimSize(0) != box_abi::kStandaloneBoxWords)
+              return callee.emitError()
+                     << "a boxed dispatch whose other operand is declared "
+                        "builtins.object needs the "
+                     << box_abi::kStandaloneBoxWords
+                     << "-word box as its second parameter, got "
+                     << type.getInput(1);
+            // ⭐ A BORROWED BOX ON THE STACK. The callee reads a standalone
+            // box's class and entity words, and a slot is the entity alone
+            // (BoxLayout.h), so the two words are written into a box the size
+            // of one: refcount 1 (never released -- the slot keeps the
+            // reference), class from the entity, entity copied.
+            mlir::Value entity =
+                mlir::LLVM::LoadOp::create(b, loc, i64, rhsSlot).getResult();
+            operands.push_back(RuntimeBundleLowerer::borrowedBoxOfSlotEntity(
+                b, loc, entity, boxType));
+          } else if (mlir::failed(appendLanesFrom(rhsSlot))) {
+            return mlir::failure();
+          }
+          mlir::func::CallOp call =
+              mlir::func::CallOp::create(b, loc, callee, operands);
+          RuntimeBundleLowerer::returnSlotHit(b, loc, call.getResults());
+          return mlir::success();
+        });
+    if (mlir::failed(slot))
+      return mlir::failure();
+    type_objects::recordSlot(module, hookEntry.runtimeClass, *slotHook, *slot);
   }
-  if (!prunedIds.empty())
-    return endWithPrunedClassTrap(hook, check, miss, classValue, prunedIds,
-                                  hookName);
-  {
-    mlir::OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointToEnd(check);
-    mlir::cf::BranchOp::create(builder, loc, miss);
-  }
-  return mlir::success();
+  return RuntimeBundleLowerer::recordUnreachableSlots(hookName, *slotHook,
+                                                      slotType, pruned);
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::generateBoxedLtHook() {

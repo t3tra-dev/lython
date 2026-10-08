@@ -984,11 +984,11 @@ def Py_ReprOp : Py_Op<"repr", []> {
 }
 
 def Py_ClassNameOp : Py_Op<"class_name", []> {
-  let summary = "The runtime class name of a value that carries its class id";
+  let summary = "The runtime class name of a value that carries its class word";
   let description = [{
     `type(x).__name__` where the answer cannot be folded: the static class is a
     base of the one the value actually has. Only contracts whose instances carry
-    a dynamic class id can lower this -- the exception representation is the one
+    a dynamic class word can lower this -- the exception representation is the one
     that does -- and the result contract must instantiate `builtins.str`.
   }];
 

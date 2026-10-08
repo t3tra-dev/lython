@@ -43,8 +43,8 @@ Emscripten は使わない (2026-10-04 に外した)。JS との境界は最初�
   クラスとは混同しない。
 - `isinstance(x, C)` で C がホストのコンストラクタのとき (`new` の結果が T)、
   T に対する JS の `instanceof` を実行時に行い、真の側で x を T に絞り込む
-  (`IsInstanceAnalysis::Kind::HostTest`)。Lython の class id の比較には決して
-  回さない (JS 値の class id はすべて同じなので、答えにならない)。union の値は
+  (`IsInstanceAnalysis::Kind::HostTest`)。Lython のクラスワード (型オブジェクトのアドレス) の比較には決して
+  回さない (JS 値のクラスはすべて同じなので、答えにならない)。union の値は
   先に None などを外す必要があり、そうでなければ拒否する。
 
 ## 表現: 1 つの runtime 契約
@@ -55,7 +55,7 @@ Emscripten は使わない (2026-10-04 に外した)。JS との境界は最初�
 これ 1 つだけになる。メンバーへのアクセスに必要な情報は、名前と、両端の静的な型
 (引数の型と結果の型) だけで、どちらも op に残っている。
 
-- `_js.JsProxy` は `[refcount, class id, handle]` という形で、幅は 17
+- `_js.JsProxy` は `[refcount, 型オブジェクト, handle]` という形で、幅は 17
   (`HandleWidthRegistry.h`)。解放するとホスト側の handle も落とす。
 - `_js.mlir` は `ly.runtime.only_with = "ly.js.host"` を持つ。`js` を import
   したプログラムにだけ取り込まれる。

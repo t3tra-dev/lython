@@ -10,7 +10,7 @@
 // `LyBytes_FromBytes` / `LyLong_FromDigits`). The block is therefore a
 // compile-time-constant ARGUMENT, never the object's payload, and its storage is
 // a physical-ABI question rather than an ownership one: it is `NonObject` -- no
-// refcount word, no class id, no deallocator, no release obligation -- both
+// refcount word, no class word, no deallocator, no release obligation -- both
 // before and after this change, so nothing in the ownership model moves.
 //
 // Why NOT `memref.alloca` plus a store per element, which is what each site did:

@@ -108,7 +108,7 @@ module attributes {
 
   // ===== from builtins =====
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1
-  func.func private @__ly_raise_message_object(%class_id: i64, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>)
+  func.func private @__ly_raise_message_object(%class_word: i64, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>)
   func.func private @__ly_unicode_alloc(%count: i64, %width: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @__ly_unicode_width(%header: memref<2xi64>) -> i64
   func.func private @LyLong_TryAsI64(%header: memref<2xi64> {ly.ownership.object_header}) -> (i64, i1)
@@ -117,18 +117,18 @@ module attributes {
   func.func private @LyLong_FromI64(%value: i64) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0]}
 
   // ===== the proxy object =====
-  // Words: refcount, class id, handle. The width is the one it was given when
+  // Words: refcount, class word, handle. The width is the one it was given when
   // a release was chosen by shape; it is now chosen by contract name, so the
   // width no longer has to be this contract's alone.
-  func.func @LyJsProxy_New(%handle: i32) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "_js.JsProxy", ly.runtime.initializer = "__new__"} {
+  func.func @LyJsProxy_New(%handle: i32) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "_js.JsProxy", ly.runtime.initializer = "__new__"} {
     %one = arith.constant 1 : i64
-    %class_id = arith.constant {ly.class_id_of = "_js.JsProxy"} 151 : i64
+    %class_word = arith.constant {ly.class_of = "_js.JsProxy"} 151 : i64
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
     %handle_slot = arith.constant 2 : index
     %proxy = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<3xi64>
     memref.store %one, %proxy[%refcount_slot] : memref<3xi64>
-    memref.store %class_id, %proxy[%layout_slot] : memref<3xi64>
+    memref.store %class_word, %proxy[%layout_slot] : memref<3xi64>
     %word = arith.extui %handle : i32 to i64
     memref.store %word, %proxy[%handle_slot] : memref<3xi64>
     func.return %proxy : memref<3xi64>
@@ -158,11 +158,11 @@ module attributes {
 
   // ===== failure =====
   // Raises `class_id` with the host's parked message.
-  func.func private @__ly_js_raise_parked(%class_id: i64) {
+  func.func private @__ly_js_raise_parked(%class_word: i64) {
     %message = func.call @LyJs_TakeError() : () -> i32
     %header, %bytes = func.call @__ly_js_string(%message) : (i32) -> (memref<2xi64>, memref<?xi8>)
     func.call @LyJs_Drop(%message) : (i32) -> ()
-    func.call @__ly_raise_message_object(%class_id, %header, %bytes) : (i64, memref<2xi64>, memref<?xi8>) -> ()
+    func.call @__ly_raise_message_object(%class_word, %header, %bytes) : (i64, memref<2xi64>, memref<?xi8>) -> ()
     func.return
   }
 
@@ -174,7 +174,7 @@ module attributes {
     %failed_value = arith.constant -1 : i32
     %failed = arith.cmpi eq, %handle, %failed_value : i32
     scf.if %failed {
-      %runtime_error = arith.constant {ly.class_id_of = "builtins.RuntimeError"} 51 : i64
+      %runtime_error = arith.constant {ly.class_of = "builtins.RuntimeError"} 51 : i64
       func.call @__ly_js_raise_parked(%runtime_error) : (i64) -> ()
     }
     func.return %handle : i32
@@ -188,7 +188,7 @@ module attributes {
     %bad = arith.cmpi eq, %ok, %zero : i32
     scf.if %bad {
       func.call @LyJs_Drop(%handle) : (i32) -> ()
-      %type_error = arith.constant {ly.class_id_of = "builtins.TypeError"} 52 : i64
+      %type_error = arith.constant {ly.class_of = "builtins.TypeError"} 52 : i64
       func.call @__ly_js_raise_parked(%type_error) : (i64) -> ()
     }
     func.return

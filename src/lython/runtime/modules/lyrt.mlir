@@ -30,10 +30,10 @@ module attributes {
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1
   func.func private @LyLong_FromI64(%value: i64) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0]}
 
-  func.func @LyCounter_New(%limit: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "lyrt.Counter", ly.runtime.initializer = "__new__"} {
+  func.func @LyCounter_New(%limit: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "lyrt.Counter", ly.runtime.initializer = "__new__"} {
     %one = arith.constant 1 : i64
     %zero = arith.constant 0 : i64
-    %layout_counter = arith.constant {ly.class_id_of = "lyrt.Counter"} 19 : i64
+    %layout_counter = arith.constant {ly.class_of = "lyrt.Counter"} 19 : i64
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
     %current_slot = arith.constant 2 : index

@@ -80,14 +80,14 @@ module attributes {
   ]
 } {
   // --- shared runtime entry points -----------------------------------------
-  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
-  func.func private @LyFloat_FromF64(%value: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.float", ly.runtime.initializer = "__new__"}
+  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
+  func.func private @LyFloat_FromF64(%value: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.float", ly.runtime.initializer = "__new__"}
   func.func private @LyFloat_AsF64(%header: memref<3xi64> {ly.ownership.object_header}) -> f64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "__float__", ly.runtime.primitive = "unbox.f64"}
-  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
+  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_Encode(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "encode", ly.runtime.result_contract = "builtins.bytes"}
   func.func private @LyBytes_DecRef(%header: memref<4xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.deallocator}
   func.func private @__ly_bytes_payload(%self: memref<4xi64>) -> memref<?xi8> attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.interior_word, ly.runtime.primitive = "payload_view"}
-  func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
+  func.func private @LyBaseException_New(%class_word: i64 {ly.runtime.class_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
   func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "raise"}
 
@@ -98,7 +98,7 @@ module attributes {
   func.func private @LyHost_Strftime(memref<?xi8>, i64, memref<?xi64>, memref<?xi8>, i64) -> i64
   func.func private @LyHost_Mktime(memref<?xi64>) -> i64
   func.func private @LyHost_Errno() -> i32
-  func.func private @LyHost_OSErrorClassId(i32) -> i64
+  func.func private @LyHost_OSErrorClass(i32) -> i64
   func.func private @LyHost_OSErrorMessage(i32, memref<?xi8>, i64) -> i64
 
   // --- diagnostics ---------------------------------------------------------
@@ -114,22 +114,22 @@ module attributes {
   //
   // The string is not released here: `LyBaseException_Init` declares
   // `transfer_args` for it, so the exception takes it.
-  func.func private @__ly_raise_message_object(%class_id: i64, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>)
+  func.func private @__ly_raise_message_object(%class_word: i64, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>)
 
-  func.func private @__ly_raise_static_message(%class_id: i64, %message: memref<?xi8>, %length: i64)
+  func.func private @__ly_raise_static_message(%class_word: i64, %message: memref<?xi8>, %length: i64)
 
   func.func private @__ly_time_raise_neg_sleep() {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %len = arith.constant 33 : i64
-    %class_id = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
+    %class_word = arith.constant {ly.class_of = "builtins.ValueError"} 53 : i64
     // The message is a static global, so it is passed as a view rather than copied
     // into a heap buffer first. The copy was the leak: nothing frees it, and the
     // throw below does not return. `__ly_io_raise` has always been called with a
     // global this way -- this is that, not a new convention.
     %text = memref.get_global @__ly_time_msg_neg_sleep : memref<33xi8>
     %buffer = memref.cast %text : memref<33xi8> to memref<?xi8>
-    func.call @__ly_raise_static_message(%class_id, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_word, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -137,14 +137,14 @@ module attributes {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %len = arith.constant 17 : i64
-    %class_id = arith.constant {ly.class_id_of = "builtins.ValueError"} 53 : i64
+    %class_word = arith.constant {ly.class_of = "builtins.ValueError"} 53 : i64
     // The message is a static global, so it is passed as a view rather than copied
     // into a heap buffer first. The copy was the leak: nothing frees it, and the
     // throw below does not return. `__ly_io_raise` has always been called with a
     // global this way -- this is that, not a new convention.
     %text = memref.get_global @__ly_time_msg_bad_time : memref<17xi8>
     %buffer = memref.cast %text : memref<17xi8> to memref<?xi8>
-    func.call @__ly_raise_static_message(%class_id, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_word, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -153,7 +153,7 @@ module attributes {
   func.func private @__ly_time_raise_errno(%err: i32) {
     %cap_index = arith.constant 256 : index
     %cap = arith.constant 256 : i64
-    %class_id = func.call @LyHost_OSErrorClassId(%err) : (i32) -> i64
+    %class_word = func.call @LyHost_OSErrorClass(%err) : (i32) -> i64
     %c0 = arith.constant 0 : index
     %buffer = memref.alloc(%cap_index) : memref<?xi8>
     %len = func.call @LyHost_OSErrorMessage(%err, %buffer, %cap) : (i32, memref<?xi8>, i64) -> i64
@@ -162,7 +162,7 @@ module attributes {
     // other callers hand it a static global.
     %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     memref.dealloc %buffer : memref<?xi8>
-    func.call @__ly_raise_message_object(%class_id, %message_header, %message_bytes) : (i64, memref<2xi64>, memref<?xi8>) -> ()
+    func.call @__ly_raise_message_object(%class_word, %message_header, %message_bytes) : (i64, memref<2xi64>, memref<?xi8>) -> ()
     func.return
   }
 

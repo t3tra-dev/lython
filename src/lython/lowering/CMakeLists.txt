@@ -6,6 +6,7 @@ add_library(LythonRuntimeLowering STATIC
     Common/OsSupportBuilder.cpp
     Common/RuntimeSupportBuilder.cpp
     Common/TracebackSupportBuilder.cpp
+    Common/TypeObjects.cpp
     Passes/LoweringPipeline.cpp
     Passes/Runtime/ABI/BoxLayout.cpp
     Passes/Runtime/ABI/CallableABI.cpp
