@@ -1,0 +1,13 @@
+[1, 2] None {}
+['A', '-', 'B', '-']
+None 3 None {}
+1 ['key', 'default']
+3
+none
+30001
+True ('z', 5) {}
+600 q
+600
+{}
+9000 None 0
+KeyError('nope')

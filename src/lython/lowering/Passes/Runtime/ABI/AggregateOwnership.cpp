@@ -1,4 +1,5 @@
 #include "Runtime/Core/Lowerer.h"
+#include "Runtime/ABI/BoxLayout.h"
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Matchers.h"
@@ -202,6 +203,35 @@ RuntimeBundleLowerer::retainAggregateSlot(mlir::Operation *op,
     return RuntimeBundleLowerer::retainAggregateSlot(
         op, concrete->objectValue.contract,
         mlir::ValueRange{concrete->deferredObject}, slotName);
+  // ⭐ AN `object` VALUE IS A BOX, and the slot keeps the box's ENTITY
+  // (objectPayloadClassEntity), so the slot's reference is the entity's.
+  // Retaining the box instead left the box alive forever and the entity one
+  // reference short -- the frame's release of the box then dropped the
+  // reference the slot was counting on.
+  if (RuntimeBundleLowerer::isBuiltinsObjectContract(concrete->contract) &&
+      concrete->physicalValues().size() == 1 &&
+      mlir::isa<mlir::MemRefType>(
+          concrete->physicalValues().front().getType())) {
+    auto retainRaw = module.lookupSymbol<mlir::func::FuncOp>(
+        "__ly_handle_retain_raw");
+    if (!retainRaw)
+      return op->emitError()
+             << "an object slot retain needs __ly_handle_retain_raw";
+    mlir::Location loc = op->getLoc();
+    mlir::Value box = concrete->physicalValues().front();
+    mlir::Type words = mlir::MemRefType::get({mlir::ShapedType::kDynamic},
+                                             builder.getI64Type());
+    if (box.getType() != words)
+      box = mlir::memref::CastOp::create(builder, loc, words, box);
+    mlir::Value entity = mlir::memref::LoadOp::create(
+        builder, loc, box,
+        mlir::arith::ConstantIndexOp::create(builder, loc,
+                                             box_abi::kBoxEntityWord)
+            .getResult());
+    mlir::func::CallOp::create(builder, loc, retainRaw,
+                               mlir::ValueRange{entity});
+    return mlir::success();
+  }
   return RuntimeBundleLowerer::retainAggregateSlot(
       op, concrete->objectValue.contract, concrete->physicalValues(), slotName);
 }

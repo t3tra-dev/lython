@@ -1040,8 +1040,13 @@ bool RuntimeBundleLowerer::isInheritedObjectDunder(llvm::StringRef methodName) {
 
 bool RuntimeBundleLowerer::usesInheritedObjectDunder(
     const RuntimeSymbol &symbol, const RuntimeBundle &source) const {
-  if (symbol.contract != "builtins.object" || symbol.role != "method" ||
-      !RuntimeBundleLowerer::isInheritedObjectDunder(symbol.name))
+  // id() reads the same entity word object.__eq__ compares, so it takes the
+  // same box.
+  bool readsIdentity =
+      symbol.contract == "builtins.object" && symbol.name == "builtin_id";
+  if (!readsIdentity &&
+      (symbol.contract != "builtins.object" || symbol.role != "method" ||
+       !RuntimeBundleLowerer::isInheritedObjectDunder(symbol.name)))
     return false;
   if (source.kind != RuntimeBundle::Kind::Object ||
       RuntimeBundleLowerer::isBuiltinsObjectContract(source.contract) ||

@@ -1,0 +1,12 @@
+6 3
+800 3 True True
+[31, 800, 909]
+3 True
+4 True True True True False
+2 True
+2
+2
+6
+[1, 700]
+['NoneType', 'float', 'int', 'list', 'str', 'tuple']
+[('(1,', 607), ('1.5', 3), ('100', 41), ('Non', 4), ('[1,', 6), ('b', 1), ('sss', 700)]

@@ -2028,10 +2028,9 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                                            emitExpr(calleeNode));
     }
     if (!types.lookupSymbol(name) && !types.lookupClass(name)) {
-      std::string reason = importedModuleBindingReason(name);
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, calleeNode->range.start,
-          reason.empty() ? "unresolved name '" + name.str() + "'" : reason});
+          unresolvedNameMessage(name)});
       return emitNone(expr);
     }
   }
@@ -5773,6 +5772,53 @@ ModuleEmitter::tryEmitNextCall(const parser::Node &expr,
 std::optional<Value>
 ModuleEmitter::tryEmitHashCall(const parser::Node &expr,
                                const parser::Node *calleeNode) {
+  // ⭐ id() answers only where `is` does: a value type's identity depends on
+  // whether it was boxed (an int read twice from a lane is two boxes), and a
+  // function value is built at each reference -- `id(x) == id(x)` would be
+  // False. Same refusal, same reason, as the `is` operator's.
+  if (callsUnshadowedBuiltin(calleeNode, "id")) {
+    const auto *idArgs = ast::nodeList(expr, "args");
+    if (idArgs && idArgs->size() == 1 && idArgs->front() &&
+        idArgs->front()->kind != "Starred") {
+      mlir::Type argType =
+          types.widenLiteral(types.inferExpr(idArgs->front().get()));
+      bool valueType =
+          argType == types.intType() || argType == types.floatType() ||
+          argType == types.strType() ||
+          argType == types.contract("builtins.bytes") ||
+          argType == types.contract("builtins.complex");
+      // None is one entity (its box word is 0) and an empty literal builds a
+      // container, so both have the identity `is` gives them.
+      bool reference = mlir::isa_and_present<py::ContractType>(argType) ||
+                       argType == types.none() ||
+                       isEmptyContainerExpression(idArgs->front().get());
+      if (valueType) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "id() of an int/str/float/bytes/complex is rejected (identity of "
+            "value types is an implementation detail, as `is` on them is); "
+            "compare with `==` instead"});
+        return emitNone(expr);
+      }
+      if (!reference) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "id() needs an argument of one reference type; a function value "
+            "is built at each reference and a union is not one type, so this "
+            "argument has no stable identity here"});
+        return emitNone(expr);
+      }
+      // None has no lanes to box; inside an `object` it is the entity word
+      // 0, which is what id() of that `object` answers, so a None-typed
+      // argument is evaluated and answers the same.
+      if (argType == types.none()) {
+        emitExpr(idArgs->front().get());
+        parser::NodePtr zero = synth::intConstant(0, expr.range);
+        return emitExpr(zero.get());
+      }
+    }
+    return std::nullopt;
+  }
   if (!callsUnshadowedBuiltin(calleeNode, "hash"))
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");

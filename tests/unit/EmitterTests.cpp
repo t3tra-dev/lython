@@ -2628,3 +2628,40 @@ TEST(EmitterTest, AMemoryviewTakesWhatItCanView) {
       "main.py", "<lython-no-import-dir>", native, context, module, diag)))
       << diagnostics;
 }
+
+// id() is refused where `is` is -- a value type, a function value, a union --
+// and the builtins with no value here (`vars`, the Ellipsis object) say what
+// they are instead of reading as an unbound name.
+TEST(EmitterTest, IdAndTheValuelessBuiltinsSayWhyTheyAreRefused) {
+  lython::driver::DriverOptions native;
+  native.targetTriple = llvm::sys::getDefaultTargetTriple();
+  for (auto [source, expected] :
+       std::initializer_list<std::pair<const char *, const char *>>{
+           {"print(id(5))\n", "id() of an int/str/float/bytes/complex is "
+                               "rejected"},
+           {"s = \"a\"\nprint(id(s))\n",
+            "id() of an int/str/float/bytes/complex is rejected"},
+           {"def f() -> int:\n    return 1\nprint(id(f))\n",
+            "id() needs an argument of one reference type"},
+           {"class A:\n    pass\ndef g(u: A | None) -> int:\n    return "
+            "id(u)\n",
+            "id() needs an argument of one reference type"},
+           {"class A:\n    pass\nprint(vars(A()))\n",
+            "vars() is not supported: an instance here keeps its fields in "
+            "fixed slots"},
+           {"x = ...\n", "the Ellipsis object (`...` or `Ellipsis` as a "
+                         "value) is not supported"},
+           {"print(Ellipsis)\n", "the Ellipsis object (`...` or `Ellipsis` "
+                                 "as a value) is not supported"}}) {
+    mlir::MLIRContext context(testRegistry());
+    mlir::OwningOpRef<mlir::ModuleOp> module;
+    std::string diagnostics;
+    llvm::raw_string_ostream diag(diagnostics);
+    EXPECT_TRUE(mlir::failed(lython::driver::emitMLIRFromSource(
+        source, "main.py", "<lython-no-import-dir>", native, context, module,
+        diag)))
+        << source;
+    EXPECT_NE(diagnostics.find(expected), std::string::npos)
+        << source << diagnostics;
+  }
+}
