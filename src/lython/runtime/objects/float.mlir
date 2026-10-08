@@ -14,6 +14,11 @@ module attributes {
   ly.runtime.contracts = ["builtins.float"]
 } {
   // ===== declared here, defined in another runtime file or built by the lowering =====
+  func.func private @LyLong_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.int", ly.runtime.deallocator}
+  func.func private @LyLong_LShift(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__lshift__"}
+  func.func private @__ly_tuple_alloc(%length: i64) -> memref<5xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.tuple"], ly.ownership.owned_results = [0]}
+  func.func private @__ly_tuple_items(%self: memref<5xi64>) -> memref<?xi64> attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.interior_word, ly.runtime.primitive = "items_view"}
+  func.func private @__ly_tuple_store_long(%items: memref<?xi64>, %slot: index, %h: memref<2xi64>)
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
   func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 5 : i64, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
@@ -67,7 +72,7 @@ module attributes {
                     "__ge__", "__str__", "__eq__", "__ne__", "__pow__",
                     "__hash__", "__abs__", "__format__",
                     "__lt__", "__le__", "__gt__", "__ge__", "__eq__", "__ne__",
-                    "__neg__", "__pos__"],
+                    "__neg__", "__pos__", "conjugate", "is_integer", "as_integer_ratio", "hex", "fromhex"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.float">>, !py.contract<"typing.SupportsFloat">] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.str">]>,
@@ -99,7 +104,12 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.float">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.float">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.float">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.float">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.float">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.tuple", [!py.contract<"builtins.int">, !py.contract<"builtins.int">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.float">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.type<!py.contract<"builtins.float">>, !py.contract<"builtins.str">] -> [!py.contract<"builtins.float">]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
@@ -108,7 +118,7 @@ module attributes {
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
-                    "instance"]
+                    "instance", "instance", "instance", "instance", "instance", "classmethod"]
   } {}
 
   // A float is immediate when the top three bits of its exponent are 011 or
@@ -1785,5 +1795,732 @@ module attributes {
     %value = arith.bitcast %value_bits : i64 to f64
     %h = func.call @LyFloat_FromF64(%value) : (f64) -> memref<3xi64>
     func.return %h : memref<3xi64>
+  }
+
+  memref.global "private" constant @__ly_float_text_ratio_nan : memref<35xi8> = dense<[99, 97, 110, 110, 111, 116, 32, 99, 111, 110, 118, 101, 114, 116, 32, 78, 97, 78, 32, 116, 111, 32, 105, 110, 116, 101, 103, 101, 114, 32, 114, 97, 116, 105, 111]>
+  memref.global "private" constant @__ly_float_text_ratio_inf : memref<40xi8> = dense<[99, 97, 110, 110, 111, 116, 32, 99, 111, 110, 118, 101, 114, 116, 32, 73, 110, 102, 105, 110, 105, 116, 121, 32, 116, 111, 32, 105, 110, 116, 101, 103, 101, 114, 32, 114, 97, 116, 105, 111]>
+  memref.global "private" constant @__ly_float_text_hex_digits : memref<16xi8> = dense<[48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 97, 98, 99, 100, 101, 102]>
+  memref.global "private" constant @__ly_float_text_nan : memref<3xi8> = dense<[110, 97, 110]>
+  memref.global "private" constant @__ly_float_text_inf : memref<3xi8> = dense<[105, 110, 102]>
+  memref.global "private" constant @__ly_float_text_neg_inf : memref<4xi8> = dense<[45, 105, 110, 102]>
+  memref.global "private" constant @__ly_float_text_zero : memref<8xi8> = dense<[48, 120, 48, 46, 48, 112, 43, 48]>
+  memref.global "private" constant @__ly_float_text_neg_zero : memref<9xi8> = dense<[45, 48, 120, 48, 46, 48, 112, 43, 48]>
+  memref.global "private" constant @__ly_float_text_infinity : memref<8xi8> = dense<[105, 110, 102, 105, 110, 105, 116, 121]>
+  memref.global "private" constant @__ly_float_text_bad_hex : memref<41xi8> = dense<[105, 110, 118, 97, 108, 105, 100, 32, 104, 101, 120, 97, 100, 101, 99, 105, 109, 97, 108, 32, 102, 108, 111, 97, 116, 105, 110, 103, 45, 112, 111, 105, 110, 116, 32, 115, 116, 114, 105, 110, 103]>
+  memref.global "private" constant @__ly_float_text_hex_too_large : memref<51xi8> = dense<[104, 101, 120, 97, 100, 101, 99, 105, 109, 97, 108, 32, 118, 97, 108, 117, 101, 32, 116, 111, 111, 32, 108, 97, 114, 103, 101, 32, 116, 111, 32, 114, 101, 112, 114, 101, 115, 101, 110, 116, 32, 97, 115, 32, 97, 32, 102, 108, 111, 97, 116]>
+
+  // float.conjugate(): the float itself.
+  func.func @LyFloat_Conjugate(%header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "conjugate", ly.runtime.result_contract = "builtins.float"} {
+    %h = func.call @LyFloat_Pos(%header) : (memref<3xi64>) -> memref<3xi64>
+    func.return %h : memref<3xi64>
+  }
+
+  // float.is_integer(): finite and equal to its floor.
+  func.func @LyFloat_IsInteger(%header: memref<3xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "is_integer"} {
+    %value_slot = arith.constant 2 : index
+    %value_bits = memref.load %header[%value_slot] : memref<3xi64>
+    %value = arith.bitcast %value_bits : i64 to f64
+    %inf = arith.constant 0x7FF0000000000000 : f64
+    %magnitude = math.absf %value : f64
+    %finite = arith.cmpf olt, %magnitude, %inf : f64
+    %floor = math.floor %value : f64
+    %whole = arith.cmpf oeq, %floor, %value : f64
+    %result = arith.andi %finite, %whole : i1
+    func.return %result : i1
+  }
+
+  // float.as_integer_ratio() (float_as_integer_ratio): the mantissa with its
+  // trailing zero bits moved into the exponent, which then scales the
+  // numerator or the denominator. Read from the bits, so no frexp loop.
+  func.func @LyFloat_AsIntegerRatio(%header: memref<3xi64> {ly.ownership.object_header}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "as_integer_ratio", ly.runtime.result_contract = "builtins.tuple"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %value_slot = arith.constant 2 : index
+    %bits = memref.load %header[%value_slot] : memref<3xi64>
+    %exp_shift = arith.constant 52 : i64
+    %exp_mask = arith.constant 2047 : i64
+    %mant_mask = arith.constant 4503599627370495 : i64
+    %implicit_bit = arith.constant 4503599627370496 : i64
+    %exp_shifted = arith.shrui %bits, %exp_shift : i64
+    %exp_raw = arith.andi %exp_shifted, %exp_mask : i64
+    %mant = arith.andi %bits, %mant_mask : i64
+    %special = arith.cmpi eq, %exp_raw, %exp_mask : i64
+    scf.if %special {
+      %is_nan = arith.cmpi ne, %mant, %zero : i64
+      scf.if %is_nan {
+        %msg_static = memref.get_global @__ly_float_text_ratio_nan : memref<35xi8>
+        %msg = memref.cast %msg_static : memref<35xi8> to memref<?xi8>
+        %len = arith.constant 35 : i64
+        %cls = arith.constant 53 : i64
+        func.call @__ly_raise_static_message(%cls, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+      } else {
+        %msg_static = memref.get_global @__ly_float_text_ratio_inf : memref<40xi8>
+        %msg = memref.cast %msg_static : memref<40xi8> to memref<?xi8>
+        %len = arith.constant 40 : i64
+        %cls = arith.constant 104 : i64
+        func.call @__ly_raise_static_message(%cls, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+      }
+    }
+    %subnormal = arith.cmpi eq, %exp_raw, %zero : i64
+    %normal_mant = arith.ori %mant, %implicit_bit : i64
+    %m0 = arith.select %subnormal, %mant, %normal_mant : i64
+    %bias = arith.constant 1075 : i64
+    %normal_e = arith.subi %exp_raw, %bias : i64
+    %subnormal_e = arith.constant -1074 : i64
+    %e0 = arith.select %subnormal, %subnormal_e, %normal_e : i64
+    %is_zero = arith.cmpi eq, %m0, %zero : i64
+    %tz_raw = math.cttz %m0 : i64
+    %tz = arith.select %is_zero, %zero, %tz_raw : i64
+    %m = arith.shrui %m0, %tz : i64
+    %e_shifted = arith.addi %e0, %tz : i64
+    %e = arith.select %is_zero, %zero, %e_shifted : i64
+    %negative = arith.cmpi slt, %bits, %zero : i64
+    %neg_m = arith.subi %zero, %m : i64
+    %signed_m = arith.select %negative, %neg_m, %m : i64
+    %up = arith.maxsi %e, %zero : i64
+    %neg_e = arith.subi %zero, %e : i64
+    %down = arith.maxsi %neg_e, %zero : i64
+    %mantissa = func.call @LyLong_FromI64(%signed_m) : (i64) -> memref<2xi64>
+    %up_count = func.call @LyLong_FromI64(%up) : (i64) -> memref<2xi64>
+    %numerator = func.call @LyLong_LShift(%mantissa, %up_count) : (memref<2xi64>, memref<2xi64>) -> memref<2xi64>
+    %unit = func.call @LyLong_FromI64(%one) : (i64) -> memref<2xi64>
+    %down_count = func.call @LyLong_FromI64(%down) : (i64) -> memref<2xi64>
+    %denominator = func.call @LyLong_LShift(%unit, %down_count) : (memref<2xi64>, memref<2xi64>) -> memref<2xi64>
+    // ⛔ A native body is not given releases: the four operands of the
+    // shifts are dropped here, or every value past the small ints leaks.
+    func.call @LyLong_DecRef(%mantissa) : (memref<2xi64>) -> ()
+    func.call @LyLong_DecRef(%up_count) : (memref<2xi64>) -> ()
+    func.call @LyLong_DecRef(%unit) : (memref<2xi64>) -> ()
+    func.call @LyLong_DecRef(%down_count) : (memref<2xi64>) -> ()
+    %self = func.call @__ly_tuple_alloc(%two) : (i64) -> memref<5xi64>
+    %items = func.call @__ly_tuple_items(%self) : (memref<5xi64>) -> memref<?xi64>
+    func.call @__ly_tuple_store_long(%items, %c0, %numerator) : (memref<?xi64>, index, memref<2xi64>) -> ()
+    func.call @__ly_tuple_store_long(%items, %c1, %denominator) : (memref<?xi64>, index, memref<2xi64>) -> ()
+    func.return %self : memref<5xi64>
+  }
+
+  // float.hex() (float_hex): a leading 1 (0 for a subnormal), the 52
+  // mantissa bits as 13 hex digits, and the binary exponent -- read from the
+  // bits, which is what CPython's frexp/ldexp steps compute.
+  func.func @LyFloat_Hex(%header: memref<3xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "hex", ly.runtime.result_contract = "builtins.str"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %value_slot = arith.constant 2 : index
+    %bits = memref.load %header[%value_slot] : memref<3xi64>
+    %exp_shift = arith.constant 52 : i64
+    %exp_mask = arith.constant 2047 : i64
+    %mant_mask = arith.constant 4503599627370495 : i64
+    %exp_shifted = arith.shrui %bits, %exp_shift : i64
+    %exp_raw = arith.andi %exp_shifted, %exp_mask : i64
+    %mant = arith.andi %bits, %mant_mask : i64
+    %negative = arith.cmpi slt, %bits, %zero : i64
+    %special = arith.cmpi eq, %exp_raw, %exp_mask : i64
+    cf.cond_br %special, ^special, ^finite
+
+  ^special:
+    %is_nan = arith.cmpi ne, %mant, %zero : i64
+    cf.cond_br %is_nan, ^nan, ^infinite
+
+  ^infinite:
+    cf.cond_br %negative, ^neg_inf, ^inf
+
+  ^nan:
+    %t_nan_static = memref.get_global @__ly_float_text_nan : memref<3xi8>
+    %t_nan = memref.cast %t_nan_static : memref<3xi8> to memref<?xi8>
+    %nan_c0 = arith.constant 0 : index
+    %nan_len = arith.constant 3 : i64
+    %nan_h, %nan_b = func.call @LyUnicode_FromBytes(%t_nan, %nan_c0, %nan_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %nan_h, %nan_b : memref<2xi64>, memref<?xi8>
+
+  ^inf:
+    %t_inf_static = memref.get_global @__ly_float_text_inf : memref<3xi8>
+    %t_inf = memref.cast %t_inf_static : memref<3xi8> to memref<?xi8>
+    %inf_c0 = arith.constant 0 : index
+    %inf_len = arith.constant 3 : i64
+    %inf_h, %inf_b = func.call @LyUnicode_FromBytes(%t_inf, %inf_c0, %inf_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %inf_h, %inf_b : memref<2xi64>, memref<?xi8>
+
+  ^neg_inf:
+    %t_neg_inf_static = memref.get_global @__ly_float_text_neg_inf : memref<4xi8>
+    %t_neg_inf = memref.cast %t_neg_inf_static : memref<4xi8> to memref<?xi8>
+    %neg_inf_c0 = arith.constant 0 : index
+    %neg_inf_len = arith.constant 4 : i64
+    %neg_inf_h, %neg_inf_b = func.call @LyUnicode_FromBytes(%t_neg_inf, %neg_inf_c0, %neg_inf_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %neg_inf_h, %neg_inf_b : memref<2xi64>, memref<?xi8>
+
+  ^finite:
+    %subnormal = arith.cmpi eq, %exp_raw, %zero : i64
+    %mant_zero = arith.cmpi eq, %mant, %zero : i64
+    %is_zero = arith.andi %subnormal, %mant_zero : i1
+    cf.cond_br %is_zero, ^zero_text, ^digits
+
+  ^zero_text:
+    cf.cond_br %negative, ^neg_zero, ^zero
+
+  ^zero:
+    %t_zero_static = memref.get_global @__ly_float_text_zero : memref<8xi8>
+    %t_zero = memref.cast %t_zero_static : memref<8xi8> to memref<?xi8>
+    %zero_c0 = arith.constant 0 : index
+    %zero_len = arith.constant 8 : i64
+    %zero_h, %zero_b = func.call @LyUnicode_FromBytes(%t_zero, %zero_c0, %zero_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %zero_h, %zero_b : memref<2xi64>, memref<?xi8>
+
+  ^neg_zero:
+    %t_neg_zero_static = memref.get_global @__ly_float_text_neg_zero : memref<9xi8>
+    %t_neg_zero = memref.cast %t_neg_zero_static : memref<9xi8> to memref<?xi8>
+    %neg_zero_c0 = arith.constant 0 : index
+    %neg_zero_len = arith.constant 9 : i64
+    %neg_zero_h, %neg_zero_b = func.call @LyUnicode_FromBytes(%t_neg_zero, %neg_zero_c0, %neg_zero_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %neg_zero_h, %neg_zero_b : memref<2xi64>, memref<?xi8>
+
+  ^digits:
+    %hex_static = memref.get_global @__ly_float_text_hex_digits : memref<16xi8>
+    %hex = memref.cast %hex_static : memref<16xi8> to memref<?xi8>
+    %buffer_size = arith.constant 32 : index
+    %buffer = memref.alloc(%buffer_size) : memref<?xi8>
+    %minus = arith.constant 45 : i8
+    %ch_0 = arith.constant 48 : i8
+    %ch_1 = arith.constant 49 : i8
+    %ch_x = arith.constant 120 : i8
+    %ch_dot = arith.constant 46 : i8
+    %ch_p = arith.constant 112 : i8
+    %ch_plus = arith.constant 43 : i8
+    %start = arith.select %negative, %c1, %c0 : index
+    scf.if %negative {
+      memref.store %minus, %buffer[%c0] : memref<?xi8>
+    }
+    %p1 = arith.addi %start, %c1 : index
+    memref.store %ch_0, %buffer[%start] : memref<?xi8>
+    memref.store %ch_x, %buffer[%p1] : memref<?xi8>
+    %p2 = arith.addi %p1, %c1 : index
+    %lead = arith.select %subnormal, %ch_0, %ch_1 : i8
+    memref.store %lead, %buffer[%p2] : memref<?xi8>
+    %p3 = arith.addi %p2, %c1 : index
+    memref.store %ch_dot, %buffer[%p3] : memref<?xi8>
+    %p4 = arith.addi %p3, %c1 : index
+    %c13 = arith.constant 13 : index
+    %four = arith.constant 4 : i64
+    %fifteen = arith.constant 15 : i64
+    %top_shift = arith.constant 48 : i64
+    scf.for %i = %c0 to %c13 step %c1 {
+      %i64v = arith.index_cast %i : index to i64
+      %drop = arith.muli %i64v, %four : i64
+      %shift = arith.subi %top_shift, %drop : i64
+      %nibble_word = arith.shrui %mant, %shift : i64
+      %nibble = arith.andi %nibble_word, %fifteen : i64
+      %nibble_index = arith.index_cast %nibble : i64 to index
+      %ch = memref.load %hex[%nibble_index] : memref<?xi8>
+      %slot = arith.addi %p4, %i : index
+      memref.store %ch, %buffer[%slot] : memref<?xi8>
+    }
+    %p5 = arith.addi %p4, %c13 : index
+    memref.store %ch_p, %buffer[%p5] : memref<?xi8>
+    %p6 = arith.addi %p5, %c1 : index
+    %bias = arith.constant 1023 : i64
+    %normal_e = arith.subi %exp_raw, %bias : i64
+    %subnormal_e = arith.constant -1022 : i64
+    %e = arith.select %subnormal, %subnormal_e, %normal_e : i64
+    %e_negative = arith.cmpi slt, %e, %zero : i64
+    %e_sign = arith.select %e_negative, %minus, %ch_plus : i8
+    memref.store %e_sign, %buffer[%p6] : memref<?xi8>
+    %p7 = arith.addi %p6, %c1 : index
+    %neg_e = arith.subi %zero, %e : i64
+    %magnitude = arith.select %e_negative, %neg_e, %e : i64
+    %c4 = arith.constant 4 : index
+    %ten = arith.constant 10 : i64
+    %thousand = arith.constant 1000 : i64
+    %c3 = arith.constant 3 : index
+    %false = arith.constant false
+    %written:3 = scf.for %k = %c0 to %c4 step %c1 iter_args(%pos = %p7, %divisor = %thousand, %started = %false) -> (index, i64, i1) {
+      %q = arith.divui %magnitude, %divisor : i64
+      %digit = arith.remui %q, %ten : i64
+      %nonzero = arith.cmpi ne, %digit, %zero : i64
+      %is_last = arith.cmpi eq, %k, %c3 : index
+      %some = arith.ori %started, %nonzero : i1
+      %emit = arith.ori %some, %is_last : i1
+      %next_pos = scf.if %emit -> (index) {
+        %digit8 = arith.trunci %digit : i64 to i8
+        %ch = arith.addi %digit8, %ch_0 : i8
+        memref.store %ch, %buffer[%pos] : memref<?xi8>
+        %bumped = arith.addi %pos, %c1 : index
+        scf.yield %bumped : index
+      } else {
+        scf.yield %pos : index
+      }
+      %next_divisor = arith.divui %divisor, %ten : i64
+      scf.yield %next_pos, %next_divisor, %emit : index, i64, i1
+    }
+    %length = arith.index_cast %written#0 : index to i64
+    %h, %b = func.call @LyUnicode_FromBytes(%buffer, %c0, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    memref.dealloc %buffer : memref<?xi8>
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  // The double nearest x * 2**e, for an x already rounded to fit: the bits
+  // are assembled, so no ldexp is needed and nothing rounds twice.
+  func.func private @__ly_float_exact_scaled(%x: i64, %e: i64) -> f64 {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %c52 = arith.constant 52 : i64
+    %c53 = arith.constant 53 : i64
+    %c64 = arith.constant 64 : i64
+    %bias = arith.constant 1023 : i64
+    %min_exp = arith.constant -1022 : i64
+    %subnormal_shift_base = arith.constant 1074 : i64
+    %mant_mask = arith.constant 4503599627370495 : i64
+    %is_zero = arith.cmpi eq, %x, %zero : i64
+    %lz = math.ctlz %x : i64
+    %bitlen = arith.subi %c64, %lz : i64
+    %top = arith.addi %e, %bitlen : i64
+    %top_exp = arith.subi %top, %one : i64
+    %normal = arith.cmpi sge, %top_exp, %min_exp : i64
+    // Normal: the 53 significant bits, the leading one dropped.
+    %excess = arith.subi %bitlen, %c53 : i64
+    %too_long = arith.cmpi sgt, %excess, %zero : i64
+    %neg_excess = arith.subi %zero, %excess : i64
+    %right = arith.shrui %x, %excess : i64
+    %left = arith.shli %x, %neg_excess : i64
+    %mant53 = arith.select %too_long, %right, %left : i64
+    %fraction = arith.andi %mant53, %mant_mask : i64
+    %biased = arith.addi %top_exp, %bias : i64
+    %exp_field = arith.shli %biased, %c52 : i64
+    %normal_bits = arith.ori %exp_field, %fraction : i64
+    // Subnormal: x * 2**(e + 1074) is the field itself.
+    %sub_shift = arith.addi %e, %subnormal_shift_base : i64
+    %sub_right_count = arith.subi %zero, %sub_shift : i64
+    %sub_left = arith.cmpi sge, %sub_shift, %zero : i64
+    %sub_l = arith.shli %x, %sub_shift : i64
+    %sub_r = arith.shrui %x, %sub_right_count : i64
+    %subnormal_bits = arith.select %sub_left, %sub_l, %sub_r : i64
+    %chosen = arith.select %normal, %normal_bits, %subnormal_bits : i64
+    %bits = arith.select %is_zero, %zero, %chosen : i64
+    %result = arith.bitcast %bits : i64 to f64
+    func.return %result : f64
+  }
+
+  // CPython's float_fromhex rounding over `total` hex digit values (most
+  // significant first) scaled by 2**exp: round-half-even at the double's
+  // last bit, subnormals included. The i1 is the overflow CPython reports.
+  func.func private @__ly_float_round_hex_digits(%digits: memref<?xi8>, %total: i64, %exp: i64) -> (f64, i1) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %three = arith.constant 3 : i64
+    %four = arith.constant 4 : i64
+    %eight = arith.constant 8 : i64
+    %sixteen = arith.constant 16 : i64
+    %c53 = arith.constant 53 : i64
+    %c64 = arith.constant 64 : i64
+    %min_exp = arith.constant -1021 : i64
+    %max_exp = arith.constant 1024 : i64
+    %underflow_exp = arith.constant -1074 : i64
+    %c0_i8 = arith.constant 0 : i8
+    %false = arith.constant false
+    %true = arith.constant true
+    %zero_f = arith.constant 0.0 : f64
+    %total_index = arith.index_cast %total : i64 to index
+    // Leading zeros carry nothing.
+    %lead = scf.for %i = %c0 to %total_index step %c1 iter_args(%found = %total) -> (i64) {
+      %unset = arith.cmpi eq, %found, %total : i64
+      %d8 = memref.load %digits[%i] : memref<?xi8>
+      %nonzero = arith.cmpi ne, %d8, %c0_i8 : i8
+      %take = arith.andi %unset, %nonzero : i1
+      %i64v = arith.index_cast %i : index to i64
+      %next = arith.select %take, %i64v, %found : i64
+      scf.yield %next : i64
+    }
+    %nd = arith.subi %total, %lead : i64
+    %no_digits = arith.cmpi eq, %nd, %zero : i64
+    cf.cond_br %no_digits, ^zero_result, ^scale
+
+  ^zero_result:
+    func.return %zero_f, %false : f64, i1
+
+  ^scale:
+    // HEX_DIGIT(j), j counted from the least significant digit, is
+    // digits[total - 1 - j].
+    %last = arith.subi %total, %one : i64
+    %lead_index = arith.index_cast %lead : i64 to index
+    %top_digit8 = memref.load %digits[%lead_index] : memref<?xi8>
+    %top_digit = arith.extui %top_digit8 : i8 to i64
+    %top_lz = math.ctlz %top_digit : i64
+    %top_bits = arith.subi %c64, %top_lz : i64
+    %nd_less = arith.subi %nd, %one : i64
+    %whole_digits_bits = arith.muli %nd_less, %four : i64
+    %top_base = arith.addi %exp, %whole_digits_bits : i64
+    %top_exp = arith.addi %top_base, %top_bits : i64
+    %underflows = arith.cmpi slt, %top_exp, %underflow_exp : i64
+    cf.cond_br %underflows, ^zero_result, ^check_overflow
+
+  ^check_overflow:
+    %overflows = arith.cmpi sgt, %top_exp, %max_exp : i64
+    cf.cond_br %overflows, ^overflow, ^round
+
+  ^overflow:
+    func.return %zero_f, %true : f64, i1
+
+  ^round:
+    %floor_exp = arith.maxsi %top_exp, %min_exp : i64
+    %lsb = arith.subi %floor_exp, %c53 : i64
+    %exact = arith.cmpi sge, %exp, %lsb : i64
+    cf.cond_br %exact, ^exact_digits, ^rounded_digits
+
+  ^exact_digits:
+    %nd_index = arith.index_cast %nd : i64 to index
+    %all = scf.for %k = %c0 to %nd_index step %c1 iter_args(%x = %zero) -> (i64) {
+      %k64 = arith.index_cast %k : index to i64
+      %at64 = arith.addi %lead, %k64 : i64
+      %at = arith.index_cast %at64 : i64 to index
+      %d8 = memref.load %digits[%at] : memref<?xi8>
+      %d = arith.extui %d8 : i8 to i64
+      %shifted = arith.muli %x, %sixteen : i64
+      %next = arith.addi %shifted, %d : i64
+      scf.yield %next : i64
+    }
+    %exact_value = func.call @__ly_float_exact_scaled(%all, %exp) : (i64, i64) -> f64
+    func.return %exact_value, %false : f64, i1
+
+  ^rounded_digits:
+    %gap = arith.subi %lsb, %exp : i64
+    %gap_less = arith.subi %gap, %one : i64
+    %half_shift = arith.remsi %gap_less, %four : i64
+    %half_eps = arith.shli %one, %half_shift : i64
+    %key = arith.divsi %gap_less, %four : i64
+    // Digits above the key digit, most significant first: positions
+    // lead .. total - 2 - key.
+    %key_pos = arith.subi %last, %key : i64
+    %lead_index_r = arith.index_cast %lead : i64 to index
+    %key_index = arith.index_cast %key_pos : i64 to index
+    %above = scf.for %at = %lead_index_r to %key_index step %c1 iter_args(%x = %zero) -> (i64) {
+      %d8 = memref.load %digits[%at] : memref<?xi8>
+      %d = arith.extui %d8 : i8 to i64
+      %shifted = arith.muli %x, %sixteen : i64
+      %next = arith.addi %shifted, %d : i64
+      scf.yield %next : i64
+    }
+    %key8 = memref.load %digits[%key_index] : memref<?xi8>
+    %key_digit = arith.extui %key8 : i8 to i64
+    %two_half = arith.muli %half_eps, %two : i64
+    %keep_mask = arith.subi %sixteen, %two_half : i64
+    %kept = arith.andi %key_digit, %keep_mask : i64
+    %above16 = arith.muli %above, %sixteen : i64
+    %x0 = arith.addi %above16, %kept : i64
+    %half_bit = arith.andi %key_digit, %half_eps : i64
+    %at_half = arith.cmpi ne, %half_bit, %zero : i64
+    // Round up past the half, or at it when the kept part is odd.
+    %three_half = arith.muli %half_eps, %three : i64
+    %below_mask = arith.subi %three_half, %one : i64
+    %below_bits = arith.andi %key_digit, %below_mask : i64
+    %below_or_odd = arith.cmpi ne, %below_bits, %zero : i64
+    %half_is_eight = arith.cmpi eq, %half_eps, %eight : i64
+    %key_up = arith.addi %key, %one : i64
+    %has_next = arith.cmpi slt, %key_up, %nd : i64
+    %eight_case = arith.andi %half_is_eight, %has_next : i1
+    %next_odd = scf.if %eight_case -> (i1) {
+      %prev_pos = arith.subi %key_index, %c1 : index
+      %p8 = memref.load %digits[%prev_pos] : memref<?xi8>
+      %p = arith.extui %p8 : i8 to i64
+      %p_low = arith.andi %p, %one : i64
+      %odd = arith.cmpi ne, %p_low, %zero : i64
+      scf.yield %odd : i1
+    } else {
+      scf.yield %false : i1
+    }
+    %decided = arith.ori %below_or_odd, %next_odd : i1
+    %after_key = arith.addi %key_index, %c1 : index
+    %sticky = scf.for %at = %after_key to %total_index step %c1 iter_args(%any = %false) -> (i1) {
+      %d8 = memref.load %digits[%at] : memref<?xi8>
+      %nonzero = arith.cmpi ne, %d8, %c0_i8 : i8
+      %next = arith.ori %any, %nonzero : i1
+      scf.yield %next : i1
+    }
+    %up_reason = arith.ori %decided, %sticky : i1
+    %round_up = arith.andi %at_half, %up_reason : i1
+    %bumped = arith.addi %x0, %two_half : i64
+    %x = arith.select %round_up, %bumped, %x0 : i64
+    %at_max = arith.cmpi eq, %top_exp, %max_exp : i64
+    %limit = arith.shli %two_half, %c53 : i64
+    %reached = arith.cmpi eq, %x, %limit : i64
+    %rounded_over = arith.andi %at_max, %reached : i1
+    %round_over_up = arith.andi %rounded_over, %round_up : i1
+    %key_bits = arith.muli %key, %four : i64
+    %scale = arith.addi %exp, %key_bits : i64
+    %rounded_value = func.call @__ly_float_exact_scaled(%x, %scale) : (i64, i64) -> f64
+    func.return %rounded_value, %round_over_up : f64, i1
+  }
+
+  // Whether code points [start, start + len) of a str spell `word`, ASCII
+  // case ignored.
+  func.func private @__ly_float_span_is(%bytes: memref<?xi8>, %width: i64, %start: index, %len: index, %word: memref<?xi8>) -> i1 {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %true = arith.constant true
+    %word_len = memref.dim %word, %c0 : memref<?xi8>
+    %same_len = arith.cmpi eq, %len, %word_len : index
+    %result = scf.if %same_len -> (i1) {
+      %all = scf.for %i = %c0 to %len step %c1 iter_args(%acc = %true) -> (i1) {
+        %at = arith.addi %start, %i : index
+        %cp = func.call @__ly_unicode_get(%bytes, %width, %at) : (memref<?xi8>, i64, index) -> i64
+        %upper_a = arith.constant 65 : i64
+        %upper_z = arith.constant 90 : i64
+        %ge = arith.cmpi sge, %cp, %upper_a : i64
+        %le = arith.cmpi sle, %cp, %upper_z : i64
+        %is_upper = arith.andi %ge, %le : i1
+        %case_bit = arith.constant 32 : i64
+        %lowered = arith.ori %cp, %case_bit : i64
+        %folded = arith.select %is_upper, %lowered, %cp : i64
+        %w8 = memref.load %word[%i] : memref<?xi8>
+        %w = arith.extui %w8 : i8 to i64
+        %eq = arith.cmpi eq, %folded, %w : i64
+        %next = arith.andi %acc, %eq : i1
+        scf.yield %next : i1
+      }
+      scf.yield %all : i1
+    } else {
+      %no = arith.constant false
+      scf.yield %no : i1
+    }
+    func.return %result : i1
+  }
+
+  // float.fromhex (float_fromhex): an optional "0x", hex digits with at most
+  // one point, an optional binary exponent; the digits are rounded by
+  // __ly_float_round_hex_digits.
+  //
+  // ⛔ Not strtod over "0x" + the text: wasi-libc's answered
+  // "0x1.fffffffffffff7p1023" with an overflow where CPython and the host
+  // libc round down to the largest double -- a target-dependent answer.
+  func.func @LyFloat_FromHex(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.initializer = "fromhex"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %neg_one = arith.constant -1 : i64
+    %true = arith.constant true
+    %false = arith.constant false
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %count_index = arith.index_cast %count : i64 to index
+    %cp_space = arith.constant 32 : i64
+    %cp_tab = arith.constant 9 : i64
+    %cp_cr = arith.constant 13 : i64
+    %first = scf.for %i = %c0 to %count_index step %c1 iter_args(%found = %neg_one) -> (i64) {
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+      %is_sp = arith.cmpi eq, %cp, %cp_space : i64
+      %ge_tab = arith.cmpi sge, %cp, %cp_tab : i64
+      %le_cr = arith.cmpi sle, %cp, %cp_cr : i64
+      %is_ctl = arith.andi %ge_tab, %le_cr : i1
+      %is_ws = arith.ori %is_sp, %is_ctl : i1
+      %unset = arith.cmpi eq, %found, %neg_one : i64
+      %i64v = arith.index_cast %i : index to i64
+      %candidate = arith.select %is_ws, %found, %i64v : i1, i64
+      %next = arith.select %unset, %candidate, %found : i1, i64
+      scf.yield %next : i64
+    }
+    %last = scf.for %i = %c0 to %count_index step %c1 iter_args(%found = %neg_one) -> (i64) {
+      %step = arith.addi %i, %c1 : index
+      %rev = arith.subi %count_index, %step : index
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %rev) : (memref<?xi8>, i64, index) -> i64
+      %is_sp = arith.cmpi eq, %cp, %cp_space : i64
+      %ge_tab = arith.cmpi sge, %cp, %cp_tab : i64
+      %le_cr = arith.cmpi sle, %cp, %cp_cr : i64
+      %is_ctl = arith.andi %ge_tab, %le_cr : i1
+      %is_ws = arith.ori %is_sp, %is_ctl : i1
+      %unset = arith.cmpi eq, %found, %neg_one : i64
+      %rev64 = arith.index_cast %rev : index to i64
+      %candidate = arith.select %is_ws, %found, %rev64 : i1, i64
+      %next = arith.select %unset, %candidate, %found : i1, i64
+      scf.yield %next : i64
+    }
+    %empty = arith.cmpi eq, %first, %neg_one : i64
+    cf.cond_br %empty, ^invalid, ^sign
+
+  ^sign:
+    %first_index = arith.index_cast %first : i64 to index
+    %end64 = arith.addi %last, %one : i64
+    %end = arith.index_cast %end64 : i64 to index
+    %lead = func.call @__ly_unicode_get(%bytes, %width, %first_index) : (memref<?xi8>, i64, index) -> i64
+    %cp_minus = arith.constant 45 : i64
+    %cp_plus = arith.constant 43 : i64
+    %is_minus = arith.cmpi eq, %lead, %cp_minus : i64
+    %is_plus = arith.cmpi eq, %lead, %cp_plus : i64
+    %has_sign = arith.ori %is_minus, %is_plus : i1
+    %after_sign = arith.addi %first_index, %c1 : index
+    %body = arith.select %has_sign, %after_sign, %first_index : index
+    %body_len = arith.subi %end, %body : index
+    %w_inf_static = memref.get_global @__ly_float_text_inf : memref<3xi8>
+    %w_inf = memref.cast %w_inf_static : memref<3xi8> to memref<?xi8>
+    %w_infinity_static = memref.get_global @__ly_float_text_infinity : memref<8xi8>
+    %w_infinity = memref.cast %w_infinity_static : memref<8xi8> to memref<?xi8>
+    %w_nan_static = memref.get_global @__ly_float_text_nan : memref<3xi8>
+    %w_nan = memref.cast %w_nan_static : memref<3xi8> to memref<?xi8>
+    %is_inf = func.call @__ly_float_span_is(%bytes, %width, %body, %body_len, %w_inf) : (memref<?xi8>, i64, index, index, memref<?xi8>) -> i1
+    %is_infinity = func.call @__ly_float_span_is(%bytes, %width, %body, %body_len, %w_infinity) : (memref<?xi8>, i64, index, index, memref<?xi8>) -> i1
+    %is_nan = func.call @__ly_float_span_is(%bytes, %width, %body, %body_len, %w_nan) : (memref<?xi8>, i64, index, index, memref<?xi8>) -> i1
+    %infinite = arith.ori %is_inf, %is_infinity : i1
+    cf.cond_br %infinite, ^infinite, ^not_infinite
+
+  ^infinite:
+    %pos_inf = arith.constant 0x7FF0000000000000 : f64
+    %neg_inf = arith.constant 0xFFF0000000000000 : f64
+    %inf_value = arith.select %is_minus, %neg_inf, %pos_inf : f64
+    %inf_h = func.call @LyFloat_FromF64(%inf_value) : (f64) -> memref<3xi64>
+    func.return %inf_h : memref<3xi64>
+
+  ^not_infinite:
+    cf.cond_br %is_nan, ^nan, ^hex
+
+  ^nan:
+    %nan_value = arith.constant 0x7FF8000000000000 : f64
+    %nan_h = func.call @LyFloat_FromF64(%nan_value) : (f64) -> memref<3xi64>
+    func.return %nan_h : memref<3xi64>
+
+  ^hex:
+    // An optional "0x" / "0X".
+    %cp_zero = arith.constant 48 : i64
+    %cp_x = arith.constant 120 : i64
+    %case_bit = arith.constant 32 : i64
+    %room_for_prefix = arith.cmpi sge, %body_len, %c2 : index
+    %prefixed = scf.if %room_for_prefix -> (i1) {
+      %a = func.call @__ly_unicode_get(%bytes, %width, %body) : (memref<?xi8>, i64, index) -> i64
+      %second = arith.addi %body, %c1 : index
+      %b = func.call @__ly_unicode_get(%bytes, %width, %second) : (memref<?xi8>, i64, index) -> i64
+      %b_lower = arith.ori %b, %case_bit : i64
+      %a_ok = arith.cmpi eq, %a, %cp_zero : i64
+      %b_ok = arith.cmpi eq, %b_lower, %cp_x : i64
+      %both = arith.andi %a_ok, %b_ok : i1
+      scf.yield %both : i1
+    } else {
+      scf.yield %false : i1
+    }
+    %after_prefix = arith.addi %body, %c2 : index
+    %digits_start = arith.select %prefixed, %after_prefix, %body : index
+    %rest = arith.subi %end, %digits_start : index
+    %digits_size = arith.addi %rest, %c1 : index
+    %digits = memref.alloc(%digits_size) : memref<?xi8>
+    // States: 0 integer digits, 1 fraction digits, 2 just after 'p',
+    // 3 after the exponent's sign, 4 exponent digits. The exponent saturates
+    // far past any double, as CPython's strtol does past a long.
+    %s0 = arith.constant 0 : i64
+    %s1 = arith.constant 1 : i64
+    %s2 = arith.constant 2 : i64
+    %s3 = arith.constant 3 : i64
+    %s4 = arith.constant 4 : i64
+    %ten = arith.constant 10 : i64
+    %exp_cap = arith.constant 1099511627776 : i64
+    %scan:6 = scf.for %i = %digits_start to %end step %c1 iter_args(%state = %s0, %ok = %true, %total = %zero, %fdigits = %zero, %exp_abs = %zero, %exp_neg = %false) -> (i64, i1, i64, i64, i64, i1) {
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+      %lower = arith.ori %cp, %case_bit : i64
+      %ge_0 = arith.cmpi sge, %cp, %cp_zero : i64
+      %cp_nine = arith.constant 57 : i64
+      %le_9 = arith.cmpi sle, %cp, %cp_nine : i64
+      %is_dec = arith.andi %ge_0, %le_9 : i1
+      %cp_a = arith.constant 97 : i64
+      %cp_f = arith.constant 102 : i64
+      %ge_a = arith.cmpi sge, %lower, %cp_a : i64
+      %le_f = arith.cmpi sle, %lower, %cp_f : i64
+      %is_letter = arith.andi %ge_a, %le_f : i1
+      %is_hex = arith.ori %is_dec, %is_letter : i1
+      %cp_dot = arith.constant 46 : i64
+      %cp_p = arith.constant 112 : i64
+      %is_dot = arith.cmpi eq, %cp, %cp_dot : i64
+      %is_p = arith.cmpi eq, %lower, %cp_p : i64
+      %is_sign_ch_m = arith.cmpi eq, %cp, %cp_minus : i64
+      %is_sign_ch_p = arith.cmpi eq, %cp, %cp_plus : i64
+      %is_sign_ch = arith.ori %is_sign_ch_m, %is_sign_ch_p : i1
+      %in0 = arith.cmpi eq, %state, %s0 : i64
+      %in1 = arith.cmpi eq, %state, %s1 : i64
+      %in2 = arith.cmpi eq, %state, %s2 : i64
+      %in3 = arith.cmpi eq, %state, %s3 : i64
+      %in4 = arith.cmpi eq, %state, %s4 : i64
+      %in_mantissa = arith.ori %in0, %in1 : i1
+      %in_exp_head = arith.ori %in2, %in3 : i1
+      %in_exp = arith.ori %in_exp_head, %in4 : i1
+      %mant_digit = arith.andi %in_mantissa, %is_hex : i1
+      %point = arith.andi %in0, %is_dot : i1
+      %exp_mark = arith.andi %in_mantissa, %is_p : i1
+      %exp_sign = arith.andi %in2, %is_sign_ch : i1
+      %exp_digit = arith.andi %in_exp, %is_dec : i1
+      %t1 = arith.ori %mant_digit, %point : i1
+      %t2 = arith.ori %t1, %exp_mark : i1
+      %t3 = arith.ori %t2, %exp_sign : i1
+      %accepted = arith.ori %t3, %exp_digit : i1
+      %next_ok = arith.andi %ok, %accepted : i1
+      %st_point = arith.select %point, %s1, %state : i64
+      %st_mark = arith.select %exp_mark, %s2, %st_point : i64
+      %st_sign = arith.select %exp_sign, %s3, %st_mark : i64
+      %next_state = arith.select %exp_digit, %s4, %st_sign : i64
+      scf.if %mant_digit {
+        %letter_value = arith.constant 87 : i64
+        %dec_value = arith.subi %cp, %cp_zero : i64
+        %hex_value = arith.subi %lower, %letter_value : i64
+        %value = arith.select %is_dec, %dec_value, %hex_value : i64
+        %value8 = arith.trunci %value : i64 to i8
+        %slot = arith.index_cast %total : i64 to index
+        memref.store %value8, %digits[%slot] : memref<?xi8>
+      }
+      %bump = arith.select %mant_digit, %one, %zero : i64
+      %next_total = arith.addi %total, %bump : i64
+      %fraction_digit = arith.andi %mant_digit, %in1 : i1
+      %fbump = arith.select %fraction_digit, %one, %zero : i64
+      %next_fdigits = arith.addi %fdigits, %fbump : i64
+      %dec = arith.subi %cp, %cp_zero : i64
+      %scaled = arith.muli %exp_abs, %ten : i64
+      %grown = arith.addi %scaled, %dec : i64
+      %capped = arith.minsi %grown, %exp_cap : i64
+      %next_exp_abs = arith.select %exp_digit, %capped, %exp_abs : i64
+      %negates = arith.andi %exp_sign, %is_sign_ch_m : i1
+      %next_exp_neg = arith.ori %exp_neg, %negates : i1
+      scf.yield %next_state, %next_ok, %next_total, %next_fdigits, %next_exp_abs, %next_exp_neg : i64, i1, i64, i64, i64, i1
+    }
+    %has_digits = arith.cmpi sgt, %scan#2, %zero : i64
+    %ends_head = arith.cmpi eq, %scan#0, %s2 : i64
+    %ends_sign = arith.cmpi eq, %scan#0, %s3 : i64
+    %ends_open = arith.ori %ends_head, %ends_sign : i1
+    %ends_closed = arith.xori %ends_open, %true : i1
+    %grammar_ok = arith.andi %scan#1, %has_digits : i1
+    %valid = arith.andi %grammar_ok, %ends_closed : i1
+    cf.cond_br %valid, ^parse, ^invalid_free
+
+  ^invalid_free:
+    memref.dealloc %digits : memref<?xi8>
+    cf.br ^invalid
+
+  ^parse:
+    %four = arith.constant 4 : i64
+    %neg_exp_abs = arith.subi %zero, %scan#4 : i64
+    %parsed_exp = arith.select %scan#5, %neg_exp_abs, %scan#4 : i64
+    %fraction_bits = arith.muli %scan#3, %four : i64
+    %exp = arith.subi %parsed_exp, %fraction_bits : i64
+    %magnitude, %overflow = func.call @__ly_float_round_hex_digits(%digits, %scan#2, %exp) : (memref<?xi8>, i64, i64) -> (f64, i1)
+    memref.dealloc %digits : memref<?xi8>
+    scf.if %overflow {
+      %msg_static = memref.get_global @__ly_float_text_hex_too_large : memref<51xi8>
+      %msg = memref.cast %msg_static : memref<51xi8> to memref<?xi8>
+      %len = arith.constant 51 : i64
+      %cls = arith.constant 104 : i64
+      func.call @__ly_raise_static_message(%cls, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+    }
+    %negated = arith.negf %magnitude : f64
+    %value = arith.select %is_minus, %negated, %magnitude : f64
+    %h = func.call @LyFloat_FromF64(%value) : (f64) -> memref<3xi64>
+    func.return %h : memref<3xi64>
+
+  ^invalid:
+    %msg_static = memref.get_global @__ly_float_text_bad_hex : memref<41xi8>
+    %msg = memref.cast %msg_static : memref<41xi8> to memref<?xi8>
+    %len = arith.constant 41 : i64
+    %cls = arith.constant 53 : i64
+    func.call @__ly_raise_static_message(%cls, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+    %zero_f = arith.constant 0.0 : f64
+    %unreached = func.call @LyFloat_FromF64(%zero_f) : (f64) -> memref<3xi64>
+    func.return %unreached : memref<3xi64>
   }
 }

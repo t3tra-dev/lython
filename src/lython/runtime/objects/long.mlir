@@ -3,12 +3,26 @@
 //
 // Signature source (1:1 correspondence target):
 //   https://github.com/python/typeshed/blob/main/stdlib/builtins.pyi
+//
+// Deviations from CPython:
+//   - to_bytes and from_bytes take `signed` by position as well as by
+//     keyword (keyword-only in CPython): the position is what tells the
+//     overloads apart, so `(1).to_bytes(1, "big", True)` -- a TypeError in
+//     CPython -- is accepted.
 
 module attributes {
   ly.typing.manifest,
   ly.runtime.contracts = ["builtins.int"]
 } {
   // ===== declared here, defined in another runtime file or built by the lowering =====
+  func.func private @__ly_bytes_alloc(%len: i64) -> memref<4xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytes"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.primitive = "alloc"}
+  func.func private @__ly_bytes_payload(%self: memref<4xi64>) -> memref<?xi8> attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.interior_word, ly.runtime.primitive = "payload_view"}
+  func.func private @__ly_tuple_alloc(%length: i64) -> memref<5xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.tuple"], ly.ownership.owned_results = [0]}
+  func.func private @__ly_tuple_items(%self: memref<5xi64>) -> memref<?xi64> attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.interior_word, ly.runtime.primitive = "items_view"}
+  func.func private @__ly_tuple_store_long(%items: memref<?xi64>, %slot: index, %h: memref<2xi64>)
+  func.func private @__ly_unicode_count(%header: memref<2xi64>, %bytes: memref<?xi8>) -> i64
+  func.func private @__ly_unicode_get(%bytes: memref<?xi8>, %width: i64, %i: index) -> i64
+  func.func private @__ly_unicode_width(%header: memref<2xi64>) -> i64
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
   func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 5 : i64, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
@@ -56,7 +70,7 @@ module attributes {
                     "__gt__", "__ge__", "__repr__", "__str__", "__eq__", "__ne__",
                     "__pow__", "__abs__", "__format__",
                     "__lt__", "__le__", "__gt__", "__ge__", "__eq__", "__ne__",
-                    "__round__", "bit_length"],
+                    "__round__", "bit_length", "conjugate", "is_integer", "as_integer_ratio", "bit_count", "to_bytes", "to_bytes", "to_bytes", "to_bytes", "from_bytes", "from_bytes", "from_bytes"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.int">>, !py.union<!py.contract<"typing.SupportsInt">, !py.contract<"typing.SupportsIndex">, !py.contract<"builtins.str">, !py.contract<"builtins.bytes">, !py.contract<"builtins.bytearray">>] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
@@ -97,7 +111,18 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.int">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.int">] -> [!py.contract<"builtins.tuple", [!py.contract<"builtins.int">, !py.contract<"builtins.int">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.int">] -> [!py.contract<"builtins.bytes">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bytes">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.bytes">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.str">, !py.contract<"builtins.bool">] -> [!py.contract<"builtins.bytes">]>,
+      !py.protocol<"Callable", [!py.type<!py.contract<"builtins.int">>, !py.contract<"builtins.bytes">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.type<!py.contract<"builtins.int">>, !py.contract<"builtins.bytes">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.type<!py.contract<"builtins.int">>, !py.contract<"builtins.bytes">, !py.contract<"builtins.str">, !py.contract<"builtins.bool">] -> [!py.contract<"builtins.int">]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
@@ -109,7 +134,7 @@ module attributes {
                     "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance",
-                    "instance", "instance"]
+                    "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "classmethod", "classmethod", "classmethod"]
   } {}
 
   func.func @LyLong_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.int", ly.runtime.deallocator} {
@@ -1665,6 +1690,393 @@ module attributes {
     %bits = func.call @__ly_long_bit_length(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i64
     func.return %bits : i64
   }
+  memref.global "private" constant @__ly_long_msg_order : memref<42xi8> = dense<[98, 121, 116, 101, 111, 114, 100, 101, 114, 32, 109, 117, 115, 116, 32, 98, 101, 32, 101, 105, 116, 104, 101, 114, 32, 39, 108, 105, 116, 116, 108, 101, 39, 32, 111, 114, 32, 39, 98, 105, 103, 39]>
+  memref.global "private" constant @__ly_long_msg_neglen : memref<36xi8> = dense<[108, 101, 110, 103, 116, 104, 32, 97, 114, 103, 117, 109, 101, 110, 116, 32, 109, 117, 115, 116, 32, 98, 101, 32, 110, 111, 110, 45, 110, 101, 103, 97, 116, 105, 118, 101]>
+  memref.global "private" constant @__ly_long_msg_negun : memref<38xi8> = dense<[99, 97, 110, 39, 116, 32, 99, 111, 110, 118, 101, 114, 116, 32, 110, 101, 103, 97, 116, 105, 118, 101, 32, 105, 110, 116, 32, 116, 111, 32, 117, 110, 115, 105, 103, 110, 101, 100]>
+  memref.global "private" constant @__ly_long_msg_big : memref<22xi8> = dense<[105, 110, 116, 32, 116, 111, 111, 32, 98, 105, 103, 32, 116, 111, 32, 99, 111, 110, 118, 101, 114, 116]>
+
+  // int.conjugate(): the int itself -- a fresh one, as `+x` gives here.
+  func.func @LyLong_Conjugate(%header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "conjugate"} {
+    %h = func.call @LyLong_Pos(%header) : (memref<2xi64>) -> memref<2xi64>
+    func.return %h : memref<2xi64>
+  }
+
+  // int.is_integer() (3.12): always True.
+  func.func @LyLong_IsInteger(%header: memref<2xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "is_integer"} {
+    %true = arith.constant true
+    func.return %true : i1
+  }
+
+  // int.as_integer_ratio(): (self, 1).
+  func.func @LyLong_AsIntegerRatio(%header: memref<2xi64> {ly.ownership.object_header}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "as_integer_ratio", ly.runtime.result_contract = "builtins.tuple"} {
+    %two = arith.constant 2 : i64
+    %one = arith.constant 1 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %numerator = func.call @LyLong_Pos(%header) : (memref<2xi64>) -> memref<2xi64>
+    %denominator = func.call @LyLong_FromI64(%one) : (i64) -> memref<2xi64>
+    %self = func.call @__ly_tuple_alloc(%two) : (i64) -> memref<5xi64>
+    %items = func.call @__ly_tuple_items(%self) : (memref<5xi64>) -> memref<?xi64>
+    func.call @__ly_tuple_store_long(%items, %c0, %numerator) : (memref<?xi64>, index, memref<2xi64>) -> ()
+    func.call @__ly_tuple_store_long(%items, %c1, %denominator) : (memref<?xi64>, index, memref<2xi64>) -> ()
+    func.return %self : memref<5xi64>
+  }
+
+  // The number of one bits in the ABSOLUTE value (int_bit_count_impl).
+  func.func private @__ly_long_popcount(%meta: memref<2xi64>, %digits: memref<?xi32>) -> i64 {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %count_slot = arith.constant 1 : index
+    %count = memref.load %meta[%count_slot] : memref<2xi64>
+    %count_index = arith.index_cast %count : i64 to index
+    %total = scf.for %i = %c0 to %count_index step %c1 iter_args(%acc = %zero) -> (i64) {
+      %d32 = memref.load %digits[%i] : memref<?xi32>
+      %ones = math.ctpop %d32 : i32
+      %ones64 = arith.extui %ones : i32 to i64
+      %next = arith.addi %acc, %ones64 : i64
+      scf.yield %next : i64
+    }
+    func.return %total : i64
+  }
+
+  func.func @LyLong_BitCount(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "bit_count"} {
+    %meta_raw, %digits_raw = func.call @__ly_long_parts(%header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
+    %meta, %digits = func.call @__ly_long_operand_view(%meta_raw, %digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
+    %ones = func.call @__ly_long_popcount(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i64
+    func.return %ones : i64
+  }
+
+  // "little" -> true, "big" -> false, anything else ValueError.
+  func.func private @__ly_long_byteorder_little(%header: memref<2xi64>, %bytes: memref<?xi8>) -> i1 {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+    %c4 = arith.constant 4 : index
+    %c5 = arith.constant 5 : index
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %three = arith.constant 3 : i64
+    %six = arith.constant 6 : i64
+    %is_three = arith.cmpi eq, %count, %three : i64
+    %is_six = arith.cmpi eq, %count, %six : i64
+    %big = scf.if %is_three -> (i1) {
+      %a = func.call @__ly_unicode_get(%bytes, %width, %c0) : (memref<?xi8>, i64, index) -> i64
+      %b = func.call @__ly_unicode_get(%bytes, %width, %c1) : (memref<?xi8>, i64, index) -> i64
+      %c = func.call @__ly_unicode_get(%bytes, %width, %c2) : (memref<?xi8>, i64, index) -> i64
+      %ea = arith.constant 98 : i64
+      %eb = arith.constant 105 : i64
+      %ec = arith.constant 103 : i64
+      %ma = arith.cmpi eq, %a, %ea : i64
+      %mb = arith.cmpi eq, %b, %eb : i64
+      %mc = arith.cmpi eq, %c, %ec : i64
+      %m1 = arith.andi %ma, %mb : i1
+      %m = arith.andi %m1, %mc : i1
+      scf.yield %m : i1
+    } else {
+      %no = arith.constant false
+      scf.yield %no : i1
+    }
+    %little = scf.if %is_six -> (i1) {
+      %lc0 = func.call @__ly_unicode_get(%bytes, %width, %c0) : (memref<?xi8>, i64, index) -> i64
+      %lw0 = arith.constant 108 : i64
+      %lm0 = arith.cmpi eq, %lc0, %lw0 : i64
+      %lc1 = func.call @__ly_unicode_get(%bytes, %width, %c1) : (memref<?xi8>, i64, index) -> i64
+      %lw1 = arith.constant 105 : i64
+      %lm1 = arith.cmpi eq, %lc1, %lw1 : i64
+      %la1 = arith.andi %lm0, %lm1 : i1
+      %lc2 = func.call @__ly_unicode_get(%bytes, %width, %c2) : (memref<?xi8>, i64, index) -> i64
+      %lw2 = arith.constant 116 : i64
+      %lm2 = arith.cmpi eq, %lc2, %lw2 : i64
+      %la2 = arith.andi %la1, %lm2 : i1
+      %lc3 = func.call @__ly_unicode_get(%bytes, %width, %c3) : (memref<?xi8>, i64, index) -> i64
+      %lw3 = arith.constant 116 : i64
+      %lm3 = arith.cmpi eq, %lc3, %lw3 : i64
+      %la3 = arith.andi %la2, %lm3 : i1
+      %lc4 = func.call @__ly_unicode_get(%bytes, %width, %c4) : (memref<?xi8>, i64, index) -> i64
+      %lw4 = arith.constant 108 : i64
+      %lm4 = arith.cmpi eq, %lc4, %lw4 : i64
+      %la4 = arith.andi %la3, %lm4 : i1
+      %lc5 = func.call @__ly_unicode_get(%bytes, %width, %c5) : (memref<?xi8>, i64, index) -> i64
+      %lw5 = arith.constant 101 : i64
+      %lm5 = arith.cmpi eq, %lc5, %lw5 : i64
+      %la5 = arith.andi %la4, %lm5 : i1
+      scf.yield %la5 : i1
+    } else {
+      %no = arith.constant false
+      scf.yield %no : i1
+    }
+    %either = arith.ori %big, %little : i1
+    scf.if %either {
+    } else {
+      %msg_static = memref.get_global @__ly_long_msg_order : memref<42xi8>
+      %msg = memref.cast %msg_static : memref<42xi8> to memref<?xi8>
+      %len = arith.constant 42 : i64
+      %cls = arith.constant 53 : i64
+      func.call @__ly_raise_static_message(%cls, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+    }
+    func.return %little : i1
+  }
+
+  // int.to_bytes (long_to_bytes / _PyLong_AsByteArray): the little-endian
+  // bytes of the magnitude, two's complement for a negative value, reversed
+  // for "big". OverflowError where CPython raises it, before a byte is built.
+  func.func private @__ly_long_to_bytes(%header: memref<2xi64>, %length: i64, %little: i1, %signed: i1) -> memref<4xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytes"], ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %eight = arith.constant 8 : i64
+    %thirty = arith.constant 30 : i64
+    %mask = arith.constant 255 : i64
+    %true = arith.constant true
+    %negative_length = arith.cmpi slt, %length, %zero : i64
+    scf.if %negative_length {
+      %msg_static = memref.get_global @__ly_long_msg_neglen : memref<36xi8>
+      %msg = memref.cast %msg_static : memref<36xi8> to memref<?xi8>
+      %len = arith.constant 36 : i64
+      %cls = arith.constant 53 : i64
+      func.call @__ly_raise_static_message(%cls, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+    }
+    %meta_raw, %digits_raw = func.call @__ly_long_parts(%header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
+    %meta, %digits = func.call @__ly_long_operand_view(%meta_raw, %digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
+    %sign = memref.load %meta[%c0] : memref<2xi64>
+    %count = memref.load %meta[%c1] : memref<2xi64>
+    %negative = arith.cmpi slt, %sign, %zero : i64
+    %unsigned = arith.xori %signed, %true : i1
+    %negative_unsigned = arith.andi %negative, %unsigned : i1
+    scf.if %negative_unsigned {
+      %msg_static = memref.get_global @__ly_long_msg_negun : memref<38xi8>
+      %msg = memref.cast %msg_static : memref<38xi8> to memref<?xi8>
+      %len = arith.constant 38 : i64
+      %cls = arith.constant 104 : i64
+      func.call @__ly_raise_static_message(%cls, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+    }
+    %bits = func.call @__ly_long_bit_length(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i64
+    %limit = arith.muli %length, %eight : i64
+    %limit_less_one = arith.subi %limit, %one : i64
+    %is_zero = arith.cmpi eq, %sign, %zero : i64
+    %fits_unsigned = arith.cmpi sle, %bits, %limit : i64
+    %fits_below = arith.cmpi sle, %bits, %limit_less_one : i64
+    %ones = func.call @__ly_long_popcount(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i64
+    %power_of_two = arith.cmpi eq, %ones, %one : i64
+    %at_limit = arith.cmpi eq, %bits, %limit : i64
+    %most_negative = arith.andi %at_limit, %power_of_two : i1
+    %fits_negative = arith.ori %fits_below, %most_negative : i1
+    %fits_signed = arith.select %negative, %fits_negative, %fits_below : i1
+    %fits_nonzero = arith.select %signed, %fits_signed, %fits_unsigned : i1
+    %fits = arith.ori %is_zero, %fits_nonzero : i1
+    scf.if %fits {
+    } else {
+      %msg_static = memref.get_global @__ly_long_msg_big : memref<22xi8>
+      %msg = memref.cast %msg_static : memref<22xi8> to memref<?xi8>
+      %len = arith.constant 22 : i64
+      %cls = arith.constant 104 : i64
+      func.call @__ly_raise_static_message(%cls, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+    }
+    %result = func.call @__ly_bytes_alloc(%length) : (i64) -> memref<4xi64>
+    %payload = func.call @__ly_bytes_payload(%result) : (memref<4xi64>) -> memref<?xi8>
+    %count_index = arith.index_cast %count : i64 to index
+    %filled:3 = scf.for %i = %c0 to %count_index step %c1 iter_args(%acc = %zero, %acc_bits = %zero, %out = %zero) -> (i64, i64, i64) {
+      %d32 = memref.load %digits[%i] : memref<?xi32>
+      %d = arith.extui %d32 : i32 to i64
+      %shifted = arith.shli %d, %acc_bits : i64
+      %merged = arith.ori %acc, %shifted : i64
+      %merged_bits = arith.addi %acc_bits, %thirty : i64
+      %drained:3 = scf.while (%a = %merged, %ab = %merged_bits, %o = %out) : (i64, i64, i64) -> (i64, i64, i64) {
+        %enough = arith.cmpi sge, %ab, %eight : i64
+        %room = arith.cmpi slt, %o, %length : i64
+        %go = arith.andi %enough, %room : i1
+        scf.condition(%go) %a, %ab, %o : i64, i64, i64
+      } do {
+      ^bb0(%a: i64, %ab: i64, %o: i64):
+        %byte = arith.andi %a, %mask : i64
+        %byte8 = arith.trunci %byte : i64 to i8
+        %slot = arith.index_cast %o : i64 to index
+        memref.store %byte8, %payload[%slot] : memref<?xi8>
+        %rest = arith.shrui %a, %eight : i64
+        %rest_bits = arith.subi %ab, %eight : i64
+        %next = arith.addi %o, %one : i64
+        scf.yield %rest, %rest_bits, %next : i64, i64, i64
+      }
+      scf.yield %drained#0, %drained#1, %drained#2 : i64, i64, i64
+    }
+    %tail_start = arith.index_cast %filled#2 : i64 to index
+    %length_index = arith.index_cast %length : i64 to index
+    %leftover = scf.for %i = %tail_start to %length_index step %c1 iter_args(%a = %filled#0) -> (i64) {
+      %byte = arith.andi %a, %mask : i64
+      %byte8 = arith.trunci %byte : i64 to i8
+      memref.store %byte8, %payload[%i] : memref<?xi8>
+      %rest = arith.shrui %a, %eight : i64
+      scf.yield %rest : i64
+    }
+    scf.if %negative {
+      %carry_out = scf.for %i = %c0 to %length_index step %c1 iter_args(%carry = %one) -> (i64) {
+        %b8 = memref.load %payload[%i] : memref<?xi8>
+        %b = arith.extui %b8 : i8 to i64
+        %inverted = arith.xori %b, %mask : i64
+        %sum = arith.addi %inverted, %carry : i64
+        %low = arith.andi %sum, %mask : i64
+        %low8 = arith.trunci %low : i64 to i8
+        memref.store %low8, %payload[%i] : memref<?xi8>
+        %next_carry = arith.shrui %sum, %eight : i64
+        scf.yield %next_carry : i64
+      }
+    }
+    %big_endian = arith.xori %little, %true : i1
+    scf.if %big_endian {
+      %two_index = arith.constant 2 : index
+      %half = arith.divui %length_index, %two_index : index
+      scf.for %i = %c0 to %half step %c1 {
+        %last = arith.subi %length_index, %c1 : index
+        %mirror = arith.subi %last, %i : index
+        %x = memref.load %payload[%i] : memref<?xi8>
+        %y = memref.load %payload[%mirror] : memref<?xi8>
+        memref.store %y, %payload[%i] : memref<?xi8>
+        memref.store %x, %payload[%mirror] : memref<?xi8>
+      }
+    }
+    func.return %result : memref<4xi64>
+  }
+
+  func.func @LyLong_ToBytes(%header: memref<2xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "to_bytes", ly.runtime.result_contract = "builtins.bytes"} {
+    %one = arith.constant 1 : i64
+    %false = arith.constant false
+    %r = func.call @__ly_long_to_bytes(%header, %one, %false, %false) : (memref<2xi64>, i64, i1, i1) -> memref<4xi64>
+    func.return %r : memref<4xi64>
+  }
+
+  func.func @LyLong_ToBytesLength(%header: memref<2xi64> {ly.ownership.object_header}, %length: i64) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "to_bytes", ly.runtime.result_contract = "builtins.bytes"} {
+    %false = arith.constant false
+    %r = func.call @__ly_long_to_bytes(%header, %length, %false, %false) : (memref<2xi64>, i64, i1, i1) -> memref<4xi64>
+    func.return %r : memref<4xi64>
+  }
+
+  func.func @LyLong_ToBytesOrder(%header: memref<2xi64> {ly.ownership.object_header}, %length: i64, %order_header: memref<2xi64> {ly.ownership.object_header}, %order_bytes: memref<?xi8>) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "to_bytes", ly.runtime.result_contract = "builtins.bytes"} {
+    %false = arith.constant false
+    %little = func.call @__ly_long_byteorder_little(%order_header, %order_bytes) : (memref<2xi64>, memref<?xi8>) -> i1
+    %r = func.call @__ly_long_to_bytes(%header, %length, %little, %false) : (memref<2xi64>, i64, i1, i1) -> memref<4xi64>
+    func.return %r : memref<4xi64>
+  }
+
+  func.func @LyLong_ToBytesSigned(%header: memref<2xi64> {ly.ownership.object_header}, %length: i64, %order_header: memref<2xi64> {ly.ownership.object_header}, %order_bytes: memref<?xi8>, %signed: i1) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "to_bytes", ly.runtime.result_contract = "builtins.bytes"} {
+    %little = func.call @__ly_long_byteorder_little(%order_header, %order_bytes) : (memref<2xi64>, memref<?xi8>) -> i1
+    %r = func.call @__ly_long_to_bytes(%header, %length, %little, %signed) : (memref<2xi64>, i64, i1, i1) -> memref<4xi64>
+    func.return %r : memref<4xi64>
+  }
+
+  // int.from_bytes (_PyLong_FromByteArray): the bytes read in `byteorder`,
+  // as a two's complement value when `signed` and the top bit is set.
+  func.func private @__ly_long_from_bytes(%data: memref<?xi8>, %n: i64, %little: i1, %signed: i1) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %eight = arith.constant 8 : i64
+    %thirty = arith.constant 30 : i64
+    %twenty_nine = arith.constant 29 : i64
+    %mask = arith.constant 255 : i64
+    %digit_mask = arith.constant 1073741823 : i64
+    %last = arith.subi %n, %one : i64
+    // The byte at little-endian position i.
+    %n_index = arith.index_cast %n : i64 to index
+    %nonempty = arith.cmpi sgt, %n, %zero : i64
+    %top_negative = scf.if %nonempty -> (i1) {
+      %top_pos = arith.select %little, %last, %zero : i64
+      %top_slot = arith.index_cast %top_pos : i64 to index
+      %top8 = memref.load %data[%top_slot] : memref<?xi8>
+      %top = arith.extui %top8 : i8 to i64
+      %bit = arith.constant 128 : i64
+      %high = arith.andi %top, %bit : i64
+      %set = arith.cmpi ne, %high, %zero : i64
+      scf.yield %set : i1
+    } else {
+      %no = arith.constant false
+      scf.yield %no : i1
+    }
+    %negative = arith.andi %signed, %top_negative : i1
+    // Digits enough for 8n bits.
+    %bits = arith.muli %n, %eight : i64
+    %bits_up = arith.addi %bits, %twenty_nine : i64
+    %ndigits = arith.divui %bits_up, %thirty : i64
+    %capacity = arith.addi %ndigits, %one : i64
+    %minus_one = arith.constant -1 : i64
+    %signed_sign = arith.select %negative, %minus_one, %one : i64
+    %header = func.call @__ly_long_alloc_raw(%signed_sign, %capacity) : (i64, i64) -> memref<2xi64>
+    %meta, %digits = func.call @__ly_long_parts(%header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
+    // Each byte (inverted and carried for a negative value, which yields the
+    // magnitude) shifted into 30-bit digits.
+    %acc_final:4 = scf.for %i = %c0 to %n_index step %c1 iter_args(%acc = %zero, %acc_bits = %zero, %out = %zero, %carry = %one) -> (i64, i64, i64, i64) {
+      %i64v = arith.index_cast %i : index to i64
+      %mirror = arith.subi %last, %i64v : i64
+      %pos = arith.select %little, %i64v, %mirror : i64
+      %slot = arith.index_cast %pos : i64 to index
+      %b8 = memref.load %data[%slot] : memref<?xi8>
+      %b = arith.extui %b8 : i8 to i64
+      %inverted = arith.xori %b, %mask : i64
+      %plus = arith.addi %inverted, %carry : i64
+      %neg_byte = arith.andi %plus, %mask : i64
+      %neg_carry = arith.shrui %plus, %eight : i64
+      %byte = arith.select %negative, %neg_byte, %b : i64
+      %next_carry = arith.select %negative, %neg_carry, %carry : i64
+      %shifted = arith.shli %byte, %acc_bits : i64
+      %merged = arith.ori %acc, %shifted : i64
+      %merged_bits = arith.addi %acc_bits, %eight : i64
+      %full = arith.cmpi sge, %merged_bits, %thirty : i64
+      %r:3 = scf.if %full -> (i64, i64, i64) {
+        %digit = arith.andi %merged, %digit_mask : i64
+        %digit32 = arith.trunci %digit : i64 to i32
+        %dslot = arith.index_cast %out : i64 to index
+        memref.store %digit32, %digits[%dslot] : memref<?xi32>
+        %rest = arith.shrui %merged, %thirty : i64
+        %rest_bits = arith.subi %merged_bits, %thirty : i64
+        %next_out = arith.addi %out, %one : i64
+        scf.yield %rest, %rest_bits, %next_out : i64, i64, i64
+      } else {
+        scf.yield %merged, %merged_bits, %out : i64, i64, i64
+      }
+      scf.yield %r#0, %r#1, %r#2, %next_carry : i64, i64, i64, i64
+    }
+    %remaining = arith.cmpi sgt, %acc_final#1, %zero : i64
+    scf.if %remaining {
+      %digit = arith.andi %acc_final#0, %digit_mask : i64
+      %digit32 = arith.trunci %digit : i64 to i32
+      %dslot = arith.index_cast %acc_final#2 : i64 to index
+      memref.store %digit32, %digits[%dslot] : memref<?xi32>
+    }
+    func.call @__ly_long_normalize(%meta, %digits, %capacity) : (memref<2xi64>, memref<?xi32>, i64) -> ()
+    func.return %header : memref<2xi64>
+  }
+
+  func.func @LyLong_FromBytes(%bytes: memref<4xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.initializer = "from_bytes"} {
+    %length_slot = arith.constant 3 : index
+    %n = memref.load %bytes[%length_slot] : memref<4xi64>
+    %data = func.call @__ly_bytes_payload(%bytes) : (memref<4xi64>) -> memref<?xi8>
+    %false = arith.constant false
+    %r = func.call @__ly_long_from_bytes(%data, %n, %false, %false) : (memref<?xi8>, i64, i1, i1) -> memref<2xi64>
+    func.return %r : memref<2xi64>
+  }
+
+  func.func @LyLong_FromBytesOrder(%bytes: memref<4xi64> {ly.ownership.object_header}, %order_header: memref<2xi64> {ly.ownership.object_header}, %order_bytes: memref<?xi8>) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.initializer = "from_bytes"} {
+    %length_slot = arith.constant 3 : index
+    %n = memref.load %bytes[%length_slot] : memref<4xi64>
+    %data = func.call @__ly_bytes_payload(%bytes) : (memref<4xi64>) -> memref<?xi8>
+    %little = func.call @__ly_long_byteorder_little(%order_header, %order_bytes) : (memref<2xi64>, memref<?xi8>) -> i1
+    %false = arith.constant false
+    %r = func.call @__ly_long_from_bytes(%data, %n, %little, %false) : (memref<?xi8>, i64, i1, i1) -> memref<2xi64>
+    func.return %r : memref<2xi64>
+  }
+
+  func.func @LyLong_FromBytesSigned(%bytes: memref<4xi64> {ly.ownership.object_header}, %order_header: memref<2xi64> {ly.ownership.object_header}, %order_bytes: memref<?xi8>, %signed: i1) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.initializer = "from_bytes"} {
+    %length_slot = arith.constant 3 : index
+    %n = memref.load %bytes[%length_slot] : memref<4xi64>
+    %data = func.call @__ly_bytes_payload(%bytes) : (memref<4xi64>) -> memref<?xi8>
+    %little = func.call @__ly_long_byteorder_little(%order_header, %order_bytes) : (memref<2xi64>, memref<?xi8>) -> i1
+    %r = func.call @__ly_long_from_bytes(%data, %n, %little, %signed) : (memref<?xi8>, i64, i1, i1) -> memref<2xi64>
+    func.return %r : memref<2xi64>
+  }
+
 
   func.func private @__ly_long_bit_length(%meta: memref<2xi64>, %digits: memref<?xi32>) -> i64 {
     %zero = arith.constant 0 : i64
