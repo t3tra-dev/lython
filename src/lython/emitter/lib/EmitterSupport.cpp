@@ -730,8 +730,15 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
     }
 
     analysis.kind = IsInstanceAnalysis::Kind::UnionTest;
+    // ⭐ AND THE TRUE ARM KEEPS EVERY MEMBER THE TARGET MATCHES. With two
+    // subclasses of the target in the union (`File | Pipe | Rock` under
+    // `isinstance(t, Closer)`), the arm kept the whole union and `t.close()`
+    // was refused for Rock -- a member the test had just excluded. One member
+    // was the only case that narrowed.
     if (analysis.unionMembers.size() == 1)
       analysis.trueType = analysis.unionMembers.front();
+    else
+      analysis.trueType = types.join(analysis.unionMembers);
     // ⭐ WHAT IS LEFT, EVEN WHEN IT IS STILL SEVERAL. The false arm used to
     // narrow only down to a single member, so a union of four narrowed to
     // nothing after the first elimination and every guard after it started
@@ -977,8 +984,10 @@ IsInstanceAnalysis analyzeIsInstanceAny(mlir::Type sourceType,
   }
   merged.kind = IsInstanceAnalysis::Kind::UnionTest;
   merged.unionMembers.assign(selected.begin(), selected.end());
-  if (selected.size() == 1)
-    merged.trueType = selected.front();
+  // Several selected members are a sub-union, as one is a member; the arm
+  // takes it either way (`applyBranchNarrowing` unwraps to a sub-union).
+  merged.trueType = selected.size() == 1 ? selected.front()
+                                         : types.join(selected);
   if (unionType) {
     llvm::SmallVector<mlir::Type, 4> remaining;
     for (mlir::Type member : unionType.getMemberTypes())
@@ -1318,6 +1327,12 @@ optionalBranchTypeNarrowing(const parser::Node &test, TypeSystem &types,
   if (analysis.kind == IsInstanceAnalysis::Kind::UnionClassTest &&
       analysis.unionMembers.size() == 1)
     narrowing.trueSourceType = analysis.unionMembers.front();
+  // Several members the test keeps join at their common base (`join`); the
+  // value is the sub-union of them, which the arm unwraps and then upcasts.
+  if (analysis.kind == IsInstanceAnalysis::Kind::UnionTest &&
+      analysis.unionMembers.size() > 1)
+    narrowing.trueSourceType = py::UnionType::getNormalized(
+        &types.getContext(), analysis.unionMembers);
   if (!narrowing.trueType && !narrowing.falseType)
     return std::nullopt;
   return narrowing;

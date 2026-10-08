@@ -3336,8 +3336,37 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   }
   mlir::Type result = types.inferExpr(&expr);
   std::optional<mlir::Type> field = lookupClassField(object.type, *attr);
+  // ⭐ A FIELD NO INSTANCE CAN HOLD IS NOT READ. `name: str` declares a slot;
+  // a class line that binds `name = "R2"` and never stores `self.name` leaves
+  // it empty forever, and CPython's lookup -- the instance, then the class --
+  // finds the class attribute. The slot was read instead: a segfault on
+  // `Robot().name`.
+  if (field)
+    if (auto contract =
+            mlir::dyn_cast_if_present<py::ContractType>(object.type);
+        contract && classLineBindsReadable(contract.getContractName(), *attr) &&
+        (resolveClassAttrSlot(contract.getContractName(), *attr) ||
+         lookupClassStaticAttr(object.type, *attr)) &&
+        !fieldEverStored(contract.getContractName(), *attr))
+      field = std::nullopt;
   if (field)
     result = *field;
+
+  // A field a subclass answers without storing (a class attribute, a
+  // property) is the same unresolvable read as an overridden class
+  // attribute, and goes through the same dispatch and the same gate.
+  if (field && virtualPropertyBodyDepth == 0)
+    if (auto contract =
+            mlir::dyn_cast_if_present<py::ContractType>(object.type);
+        contract &&
+        subclassReadsFieldOtherwise(contract.getContractName(), *attr)) {
+      if (std::optional<Value> dispatched =
+              tryEmitVirtualFieldRead(expr, object, *attr, *field))
+        return *dispatched;
+      if (refuseUnresolvableDispatch(expr, object, *attr,
+                                     ast::node(expr, "value")))
+        return emitNone(expr);
+    }
 
   // Mutable class attributes read from the defining class's global cell
   // (instance receivers too, unless an instance field shadows the name).

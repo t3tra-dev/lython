@@ -547,6 +547,19 @@ void ModuleEmitter::applyBranchNarrowing(const parser::Node &anchor,
           auto unwrap = py::UnionUnwrapOp::create(
               builder, loc(anchor), narrowedUnion, found->second.value);
           found->second.value = unwrap.getResult();
+        } else if (auto sourceUnion =
+                       mlir::dyn_cast_if_present<py::UnionType>(sourceType);
+                   sourceUnion && mlir::isa<py::ContractType>(narrowed) &&
+                   llvm::all_of(sourceUnion.getMemberTypes(),
+                                [&](mlir::Type member) {
+                                  return unionType.hasMember(member);
+                                })) {
+          // The members kept share a base: the sub-union of them, upcast to
+          // it, as `def up(x: A | B) -> Base: return x` does.
+          auto unwrap = py::UnionUnwrapOp::create(
+              builder, loc(anchor), sourceUnion, found->second.value);
+          Value kept{unwrap.getResult(), sourceUnion};
+          found->second.value = coerceValue(kept, narrowed, anchor).value;
         } else if (sourceType && unionType.hasMember(sourceType)) {
           auto unwrap = py::UnionUnwrapOp::create(
               builder, loc(anchor), sourceType, found->second.value);

@@ -242,6 +242,12 @@ public:
     memberProofs = proofs;
     memberProofsSuppressed = suppressed;
   }
+  // Why a class does not satisfy a protocol, keyed "Class\0Protocol" by
+  // contract name (desugarProtocols fills it): what a refused call says when
+  // the parameter it missed is a protocol.
+  void setProtocolMisses(const llvm::StringMap<std::string> *misses) {
+    protocolMisses = misses;
+  }
   // True when the manifest class of the instance type `instance` declares
   // `methodName` as a CLASSMETHOD in every overload -- its first parameter is
   // the class object -- so `instance.methodName(...)` is the class's call.
@@ -521,6 +527,7 @@ private:
   mlir::MLIRContext &context;
   mutable InferenceContext inferenceState;
   const llvm::StringMap<mlir::Type> *memberProofs = nullptr;
+  const llvm::StringMap<std::string> *protocolMisses = nullptr;
   const bool *memberProofsSuppressed = nullptr;
   llvm::StringSet<llvm::MallocAllocator> importedModuleLocalNames;
   // The module names each pushed scope bound, beside `scopes`: a module name

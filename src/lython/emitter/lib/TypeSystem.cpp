@@ -1436,6 +1436,18 @@ constexpr NameAliasImport kNameAliasImports[] = {
     {"typing_extensions", "ClassVar", "typing.ClassVar", true},
     {"typing", "Final", "typing.Final", true},
     {"typing_extensions", "Final", "typing.Final", true},
+    // ⭐ The checker's decorators, which `checkDecorators` already recognized
+    // while their import was refused: `from typing import final` stopped at
+    // "unsupported import 'typing.final'" before the `@final` it names was
+    // read. `runtime_checkable` is what decides isinstance() against a
+    // Protocol (desugarProtocols).
+    {"typing", "final", "typing.final", false},
+    {"typing_extensions", "final", "typing.final", false},
+    {"typing", "override", "typing.override", false},
+    {"typing_extensions", "override", "typing.override", false},
+    {"typing", "runtime_checkable", "typing.runtime_checkable", false},
+    {"typing_extensions", "runtime_checkable", "typing.runtime_checkable",
+     false},
 };
 
 constexpr ModuleStringConstantImport kModuleStringConstantImports[] = {
@@ -2964,6 +2976,13 @@ bool TypeSystem::bindImportedName(llvm::StringRef module,
   // `@overload` and `@final` already carry: the marker constrains a CHECKER,
   // and this compiler's checker is its type system.
   if (module == "abc" && exportedName == "ABC") {
+    bindClass(localName, contract("builtins.object"));
+    return true;
+  }
+  // `Protocol` is consumed as a base before anything binds (desugarProtocols);
+  // the import itself names it, and is bound as `ABC` is.
+  if ((module == "typing" || module == "typing_extensions") &&
+      exportedName == "Protocol") {
     bindClass(localName, contract("builtins.object"));
     return true;
   }
@@ -5306,8 +5325,30 @@ CallInferenceResult TypeSystem::inferCallWithEvidence(
     // does not have and which two same-signature functions would make
     // ambiguous. The limitation and its shape are in
     // tests/probe/wb_argument_boundary_numeric_tower.py.
-    return unresolvedCallable(
-        calleeType, "call arguments do not match the Callable contract");
+    std::string reason = "call arguments do not match the Callable contract";
+    if (protocolMisses)
+      for (auto [index, argument] : llvm::enumerate(positional)) {
+        if (index >= callable.getPositionalTypes().size())
+          break;
+        auto given = mlir::dyn_cast_if_present<py::ContractType>(
+            widenLiteral(argument));
+        auto wanted = mlir::dyn_cast_if_present<py::ContractType>(
+            callable.getPositionalTypes()[index]);
+        if (!given || !wanted)
+          continue;
+        auto miss = protocolMisses->find(
+            (given.getContractName() + llvm::Twine('\0') +
+             wanted.getContractName())
+                .str());
+        if (miss != protocolMisses->end()) {
+          reason += "; argument " + std::to_string(index + 1) + " ('" +
+                    given.getContractName().str() +
+                    "') does not satisfy the protocol '" +
+                    wanted.getContractName().str() + "': " + miss->second;
+          break;
+        }
+      }
+    return unresolvedCallable(calleeType, reason);
   }
   if (auto overload = mlir::dyn_cast_if_present<py::OverloadType>(calleeType)) {
     llvm::SmallVector<py::CallableType, 4> callables;
