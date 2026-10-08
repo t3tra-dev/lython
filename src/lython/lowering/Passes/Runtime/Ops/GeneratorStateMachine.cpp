@@ -800,7 +800,8 @@ mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorArgumentOperands(
         RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*source)) {
       builder.setInsertionPoint(op);
       if (mlir::failed(RuntimeBundleLowerer::appendBundlePhysicalOperands(
-              op, *source, lane->physicalTypes, operands)))
+              op, *source, runtimeContractType(context, lane->contract),
+              lane->physicalTypes, operands)))
         return mlir::failure();
       if (mlir::failed(appendWord()))
         return mlir::failure();

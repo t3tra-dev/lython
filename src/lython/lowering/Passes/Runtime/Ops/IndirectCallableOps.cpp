@@ -139,7 +139,7 @@ RuntimeBundleLowerer::collectIndirectCallableTargets(
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::appendBundlePhysicalOperands(
-    mlir::Operation *op, const RuntimeBundle &bundle,
+    mlir::Operation *op, const RuntimeBundle &bundle, mlir::Type destination,
     llvm::ArrayRef<mlir::Type> expectedTypes,
     llvm::SmallVectorImpl<mlir::Value> &operands) {
   llvm::ArrayRef<mlir::Value> values = bundle.physicalValues();
@@ -157,7 +157,7 @@ mlir::LogicalResult RuntimeBundleLowerer::appendBundlePhysicalOperands(
                                                 value->values);
     boxed.copyEvidenceFrom(bundle);
     return RuntimeBundleLowerer::appendBundlePhysicalOperands(
-        op, boxed, expectedTypes, operands);
+        op, boxed, destination, expectedTypes, operands);
   }
   if (values.empty() &&
       RuntimeBundleLowerer::hasLazyPrimitiveI64Object(bundle)) {
@@ -169,7 +169,18 @@ mlir::LogicalResult RuntimeBundleLowerer::appendBundlePhysicalOperands(
     materializedObject = std::move(*value);
     values = materializedObject->values;
   }
-  if (values.size() == expectedTypes.size()) {
+  // ⭐ AN `object` IS A BOX, ASKED OF THE DESTINATION AND NOT OF THE LANES.
+  // An instance's header is five words, as wide as a box, so the exact-type
+  // match below took it for one: `k: object = P(0)` joined with a P made in
+  // an `if` arm handed the join the instance's header, whose word 2 is its
+  // field block where a box keeps the entity -- and the repr that read it
+  // crashed, or a dict stored the field block as the key.
+  bool boxIntoObject =
+      destination &&
+      RuntimeBundleLowerer::isBuiltinsObjectContract(destination) &&
+      bundle.kind == RuntimeBundle::Kind::Object &&
+      !RuntimeBundleLowerer::isBuiltinsObjectContract(bundle.contract);
+  if (values.size() == expectedTypes.size() && !boxIntoObject) {
     bool exact = true;
     for (auto [value, expected] : llvm::zip(values, expectedTypes)) {
       if (value.getType() != expected) {
@@ -775,7 +786,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
     }
     llvm::SmallVector<mlir::Value, 4> branchOperands;
     if (mlir::failed(RuntimeBundleLowerer::appendBundlePhysicalOperands(
-            op, targetResult, *resultTypes, branchOperands)))
+            op, targetResult, op.getResult(0).getType(), *resultTypes,
+            branchOperands)))
       return mlir::failure();
     if (RuntimeBundleLowerer::hasPrimitiveI64ABI(op.getResult(0).getType())) {
       if (targetResult.primitiveI64) {
