@@ -39,6 +39,26 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::emitSourceClassReprCall(
   return true;
 }
 
+// The bundle a special method of `argument` is asked of: the concrete value
+// behind a box, whose static class decides the method -- except a program
+// class's instance seen as `object`. That was made as its static class but
+// may be a subclass (`def mk() -> A` handing back a B), so its box, which
+// asks the type object the instance points at, answers instead: `print(x)`
+// printed A's repr for a B.
+const RuntimeBundle *
+RuntimeBundleLowerer::specialMethodReceiver(const RuntimeBundle &argument) {
+  const RuntimeBundle *concrete =
+      RuntimeBundleLowerer::concreteObjectForOwnership(argument);
+  if (!concrete)
+    return &argument;
+  if (concrete != &argument && isBuiltinsObjectContract(argument.contract))
+    if (py::ClassOp classOp = classForContract(concrete->contract))
+      if (classOp->hasAttr("ly.class.source") &&
+          !exceptionAncestorContract(classOp))
+        return &argument;
+  return concrete;
+}
+
 namespace {
 
 // ⭐ KEEP THE TYPE ARGUMENTS THE OP'S OWN RESULT ALREADY CARRIES. The manifest
@@ -175,9 +195,7 @@ RuntimeBundleLowerer::lowerBuiltinMethodCall(py::CallOp op,
   if (mlir::failed(collectSingleBuiltinArgument(op, symbol, argument)))
     return mlir::failure();
   const RuntimeBundle *receiver =
-      RuntimeBundleLowerer::concreteObjectForOwnership(*argument);
-  if (!receiver)
-    receiver = argument;
+      RuntimeBundleLowerer::specialMethodReceiver(*argument);
 
   if (symbol.builtinName == "repr" && symbol.builtinMethod == "__repr__") {
     RuntimeBundle rendered;
@@ -347,9 +365,7 @@ RuntimeBundleLowerer::lowerBuiltinMethodSinkCall(py::CallOp op,
   if (mlir::failed(collectSingleBuiltinArgument(op, symbol, argument)))
     return mlir::failure();
   const RuntimeBundle *sinkArgument =
-      RuntimeBundleLowerer::concreteObjectForOwnership(*argument);
-  if (!sinkArgument)
-    sinkArgument = argument;
+      RuntimeBundleLowerer::specialMethodReceiver(*argument);
 
   RuntimeBundle printable = *sinkArgument;
   // User exception classes have no manifest methods of their own but share

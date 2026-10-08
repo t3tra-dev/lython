@@ -616,6 +616,7 @@ private:
                                  const RuntimeBundle &source) const;
   const RuntimeBundle *
   concreteObjectForOwnership(const RuntimeBundle &bundle) const;
+  const RuntimeBundle *specialMethodReceiver(const RuntimeBundle &argument);
   mlir::FailureOr<RuntimeBundle> boxRuntimeObject(mlir::Operation *op,
                                                   const RuntimeBundle &source,
                                                   bool retainPayload);
@@ -1928,7 +1929,10 @@ private:
                                            mlir::ValueRange values,
                                            RuntimeBundle &result);
   mlir::LogicalResult
+  // `destination` is the logical type the operands are handed over as: an
+  // `object` is a box whatever the source's lanes look like.
   appendBundlePhysicalOperands(mlir::Operation *op, const RuntimeBundle &bundle,
+                               mlir::Type destination,
                                mlir::ArrayRef<mlir::Type> expectedTypes,
                                llvm::SmallVectorImpl<mlir::Value> &operands);
   mlir::LogicalResult ensureValueBundle(mlir::Operation *op, mlir::Value value);

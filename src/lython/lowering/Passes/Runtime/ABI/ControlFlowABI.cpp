@@ -685,7 +685,8 @@ mlir::LogicalResult RuntimeBundleLowerer::spliceControlFlowBlockArgumentEdges(
               physicalOperands)))
         return mlir::failure();
     } else if (mlir::failed(RuntimeBundleLowerer::appendBundlePhysicalOperands(
-                   anchor, *source, physicalTypes, physicalOperands))) {
+                   anchor, *source, argument.getType(), physicalTypes,
+                   physicalOperands))) {
       return mlir::failure();
     }
 
@@ -1197,9 +1198,11 @@ RuntimeBundleLowerer::lowerRuntimeValueSelect(mlir::arith::SelectOp select) {
   llvm::SmallVector<mlir::Value, 8> trueValues;
   llvm::SmallVector<mlir::Value, 8> falseValues;
   if (mlir::failed(RuntimeBundleLowerer::appendBundlePhysicalOperands(
-          select, trueBundle, *physicalTypes, trueValues)) ||
+          select, trueBundle, result.getType(), *physicalTypes,
+          trueValues)) ||
       mlir::failed(RuntimeBundleLowerer::appendBundlePhysicalOperands(
-          select, falseBundle, *physicalTypes, falseValues)))
+          select, falseBundle, result.getType(), *physicalTypes,
+          falseValues)))
     return mlir::failure();
   if (trueValues.size() != falseValues.size())
     return select.emitError()

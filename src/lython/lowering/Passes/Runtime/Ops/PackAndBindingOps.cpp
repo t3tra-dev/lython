@@ -897,6 +897,39 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
         runtimeContractName(resultValue.getType()) == "builtins.object" &&
         runtimeContractName(inputBundle->objectValue.contract) !=
             "builtins.object";
+    // ⭐ AN INSTANCE SEEN AS `object` IS BOXED HERE, because what the static
+    // type knew is the class it was MADE as, not the class it is: a
+    // `def mk() -> A` may hand back a B. Kept as the A, every special method
+    // asked of the `object` was answered by A's -- `print(x)` printed A's
+    // repr for a B, `repr(x)` fell back to the default repr past the class's
+    // own `__repr__`, `str(x)` found no `A.__str__` at all -- where a box
+    // asks the type object the instance points at. The concrete value stays
+    // the box's evidence, so narrowing it back costs nothing.
+    // ⛔ Not for a value of a runtime class: none of those can be subclassed
+    // by a program, so its static class is its class, and an int or a str
+    // boxed at every upcast would be an allocation for nothing.
+    // ⛔ Not for an exception: its repr and name already read the class from
+    // the instance (`repr_by_id`).
+    py::ClassOp sourceClass =
+        RuntimeBundleLowerer::classForContract(inputBundle->objectValue.contract);
+    if (upcastToObject && sourceClass &&
+        sourceClass->hasAttr("ly.class.source") &&
+        !RuntimeBundleLowerer::exceptionAncestorContract(sourceClass) &&
+        !inputBundle->physicalValues().empty()) {
+      builder.setInsertionPoint(op);
+      mlir::FailureOr<RuntimeBundle> boxed =
+          RuntimeBundleLowerer::boxRuntimeObject(op, *inputBundle,
+                                                 /*retainPayload=*/true);
+      if (mlir::failed(boxed))
+        return mlir::failure();
+      RuntimeBundle concrete = *inputBundle;
+      concrete.setObjectLogicalOwnership(/*ownsObject=*/false);
+      RuntimeBundle result = std::move(*boxed);
+      result.boxedObject = std::make_shared<RuntimeBundle>(std::move(concrete));
+      valueBundles[resultValue] = std::move(result);
+      erase.push_back(op);
+      return mlir::success();
+    }
     if (!upcastToObject &&
         expectedTypes->size() <= inputBundle->physicalValues().size()) {
       bool prefixMatches = true;
