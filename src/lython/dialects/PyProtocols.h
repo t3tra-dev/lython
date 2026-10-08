@@ -106,6 +106,9 @@ struct ProtocolInfo {
   std::string fieldsSpecAttrName;
   std::string fieldsSpecViaBase;
   bool isProtocol = false;
+  // Loaded from a runtime manifest (not registered by the emitter for a
+  // program class).
+  bool fromManifest = false;
   bool isAbstract = false;
   bool isFinal = false;
   // `ly.typing.keeps_arguments`: the constructor stores the objects it is
@@ -310,6 +313,11 @@ private:
                            llvm::StringRef methodName, unsigned depth,
                            std::vector<ProtocolMethod> &out) const;
   std::map<std::string, ProtocolInfo> classes;
+  // A manifest protocol a program class of the same name displaced: the
+  // protocol's entry moved to this key, and every manifest base naming it
+  // was rewritten to it (`registerClass`). Read through `keyForProtocol`.
+  std::map<std::string, std::string> protocolKeys;
+  std::string keyForProtocol(llvm::StringRef name) const;
   std::map<std::string, std::map<std::string, std::string>>
       classExportsByModule;
   std::map<std::string, std::vector<std::string>> callableExportsByModule;
