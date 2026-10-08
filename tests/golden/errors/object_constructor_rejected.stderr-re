@@ -1,1 +1,1 @@
-error: .object\(\). cannot be constructed: a bare object shares the runtime class id of the None singleton
+error: .object\(\). cannot be constructed yet: a bare object has no runtime allocation of its own

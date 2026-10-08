@@ -1048,9 +1048,15 @@ bool RuntimeBundleLowerer::usesInheritedObjectDunder(
       (symbol.contract != "builtins.object" || symbol.role != "method" ||
        !RuntimeBundleLowerer::isInheritedObjectDunder(symbol.name)))
     return false;
+  // ⭐ None too: it has no lanes, and its box holds the None object
+  // (`objectPayloadClassEntity`), so `xs[0] == None` over a list[object]
+  // reaches object.__eq__ with two boxes like any other comparison.
+  bool none = source.kind == RuntimeBundle::Kind::Object &&
+              runtimeContractName(source.contract) ==
+                  "types.NoneType";
   if (source.kind != RuntimeBundle::Kind::Object ||
       RuntimeBundleLowerer::isBuiltinsObjectContract(source.contract) ||
-      source.physicalValues().empty())
+      (source.physicalValues().empty() && !none))
     return false;
   // ⭐ A BUILTIN VALUE NEEDS THE BOX FOR THE SAME REASON A SOURCE INSTANCE DOES.
   // object.__eq__ compares two payload boxes and dispatches on the box's class
@@ -2378,7 +2384,11 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
     // conforming boxed one for the same class.
     if (!classId || !conforms(function))
       return;
-    if (!dispatchable(*classId)) {
+    // `builtins.object`'s method takes the BOX, so it is the class-0 (None)
+    // arm below, never an arm rebuilt from a slot -- chosen by name, since
+    // object's own number is no longer 0.
+    if (contractAttr.getValue() == "builtins.object" ||
+        !dispatchable(*classId)) {
       if (!objectFallback && function.getFunctionType().getNumInputs() == 1)
         objectFallback = function;
       return;
@@ -2568,9 +2578,9 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
       builder.setInsertionPointToStart(handle);
       auto boxType = mlir::cast<mlir::MemRefType>(
           objectFallback.getFunctionType().getInput(0));
-      // Class 0 in a slot is None (its entity is 0), and the `builtins.object`
-      // method wants a standalone box: one is built on the stack around the
-      // slot's entity (see `borrowedBoxOfSlotEntity`).
+      // Class 0 in a slot is None (its entity is the None object), and the
+      // `builtins.object` method wants a standalone box: one is built on the
+      // stack around the slot's entity (see `borrowedBoxOfSlotEntity`).
       mlir::Value entity =
           mlir::LLVM::LoadOp::create(builder, loc, i64, hook.getArgument(0))
               .getResult();
