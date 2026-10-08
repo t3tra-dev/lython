@@ -724,6 +724,280 @@ bool ModuleEmitter::subclassReadsFieldOtherwise(
                             fieldName);
 }
 
+namespace {
+bool mentionsName(const parser::Node &node, llvm::StringRef name) {
+  if (node.kind == "Name" && llvm::StringRef(ast::nameSpelling(node)) == name)
+    return true;
+  for (const parser::Field &field : node.fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child && mentionsName(**child, name))
+        return true;
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &item : *children)
+        if (item && mentionsName(*item, name))
+          return true;
+    }
+  }
+  return false;
+}
+// Whether `self` can reach code other than this statement: any mention of it
+// except a read of a field already stored (`self.a` once `self.a = ...` ran),
+// which reads the instance and hands it to nothing. A method call through it
+// (`self.f()`), a property, or `self` itself as a value all escape.
+bool selfEscapes(const parser::Node &node, llvm::StringRef self,
+                 const llvm::StringSet<> &stored) {
+  if (node.kind == "Attribute")
+    if (const parser::Node *owner = ast::node(node, "value");
+        owner && owner->kind == "Name" &&
+        llvm::StringRef(ast::nameSpelling(*owner)) == self)
+      return !stored.contains(ast::string(node, "attr").value_or(""));
+  if (node.kind == "Call")
+    if (const parser::Node *callee = ast::node(node, "func");
+        callee && callee->kind == "Attribute")
+      if (const parser::Node *owner = ast::node(*callee, "value");
+          owner && owner->kind == "Name" &&
+          llvm::StringRef(ast::nameSpelling(*owner)) == self)
+        return true;
+  if (node.kind == "Name" && llvm::StringRef(ast::nameSpelling(node)) == self)
+    return true;
+  for (const parser::Field &field : node.fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child && selfEscapes(**child, self, stored))
+        return true;
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &item : *children)
+        if (item && selfEscapes(*item, self, stored))
+          return true;
+    }
+  }
+  return false;
+}
+} // namespace
+
+// The fields a construction of `cls` has stored by the time `self` can be
+// seen by anything but `__init__`'s own straight-line prefix: the walk takes
+// `self.x = <no self>` and a `super().__init__(...)` / `Base.__init__(self,
+// ...)` that passes nothing else of self, and stops at the first statement
+// that mentions self any other way -- a method call, a self-reading value, a
+// branch. A field it reaches is stored before any code that could read it
+// runs, so its reads need no test.
+//
+// ⛔ A branch stops the walk even when both arms store: the cheap answer is
+// the conservative one, and the cost of being conservative is a compare.
+std::optional<llvm::StringSet<>>
+ModuleEmitter::fieldsStoredByConstruction(llvm::StringRef cls) {
+  if (auto memo = constructionStoreMemo.find(cls);
+      memo != constructionStoreMemo.end())
+    return memo->second;
+  // A cycle (a class that names itself) answers "nothing" while it is open.
+  constructionStoreMemo[cls] = llvm::StringSet<>{};
+  std::optional<llvm::StringSet<>> answer = llvm::StringSet<>{};
+  auto node = declaredClassNodes.find(cls);
+  if (node == declaredClassNodes.end() || !node->second) {
+    constructionStoreMemo[cls] = answer;
+    return answer;
+  }
+  const parser::Node &classDef = *node->second;
+  // Constructions this walk does not read: every field is a parameter of a
+  // synthesized __init__.
+  if (const auto *decorators = ast::nodeList(classDef, "decorator_list"))
+    for (const parser::NodePtr &decorator : *decorators) {
+      if (!decorator)
+        continue;
+      const parser::Node *callee = decorator->kind == "Call"
+                                       ? ast::node(*decorator, "func")
+                                       : decorator.get();
+      std::string spelled = ast::qualifiedName(callee);
+      if (llvm::StringRef(spelled).ends_with("dataclass")) {
+        constructionStoreMemo[cls] = std::nullopt;
+        return std::nullopt;
+      }
+    }
+  if (const auto *bases = ast::nodeList(classDef, "bases"))
+    for (const parser::NodePtr &base : *bases)
+      if (base &&
+          llvm::StringRef(ast::qualifiedName(base.get())).ends_with("NamedTuple")) {
+        constructionStoreMemo[cls] = std::nullopt;
+        return std::nullopt;
+      }
+  auto firstSourceBase = [&]() -> std::optional<std::string> {
+    auto bases = declaredClassBases.find(cls);
+    if (bases == declaredClassBases.end())
+      return std::nullopt;
+    for (const std::string &base : bases->second)
+      if (declaredClassNodes.count(base))
+        return base;
+    return std::nullopt;
+  };
+  const parser::Node *init = nullptr;
+  if (const auto *body = ast::nodeList(classDef, "body"))
+    for (const parser::NodePtr &member : *body)
+      if (member && member->kind == "FunctionDef" &&
+          ast::string(*member, "name").value_or("") == "__init__")
+        init = member.get();
+  if (!init) {
+    if (std::optional<std::string> base = firstSourceBase())
+      answer = fieldsStoredByConstruction(*base);
+    constructionStoreMemo[cls] = answer;
+    return answer;
+  }
+  std::string self = "self";
+  if (const parser::Node *args = ast::node(*init, "args"))
+    if (const auto *positional = ast::nodeList(*args, "args");
+        positional && !positional->empty() && positional->front())
+      self = std::string(ast::nameSpelling(*positional->front()));
+  auto storedName = [&](const parser::Node *target) -> std::optional<std::string> {
+    if (!target || target->kind != "Attribute")
+      return std::nullopt;
+    const parser::Node *owner = ast::node(*target, "value");
+    if (!owner || owner->kind != "Name" || ast::nameSpelling(*owner) != self)
+      return std::nullopt;
+    if (auto attr = ast::string(*target, "attr"))
+      return std::string(*attr);
+    return std::nullopt;
+  };
+  auto merge = [&](const std::optional<llvm::StringSet<>> &more) {
+    if (!more) {
+      answer = std::nullopt;
+      return;
+    }
+    if (answer)
+      for (const auto &entry : *more)
+        answer->insert(entry.getKey());
+  };
+  if (const auto *statements = ast::nodeList(*init, "body"))
+    for (const parser::NodePtr &statement : *statements) {
+      if (!statement)
+        continue;
+      if (statement->kind == "Pass")
+        continue;
+      if (statement->kind == "Assign" || statement->kind == "AnnAssign") {
+        const parser::Node *value = ast::node(*statement, "value");
+        llvm::SmallVector<std::string, 2> names;
+        bool allFields = true;
+        if (statement->kind == "Assign") {
+          if (const auto *targets = ast::nodeList(*statement, "targets"))
+            for (const parser::NodePtr &target : *targets) {
+              std::optional<std::string> name = storedName(target.get());
+              if (!name)
+                allFields = false;
+              else
+                names.push_back(*name);
+            }
+        } else if (std::optional<std::string> name =
+                       storedName(ast::node(*statement, "target"))) {
+          names.push_back(*name);
+        } else {
+          allFields = false;
+        }
+        static const llvm::StringSet<> kNothing;
+        if (allFields && !names.empty() && value &&
+            !selfEscapes(*value, self, answer ? *answer : kNothing)) {
+          if (answer)
+            for (const std::string &name : names)
+              answer->insert(name);
+          continue;
+        }
+      }
+      if (statement->kind == "Expr")
+        if (const parser::Node *call = ast::node(*statement, "value");
+            call && call->kind == "Call") {
+          const parser::Node *callee = ast::node(*call, "func");
+          const auto *args = ast::nodeList(*call, "args");
+          bool superInit = false;
+          std::optional<std::string> named;
+          if (callee && callee->kind == "Attribute" &&
+              ast::string(*callee, "attr").value_or("") == "__init__") {
+            const parser::Node *owner = ast::node(*callee, "value");
+            if (owner && owner->kind == "Call")
+              if (const parser::Node *superName = ast::node(*owner, "func");
+                  superName && superName->kind == "Name" &&
+                  ast::nameSpelling(*superName) == "super")
+                superInit = true;
+            if (owner && owner->kind == "Name")
+              named = canonicalClassName(ast::nameSpelling(*owner));
+          }
+          bool othersClean = true;
+          if (args)
+            for (auto [index, argument] : llvm::enumerate(*args)) {
+              if (!argument)
+                continue;
+              bool receiver = named && index == 0 &&
+                              argument->kind == "Name" &&
+                              ast::nameSpelling(*argument) == self;
+              if (!receiver && mentionsName(*argument, self))
+                othersClean = false;
+            }
+          if (othersClean && superInit) {
+            if (std::optional<std::string> base = firstSourceBase())
+              merge(fieldsStoredByConstruction(*base));
+            continue;
+          }
+          if (othersClean && named && declaredClassNodes.count(*named) &&
+              args && !args->empty()) {
+            merge(fieldsStoredByConstruction(*named));
+            continue;
+          }
+        }
+      static const llvm::StringSet<> kNone;
+      if (statement->kind == "Return" ||
+          selfEscapes(*statement, self, answer ? *answer : kNone))
+        break;
+    }
+  constructionStoreMemo[cls] = answer;
+  return answer;
+}
+
+bool ModuleEmitter::fieldAlwaysStoredBeforeRead(llvm::StringRef cls,
+                                                llvm::StringRef field) {
+  // The receiver may be an instance of `cls` or of any subclass, and each
+  // constructs itself.
+  llvm::SmallVector<std::string, 8> classes;
+  if (!protocolClassNames.contains(cls))
+    classes.push_back(cls.str());
+  for (const auto &entry : declaredClassBases) {
+    llvm::StringRef candidate = entry.getKey();
+    if (candidate == cls)
+      continue;
+    llvm::SmallVector<llvm::StringRef, 8> worklist{candidate};
+    llvm::StringSet<> seen;
+    bool derived = false;
+    while (!worklist.empty() && !derived) {
+      auto bases = declaredClassBases.find(worklist.pop_back_val());
+      if (bases == declaredClassBases.end())
+        continue;
+      for (const std::string &base : bases->second) {
+        if (base == cls)
+          derived = true;
+        if (seen.insert(base).second)
+          worklist.push_back(base);
+      }
+    }
+    if (derived)
+      classes.push_back(candidate.str());
+  }
+  for (const std::string &each : classes) {
+    if (!declaredClassNodes.count(each))
+      continue;
+    std::optional<llvm::StringSet<>> stored = fieldsStoredByConstruction(each);
+    if (stored && !stored->contains(field))
+      return false;
+  }
+  return true;
+}
+
+void ModuleEmitter::markFieldReadMaybeUnset(mlir::Operation *read,
+                                            mlir::Type objectType,
+                                            llvm::StringRef field) {
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(objectType);
+  if (!read || !contract || !declaredClassNodes.count(contract.getContractName()))
+    return;
+  if (!fieldAlwaysStoredBeforeRead(contract.getContractName(), field))
+    read->setAttr("ly.field.maybe_unset", builder.getUnitAttr());
+}
+
 bool ModuleEmitter::classLineBindsReadable(llvm::StringRef cls,
                                            llvm::StringRef name) const {
   llvm::SmallVector<llvm::StringRef, 8> line{cls};

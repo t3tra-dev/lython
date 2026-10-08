@@ -762,6 +762,7 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
         auto attrGet = py::AttrGetOp::create(
             builder, loc(statement), *field, narrowed.value, attrName);
         attrGet->setAttr("ly.attr.kind", builder.getStringAttr("field"));
+        markFieldReadMaybeUnset(attrGet, narrowed.type, attrName);
         if (auto contract =
                 mlir::dyn_cast_if_present<py::ContractType>(narrowed.type))
           attrGet->setAttr("ly.attr.owner",

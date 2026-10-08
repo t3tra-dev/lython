@@ -1709,6 +1709,27 @@ mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeClassObjectValue(
                              builder, loc, box_abi::kInstanceBodyWord)
                              .getResult();
   mlir::memref::StoreOp::create(builder, loc, bodyWord, header, bodySlot);
+  // ⛔ After the header: the body begins at word 3, which
+  // `initializeObjectHeader` zeroes, so a mark written before it was erased.
+  if (body) {
+    // ⭐ A bool field's word is 0 or 1 once stored, so 2 says "never stored"
+    // -- the zero that says it for a boxed field is False here. The read
+    // tests for it where the emitter could not prove a store came first.
+    llvm::SmallVector<mlir::Type, 8> fieldTypes =
+        RuntimeBundleLowerer::classFieldContractTypes(classOp);
+    for (unsigned index = 0; index < fieldTypes.size(); ++index) {
+      if (runtimeContractName(fieldTypes[index]) != "builtins.bool")
+        continue;
+      std::optional<unsigned> word =
+          RuntimeBundleLowerer::classFieldBodyWord(classOp, index);
+      if (!word)
+        continue;
+      mlir::Value unsetMark =
+          mlir::arith::ConstantIntOp::create(builder, loc, 2, 64);
+      mlir::Value slot = mlir::arith::ConstantIndexOp::create(builder, loc, *word);
+      mlir::memref::StoreOp::create(builder, loc, unsetMark, body, slot);
+    }
+  }
 
   llvm::SmallVector<mlir::Type, 8> fieldContractTypes =
       RuntimeBundleLowerer::classFieldContractTypes(classOp);

@@ -411,6 +411,7 @@ void ModuleEmitter::recordClassBodyDeclarations(llvm::StringRef name,
   auto &attributes = declaredClassAttributes[name];
   auto &readable = declaredClassReadableNames[name];
   auto &stored = declaredClassStoredFields[name];
+  declaredClassNodes[name] = &classDef;
   const auto *classBody = ast::nodeList(classDef, "body");
   if (!classBody)
     return;

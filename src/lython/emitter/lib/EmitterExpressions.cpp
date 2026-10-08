@@ -3459,8 +3459,10 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
 
   auto op =
       py::AttrGetOp::create(builder, loc(expr), result, object.value, *attr);
-  if (field)
+  if (field) {
     op->setAttr("ly.attr.kind", builder.getStringAttr("field"));
+    markFieldReadMaybeUnset(op, object.type, *attr);
+  }
   else if (staticAttr)
     op->setAttr("ly.attr.kind", builder.getStringAttr("static"));
   else if (methodBinding)

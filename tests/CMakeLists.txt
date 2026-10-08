@@ -618,6 +618,9 @@ set(LYTHON_LEAK_GATE_RUNNER "${CMAKE_CURRENT_SOURCE_DIR}/leak_gate.py")
 #     dict literal family whose dict side was repaired earlier and which
 #     rfc/test-suite-debt.md listed as still leaking. Both are net zero now.
 set(LYTHON_LEAK_GATE_CASES
+    # A field read that raises because no store filled it: the instance it
+    # was read from is released on the way out.
+    a_field_read_before_its_store_raises
     # Protocol values are class instances (desugarProtocols), counted as
     # any; a union narrowed to its members' base is a view of the header the
     # union owns.

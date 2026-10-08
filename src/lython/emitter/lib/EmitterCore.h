@@ -1460,6 +1460,20 @@ private:
   llvm::StringMap<llvm::StringSet<>> declaredClassStoredFields;
   void recordClassBodyDeclarations(llvm::StringRef name,
                                    const parser::Node &classDef);
+  // Every program class's ClassDef, by the name the declaration maps use.
+  llvm::StringMap<const parser::Node *> declaredClassNodes;
+  // The fields every construction of `cls` stores before `self` can escape
+  // (EmitterClasses.cpp); nullopt when construction is not this walk's to
+  // read (a dataclass, a NamedTuple), which means every field.
+  std::optional<llvm::StringSet<>>
+  fieldsStoredByConstruction(llvm::StringRef cls);
+  llvm::StringMap<std::optional<llvm::StringSet<>>> constructionStoreMemo;
+  // Whether a read of `field` through a value of static class `cls` -- an
+  // instance of it or of any subclass -- always follows a store.
+  bool fieldAlwaysStoredBeforeRead(llvm::StringRef cls, llvm::StringRef field);
+  // Marks a field read the lowering must test for an empty slot.
+  void markFieldReadMaybeUnset(mlir::Operation *read, mlir::Type objectType,
+                               llvm::StringRef field);
   // How many except handler bodies enclose the statement being emitted. A bare
   // `raise` re-raises what a handler caught, so at zero there is nothing to
   // re-raise -- the question the lowering cannot ask, because `py.try`'s

@@ -510,6 +510,7 @@ ModuleEmitter::emitValueAttribute(const parser::Node &anchor, Value object,
   auto op = py::AttrGetOp::create(builder, loc(anchor), *field, object.value,
                                   attr);
   op->setAttr("ly.attr.kind", builder.getStringAttr("field"));
+  markFieldReadMaybeUnset(op, object.type, attr);
   if (auto contract =
           mlir::dyn_cast_if_present<py::ContractType>(object.type))
     op->setAttr("ly.attr.owner",
