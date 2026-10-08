@@ -1303,10 +1303,33 @@ ModuleEmitter::tryEmitDictMethodSugar(const parser::Node &expr,
     return result;
   }
 
-  if (*attr != "get" && *attr != "setdefault" && *attr != "popitem")
+  bool popWithDefault = *attr == "pop" && argCount == 2;
+  bool popOnly = *attr == "pop" && argCount == 1;
+  if (*attr != "get" && *attr != "setdefault" && *attr != "popitem" &&
+      !popWithDefault && !popOnly)
     return std::nullopt;
   if (!isDictTypedExpr(receiver.get()))
     return std::nullopt;
+  // ⭐ pop(k) over a value the native pop cannot rebuild -- a union or
+  // `object`, which its slot shapes do not cover -- is `d[k]` then `del d[k]`,
+  // both of which read and drop such a value; `m.pop("y")` over a
+  // `dict[str, int | None]` was "runtime manifest has no builtins.dict.pop
+  // method" at the lowering. A miss raises KeyError(k) from the read, as
+  // CPython's pop does.
+  //
+  // ⛔ Not for every value: the native pop removes and returns in one probe.
+  if (popOnly) {
+    auto dictContract = mlir::dyn_cast_if_present<py::ContractType>(
+        types.widenLiteral(types.inferExpr(receiver.get())));
+    if (!dictContract || dictContract.getArguments().size() != 2)
+      return std::nullopt;
+    mlir::Type value = dictContract.getArguments()[1];
+    auto valueContract = mlir::dyn_cast<py::ContractType>(value);
+    bool nativeValue = valueContract &&
+                       valueContract.getContractName() != "builtins.object";
+    if (nativeValue || !(*args)[0] || (*args)[0]->kind == "Starred")
+      return std::nullopt;
+  }
   // get with a default of the VALUE type has a native lowering; the
   // one-argument form and a default of any other type desugar here.
   //
@@ -1316,7 +1339,9 @@ ModuleEmitter::tryEmitDictMethodSugar(const parser::Node &expr,
   // `m.get(k, [])` all reached the lowering as "runtime manifest has no
   // builtins.dict.get method". The one-argument desugar is that overload with
   // None for the default.
-  if (*attr == "get" && argCount != 1) {
+  // ⭐ pop(k, default) is the same overload: `d.pop(k, None)` over a
+  // `dict[int, int]` was "no signature that accepts" at the emitter.
+  if ((*attr == "get" && argCount != 1) || popWithDefault) {
     if (argCount != 2 || !(*args)[1] || (*args)[1]->kind == "Starred")
       return std::nullopt;
     auto dictContract = mlir::dyn_cast_if_present<py::ContractType>(
@@ -1366,6 +1391,49 @@ ModuleEmitter::tryEmitDictMethodSugar(const parser::Node &expr,
       auto bound = values.find(resultName);
       if (bound == values.end() || !bound->second.value)
         return rejectSugar("cannot lower dict.get(key) over this dict");
+      return bound->second;
+    });
+  }
+
+  if (popOnly) {
+    std::string keyName = scratch("pk");
+    std::string resultName = scratch("pr");
+    return withPrologue({keyName, resultName}, [&]() -> std::optional<Value> {
+      emitStatement(*synth::assign(synth::name(keyName, range), (*args)[0], range));
+      emitStatement(*synth::assign(
+          synth::name(resultName, range),
+          synth::subscript(dictRef, synth::name(keyName, range), range), range));
+      NodePtr removal = parser::makeNode("Delete", range);
+      parser::addField(*removal, "targets",
+                       std::vector<NodePtr>{synth::subscript(
+                           dictRef, synth::name(keyName, range), range)});
+      emitStatement(*removal);
+      auto bound = values.find(resultName);
+      if (bound == values.end() || !bound->second.value)
+        return rejectSugar("cannot lower dict.pop(key) over this dict");
+      return bound->second;
+    });
+  }
+
+  if (popWithDefault) {
+    // __r = default; if __k in d: __r = d.pop(__k)  ->  V | type(default).
+    // The one-argument pop cannot miss there, so its KeyError never fires.
+    std::string keyName = scratch("pk");
+    std::string resultName = scratch("pr");
+    return withPrologue({keyName, resultName}, [&]() -> std::optional<Value> {
+      emitStatement(*synth::assign(synth::name(keyName, range), (*args)[0], range));
+      emitStatement(*synth::assign(synth::name(resultName, range), (*args)[1],
+                                   range));
+      emitStatement(*synth::ifStmt(
+          synth::compareIn(synth::name(keyName, range), dictRef, range),
+          {synth::assign(synth::name(resultName, range),
+                         synth::methodCall(dictRef, "pop",
+                                           {synth::name(keyName, range)}, range),
+                         range)},
+          {}, range));
+      auto bound = values.find(resultName);
+      if (bound == values.end() || !bound->second.value)
+        return rejectSugar("cannot lower dict.pop(key, default) over this dict");
       return bound->second;
     });
   }

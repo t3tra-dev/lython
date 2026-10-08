@@ -791,6 +791,9 @@ private:
   // bind the name at its top level and the binding is one this compiler
   // cannot carry across the import. Returns the honest sentence, or empty.
   std::string importedModuleBindingReason(llvm::StringRef name) const;
+  // The diagnostic for a name nothing binds: an import's own reason, a
+  // builtin this compiler has no value for, or "unresolved name".
+  std::string unresolvedNameMessage(llvm::StringRef name) const;
   // Generic lookup for a callee spelling: the local registration first, then
   // the canonical import binding (imported generics register under their
   // canonical "<module>.<name>" symbol).

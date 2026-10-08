@@ -29,6 +29,12 @@
 #include <optional>
 #include <string>
 
+
+// ⛔ No Ellipsis object: `...` is accepted as a statement (a stub body) and
+// inside an annotation, where no value is made.
+static constexpr const char *kNoEllipsisObject =
+    "the Ellipsis object (`...` or `Ellipsis` as a value) is not supported; "
+    "`...` is accepted as a statement and inside annotations";
 namespace lython::emitter {
 
 // ⭐ TWO TYPE OBJECTS NAME ONE CLASS WHEN THEIR CONTRACTS DO, arguments aside.
@@ -214,11 +220,9 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
             types.lookupCanonicalBinding(name))
       binding = *canonical;
     if (!symbolType) {
-      std::string reason = importedModuleBindingReason(name);
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, expr->range.start,
-          reason.empty() ? "unresolved name '" + std::string(name) + "'"
-                         : reason});
+          unresolvedNameMessage(name)});
       return emitNone(*expr);
     }
     if (std::optional<Value> constant =
@@ -1002,9 +1006,10 @@ Value ModuleEmitter::emitConstant(const parser::Node &expr) {
       return {op.getResult(), type};
     }
   }
-  diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
-                                           expr.range.start,
-                                           "unsupported constant literal"});
+  diagnostics.push_back(parser::Diagnostic{
+      parser::Severity::Error, expr.range.start,
+      ast::isEllipsisField(expr, "value") ? std::string(kNoEllipsisObject)
+                                          : "unsupported constant literal"});
   return emitNone(expr);
 }
 
@@ -3980,13 +3985,18 @@ Value ModuleEmitter::emitSetLiteral(const parser::Node &expr,
     if (expectedContract.getContractName() == "builtins.set" &&
         expectedContract.getArguments().size() == 1)
       elementType = expectedContract.getArguments().front();
+  // ⭐ An annotated `set[object]` is the program's own choice and is built by
+  // the same `add` per element that `set()` then `add` already runs; only an
+  // INFERRED object (elements with nothing in common) is refused. `t:
+  // set[object] = {1}` was "cannot infer the set literal element type".
+  bool declared = static_cast<bool>(elementType);
   if (!elementType) {
     llvm::SmallVector<mlir::Type, 8> parts;
     for (const parser::NodePtr &element : *elts)
       parts.push_back(types.widenLiteral(types.inferExpr(element.get())));
     elementType = types.join(parts);
   }
-  if (!elementType || containsObjectTop(elementType, types))
+  if (!elementType || (!declared && containsObjectTop(elementType, types)))
     return reject("cannot infer the set literal element type");
 
   std::string tmp = "__setlit" + std::to_string(++listCompCounter);
@@ -5517,6 +5527,21 @@ mlir::Value ModuleEmitter::emitBoolValue(Value value,
                          mlir::FlatSymbolRefAttr::get(&context, "__bool__"),
                          callProtocolFor(inference), value.value);
   return op.getResult();
+}
+
+std::string ModuleEmitter::unresolvedNameMessage(llvm::StringRef name) const {
+  std::string reason = importedModuleBindingReason(name);
+  if (!reason.empty())
+    return reason;
+  // Builtins this compiler has no value for say so, rather than reading as a
+  // typo of the program's.
+  if (name == "Ellipsis")
+    return kNoEllipsisObject;
+  if (name == "vars")
+    return "vars() is not supported: an instance here keeps its fields in "
+           "fixed slots and has no __dict__ to hand out; read the attributes "
+           "by name";
+  return "unresolved name '" + name.str() + "'";
 }
 
 } // namespace lython::emitter

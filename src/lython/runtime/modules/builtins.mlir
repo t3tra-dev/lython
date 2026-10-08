@@ -32,7 +32,7 @@ module attributes {
   // overload set on the table side (CPython abs is int->int / float->float /
   // complex->float, which one generic T->T contract cannot express -- the
   // complex result is a float).
-  ly.typing.function_names = ["builtins.print", "builtins.len", "builtins.hash", "builtins.sorted", "builtins.abs", "builtins.abs", "builtins.abs", "builtins.divmod", "builtins.pow", "builtins.ord", "builtins.chr", "builtins.hex", "builtins.oct", "builtins.bin", "builtins.input", "builtins.list", "builtins.tuple"],
+  ly.typing.function_names = ["builtins.print", "builtins.len", "builtins.hash", "builtins.sorted", "builtins.abs", "builtins.abs", "builtins.abs", "builtins.divmod", "builtins.pow", "builtins.ord", "builtins.chr", "builtins.hex", "builtins.oct", "builtins.bin", "builtins.input", "builtins.list", "builtins.tuple", "builtins.id"],
   ly.typing.function_contracts = [
     !py.callable<[], vararg = !py.contract<"builtins.tuple", [!py.contract<"builtins.object">]>, returns = [!py.literal<None>]>,
     !py.callable<[!py.contract<"builtins.object">], returns = [!py.contract<"builtins.int">]>,
@@ -50,12 +50,14 @@ module attributes {
     !py.callable<[!py.contract<"builtins.int">], returns = [!py.contract<"builtins.str">]>,
     !py.callable<[!py.contract<"builtins.str">], returns = [!py.contract<"builtins.str">]>,
     !py.callable<[!py.contract<"builtins.list", [!py.typevar<"T">]>], returns = [!py.contract<"builtins.list", [!py.typevar<"T">]>]>,
-    !py.callable<[!py.contract<"builtins.list", [!py.typevar<"T">]>], returns = [!py.contract<"builtins.tuple", [!py.typevar<"T">]>]>
+    !py.callable<[!py.contract<"builtins.list", [!py.typevar<"T">]>], returns = [!py.contract<"builtins.tuple", [!py.typevar<"T">]>]>,
+    !py.callable<[!py.contract<"builtins.object">], returns = [!py.contract<"builtins.int">]>
   ]
 } {
   func.func private @__ly_pending_push(%mark: i64, %kind: i64, %value: i64) -> i64
   func.func private @__ly_pending_pop(%index: i64)
   // ===== declared here, defined in another runtime file or built by the lowering =====
+  func.func private @LyObject_IdentityKey(%word: i64) -> i64 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "identity_key"}
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
   func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 5 : i64, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
@@ -121,6 +123,17 @@ module attributes {
   }
 
   func.func private @LyBuiltin_Len() -> memref<2xi64> attributes {ly.runtime.builtin = "len", ly.runtime.builtin_lowering = "method", ly.runtime.builtin_method = "__len__", ly.runtime.contract = "builtins.object", ly.runtime.primitive = "builtin_len", ly.runtime.result_contract = "builtins.int"}
+
+  // id(x) (builtin_id): the word `is` compares -- the box's entity through
+  // identity_key -- so `id(a) == id(b)` answers what `a is b` answers. The
+  // value types `is` refuses are refused before a call is built.
+  func.func @LyBuiltin_Id(%box: memref<5xi64>) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.builtin = "id", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.object", ly.runtime.primitive = "builtin_id", ly.runtime.result_contract = "builtins.int"} {
+    %entity_slot = arith.constant 2 : index
+    %entity = memref.load %box[%entity_slot] : memref<5xi64>
+    %key = func.call @LyObject_IdentityKey(%entity) : (i64) -> i64
+    %result = func.call @LyLong_FromI64(%key) : (i64) -> memref<2xi64>
+    func.return %result : memref<2xi64>
+  }
 
   func.func private @LyBuiltin_Hash() -> memref<2xi64> attributes {ly.runtime.builtin = "hash", ly.runtime.builtin_lowering = "method", ly.runtime.builtin_method = "__hash__", ly.runtime.contract = "builtins.object", ly.runtime.primitive = "builtin_hash", ly.runtime.result_contract = "builtins.int"}
 

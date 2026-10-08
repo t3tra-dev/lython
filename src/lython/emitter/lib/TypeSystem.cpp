@@ -1849,7 +1849,7 @@ void TypeSystem::seedBuiltins() {
                              &context, {object()}, {}, {}, {}, {intType()})));
   for (llvm::StringRef manifestBuiltin :
        {"sorted", "abs", "divmod", "pow", "ord", "chr", "hex", "oct", "bin",
-        "input"})
+        "input", "id"})
     if (std::optional<mlir::Type> manifestContract = table.freeFunctionContract(
             (llvm::Twine("builtins.") + manifestBuiltin).str()))
       bindSymbol(manifestBuiltin, *manifestContract);
@@ -3634,9 +3634,16 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     // comprehensions written over a list of pairs. Distributed the same way
     // the generator walk distributes one: positionally from a positional
     // tuple, uniformly from a one-argument container.
+    // ⭐ An `object` element is "unknown" unless the iterable DECLARES it:
+    // `[str(x) for x in xs]` over a `list[object]` is a list of str, and
+    // `sorted(...)` of it was "object does not provide manifest method
+    // '__iter__'" because the target was left unbound.
+    bool declaredObjectElement = false;
+    bool anyDeclaredObjectElement = false;
     auto bindTarget = [&](const parser::Node *target, mlir::Type element,
                           auto &&recurse) -> bool {
-      if (!target || !element || widenLiteral(element) == object())
+      if (!target || !element ||
+          (widenLiteral(element) == object() && !declaredObjectElement))
         return false;
       if (target->kind == "Name") {
         bound[ast::nameSpelling(*target)] = element;
@@ -3679,6 +3686,20 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       if (!generator)
         return object();
       mlir::Type element = iterationElementType(ast::node(*generator, "iter"));
+      declaredObjectElement = false;
+      if (widenLiteral(element) == object())
+        if (auto iterable = mlir::dyn_cast_if_present<py::ContractType>(
+                widenLiteral(inferExprImpl(ast::node(*generator, "iter"),
+                                           ctx))))
+          declaredObjectElement =
+              llvm::is_contained(
+                  {llvm::StringRef("builtins.list"),
+                   llvm::StringRef("builtins.set"),
+                   llvm::StringRef("builtins.frozenset")},
+                  iterable.getContractName()) &&
+              iterable.getArguments().size() == 1 &&
+              iterable.getArguments().front() == object();
+      anyDeclaredObjectElement |= declaredObjectElement;
       if (!bindTarget(ast::node(*generator, "target"), element, bindTarget))
         return object();
       // ⭐ THE FILTER NARROWS THE TARGET, and only the walk did not know it.
@@ -3703,8 +3724,14 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     ExprInferenceContext inner{ctx ? ctx->localCallables : kNoCallables,
                                nullptr, &bound, /*strict=*/false,
                                !ctx || ctx->seesEmitterProofs};
+    // The target itself is `object` by declaration when its iterable said
+    // so; anything else that answers `object` is still unknown.
     auto part = [&](const parser::Node *child) -> mlir::Type {
       mlir::Type inferred = widenLiteral(inferExprImpl(child, &inner));
+      if (inferred == object() && anyDeclaredObjectElement && child &&
+          child->kind == "Name" &&
+          bound.lookup(ast::nameSpelling(*child)) == object())
+        return inferred;
       return inferred == object() ? mlir::Type() : inferred;
     };
     if (node->kind == "DictComp") {
@@ -3810,6 +3837,18 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         if (*attr == "__name__") {
           if (mlir::isa_and_nonnull<py::CallableType>(widenLiteral(objectType)))
             return strType();
+          // `type(v).__name__` is a str whatever `v` is -- the emitter reads
+          // the class name off the value -- and this channel answered
+          // `object` for it, so `sorted([type(v).__name__ for v in vs])` was
+          // refused as a sort over `object`.
+          if (const parser::Node *owner = ast::node(*node, "value"))
+            if (owner->kind == "Call")
+              if (const parser::Node *callee = ast::node(*owner, "func"))
+                if (callee->kind == "Name" &&
+                    ast::nameSpelling(*callee) == "type" &&
+                    (!ctx || !ctx->localSymbols ||
+                     !ctx->localSymbols->count("type")))
+                  return strType();
           // `C.m.__name__`: the method read does not always come back as a
           // callable through this channel, and the emitter folds it either way.
           if (const parser::Node *owner = ast::node(*node, "value"))
@@ -4950,14 +4989,14 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
                                           ? widenLiteral(positional.back())
                                           : none()});
           }
-          // ⭐ `dict.get(k, default)` with a default of another type is
-          // typeshed's `V | T` overload, which the emitter desugars; the
-          // manifest has no signature for it, so the walk types it here. A
-          // default that IS a value (`dictGetDefaultIsValue`) takes the native
-          // `get(k, V) -> V`.
+          // ⭐ `dict.get(k, default)` and `dict.pop(k, default)` with a
+          // default of another type are typeshed's `V | T` overloads, which
+          // the emitter desugars; the manifest has no signature for them, so
+          // the walk types them here. A default that IS a value
+          // (`dictGetDefaultIsValue`) takes the native `(k, V) -> V`.
           if (auto dictContract = mlir::dyn_cast_if_present<py::ContractType>(
                   widenLiteral(receiver));
-              dictContract && *methodName == "get" &&
+              dictContract && (*methodName == "get" || *methodName == "pop") &&
               dictContract.getContractName() == "builtins.dict" &&
               dictContract.getArguments().size() == 2 && keywords.empty()) {
             const auto *callArgs = ast::nodeList(*node, "args");

@@ -562,16 +562,37 @@ RuntimeBundleLowerer::objectPayloadClassEntity(mlir::Operation *op,
     }
     return words;
   }
-  // Slots hold CANONICAL payload handles (word 1 = payload class, words 4+
-  // = the payload's own memrefs) so hash/eq/repr dispatch reads them
-  // uniformly. An opaque erased `object` (no tracked concrete payload)
-  // would store a handle-of-box indirection those dispatchers cannot
-  // distinguish; reject it loudly rather than mis-execute.
-  if (concrete->contractName() == "builtins.object")
-    return op->emitError()
-           << "a type-erased `object` value cannot be stored in a runtime "
-              "container slot yet; give the container a concrete element "
-              "type annotation";
+  // ⭐ AN OPAQUE `object` IS A STANDALONE BOX, AND ITS WORD 2 IS A SLOT
+  // (BoxLayout.h): the entity a slot keeps, with the class in word 1. So the
+  // box's two words are the class and entity the slot wants -- `set(xs)` over
+  // a `list[object]` and `sorted` over a `set[object]` were "a type-erased
+  // `object` value cannot be stored in a runtime container slot yet". That
+  // refusal dates from a slot of sixteen words, where a box's handle and the
+  // payload's were different words; a slot is now the entity alone.
+  if (concrete->contractName() == "builtins.object") {
+    if (concrete->physicalValues().size() != 1 ||
+        !mlir::isa<mlir::MemRefType>(
+            concrete->physicalValues().front().getType()))
+      return op->emitError()
+             << "a type-erased `object` value with no box cannot be stored "
+                "in a runtime container slot; give the container a concrete "
+                "element type annotation";
+    mlir::Value box = concrete->physicalValues().front();
+    mlir::Type words =
+        mlir::MemRefType::get({mlir::ShapedType::kDynamic},
+                              builder.getI64Type());
+    if (box.getType() != words)
+      box = mlir::memref::CastOp::create(builder, loc, words, box);
+    mlir::Value boxClass = mlir::memref::LoadOp::create(
+        builder, loc, box,
+        constantIndex(builder, loc,
+                      static_cast<unsigned>(box_abi::kBoxClassWord)));
+    mlir::Value boxEntity = mlir::memref::LoadOp::create(
+        builder, loc, box,
+        constantIndex(builder, loc,
+                      static_cast<unsigned>(box_abi::kBoxEntityWord)));
+    return llvm::SmallVector<mlir::Value, 4>{boxClass, boxEntity};
+  }
   if (concrete->storeAsSlotWord && concrete->physicalValues().empty() &&
       concrete->deferredObject && concrete->primitiveI64)
     if (std::optional<RuntimeSymbol> taking = manifest.primitive(

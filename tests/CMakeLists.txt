@@ -618,6 +618,11 @@ set(LYTHON_LEAK_GATE_RUNNER "${CMAKE_CURRENT_SOURCE_DIR}/leak_gate.py")
 #     dict literal family whose dict side was repaired earlier and which
 #     rfc/test-suite-debt.md listed as still leaking. Both are net zero now.
 set(LYTHON_LEAK_GATE_CASES
+    # An `object` value stored into another container: the slot keeps the
+    # box's entity, so the retain has to be the entity's -- retaining the box
+    # leaked every box and left the entity a reference short.
+    an_object_value_goes_into_another_container
+    a_dict_pops_with_a_default_of_another_type
     # int and float methods: a native body is given no releases, so the
     # temporaries as_integer_ratio shifts by leaked for every value past the
     # small ints.
