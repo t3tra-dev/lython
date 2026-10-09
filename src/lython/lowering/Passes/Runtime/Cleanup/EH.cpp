@@ -483,14 +483,15 @@ handledClasses(llvm::BasicBlock *dispatch) {
   llvm::SmallPtrSet<llvm::BasicBlock *, 8> seen;
   llvm::BasicBlock *block = dispatch;
   while (block && seen.insert(block).second) {
-    auto *branch = llvm::dyn_cast<llvm::BranchInst>(block->getTerminator());
+    auto *jump = llvm::dyn_cast<llvm::UncondBrInst>(block->getTerminator());
+    auto *branch = llvm::dyn_cast<llvm::CondBrInst>(block->getTerminator());
     // The pad lands on a forwarding block; following it is following control
     // flow, not assuming anything about what runs.
-    if (branch && branch->isUnconditional() && holdsOnly(*block, {branch})) {
-      block = branch->getSuccessor(0);
+    if (jump && holdsOnly(*block, {jump})) {
+      block = jump->getSuccessor(0);
       continue;
     }
-    if (branch && branch->isConditional()) {
+    if (branch) {
       auto *test = llvm::dyn_cast<llvm::CallInst>(branch->getCondition());
       if (!test || !isRuntimeMarkerCall(*test, "LyEH_CurrentExceptionMatches") ||
           test->getParent() != block)
@@ -727,8 +728,8 @@ bool rewriteTryCatchAnchor(llvm::CallInst &call) {
     return false;
 
   if (call.hasOneUse()) {
-    if (auto *branch = llvm::dyn_cast<llvm::BranchInst>(*call.user_begin())) {
-      if (branch->isConditional() && branch->getCondition() == &call) {
+    if (auto *branch = llvm::dyn_cast<llvm::CondBrInst>(*call.user_begin())) {
+      if (branch->getCondition() == &call) {
         llvm::BasicBlock *tryDest = branch->getSuccessor(1);
         // ⭐ The catch block may take values on this edge -- a generator's
         // handler entered through its trampolines does -- and its phis must
@@ -870,15 +871,15 @@ namespace {
 // shape is the one `buildPythonCatchDispatchBlock` built, and nothing has run
 // between: a plain branch, or the selector test whose handler arm branches.
 llvm::BasicBlock *dispatchBlockOf(llvm::LandingPadInst *pad) {
-  auto *branch = llvm::dyn_cast<llvm::BranchInst>(pad->getParent()->getTerminator());
+  llvm::Instruction *terminator = pad->getParent()->getTerminator();
+  if (auto *jump = llvm::dyn_cast<llvm::UncondBrInst>(terminator))
+    return jump->getSuccessor(0);
+  auto *branch = llvm::dyn_cast<llvm::CondBrInst>(terminator);
   if (!branch)
     return nullptr;
-  if (branch->isUnconditional())
-    return branch->getSuccessor(0);
   auto *handling =
-      llvm::dyn_cast<llvm::BranchInst>(branch->getSuccessor(1)->getTerminator());
-  return handling && handling->isUnconditional() ? handling->getSuccessor(0)
-                                                 : nullptr;
+      llvm::dyn_cast<llvm::UncondBrInst>(branch->getSuccessor(1)->getTerminator());
+  return handling ? handling->getSuccessor(0) : nullptr;
 }
 
 // A raise primitive that does nothing but hand the triple to
@@ -923,6 +924,39 @@ bool isThinRaiseWrapper(llvm::Function &function) {
 // ⛔ And only when the raise's unwind edge is the try's catch pad. A `with` or
 // a `finally` in between makes the edge a cleanup instead, and that cleanup has
 // to run; the edge being the catch pad is the proof that nothing else does.
+// ⭐ A FAILED ASSERTION'S MESSAGE IS FLUSHED BEFORE THE ABORT. MLIR lowers
+// `cf.assert` to `puts(message)` then `abort()`, and `puts` writes into
+// stdout's buffer -- which abort() does not flush on glibc, so on Linux a
+// program stopped by an assertion with its stdout on a pipe said nothing at
+// all: the finalizer golden's "__del__ of A kept a reference" was empty there
+// and present on macOS, whose abort() flushes.
+// ⛔ Not a different lowering of `cf.assert`: the message, its stream and its
+// ordering against the program's own output are the ones the goldens already
+// read; only the flush was missing.
+void flushAssertionMessages(llvm::Module &module) {
+  llvm::Function *puts = module.getFunction("puts");
+  llvm::Function *abort = module.getFunction("abort");
+  if (!puts || !abort)
+    return;
+  llvm::LLVMContext &context = module.getContext();
+  llvm::FunctionCallee fflush = module.getOrInsertFunction(
+      "fflush", llvm::Type::getInt32Ty(context),
+      llvm::PointerType::getUnqual(context));
+  for (llvm::User *user : llvm::make_early_inc_range(abort->users())) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+    if (!call || call->getCalledFunction() != abort)
+      continue;
+    auto *message =
+        llvm::dyn_cast_or_null<llvm::CallInst>(call->getPrevNode());
+    if (!message || message->getCalledFunction() != puts)
+      continue;
+    llvm::CallInst::Create(
+        fflush,
+        {llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(context))},
+        "", call->getIterator());
+  }
+}
+
 bool branchLocalRaisesToTheirHandler(llvm::Module &module) {
   llvm::Function *record = module.getFunction("LyEH_RecordException");
   if (!record)

@@ -124,27 +124,10 @@ Value stripLocalProtocolView(Value value) {
 
 namespace {
 
-// Jumps that target THIS loop, not one nested inside it. Both spellings are
-// the shared statement-kind walk with the loop stop switched on; the second
-// exists because the source-iterator rewrite puts the body inside a `try`'s
-// else, and either kind of jump out of one is refused there.
-bool containsLoopLevelBreak(const parser::Node *node) {
-  llvm::StringRef kinds[] = {"Break"};
-  return containsStatementKind(node, kinds, /*stopAtLoops=*/true);
-}
-
+// A `break` that targets THIS loop, not one nested inside it: the shared
+// statement-kind walk with the loop stop switched on.
 bool containsLoopLevelBreak(const std::vector<parser::NodePtr> *body) {
   llvm::StringRef kinds[] = {"Break"};
-  return containsStatementKind(body, kinds, /*stopAtLoops=*/true);
-}
-
-bool containsLoopLevelJump(const parser::Node *node) {
-  llvm::StringRef kinds[] = {"Break", "Continue"};
-  return containsStatementKind(node, kinds, /*stopAtLoops=*/true);
-}
-
-bool containsLoopLevelJump(const std::vector<parser::NodePtr> *body) {
-  llvm::StringRef kinds[] = {"Break", "Continue"};
   return containsStatementKind(body, kinds, /*stopAtLoops=*/true);
 }
 
@@ -1694,7 +1677,7 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
     // narrows n for its own body, the same fact the if statement and the
     // conditional expression apply, through the same applyBranchNarrowing.
     llvm::StringMap<mlir::Type> savedMembers = narrowedMemberTypes;
-    auto restoreMembers = llvm::make_scope_exit(
+    auto restoreMembers = llvm::scope_exit(
         [&] { narrowedMemberTypes = savedMembers; });
     if (test)
       for (const BranchTypeNarrowing &fact :

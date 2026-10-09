@@ -446,7 +446,7 @@ struct AffinePathState {
   // this file's sibling pass was attributed from one trail line: the path
   // entered a cleanup handler from ANOTHER cleanup handler, which is the shape
   // no per-op message can show.
-  llvm::SmallVector<unsigned, 16> trail;
+  llvm::SmallVector<unsigned, 16> trail = {};
   // Slot-absorption retains that are currently PARKED IN A CONTAINER, listed by
   // the container's aggregate identity (own::kAggregateIdAttr) in the order
   // they were charged. This is the kernel's `aggregate(parent, path)` with the
@@ -468,7 +468,7 @@ struct AffinePathState {
   // out (`total += ys[0]`) hands the reader a token derived from the slot, and
   // this walk needs the retain to justify the reader's later release; dropping it
   // refused 39 golden cases that compile today.
-  llvm::SmallVector<std::int64_t, 2> slotParents;
+  llvm::SmallVector<std::int64_t, 2> slotParents = {};
   // Of `retained`, the ones a slot-absorption retain parked in a container
   // whose identity this walk could not name. They belong to the holder, so the
   // owned-return rule must not read them as tokens the return failed to spend
@@ -488,7 +488,7 @@ struct AffinePathState {
   // same way -- `slotParents` by holder identity, `borrowedRetains` by op. The
   // shape that needed it: a resource produced OUTSIDE a cycle and parked
   // INSIDE it, which is every `for i in ...: for j in ...: out.append(i)`.
-  llvm::SmallVector<mlir::Operation *, 2> parkedOps;
+  llvm::SmallVector<mlir::Operation *, 2> parkedOps = {};
   // ⭐ THE UNION TAG FOLLOWS THE SAME RENAMES AS THE GROUP, and it has to be
   // carried per path for exactly the reason `views` is. A conditional token is
   // discharged where `classifyOwnershipConditionBranch` finds a `cf.cond_br`
@@ -501,7 +501,7 @@ struct AffinePathState {
   // Deliberately NOT part of the visited key, for the same reason `views` is
   // not: it only refines detections, so merging two states that differ only
   // here can miss one, never accept unsound IR.
-  llvm::SmallVector<mlir::Value, 1> conditionTag;
+  llvm::SmallVector<mlir::Value, 1> conditionTag = {};
 };
 
 struct BorrowedEntryResource {
@@ -531,7 +531,7 @@ struct BorrowedPathState {
   // Deliberately NOT part of the visited key, for the same reason
   // `AffinePathState::previous` is not: a path-dependent set in the key lets
   // nested loops defeat the dedup. Missing a state can only miss a detection.
-  llvm::SmallVector<llvm::SmallVector<mlir::Value, 4>, 4> previousGroups;
+  llvm::SmallVector<llvm::SmallVector<mlir::Value, 4>, 4> previousGroups = {};
   // Path entered through an exceptional (unwind) edge. Retain balance is
   // required on these paths like any other (rfc/stdlib-semantics.md R2).
   bool exceptional = false;
@@ -539,7 +539,7 @@ struct BorrowedPathState {
   // LYTHON_OWNERSHIP_TRACE_PATH. Same purpose as `AffinePathState::trail`: an
   // unbalanced lend has to be read against the CFG to tell a missing release
   // from a rename the walk did not follow.
-  llvm::SmallVector<unsigned, 16> trail;
+  llvm::SmallVector<unsigned, 16> trail = {};
 };
 
 // How many pre-merge namings one path keeps. A loop renames the group once per

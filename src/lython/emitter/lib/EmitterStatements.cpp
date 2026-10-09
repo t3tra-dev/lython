@@ -33,7 +33,7 @@ void ModuleEmitter::emitStatements(
       currentSuite, statements);
   llvm::SaveAndRestore<std::size_t> savedSuiteIndex(currentSuiteIndex, 0);
   suiteStack.push_back({statements, 0});
-  auto popSuite = llvm::make_scope_exit([&] { suiteStack.pop_back(); });
+  auto popSuite = llvm::scope_exit([&] { suiteStack.pop_back(); });
   for (const parser::NodePtr &statement : *statements) {
     if (insertionBlockTerminated(builder))
       break;
@@ -1146,7 +1146,7 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
       }
       target = std::move(shared);
     }
-    auto releaseValueRefs = llvm::make_scope_exit(
+    auto releaseValueRefs = llvm::scope_exit(
         [&] { pendingValueRefs.resize(valueRefStart); });
     if (!target || !op || !rhs) {
       diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,

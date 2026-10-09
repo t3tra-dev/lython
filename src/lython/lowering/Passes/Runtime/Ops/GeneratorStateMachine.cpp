@@ -777,7 +777,7 @@ mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorArgumentOperands(
                             : lane->physicalCount;
     // An int known only as its word (or a deferred one) is lent as an object
     // made for this resume; an int argument's word follows its object.
-    auto appendWord = [&]() -> mlir::LogicalResult {
+    auto appendWord = [&, index = index, source = source]() -> mlir::LogicalResult {
       if (!isIntObjectArgument(*lane))
         return mlir::success();
       if (source->primitiveI64) {
@@ -2773,7 +2773,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
         tryHandlerIds[rest] = ownId;
         // Markers already placed in the block -- the continuation's guard
         // rethrows an injected exception -- point at the trampoline too.
-        rest->walk([&](mlir::func::CallOp call) {
+        rest->walk([&, handlerId = handlerId](mlir::func::CallOp call) {
           mlir::IntegerAttr id;
           if (call.getCallee() == "LyEH_TryCallSiteMarker" &&
               call.getNumOperands() == 1 &&
@@ -3752,7 +3752,6 @@ RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
   mlir::Location loc = advance->getLoc();
   mlir::OpBuilder::InsertionGuard guard(builder);
   mlir::Type i64 = builder.getI64Type();
-  mlir::Type i1 = builder.getI1Type();
   auto headerType = mlir::MemRefType::get({3}, i64);
   auto messageType = mlir::MemRefType::get({2}, i64);
   auto bytesType =
@@ -3975,8 +3974,6 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
            << "runtime manifest has no builtins.GeneratorExit support";
   mlir::Location loc = step->getLoc();
   mlir::OpBuilder::InsertionGuard guard(builder);
-  mlir::Type i64 = builder.getI64Type();
-  mlir::Type i1 = builder.getI1Type();
 
   llvm::SmallVector<mlir::Type, 16> inputs;
   inputs.push_back(generatorStorageType(builder));

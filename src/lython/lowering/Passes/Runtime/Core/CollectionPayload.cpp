@@ -1275,7 +1275,7 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeDictPayload(
     // still routed through the same rule rather than special-cased, because
     // "constants are never Own" is a property of another pass, not of this one.
     auto moveSourceIfTemporary =
-        [&](const RuntimeBundle &payload, const RuntimeBundle &element,
+        [&, index = index](const RuntimeBundle &payload, const RuntimeBundle &element,
             llvm::ArrayRef<mlir::Value> sources,
             llvm::StringRef slot) -> mlir::LogicalResult {
       if (payload.objectValue.ownership != ownership::OwnershipKind::Own)
@@ -1426,7 +1426,6 @@ mlir::LogicalResult RuntimeBundleLowerer::clearDictValuePayload(
     return mlir::success();
   if (container.mappingCapacity && index >= container.mappingCapacity)
     return op->emitError() << "dict payload clear index exceeds capacity";
-  mlir::Value zero = constantI64(builder, op->getLoc(), 0);
   mlir::FailureOr<mlir::Value> valuesArray =
       RuntimeBundleLowerer::containerInteriorView(
           op, container, ContainerInterior::Secondary, "dict values");

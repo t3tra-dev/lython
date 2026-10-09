@@ -83,6 +83,10 @@ mapAtomicBinOp(LLVM::AtomicBinOp op) {
     return llvm::AtomicRMWInst::FMaximum;
   case LLVM::AtomicBinOp::fminimum:
     return llvm::AtomicRMWInst::FMinimum;
+  case LLVM::AtomicBinOp::fmaximumnum:
+    return llvm::AtomicRMWInst::FMaximumNum;
+  case LLVM::AtomicBinOp::fminimumnum:
+    return llvm::AtomicRMWInst::FMinimumNum;
   case LLVM::AtomicBinOp::uinc_wrap:
     return llvm::AtomicRMWInst::UIncWrap;
   case LLVM::AtomicBinOp::udec_wrap:

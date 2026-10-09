@@ -1470,8 +1470,8 @@ TEST(EmitterTest, ACellsElementStorageNamesItsRepresentation) {
       "class P:\n    v: list[int] = [1, 2]\nP.v[0] = True\nprint(P.v[0])\n",
       // Written from inside a function, where the name still resolves to the
       // module global's cell.
-      "xs: list[int] = [1, 2]\ndef go() -> None:\n    xs[0] = True\n"
-      "go()\nprint(xs[0])\n",
+      ("xs: list[int] = [1, 2]\ndef go() -> None:\n    xs[0] = True\n"
+       "go()\nprint(xs[0])\n"),
   };
   for (const char *cell : cells) {
     mlir::MLIRContext context(testRegistry());

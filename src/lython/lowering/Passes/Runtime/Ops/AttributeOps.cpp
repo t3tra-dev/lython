@@ -156,7 +156,7 @@ bool RuntimeBundleLowerer::contractIsOneRuntimeLane(mlir::Type contract) const {
   if (!laneCountQueries.insert(contract).second)
     return true;
   auto pending =
-      llvm::make_scope_exit([&] { laneCountQueries.erase(contract); });
+      llvm::scope_exit([&] { laneCountQueries.erase(contract); });
   std::string name = runtimeShapeContractName(contract);
   if (!name.empty())
     if (const RuntimeValueShape *shape = manifest.valueShape(name))
@@ -2827,7 +2827,7 @@ RuntimeBundleLowerer::unionValuesFromBoxWords(mlir::Operation *op,
     bool armFailed = false;
     auto built = mlir::scf::IfOp::create(
         builder, loc, matches[index],
-        [&](mlir::OpBuilder &nested, mlir::Location nestedLoc) {
+        [&, member = member](mlir::OpBuilder &nested, mlir::Location nestedLoc) {
           // ⭐ THE SLOT'S SHAPE, NOT THE MEMBER'S. What the box holds is
           // whatever the contract's `box` primitive returns, which for
           // `builtins.bool` is a three-word singleton header and not the truth
@@ -2867,7 +2867,7 @@ RuntimeBundleLowerer::unionValuesFromBoxWords(mlir::Operation *op,
           mlir::scf::YieldOp::create(builder, nestedLoc,
                                      mlir::ValueRange{*unboxed});
         },
-        [&](mlir::OpBuilder &nested, mlir::Location nestedLoc) {
+        [&, member = member](mlir::OpBuilder &nested, mlir::Location nestedLoc) {
           // The dead materializer writes through the lowerer's own builder, so
           // it is pointed into this region rather than handed a second one.
           mlir::OpBuilder::InsertionGuard guard(builder);
