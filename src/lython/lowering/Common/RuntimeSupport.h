@@ -140,6 +140,9 @@ void collectCtypesForeignSymbols(mlir::ModuleOp module,
 // that handler. Runs once the runtime is linked, so the raise primitives have
 // bodies to read.
 bool branchLocalRaisesToTheirHandler(llvm::Module &module);
+// Flushes the C streams between a failed assertion's message and its abort.
+// Runs once the runtime is linked, so the runtime's assertions are flushed too.
+void flushAssertionMessages(llvm::Module &module);
 // Gives every Python-defined function but `__main__` local linkage, so no
 // program name can stand in for a C symbol the runtime calls.
 void internalizePythonFunctions(llvm::Module &module);

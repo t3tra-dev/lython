@@ -545,6 +545,7 @@ mlir::LogicalResult linkEmbeddedNativeRuntime(llvm::Module &llvmModule) {
   }
 
   py::branchLocalRaisesToTheirHandler(llvmModule);
+  py::flushAssertionMessages(llvmModule);
   for (const std::string &symbol : ctypesSymbols)
     if (llvm::Function *function = llvmModule.getFunction(symbol))
       function->addFnAttr(kCtypesForeignSymbolAttr);
