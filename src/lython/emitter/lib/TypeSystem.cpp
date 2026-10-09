@@ -701,9 +701,10 @@ void collectGeneratorFunctionAnalysis(
     analysis.sawYieldFrom = true;
     if (std::optional<mlir::Type> element = generatorYieldFromElementType(
             types, ast::node(*node, "value"), localCallables,
-            analysis.failureReasons, &analysis.localSymbols))
+            analysis.failureReasons, &analysis.localSymbols)) {
       analysis.yieldTypes.push_back(*element);
       analysis.yieldNodes.push_back(nullptr);
+    }
     if (mlir::Type rawSource = inferExprWithLocalCallables(
             types, ast::node(*node, "value"), localCallables, nullptr,
             &analysis.localSymbols)) {
@@ -4316,20 +4317,22 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
               unionOperatorResult(operand, "__neg__", {}))
         return unionResult;
     }
-    if (ast::isOperator(op, "UAdd"))
+    if (ast::isOperator(op, "UAdd")) {
       if (std::optional<CallSolution> result =
               tryManifestMethod(*this, widenLiteral(operand), "__pos__", {}))
         return result->result;
       if (mlir::Type unionResult =
               unionOperatorResult(operand, "__pos__", {}))
         return unionResult;
-    if (ast::isOperator(op, "Invert"))
+    }
+    if (ast::isOperator(op, "Invert")) {
       if (std::optional<CallSolution> result =
               tryManifestMethod(*this, widenLiteral(operand), "__invert__", {}))
         return result->result;
       if (mlir::Type unionResult =
               unionOperatorResult(operand, "__invert__", {}))
         return unionResult;
+    }
     return widenLiteral(operand);
   }
   if (node->kind == "BinOp") {

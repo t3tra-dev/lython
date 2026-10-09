@@ -3267,7 +3267,7 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
         for (mlir::Block &block : *body)
           positions->second[&block] = position++;
       }
-      llvm::sort(terminators, [&](mlir::Operation *lhs, mlir::Operation *rhs) {
+      llvm::sort(terminators, [&, positions = positions](mlir::Operation *lhs, mlir::Operation *rhs) {
         return positions->second.lookup(lhs->getBlock()) <
                positions->second.lookup(rhs->getBlock());
       });

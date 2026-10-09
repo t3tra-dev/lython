@@ -260,7 +260,7 @@ RuntimeBundleLowerer::runtimeValueTypesFor(mlir::Operation *op, mlir::Type type,
               "inline, so it has no finite layout; a union whose members can "
               "each be boxed -- which is every member but a `type[X]` -- is "
               "stored as one reference and terminates";
-  auto expanding = llvm::make_scope_exit([&] { expandingContracts.erase(type); });
+  auto expanding = llvm::scope_exit([&] { expandingContracts.erase(type); });
   if (auto unionType = mlir::dyn_cast<py::UnionType>(type)) {
     llvm::SmallVector<mlir::Type, 8> types{mlir::IntegerType::get(context, 64)};
     for (mlir::Type member : unionType.getMemberTypes()) {

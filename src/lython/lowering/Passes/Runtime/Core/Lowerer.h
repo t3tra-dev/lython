@@ -103,7 +103,7 @@ private:
     // (concrete contract parts, plus the trailing (i64, i1) evidence pair for
     // builtins.int). Empty for the legacy pure-pair int tier, where `value` /
     // `valid` alone carry the yield.
-    llvm::SmallVector<mlir::Value, 6> lanePhysicals;
+    llvm::SmallVector<mlir::Value, 6> lanePhysicals = {};
   };
 
   struct CallableProtocolSpecialization {

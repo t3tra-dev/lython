@@ -153,7 +153,6 @@ mlir::LogicalResult materializeCallbackThunks(mlir::ModuleOp module) {
   mlir::MLIRContext *context = module.getContext();
   mlir::OpBuilder builder(context);
   mlir::Type i64 = builder.getI64Type();
-  mlir::Type i1 = builder.getI1Type();
 
   for (mlir::LLVM::LLVMFuncOp placeholder : placeholders) {
     auto thunkName =

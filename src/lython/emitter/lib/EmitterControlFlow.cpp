@@ -113,7 +113,7 @@ void ModuleEmitter::invalidateMemberNarrowings(const parser::Node &statement) {
   // statement just wrote, not about anything the statement invalidated.
   llvm::StringMap<mlir::Type> proved = std::move(memberNarrowingsFromStores);
   memberNarrowingsFromStores.clear();
-  auto installProved = llvm::make_scope_exit([&] {
+  auto installProved = llvm::scope_exit([&] {
     for (const auto &entry : proved)
       narrowedMemberTypes[entry.getKey()] = entry.second;
   });
@@ -643,7 +643,7 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
       applyBranchNarrowing(statement, fact, conditionIsTrue);
   };
   llvm::StringMap<mlir::Type> savedNarrowedFrom = narrowedFromTypes;
-  auto restoreNarrowedFrom = llvm::make_scope_exit(
+  auto restoreNarrowedFrom = llvm::scope_exit(
       [&] { narrowedFromTypes = std::move(savedNarrowedFrom); });
   // ⛔ A FIELD NARROWING IS BRANCH-LOCAL AND DOES NOT OUTLIVE THE STATEMENT.
   // Each branch starts from what was proved outside, and nothing a branch
@@ -652,7 +652,7 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
   // (which is how the first version of this raised inside the NEXT `if`'s own
   // test).
   llvm::StringMap<mlir::Type> savedMembers = narrowedMemberTypes;
-  auto restoreMembers = llvm::make_scope_exit(
+  auto restoreMembers = llvm::scope_exit(
       [&] { narrowedMemberTypes = savedMembers; });
 
   std::optional<bool> staticTruth =

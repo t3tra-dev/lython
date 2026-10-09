@@ -700,7 +700,7 @@ mlir::LogicalResult RuntimeBundleLowerer::appendClosureValues(
     // Callable: that gives up the static contract everywhere it is declared.
     // The closure input's declared type is the promise about which signature,
     // and it is the type this lane already carries.
-    auto erasedFunctionCapture = [&] {
+    auto erasedFunctionCapture = [&, index = index] {
       auto contract =
           mlir::dyn_cast_if_present<py::ContractType>(captureBundle->contract);
       return contract && contract.getArguments().empty() &&

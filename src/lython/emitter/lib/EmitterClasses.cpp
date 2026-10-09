@@ -2412,7 +2412,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       // corner (`C().V(1)` passes the instance, which is what @staticmethod
       // exists to opt out of), so the read is a shape question before it is a
       // storage one.
-      auto storableAs = [&](mlir::Type widened) -> bool {
+      auto storableAs = [&, attrName = attrName](mlir::Type widened) -> bool {
         bool storable =
             widened == types.intType() || widened == types.strType() ||
             widened == types.floatType() || widened == types.boolType() ||
@@ -4881,7 +4881,7 @@ Value ModuleEmitter::emitInlineMethodBody(
   std::optional<llvm::SaveAndRestore<std::string>> savedSourceName;
   std::optional<llvm::SaveAndRestore<std::string>> savedPackageName;
   llvm::SmallVector<LoopControlContext, 4> savedLoopContexts;
-  auto crossModuleCleanup = llvm::make_scope_exit([&] {
+  auto crossModuleCleanup = llvm::scope_exit([&] {
     if (!methodSource)
       return;
     // Attribute before SaveAndRestore rolls sourceName back (destruction
@@ -5239,7 +5239,7 @@ Value ModuleEmitter::emitInlineMethodBody(
     // the declared type from the expectation, the same way the empty vararg
     // tuple above does.
     std::size_t refStart = pendingValueRefs.size();
-    auto releaseRefs = llvm::make_scope_exit(
+    auto releaseRefs = llvm::scope_exit(
         [&] { pendingValueRefs.resize(refStart); });
     std::vector<parser::NodePtr> keyNodes;
     std::vector<parser::NodePtr> valueNodes;
@@ -5441,7 +5441,7 @@ Value ModuleEmitter::emitInlineMethodBody(
   // so a field path proved out here says nothing inside.
   llvm::StringMap<mlir::Type> savedInlineMembers = narrowedMemberTypes;
   narrowedMemberTypes.clear();
-  auto restoreInlineMembers = llvm::make_scope_exit(
+  auto restoreInlineMembers = llvm::scope_exit(
       [&] { narrowedMemberTypes = savedInlineMembers; });
   methodsBeingInlined.push_back(method.method);
   // The frame this body would have had if it were a function: everything it
@@ -5484,7 +5484,7 @@ Value ModuleEmitter::emitInlineMethodBody(
     // function stopped leaking. The two call sites have to agree.
     SiblingGroupState enclosingSiblings = std::move(closedSiblingGroup);
     closedSiblingGroup = SiblingGroupState{};
-    auto restoreSiblings = llvm::make_scope_exit(
+    auto restoreSiblings = llvm::scope_exit(
         [&] { closedSiblingGroup = std::move(enclosingSiblings); });
     MutualNestedDefGroup group = mutualNestedDefGroup(*method.method);
     if (!group.members.empty())

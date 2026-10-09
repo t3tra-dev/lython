@@ -24,7 +24,6 @@ namespace {
 namespace own = py::ownership;
 constexpr llvm::StringLiteral kReleaseStorageToZeroName{
     "LyObject_ReleaseStorageToZero"};
-constexpr unsigned kPrimitiveFieldSlotBase = 4;
 
 std::string sanitizeSymbolComponent(llvm::StringRef text) {
   std::string result;
@@ -2910,9 +2909,9 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
     // implementation: that is exactly when both have the declaring class in
     // their MRO, so both boxes carry its lanes. Empty means "this entry's own
     // class only", which is every manifest class.
-    llvm::SmallVector<std::string, 4> acceptedRight;
+    llvm::SmallVector<std::string, 4> acceptedRight = {};
     // The resolved implementation, used only to compute the set above.
-    std::string calleeSymbol;
+    std::string calleeSymbol = {};
   };
   llvm::SmallVector<HookEntry, 16> entries;
   llvm::StringSet<> seen;

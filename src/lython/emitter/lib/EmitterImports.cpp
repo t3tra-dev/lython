@@ -2723,7 +2723,7 @@ FunctionSignature ModuleEmitter::importedFunctionSignature(
   if (!importedSignatureScopes.insert(source.moduleName).second)
     return sourceModuleFunctionSignature(types, source.moduleName, body,
                                          function, source.isStub);
-  auto done = llvm::make_scope_exit(
+  auto done = llvm::scope_exit(
       [&] { importedSignatureScopes.erase(source.moduleName); });
   TypeSystem::ScopeIsolation isolation = types.isolateScopes();
   auto moduleScope = types.pushScope();

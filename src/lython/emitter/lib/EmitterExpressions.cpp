@@ -666,7 +666,7 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
       };
       llvm::SmallVector<Saved, 2> saved;
       llvm::StringMap<mlir::Type> savedMembers = narrowedMemberTypes;
-      auto restoreMembers = llvm::make_scope_exit(
+      auto restoreMembers = llvm::scope_exit(
           [&] { narrowedMemberTypes = savedMembers; });
       for (const BranchTypeNarrowing &fact : narrowings) {
         Saved entry{fact.name, std::nullopt, types.lookupSymbol(fact.name),
@@ -739,7 +739,7 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
       // ⛔ AND THE MEMBER PROOFS, which do not live on the scope. They are
       // restored the way the conditional expression restores its own.
       llvm::StringMap<mlir::Type> savedNarrowedMembers = narrowedMemberTypes;
-      auto restoreNarrowedMembers = llvm::make_scope_exit(
+      auto restoreNarrowedMembers = llvm::scope_exit(
           [&] { narrowedMemberTypes = savedNarrowedMembers; });
       llvm::SmallVector<std::pair<std::string, Value>, 4> restoreValues;
       // ⛔ THE PROOFS ARE READ ONCE, BEFORE ANY OF THEM IS APPLIED. Asking
@@ -1601,7 +1601,7 @@ Value ModuleEmitter::emitCompare(const parser::Node &expr) {
   if (comparators->size() > 1 && ops && ops->size() == comparators->size()) {
     std::size_t refStart = pendingValueRefs.size();
     pendingValueRefs.resize(refStart + comparators->size() - 1);
-    auto releaseRefs = llvm::make_scope_exit(
+    auto releaseRefs = llvm::scope_exit(
         [&] { pendingValueRefs.resize(refStart); });
     auto refNode = [&](std::size_t slot) {
       parser::NodePtr node = parser::makeNode("LyValueRef", expr.range);
@@ -3803,7 +3803,7 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
 
   std::string hoistedSource;
   std::optional<Value> hoistedPrior;
-  auto restoreHoisted = llvm::make_scope_exit([&] {
+  auto restoreHoisted = llvm::scope_exit([&] {
     if (hoistedSource.empty())
       return;
     if (hoistedPrior)
@@ -4982,7 +4982,7 @@ ModuleEmitter::tryEmitManifestMethodObject(const parser::Node &anchor,
       methodsBeingInlined.clear();
       auto savedInlineFrames = std::move(inlineFrames);
       inlineFrames.clear();
-      auto restoreContexts = llvm::make_scope_exit([&] {
+      auto restoreContexts = llvm::scope_exit([&] {
         loopControlContexts = std::move(savedLoops);
         inlineReturnContexts = std::move(savedInlineReturns);
         superContexts = std::move(savedSupers);

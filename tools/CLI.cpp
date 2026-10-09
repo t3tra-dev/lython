@@ -377,7 +377,7 @@ struct LinkerDriver {
   std::string program;
   LinkerDriverFlavor flavor = LinkerDriverFlavor::Clang;
   // Arguments the driver needs to find its target's libraries (WASI).
-  std::vector<std::string> toolchainArgs;
+  std::vector<std::string> toolchainArgs = {};
 };
 
 std::optional<std::string> findExecutableProgram(llvm::StringRef name) {

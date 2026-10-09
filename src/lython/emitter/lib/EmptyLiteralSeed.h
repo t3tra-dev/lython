@@ -23,7 +23,7 @@ struct SuiteCursor {
   // One past the last statement the scan reads; the whole rest by default.
   std::size_t to = static_cast<std::size_t>(-1);
   // Which statements of [from, to) the scan reads, by index; all when empty.
-  std::vector<bool> keep;
+  std::vector<bool> keep = {};
 
   std::size_t end() const {
     return suite ? std::min(to, suite->size()) : 0;

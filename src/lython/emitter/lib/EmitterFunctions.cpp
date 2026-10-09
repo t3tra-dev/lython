@@ -851,7 +851,7 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   // needed, for the same reason.
   SiblingGroupState enclosingSiblings = std::move(closedSiblingGroup);
   closedSiblingGroup = SiblingGroupState{};
-  auto restoreSiblings = llvm::make_scope_exit(
+  auto restoreSiblings = llvm::scope_exit(
       [&] { closedSiblingGroup = std::move(enclosingSiblings); });
   if (!isLambda) {
     MutualNestedDefGroup group = mutualNestedDefGroup(callable);
