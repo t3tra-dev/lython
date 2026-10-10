@@ -210,6 +210,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.IndirectCallsOfOneShapeShareOneDispatcher"
     "DriverTest.AnExecutableKeepsOnlyItsEntryExternal"
     "DriverTest.AnExecutableKeepsItsPersonalityExternal"
+    "DriverTest.AMacOSTargetNamesTheMacOSItIsFor"
     "DriverTest.AJsHostExecutableKeepsItsExportsExternal"
     "DriverTest.TheReprHookArmsOnlyTheClassesTheProgramHolds"
     "DriverTest.TheComparisonHashAndReleaseHooksArmOnlyHeldClasses"
