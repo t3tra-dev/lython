@@ -1781,9 +1781,10 @@ TEST(DriverTest, ThePersonalityIsTheOneTheTargetCanHave) {
 // The Large row is asserted too, and is not redundant: it is the measurement
 // that says WHY the code model is spelled rather than left to the default.
 //
-// ⛔ aarch64 ELF is 0x9c under BOTH code models -- the width follows LP64
-// there, not the model -- so no knob reaches it and that target still refuses.
-// Recorded in tests/probe/wb_aarch64_elf_type_table_width.py.
+// aarch64 ELF is 0x9c under BOTH code models -- the width follows LP64 there,
+// not the model -- so no knob reaches it: the personality indexes that
+// target's entries eight bytes wide instead, and this test holds
+// `typeTableEntryBytes` to what each target machine emits.
 TEST(DriverTest, EveryTargetsExceptionTableIsTheOneTheReaderReads) {
   llvm::InitializeAllTargets();
   llvm::InitializeAllTargetMCs();
@@ -1826,6 +1827,10 @@ TEST(DriverTest, EveryTargetsExceptionTableIsTheOneTheReaderReads) {
       continue; // this build of LLVM does not carry that backend
     ++checked;
     EXPECT_EQ(encodingOf(*aot), encoding) << triple << " (AOT)";
+    // And the width the personality indexes the entries by is that one.
+    EXPECT_EQ(py::runtime_library::typeTableEntryBytes(llvm::Triple(triple)),
+              encoding == kIndirectPcrelSdata8 ? 8u : 4u)
+        << triple;
 
     // The JIT reaches codegen through ORC, so it is configured separately and
     // was wrong on its own for a whole CI round. Same two knobs, same answer.

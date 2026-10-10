@@ -109,6 +109,24 @@ inline bool padsAreFunclets(const llvm::Triple &triple) {
 inline constexpr llvm::StringRef kWasmPersonalityName =
     "__gxx_wasm_personality_v0";
 
+// The width of one entry of this target's LSDA type table: the `@TType`
+// encoding is DW_EH_PE_indirect | pcrel | sdata4 (0x9b) everywhere the Python
+// personality runs except aarch64 ELF, whose object-file lowering picks sdata8
+// (0x9c) under every code model.
+//
+// ⛔ Not read off the table at run time. The width would have to travel from
+// `ly_eh_lookup_site`, which reads the header, to `ly_eh_action_walk`, which
+// indexes the entries, through the carrier's memo slot -- a wider slot for a
+// value that cannot change within one program. The support module is built per
+// triple already; `DriverTest.EveryTargetsExceptionTableIsTheOneTheReaderReads`
+// holds this answer to what each target machine emits.
+inline unsigned typeTableEntryBytes(const llvm::Triple &triple) {
+  return triple.isAArch64() && triple.isArch64Bit() &&
+                 triple.isOSBinFormatELF()
+             ? 8
+             : 4;
+}
+
 inline llvm::StringRef personalityNameFor(const llvm::Triple &triple) {
   if (usePythonPersonality(triple))
     return kPythonPersonalityName;
