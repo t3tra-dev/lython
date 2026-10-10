@@ -209,6 +209,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AnErasedGeneratorBodyLeavesNoTryIdBehind"
     "DriverTest.IndirectCallsOfOneShapeShareOneDispatcher"
     "DriverTest.AnExecutableKeepsOnlyItsEntryExternal"
+    "DriverTest.AnExecutableKeepsItsPersonalityExternal"
     "DriverTest.AJsHostExecutableKeepsItsExportsExternal"
     "DriverTest.TheReprHookArmsOnlyTheClassesTheProgramHolds"
     "DriverTest.TheComparisonHashAndReleaseHooksArmOnlyHeldClasses"

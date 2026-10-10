@@ -251,10 +251,27 @@ struct EHSafeCanonicalizer
       if (op.getStringRef() != cf::BranchOp::getOperationName())
         op.getCanonicalizationPatterns(set, context);
     set.add(canonicalizeBranch);
-    patterns = FrozenRewritePatternSet(
-        std::move(set),
-        /*disabledPatternLabels=*/
-        {"(anonymous namespace)::SimplifyUniformBlockArguments"});
+    // ⭐ DISABLED BY THE NAME IT HAS IN THIS libMLIR, read off the pattern.
+    // A pattern's default debug name is its C++ type name as the compiler
+    // that built libMLIR spells it: clang says "(anonymous namespace)::
+    // SimplifyUniformBlockArguments", GCC says "{anonymous}::...". A name
+    // written here matched Homebrew's and apt's clang-built MLIR and not
+    // nixpkgs' GCC-built one, where the fold then ran and three goldens
+    // failed the ownership verifier on Linux only.
+    // ⛔ And a fold that is not found is an error, not a no-op: a renamed
+    // pattern would otherwise run again with nothing to say so.
+    llvm::SmallVector<std::string, 2> disabled;
+    for (const std::unique_ptr<RewritePattern> &pattern :
+         set.getNativePatterns())
+      if (pattern->getDebugName().ends_with("::SimplifyUniformBlockArguments"))
+        disabled.push_back(pattern->getDebugName().str());
+    if (disabled.empty())
+      return emitError(UnknownLoc::get(context))
+             << "lython-eh-safe-canonicalize: MLIR's "
+                "SimplifyUniformBlockArguments pattern, which this pass must "
+                "disable, was not found";
+    patterns = FrozenRewritePatternSet(std::move(set),
+                                       /*disabledPatternLabels=*/disabled);
     return success();
   }
 
