@@ -179,9 +179,9 @@ TEST(DriverTest, InstallsAOTEntryPointBesideAPythonMain) {
   EXPECT_FALSE(pythonMain->use_empty());
 }
 
-// What: once the AOT entry point is installed, the C entry is the only
-// definition the module still shows to the linker; every other function and
-// global is internal to the module.
+// What: once the AOT entry point is installed, the C entry (and the
+// personality the unwind tables name) are the only definitions the module
+// still shows to the linker; every other function and global is internal.
 TEST(DriverTest, AnExecutableKeepsOnlyItsEntryExternal) {
   CompileResult result = compileSource("def twice(x: int) -> int:\n"
                                        "    return x * 2\n"
@@ -195,11 +195,48 @@ TEST(DriverTest, AnExecutableKeepsOnlyItsEntryExternal) {
       lython::driver::installAOTEntryPoint(module, diag)))
       << diagnostics;
   for (const llvm::GlobalValue &value : module.global_values())
-    if (!value.isDeclaration() && value.getName() != "main")
+    if (!value.isDeclaration() && value.getName() != "main" &&
+        value.getName() != py::runtime_library::kPythonPersonalityName)
       EXPECT_TRUE(value.hasLocalLinkage()) << value.getName().str();
   const llvm::Function *entry = module.getFunction("main");
   ASSERT_NE(entry, nullptr);
   EXPECT_FALSE(entry->hasLocalLinkage());
+}
+
+// What: the Python personality stays external when an executable's other
+// definitions become internal: the unwind tables name it, and a Mach-O ld64
+// (the linker nixpkgs uses) cannot resolve a local personality there.
+TEST(DriverTest, AnExecutableKeepsItsPersonalityExternal) {
+  CompileResult result = compileSource("def boom() -> int:\n"
+                                       "    raise ValueError('x')\n"
+                                       "\n"
+                                       "try:\n"
+                                       "    boom()\n"
+                                       "except ValueError:\n"
+                                       "    print('caught')\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  llvm::Module &module = *result.verified.llvmModule;
+  // The personality is the runtime's, defined once the runtime is linked --
+  // which lyc does, for a settled target, before it installs the entry.
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  ASSERT_TRUE(mlir::succeeded(lython::driver::configureLLVMModuleCodeGenTarget(
+      module,
+      lython::driver::detectTensorLoweringTarget(
+          lython::driver::DriverOptions{}),
+      lython::driver::DriverOptions{}, diag)))
+      << diagnostics;
+  ASSERT_TRUE(mlir::succeeded(
+      py::runtime_library::linkEmbeddedNativeRuntime(module)));
+  ASSERT_TRUE(mlir::succeeded(
+      lython::driver::installAOTEntryPoint(module, diag)))
+      << diagnostics;
+  const llvm::Function *personality =
+      module.getFunction(py::runtime_library::kPythonPersonalityName);
+  if (!personality)
+    GTEST_SKIP() << "this target does not use the Python personality";
+  EXPECT_FALSE(personality->isDeclaration());
+  EXPECT_FALSE(personality->hasLocalLinkage());
 }
 
 // What: a function the JavaScript host calls by its export name stays

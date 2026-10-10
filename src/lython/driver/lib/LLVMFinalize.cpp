@@ -1,6 +1,7 @@
 #include "DriverCodeGen.h"
 
 #include "Common/PythonSourceRange.h"
+#include "Common/UnwindABI.h"
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -291,8 +292,15 @@ LogicalResult installAOTEntryPoint(llvm::Module &llvmModule,
   // but only after code generation, and it cannot inline, propagate
   // constants into, or delete the arms of a function it must keep callable
   // from outside.
+  //
+  // ⛔ Not the personality. The unwind tables name it from every function
+  // with a landing pad, and ld64 -- the Mach-O linker nixpkgs links with --
+  // cannot resolve a LOCAL personality there ("Undefined symbols:
+  // _LyEH_Personality ... referenced from __eh_frame"); Xcode's newer linker
+  // happens to, which is why only a Nix build found it.
   llvm::internalizeModule(llvmModule, [&](const llvm::GlobalValue &value) {
-    if (value.getName() == entryName)
+    if (value.getName() == entryName ||
+        value.getName() == py::runtime_library::kPythonPersonalityName)
       return true;
     auto *function = llvm::dyn_cast<llvm::Function>(&value);
     return function && function->hasFnAttribute("wasm-export-name");
