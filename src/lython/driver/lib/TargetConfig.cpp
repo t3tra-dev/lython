@@ -21,6 +21,7 @@
 #include "llvm/TargetParser/X86TargetParser.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <string>
 #include <vector>
@@ -108,20 +109,48 @@ static void fillDarwinOSVersionFromHost(llvm::Triple &triple) {
   llvm::Triple host(llvm::sys::getDefaultTargetTriple());
   if (!host.isOSDarwin() || host.getOSVersion().empty())
     return;
-  triple.setOSName(
-      (triple.getOSName() + host.getOSVersion().getAsString()).str());
+  // ⛔ Not the host's number as it is spelled. The host says `darwin25`, a
+  // KERNEL version; pasted after `macosx` it names a macOS that does not
+  // exist, and clang refuses the link (`invalid version number in '-target
+  // x86_64-apple-macosx25.0.0'`).
+  llvm::VersionTuple version = host.getOSVersion();
+  if (triple.getOS() == llvm::Triple::MacOSX)
+    host.getMacOSXVersion(version);
+  triple.setOSName((triple.getOSName() + version.getAsString()).str());
+}
+
+// The macOS an executable is built for is MACOSX_DEPLOYMENT_TARGET when it is
+// set, as for clang: the object's LC_BUILD_VERSION and the link's
+// `-mmacosx-version-min` (appendLinkTargetArgs) both read it from the triple.
+//
+// ⛔ Not left at the host's version. That is the RUNNING macOS, which says
+// nothing about where the program is meant to run, and a linker whose own
+// default is older -- nixpkgs' clang links for 14.0 -- warns on every object
+// lyc hands it ("built for newer macOS version (26.0) than being linked").
+static void applyMacOSDeploymentTarget(llvm::Triple &triple) {
+  if (!triple.isMacOSX())
+    return;
+  const char *deployment = std::getenv("MACOSX_DEPLOYMENT_TARGET");
+  llvm::VersionTuple version;
+  if (!deployment || version.tryParse(deployment) || version.getMajor() == 0)
+    return;
+  triple.setOSName(("macos" + version.getAsString()));
 }
 
 llvm::Triple codeGenTripleForTarget(py::TensorLoweringTarget target,
                                     const DriverOptions &options) {
   (void)target;
   std::string override = configuredTargetTripleOverride(options);
-  if (override.empty())
-    return llvm::Triple(llvm::sys::getDefaultTargetTriple());
-  // Normalized: `wasm32-wasip1` read positionally has vendor "wasip1" and no
-  // OS at all.
-  llvm::Triple triple(llvm::Triple::normalize(override));
-  fillDarwinOSVersionFromHost(triple);
+  llvm::Triple triple;
+  if (override.empty()) {
+    triple = llvm::Triple(llvm::sys::getDefaultTargetTriple());
+  } else {
+    // Normalized: `wasm32-wasip1` read positionally has vendor "wasip1" and no
+    // OS at all.
+    triple = llvm::Triple(llvm::Triple::normalize(override));
+    fillDarwinOSVersionFromHost(triple);
+  }
+  applyMacOSDeploymentTarget(triple);
   return triple;
 }
 

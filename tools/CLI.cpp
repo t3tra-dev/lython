@@ -623,13 +623,28 @@ void appendLinkTargetArgs(std::vector<std::string> &args,
   llvm::Triple targetTriple = codeGenTripleForTarget(tensorTarget, Options);
   llvm::Triple hostTriple(llvm::sys::getDefaultTargetTriple());
   std::string sysroot = configuredTargetSysrootOverride(Options);
+  // ⛔ No `-target` for the host's own Darwin at another version: the version
+  // goes as `-mmacosx-version-min` below, and nixpkgs' clang wrapper warns
+  // about any `-target` that is not its own.
+  const bool hostDarwinAtAnotherVersion =
+      targetTriple.isOSDarwin() && hostTriple.isOSDarwin() &&
+      targetTriple.getArch() == hostTriple.getArch() &&
+      targetTriple.getEnvironment() == hostTriple.getEnvironment();
   if (driverFlavor == LinkerDriverFlavor::Clang &&
-      targetTriple.normalize() != hostTriple.normalize()) {
+      targetTriple.normalize() != hostTriple.normalize() &&
+      !hostDarwinAtAnotherVersion) {
     args.emplace_back("-target");
     args.emplace_back(targetTriple.normalize());
   }
   if (!sysroot.empty())
     args.emplace_back("--sysroot=" + sysroot);
+  // The link is for the macOS the object was built for. A clang's own default
+  // is its SDK's or its packager's -- nixpkgs' says 14.0 -- and ld warns about
+  // every object newer than the link.
+  llvm::VersionTuple macOS;
+  if (driverFlavor == LinkerDriverFlavor::Clang && targetTriple.isMacOSX() &&
+      targetTriple.getMacOSXVersion(macOS))
+    args.emplace_back("-mmacosx-version-min=" + macOS.getAsString());
   if (driverFlavor == LinkerDriverFlavor::Clang && !Options.targetCPU.empty())
     args.emplace_back("-mcpu=" + Options.targetCPU);
   if (driverFlavor == LinkerDriverFlavor::Clang && !Options.targetFPU.empty())
@@ -641,8 +656,10 @@ void appendLinkTargetArgs(std::vector<std::string> &args,
     args.emplace_back("-I" + path);
   for (const std::string &path : LibrarySearchPaths)
     args.emplace_back("-L" + path);
+  // `darwin25` and `macos14.0` are the same OS to the system linker.
   if (driverFlavor == LinkerDriverFlavor::Clang &&
-      targetTriple.getOS() != hostTriple.getOS())
+      targetTriple.getOS() != hostTriple.getOS() &&
+      !(targetTriple.isOSDarwin() && hostTriple.isOSDarwin()))
     args.emplace_back("-fuse-ld=lld");
   if (targetTriple.isWindowsGNUEnvironment()) {
     args.emplace_back("-static");

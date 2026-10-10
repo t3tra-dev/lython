@@ -3427,11 +3427,13 @@ void buildEHLookupSite(SupportBuilder &b) {
   mlir::Value afterTypeEncoding = b.gepI8(typeEncodingAt, b.iconst(1));
   mlir::Value noTypes =
       b.cmpi(mlir::arith::CmpIPredicate::eq, typeEncoding, b.iconst8(-1));
-  // DW_EH_PE_indirect | DW_EH_PE_pcrel | DW_EH_PE_sdata4, which is what every
-  // DWARF target's type table is in.
+  // DW_EH_PE_indirect | DW_EH_PE_pcrel, and sdata4 or sdata8 as this target's
+  // entries are wide (`ly_eh_action_walk` indexes them by the same width).
+  const std::int64_t typeTableEncoding =
+      typeTableEntryBytes(b.triple) == 8 ? 0x9c : 0x9b;
   mlir::Value knownTypes = b.orBit(
-      noTypes,
-      b.cmpi(mlir::arith::CmpIPredicate::eq, typeEncoding, b.iconst8(-101)));
+      noTypes, b.cmpi(mlir::arith::CmpIPredicate::eq, typeEncoding,
+                      b.iconst8(static_cast<std::int8_t>(typeTableEncoding))));
   mlir::cf::CondBranchOp::create(
       b.builder, b.loc, knownTypes, typeTableKnown,
       mlir::ValueRange{afterTypeEncoding}, refuse,
@@ -3642,20 +3644,27 @@ void buildEHActionWalk(SupportBuilder &b) {
       notCleanupEntry->getArguments());
 
   b.builder.setInsertionPointToEnd(typedClause);
-  // The type table grows BACKWARDS from its base, four bytes per entry, and
-  // each entry is the displacement to a slot holding the address.
+  // The type table grows BACKWARDS from its base, one target-wide entry each,
+  // and each entry is the displacement to a slot holding the address.
+  const unsigned entryBytes = typeTableEntryBytes(b.triple);
   mlir::Value entryAt = b.gepI8(
       typeTableBase,
       mlir::arith::SubIOp::create(
           b.builder, b.loc, b.iconst(0),
           mlir::arith::MulIOp::create(b.builder, b.loc,
                                       typedClause->getArgument(0),
-                                      b.iconst(4))));
-  mlir::Value displacement = mlir::LLVM::SExtOp::create(
-      b.builder, b.loc, b.i64(),
-      mlir::LLVM::LoadOp::create(b.builder, b.loc, b.i32(), entryAt,
-                                 /*alignment=*/4)
-          .getResult());
+                                      b.iconst(entryBytes))));
+  mlir::Value displacement =
+      entryBytes == 8
+          ? mlir::LLVM::LoadOp::create(b.builder, b.loc, b.i64(), entryAt,
+                                       /*alignment=*/4)
+                .getResult()
+          : mlir::LLVM::SExtOp::create(
+                b.builder, b.loc, b.i64(),
+                mlir::LLVM::LoadOp::create(b.builder, b.loc, b.i32(), entryAt,
+                                           /*alignment=*/4)
+                    .getResult())
+                .getResult();
   // ⛔ A ZERO ENTRY IS A NULL TYPE, NOT A ZERO DISPLACEMENT. The pc-relative
   // and indirect steps apply only to a nonzero value, so a `catch (...)` in a
   // function that also has typed pads -- which is every function with both a

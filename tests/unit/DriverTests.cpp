@@ -203,6 +203,41 @@ TEST(DriverTest, AnExecutableKeepsOnlyItsEntryExternal) {
   EXPECT_FALSE(entry->hasLocalLinkage());
 }
 
+// What: a macOS target named without a version takes the host's MACOS
+// version, not its Darwin kernel number (`darwin25` is macOS 26, and
+// `macosx25` does not exist), and MACOSX_DEPLOYMENT_TARGET, when set, names
+// the macOS for the host target and a named one alike.
+TEST(DriverTest, AMacOSTargetNamesTheMacOSItIsFor) {
+  llvm::Triple host(llvm::sys::getDefaultTargetTriple());
+  llvm::VersionTuple hostMacOS;
+  if (!host.isMacOSX() || !host.getMacOSXVersion(hostMacOS))
+    GTEST_SKIP() << "the host is not macOS";
+  const char *saved = std::getenv("MACOSX_DEPLOYMENT_TARGET");
+  std::string restore = saved ? saved : "";
+  ::unsetenv("MACOSX_DEPLOYMENT_TARGET");
+
+  auto macOSOf = [](const char *target) {
+    lython::driver::DriverOptions options;
+    if (target)
+      options.targetTriple = target;
+    llvm::Triple triple = lython::driver::codeGenTripleForTarget({}, options);
+    llvm::VersionTuple version;
+    EXPECT_TRUE(triple.getMacOSXVersion(version)) << triple.str();
+    return version;
+  };
+  EXPECT_EQ(macOSOf("x86_64-apple-macosx").getMajor(), hostMacOS.getMajor());
+  EXPECT_EQ(macOSOf("arm64-apple-macosx").getMajor(), hostMacOS.getMajor());
+
+  ::setenv("MACOSX_DEPLOYMENT_TARGET", "13.0", /*overwrite=*/1);
+  EXPECT_EQ(macOSOf(nullptr), llvm::VersionTuple(13, 0));
+  EXPECT_EQ(macOSOf("x86_64-apple-macosx"), llvm::VersionTuple(13, 0));
+
+  if (saved)
+    ::setenv("MACOSX_DEPLOYMENT_TARGET", restore.c_str(), /*overwrite=*/1);
+  else
+    ::unsetenv("MACOSX_DEPLOYMENT_TARGET");
+}
+
 // What: the Python personality stays external when an executable's other
 // definitions become internal: the unwind tables name it, and a Mach-O ld64
 // (the linker nixpkgs uses) cannot resolve a local personality there.
@@ -1781,9 +1816,10 @@ TEST(DriverTest, ThePersonalityIsTheOneTheTargetCanHave) {
 // The Large row is asserted too, and is not redundant: it is the measurement
 // that says WHY the code model is spelled rather than left to the default.
 //
-// ⛔ aarch64 ELF is 0x9c under BOTH code models -- the width follows LP64
-// there, not the model -- so no knob reaches it and that target still refuses.
-// Recorded in tests/probe/wb_aarch64_elf_type_table_width.py.
+// aarch64 ELF is 0x9c under BOTH code models -- the width follows LP64 there,
+// not the model -- so no knob reaches it: the personality indexes that
+// target's entries eight bytes wide instead, and this test holds
+// `typeTableEntryBytes` to what each target machine emits.
 TEST(DriverTest, EveryTargetsExceptionTableIsTheOneTheReaderReads) {
   llvm::InitializeAllTargets();
   llvm::InitializeAllTargetMCs();
@@ -1826,6 +1862,10 @@ TEST(DriverTest, EveryTargetsExceptionTableIsTheOneTheReaderReads) {
       continue; // this build of LLVM does not carry that backend
     ++checked;
     EXPECT_EQ(encodingOf(*aot), encoding) << triple << " (AOT)";
+    // And the width the personality indexes the entries by is that one.
+    EXPECT_EQ(py::runtime_library::typeTableEntryBytes(llvm::Triple(triple)),
+              encoding == kIndirectPcrelSdata8 ? 8u : 4u)
+        << triple;
 
     // The JIT reaches codegen through ORC, so it is configured separately and
     // was wrong on its own for a whole CI round. Same two knobs, same answer.
