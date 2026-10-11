@@ -36,6 +36,18 @@ cmake -B build -S .
 cmake --build build -j$(nproc)
 ```
 
+### Nix
+
+nixpkgs の `llvmPackages_23` (cache.nixos.org のバイナリ) を使うので LLVM/MLIR
+のビルドは走らない。対応システムは `aarch64-darwin` / `aarch64-linux` /
+`x86_64-linux`。
+
+```bash
+nix run github:t3tra-dev/lython -- jit examples/hello.py   # lyc を直接
+nix develop                                                # 上の cmake 手順がそのまま通る
+nix flake check                                            # ctest (bench 以外) をサンドボックスで
+```
+
 ### 実行
 
 ```bash
