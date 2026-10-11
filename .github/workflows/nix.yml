@@ -1,0 +1,45 @@
+name: Nix
+
+# The flake builds against nixpkgs' LLVM/MLIR 23 from cache.nixos.org, which
+# differs from the apt LLVM the CI job uses in ways that have broken this
+# tree before: nixpkgs builds libMLIR with GCC on Linux and links macOS with
+# its own ld64. The aarch64 runners are also the only ones that reach
+# aarch64's exception tables.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  nix:
+    name: Nix (${{ matrix.system }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-latest
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+          - system: aarch64-darwin
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+
+      - name: Build
+        run: nix build -L .#lython
+
+      - name: Run
+        run: |
+          nix run . -- jit examples/hello.py
+          nix run . -- examples/try_finally.py -o try_finally
+          ./try_finally
+
+      # The ctest suite inside the build sandbox, bench tests aside.
+      - name: Check
+        run: nix flake check -L

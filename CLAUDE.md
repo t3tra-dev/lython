@@ -28,7 +28,14 @@ cmake --build build -j$(nproc)
 
 # 型チェック (src/lyrt のスタブに対して strict モード)
 uv run pyright
+
+# Nix (nixpkgs の llvmPackages_23 を使う。LLVM はビルドしない)
+nix develop                   # cmake / LLVM / MLIR / clang / lld が揃ったシェル
+nix build .#lython            # lyc (AOT 用の clang と lld を PATH に持つ wrapper)
+nix flake check               # ctest -LE bench をサンドボックスで
 ```
+
+Nix ビルドは nixpkgs の LLVM 23 に対して行う。Linux の libMLIR は GCC ビルドなのでパターンのデバッグ名が clang と違い (`{anonymous}::` / `(anonymous namespace)::`)、macOS は nixpkgs の ld64 でリンクする。どちらも Homebrew / apt では見えない差で、`.github/workflows/nix.yml` が 3 システムで検査する。
 
 主な `lyc` フラグ: `--emit-llvm` (LLVM IR で停止)、`--release` (verifier パス無効化)、`-O2` / `-Os` / `-Oz` (AOT 実行ファイルの最適化目標。既定 `-O2`。`-Os` / `-Oz` は全関数に optsize / minsize を付ける: `examples/genexpr.py` の wasm は 137 KB → 84 KB になるが、dict と str 中心の処理は 1.3〜2 倍遅くなる。JIT では拒否される。AOT は C の入口と JS ホスト向け export 以外をすべて internal にしてから最適化する)、`--target` / `-mcpu` / `-mfpu` (クロスコンパイル)、`--fsanitize=...`、`--audit-runtime-manifest`、`-jit-codegen-opt=none|less|default|aggressive` (JIT の命令選択品質) と `-jit-opt=0..3` (JIT の LLVM IR 最適化レベル。AOT は常に O2)。どちらも既定は初回出力レイテンシ優先の最低値。実測の分岐点: `-jit-codegen-opt=less` は jit-build を約 180 ms 増やして実行を約半分にするので、実行が 360 ms を超えるプログラムから得になる (`examples/tarai.py` は合計 1.60 s → 1.11 s、`examples/hello.py` は 0.18 s → 0.35 s)、`-mmatrix=auto|sme|amx|none` (行列エンジン選択。auto は公開 ISA の SME 優先、amx は Apple AMX を runtime probe 付きで強制)、`--target wasm32-wasip1` (`-o prog.wasm` は wasmtime でそのまま動く WASI モジュール。リンクは lyc がリンクしている LLVM の clang と wasm-ld で行う。wasi-libc と wasm32 の compiler-rt は Homebrew の `wasi-libc` / `wasi-runtimes` か wasi-sdk から探す: `--sysroot`、`WASI_SDK_PATH`、LLVM の prefix、Homebrew の share、`/opt/wasi-sdk`、`~/.local/wasi-sdk*`)、`--js-host` (WASI のプログラムを JS ホストの下で動かす。`-o prog.js` がローダで、`prog.wasm` が隣に出る。docs/js-host.md)。
 

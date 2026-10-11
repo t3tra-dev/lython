@@ -488,6 +488,26 @@ mlir::LogicalResult buildNativeRuntimeModule(llvm::Module &llvmModule) {
   return mlir::success();
 }
 
+// Whether the runtime precompiled for `built` serves a program for `program`.
+//
+// ⛔ Not an exact match on macOS. The program's triple names the macOS it is
+// for (MACOSX_DEPLOYMENT_TARGET), the build's the macOS it was built on, and
+// nothing the runtime lowers reads the version -- so an exact match sent every
+// compile under a deployment target (all of nixpkgs' builds on macOS set one)
+// to lowering the runtime again.
+static bool precompiledRuntimeServes(const llvm::Triple &program,
+                                     llvm::StringRef built) {
+  if (program.str() == built)
+    return true;
+  llvm::Triple builtTriple(built);
+  return program.isMacOSX() && builtTriple.isMacOSX() &&
+         program.getArch() == builtTriple.getArch() &&
+         program.getSubArch() == builtTriple.getSubArch() &&
+         program.getVendor() == builtTriple.getVendor() &&
+         program.getEnvironment() == builtTriple.getEnvironment() &&
+         program.getObjectFormat() == builtTriple.getObjectFormat();
+}
+
 mlir::LogicalResult linkEmbeddedNativeRuntime(llvm::Module &llvmModule) {
   llvm::Triple targetTriple(llvmModule.getTargetTriple());
   std::unique_ptr<llvm::Module> runtime;
@@ -504,7 +524,8 @@ mlir::LogicalResult linkEmbeddedNativeRuntime(llvm::Module &llvmModule) {
   if (const embedded::PrecompiledNativeRuntime *precompiled =
           embedded::precompiledNativeRuntime();
       !ablated && precompiled &&
-      llvmModule.getTargetTriple().str() == precompiled->triple &&
+      precompiledRuntimeServes(llvmModule.getTargetTriple(),
+                               precompiled->triple) &&
       llvmModule.getDataLayoutStr() == precompiled->dataLayout) {
     PerfScope perf("link-runtime.precompiled");
     llvm::Expected<std::unique_ptr<llvm::Module>> parsed =
@@ -521,6 +542,7 @@ mlir::LogicalResult linkEmbeddedNativeRuntime(llvm::Module &llvmModule) {
       return mlir::failure();
     }
     runtime = std::move(*parsed);
+    runtime->setTargetTriple(llvmModule.getTargetTriple());
   } else {
     PerfScope perf("link-runtime.lowered");
     runtime = std::make_unique<llvm::Module>("lython-native-runtime",
