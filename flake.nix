@@ -104,6 +104,11 @@
             packages = [
               llvmPackages.llvm
               llvmPackages.mlir
+              # mlir-tblgen and llvm-tblgen live only in `tblgen`; nixpkgs's
+              # mlir derivation does not install them into its `out`. Lython's
+              # CMake looks them up on PATH at configure time, so the
+              # devShell has to bring them in.
+              llvmPackages.tblgen
               llvmPackages.clang
               llvmPackages.lld
               pkgs.cmake
