@@ -1,7 +1,8 @@
 name: Nix cache
 
-# Keeps comamoca-lython.cachix.org populated so `nix run` users skip the
-# ~1 hour LLVM/MLIR source build (llvm23 1.2 GiB + mlir23 774 MiB).
+# Populates comamoca-lython.cachix.org with the lython derivation so `nix
+# run` users do not pay the lython source build (LLVM/MLIR itself is
+# already a binary cache hit via llvmPackages_23).
 
 on:
   push:
@@ -43,7 +44,7 @@ jobs:
       - name: Build packages
         env:
           NIX_CONFIG: "max-jobs = 4 cores = 4"
-        run: nix build .#llvm23 .#mlir23 .#lython -L
+        run: nix build .#lython -L
 
       - name: Build devShell (warms build-only deps)
         run: nix develop -c true

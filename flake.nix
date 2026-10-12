@@ -1,15 +1,5 @@
 {
   description = "Lython: an LLVM/MLIR 23 based Python compiler toolchain";
-
-  # `nix run github:t3tra-dev/lython` otherwise compiles two LLVM trees from
-  # source; this lets a first-time user accept the binary cache instead.
-  nixConfig = {
-    extra-substituters = [ "https://comamoca-lython.cachix.org" ];
-    extra-trusted-public-keys = [
-      "comamoca-lython.cachix.org-1:AsNMU2Rio0MerjVsy2UJgjt6cP/ywp7tk0peqoxB1VU="
-    ];
-  };
-
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
 
@@ -47,22 +37,6 @@
 
       pkgsFor = system: import nixpkgs { inherit system; };
 
-      # Lython hard-requires LLVM/MLIR major 23 (LYTHON_LLVM_MAJOR_VERSION
-      # in CMakeLists.txt); nixpkgs ships 21. The overlay drops the
-      # nixpkgs-built toolchain in under the name the rest of the flake
-      # (and downstream users) expects.
-      llvm23Overlay = final: prev: {
-        llvm23 = final.callPackage ./nix/llvm23.nix { };
-        mlir23 = final.callPackage ./nix/mlir23.nix { inherit (final) llvm23; };
-      };
-
-      lyPkgsFor =
-        system:
-        import nixpkgs {
-          inherit system;
-          overlays = [ llvm23Overlay ];
-        };
-
       # Formatting and git-hook configs stay behind `formatter`/`checks` only.
       # Referencing them from `packages` or `devShells` would make `nix run`
       # fetch the tooling inputs again.
@@ -98,16 +72,17 @@
       packages = forAllSystems (
         system:
         let
-          lyPkgs = lyPkgsFor system;
-          lython = lyPkgs.callPackage ./nix/build-lython.nix {
-            inherit (lyPkgs) llvm23 mlir23;
+          pkgs = pkgsFor system;
+          llvmPackages = pkgs.llvmPackages_23;
+          lython = pkgs.callPackage ./nix/build-lython.nix {
+            llvm = llvmPackages.llvm;
+            mlir = llvmPackages.mlir;
+            tblgen = llvmPackages.tblgen;
           };
         in
         {
           default = lython;
           inherit lython;
-          llvm23 = lyPkgs.llvm23;
-          mlir23 = lyPkgs.mlir23;
         }
       );
 
@@ -122,13 +97,15 @@
         system:
         let
           pkgs = pkgsFor system;
-          lyPkgs = lyPkgsFor system;
+          llvmPackages = pkgs.llvmPackages_23;
         in
         {
           default = pkgs.mkShell {
             packages = [
-              lyPkgs.llvm23
-              lyPkgs.mlir23
+              llvmPackages.llvm
+              llvmPackages.mlir
+              llvmPackages.clang
+              llvmPackages.lld
               pkgs.cmake
               pkgs.ninja
               pkgs.gnumake
@@ -136,19 +113,19 @@
               pkgs.python3
               pkgs.uv
               pkgs.gdb
-              # `lyc` shells out to the clang in llvm23/bin for AOT and WASI
+              # `lyc` shells out to the clang in llvm23 for AOT and WASI
               # linking; that clang locates the C++ runtime by finding gcc on
               # PATH.
               pkgs.gcc
               pkgs.binutils
             ];
 
-            LLVM_DIR = "${lyPkgs.llvm23}/lib/cmake/llvm";
-            MLIR_DIR = "${lyPkgs.mlir23}/lib/cmake/mlir";
+            LLVM_DIR = "${llvmPackages.llvm.dev}/lib/cmake/llvm";
+            MLIR_DIR = "${llvmPackages.mlir.dev}/lib/cmake/mlir";
 
             shellHook = ''
-              export LLVM_DIR="${lyPkgs.llvm23}/lib/cmake/llvm"
-              export MLIR_DIR="${lyPkgs.mlir23}/lib/cmake/mlir"
+              export LLVM_DIR="${llvmPackages.llvm.dev}/lib/cmake/llvm"
+              export MLIR_DIR="${llvmPackages.mlir.dev}/lib/cmake/mlir"
               echo "LLVM_DIR=$LLVM_DIR"
               echo "MLIR_DIR=$MLIR_DIR"
             '';
