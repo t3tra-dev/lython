@@ -804,21 +804,13 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
       mlir::MLIRContext *context = analysis.targetType.getContext();
       addSubclass(py::ContractType::get(context, "builtins.bool"));
       analysis.kind = IsInstanceAnalysis::Kind::ClassTest;
-      // ⛔ THE TEST NARROWS EVERY TARGET BUT `int` AND `bool`. Narrowing hands
-      // the branch a VIEW of the box's entity, which is right exactly when
-      // every class the test accepts has the target's runtime layout.
-      //
-      // `bool` has no entity at all -- its runtime shape is `i1`, and the
-      // branch failed to compile with "builtins.bool has no statically sized
-      // entity lane". `int` accepts bool, because Python's `bool` IS an `int`
-      // and the test says so; but a boxed bool is `LyBool_Box`'s three-word
-      // immortal singleton and an int is not, so viewing one as the other read
-      // `True + 1` as 1 and `False + 1` as a pointer-shaped integer. The test
-      // keeps answering CPython's answer; only the view is withheld.
-      llvm::StringRef targetName =
-          mlir::cast<py::ContractType>(analysis.targetType).getContractName();
-      if (targetName != "builtins.bool" && targetName != "builtins.int")
-        analysis.trueType = analysis.targetType;
+      // ⭐ AND THE TEST NARROWS `int` AND `bool` TOO (2026-10-17). It
+      // withheld them because a boxed bool was a three-word singleton an int
+      // view misread (`True + 1` read as 1); bool objects now carry the int
+      // layout (objects/bool.mlir), so the int view is exact for a bool, and a
+      // bool target is unboxed to its truth bit rather than viewed
+      // (`lowerAliasView`).
+      analysis.trueType = analysis.targetType;
       return analysis;
     }
     analysis.failureReason =

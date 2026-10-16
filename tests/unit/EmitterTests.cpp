@@ -771,25 +771,23 @@ TEST(EmitterTest, ACarriedLaneStillTakesAWidenedValue) {
   EXPECT_TRUE(emitted.ok()) << emitted.diagnostics.size();
 }
 
-// WHAT: `isinstance(o, int)` on an `object` answers, and does NOT hand the
-// branch an int. The answer has to include a bool -- Python's bool is an int --
-// and a boxed bool is not an int object, so viewing one as the other read
-// `True + 1` as 1. The refusal is the boundary; the test above it is not.
-TEST(EmitterTest, AnObjectNarrowedByAnIntTestIsStillAnObject) {
+// WHAT: `isinstance(o, int)` and `isinstance(o, bool)` on an `object` narrow
+// the branch to the class they test: `o + 1` takes an int and `not o` a bool,
+// where both used to be refused as `builtins.object` -- an int test accepts a
+// bool, and the int view of a bool is exact now that bool objects carry the
+// int layout.
+TEST(EmitterTest, AnObjectNarrowedByAnIntOrBoolTestIsThatClass) {
   mlir::MLIRContext context(testRegistry());
   lython::emitter::EmitResult emitted =
       emitSource("def f(o: object) -> int:\n"
+                 "    if isinstance(o, bool):\n"
+                 "        return 0 if not o else 1\n"
                  "    if isinstance(o, int):\n"
                  "        return o + 1\n"
                  "    return -1\n"
                  "print(f(1))\n",
                  context);
-  EXPECT_FALSE(emitted.ok());
-  bool found = false;
-  for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
-    found = found || diagnostic.message.find("builtins.object") !=
-                         std::string::npos;
-  EXPECT_TRUE(found);
+  EXPECT_TRUE(emitted.ok()) << emitted.diagnostics.size();
 }
 
 // The positive control: every other target DOES narrow, and the narrowed value

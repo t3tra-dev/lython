@@ -869,11 +869,34 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
       mlir::Value entityWord =
           mlir::memref::LoadOp::create(builder, loc, header, entityIndex)
               .getResult();
+      // ⭐ A bool IS UNBOXED, NOT VIEWED: its value is the truth bit and its
+      // box holds the singleton, so the entity is read in the slot's shape and
+      // handed to the contract's unbox -- the step a union arm and a container
+      // element already take for the same pair.
+      // ⛔ Only where the contract's own lanes are not the slot's: every other
+      // class is the view it always was.
+      std::string resultContract = runtimeContractName(resultValue.getType());
       mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
-          RuntimeBundleLowerer::lanesFromBoxEntity(
-              builder, loc, entityWord, *expectedTypes,
-              runtimeContractName(resultValue.getType()), op,
-              /*ownedRead=*/true);
+          mlir::failure();
+      if (resultContract == "builtins.bool") {
+        mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> slotShapes =
+            RuntimeBundleLowerer::slotStorageShapesFor(op, resultValue.getType(),
+                                                       "isinstance bool view");
+        if (mlir::failed(slotShapes))
+          return mlir::failure();
+        mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> stored =
+            RuntimeBundleLowerer::lanesFromBoxEntity(
+                builder, loc, entityWord, *slotShapes, resultContract, op,
+                /*ownedRead=*/true);
+        if (mlir::failed(stored))
+          return mlir::failure();
+        lanes = RuntimeBundleLowerer::unboxSlotElementValues(
+            op, resultValue.getType(), *stored);
+      } else {
+        lanes = RuntimeBundleLowerer::lanesFromBoxEntity(
+            builder, loc, entityWord, *expectedTypes, resultContract, op,
+            /*ownedRead=*/true);
+      }
       if (mlir::failed(lanes))
         return mlir::failure();
       RuntimeBundle result;
