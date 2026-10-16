@@ -1375,6 +1375,10 @@ private:
     // An empty `callerName` means the enclosing LLVM function, which only the
     // lowering can name.
     std::string callerName;
+    // The file that call is written in. A method of another module is
+    // emitted under ITS module's `sourceName`, so the caller's has to be
+    // remembered here or the caller's frame prints the callee's file.
+    std::string callerFile;
     std::int32_t line = 0;
     std::int32_t column = 0;
     std::int32_t endLine = 0;

@@ -260,6 +260,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AnUntabledCtypesSymbolsAddressLinksOnWasi"
     "DriverTest.AnImportedFunctionReturnsTheClassItsModuleImports"
     "DriverTest.AnImportedGlobalAnnotationNamesItsModulesClass"
+    "DriverTest.AModuleBesideAProgramRunFromItsDirectoryHasNoDotInItsPath"
     "DriverTest.OnlyAValueWhoseReleaseIsObservableIsKeptAlive"
     "DriverTest.AnIntOrFloatAContainerOnlyStoresGoesInAsItsSlotWord"
     "DriverTest.ALibrarysModuleAliasIsNotTheProgramsName"

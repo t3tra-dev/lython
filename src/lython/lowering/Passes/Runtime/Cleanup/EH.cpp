@@ -374,10 +374,14 @@ void emitTracebackPush(llvm::IRBuilder<> &builder, llvm::Module &module,
   // callee's line under the caller's name.
   auto push = [&](llvm::StringRef frameName, std::int32_t frameLine,
                   std::int32_t frameColumn, std::int32_t frameEndLine,
-                  std::int32_t frameEndColumn, std::int32_t frameMarker) {
+                  std::int32_t frameEndColumn, std::int32_t frameMarker,
+                  llvm::StringRef frameFile = {}) {
     llvm::Value *name = globalCStringPtr(builder, frameName, "py.tb.func");
+    llvm::Value *frameFileValue =
+        frameFile.empty() ? file
+                          : globalCStringPtr(builder, frameFile, "py.tb.file");
     builder.CreateCall(tracebackPushCStringRange(module),
-                       {file, name, i32Constant(builder, frameLine),
+                       {frameFileValue, name, i32Constant(builder, frameLine),
                         i32Constant(builder, frameColumn),
                         i32Constant(builder, frameEndLine),
                         i32Constant(builder, frameEndColumn),
@@ -397,7 +401,7 @@ void emitTracebackPush(llvm::IRBuilder<> &builder, llvm::Module &module,
       push(frame.functionName.empty() ? functionName
                                       : llvm::StringRef(frame.functionName),
            frame.line, frame.column, frame.endLine, frame.endColumn,
-           frame.noAnchor ? 0 : 1);
+           frame.noAnchor ? 0 : 1, frame.filename);
 }
 
 void buildPythonCleanupBlock(llvm::CallInst &call, llvm::BasicBlock *unwindDest,
@@ -1104,7 +1108,8 @@ void collectPythonCallSiteRanges(
         a.noAnchor != b.noAnchor || a.inlinedAt.size() != b.inlinedAt.size())
       return false;
     for (auto [x, y] : llvm::zip(a.inlinedAt, b.inlinedAt))
-      if (x.functionName != y.functionName || x.line != y.line ||
+      if (x.functionName != y.functionName || x.filename != y.filename ||
+          x.line != y.line ||
           x.column != y.column || x.endLine != y.endLine ||
           x.endColumn != y.endColumn || x.noAnchor != y.noAnchor)
         return false;

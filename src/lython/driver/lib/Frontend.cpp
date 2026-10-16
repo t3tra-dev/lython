@@ -273,6 +273,10 @@ localSourceModulePath(StringRef baseDir,
       return std::nullopt;
     llvm::sys::path::append(path, part);
   }
+  // A program run from its own directory has baseDir "", and "./mod.py" is
+  // what the traceback would then print after the cwd: ".../dir/./mod.py",
+  // where CPython prints ".../dir/mod.py".
+  llvm::sys::path::remove_dots(path);
   llvm::SmallString<256> sourcePath(path);
   sourcePath += ".py";
   if (llvm::sys::fs::exists(sourcePath))

@@ -1,0 +1,7 @@
+Traceback \(most recent call last\):
+  File "[^"]*/a_traceback_frame_names_its_own_file\.py", line 12, in <module>
+    print\(table\.get\("present"\)\)
+          ~~~~~~~~~\^\^\^\^\^\^\^\^\^\^\^
+  File "[^"]*/a_method_of_another_module_raises\.py", line 9, in get
+    raise KeyError\(key\)
+KeyError: 'present'

@@ -339,6 +339,9 @@ mlir::Location ModuleEmitter::loc(const parser::Node &node) const {
       llvm::SmallVector<mlir::NamedAttribute, 6> entry;
       entry.push_back(attrBuilder.getNamedAttr(
           "function", attrBuilder.getStringAttr(frame.callerName)));
+      if (frame.callerFile != sourceName)
+        entry.push_back(attrBuilder.getNamedAttr(
+            "file", attrBuilder.getStringAttr(frame.callerFile)));
       entry.push_back(attrBuilder.getNamedAttr(
           "start_line", attrBuilder.getI32IntegerAttr(frame.line)));
       entry.push_back(attrBuilder.getNamedAttr(

@@ -2924,6 +2924,54 @@ TEST(DriverTest, AnImportedFunctionReturnsTheClassItsModuleImports) {
   EXPECT_TRUE(result.succeeded) << result.diagnostics;
 }
 
+// What: a module imported by a program compiled from its own directory (an
+// empty base directory) is named "helper.py" in the frames it raises from, not
+// "./helper.py" -- which printed after the cwd as ".../dir/./helper.py".
+TEST(DriverTest, AModuleBesideAProgramRunFromItsDirectoryHasNoDotInItsPath) {
+  llvm::SmallString<128> dir;
+  ASSERT_FALSE(llvm::sys::fs::createUniqueDirectory("lython-driver-dot", dir));
+  {
+    llvm::SmallString<128> path(dir);
+    llvm::sys::path::append(path, "helper.py");
+    std::error_code error;
+    llvm::raw_fd_ostream out(path, error);
+    out << "def boom(n: int) -> int:\n"
+           "    if n > 0:\n"
+           "        raise ValueError(\"boom\")\n"
+           "    return n\n";
+  }
+  llvm::SmallString<256> previous;
+  ASSERT_FALSE(llvm::sys::fs::current_path(previous));
+  ASSERT_FALSE(llvm::sys::fs::set_current_path(dir));
+  CompileResult result;
+  {
+    mlir::MLIRContext context(testRegistry());
+    llvm::raw_string_ostream diag(result.diagnostics);
+    result.succeeded =
+        mlir::succeeded(lython::driver::compilePythonSourceToLLVMIR(
+            "import helper\nprint(helper.boom(1))\n", "main.py", "",
+            lython::driver::DriverOptions{}, context, result.verified, diag));
+  }
+  ASSERT_FALSE(llvm::sys::fs::set_current_path(previous));
+  llvm::sys::fs::remove_directories(dir);
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  ASSERT_TRUE(result.verified.llvmModule);
+  unsigned named = 0;
+  for (const llvm::GlobalVariable &global :
+       result.verified.llvmModule->globals()) {
+    auto *data = llvm::dyn_cast_if_present<llvm::ConstantDataSequential>(
+        global.hasInitializer() ? global.getInitializer() : nullptr);
+    if (!data || !data->isString())
+      continue;
+    llvm::StringRef text = data->getAsString();
+    if (!text.contains("helper.py"))
+      continue;
+    ++named;
+    EXPECT_FALSE(text.contains("./helper.py")) << text.str();
+  }
+  EXPECT_GT(named, 0u);
+}
+
 // What: an imported module's annotated global names the module's own class
 // -- `list[A]` there is `lib.A` -- so a field of an element read from the
 // importer resolves, and a method of the module that fills it agrees.
