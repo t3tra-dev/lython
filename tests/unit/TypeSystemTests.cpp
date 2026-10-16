@@ -197,3 +197,46 @@ TEST_F(TypeSystemTest, LambdaAdoptsExpectedCallableParameterTypes) {
 }
 
 } // namespace
+
+// What: the names a def or class statement binds and reads, as the
+// empty-literal scan's slice sees them, are its own name and its header --
+// the decorators, defaults, annotations and bases -- and nothing its body
+// binds or reads; an except handler still binds its name.
+TEST_F(TypeSystemTest, ADefStatementIsItsNameAndItsHeader) {
+  const lython::parser::Node &module =
+      parseModule("@deco\n"
+                  "def f(x: Ann = dflt) -> Ret:\n"
+                  "    result = helper(x)\n"
+                  "    return result\n"
+                  "class C(Base):\n"
+                  "    def method(self) -> None:\n"
+                  "        inner = other\n"
+                  "try:\n"
+                  "    pass\n"
+                  "except E as err:\n"
+                  "    caught = err\n");
+  const auto *body = ast::nodeList(module, "body");
+  ASSERT_TRUE(body && body->size() == 3);
+  const std::vector<lython::emitter::StatementNames> &names =
+      types->statementNamesOf(*body);
+  ASSERT_EQ(names.size(), 3u);
+
+  const lython::emitter::StatementNames &def = names[0];
+  EXPECT_TRUE(def.stored.contains("f"));
+  EXPECT_FALSE(def.stored.contains("result"));
+  for (llvm::StringRef header : {"deco", "Ann", "dflt", "Ret"})
+    EXPECT_TRUE(def.mentioned.contains(header)) << header.str();
+  for (llvm::StringRef inside : {"helper", "result"})
+    EXPECT_FALSE(def.mentioned.contains(inside)) << inside.str();
+
+  const lython::emitter::StatementNames &cls = names[1];
+  EXPECT_TRUE(cls.stored.contains("C"));
+  EXPECT_FALSE(cls.stored.contains("method"));
+  EXPECT_FALSE(cls.stored.contains("inner"));
+  EXPECT_TRUE(cls.mentioned.contains("Base"));
+  EXPECT_FALSE(cls.mentioned.contains("other"));
+
+  const lython::emitter::StatementNames &handler = names[2];
+  EXPECT_TRUE(handler.stored.contains("err"));
+  EXPECT_TRUE(handler.stored.contains("caught"));
+}
