@@ -2131,6 +2131,92 @@ bool releaseOwnedGroupByLiveness(
     }
     return false;
   };
+  // The same question past the consume's block: a read in any block the
+  // consume reaches -- by a CFG edge, or by an unwind from a guarded call that
+  // runs after it -- before the value is defined again.
+  //
+  //     name = "N" + str(c)
+  //     e = ValueError(name)      # transfer_args: the frame's token moves
+  //     if c:
+  //         print(name)           # read in another block: used after release
+  //
+  //     try:
+  //         raise KeyError(name)  # the consume, then the guarded raise
+  //     except KeyError:
+  //         ...                   # the handler drops the exception and `key`
+  //     print(name + "_A")        # reached through the unwind edge only
+  //
+  // ⛔ Why NOT dominance, which is how `useFollowsAConsume` asks: the handler
+  // is reached through the exception edge of a call that runs AFTER the
+  // consume, and the anchor that dominates the handler runs before it, so the
+  // read there is not dominated by the consume and still follows it.
+  // ⛔ Nor the defining block itself: entering it again defines the value
+  // again (a loop body), and a read there names the next incarnation.
+  // ⛔ A branch forwarding the value to a block argument is not counted, as
+  // the in-block walk above explains for the back edge it does count: the
+  // destination argument takes its own token from the merge-borrow retain.
+  auto readFollowsConsumeAcrossBlocks = [&](mlir::Operation *consume,
+                                            bool countConsumes) {
+    mlir::Block *consumeBlock = consume->getBlock();
+    llvm::SmallPtrSet<mlir::Block *, 16> readBlocks;
+    for (mlir::Value name : group.values) {
+      llvm::SmallVector<mlir::Value, 8> names;
+      aliases.namesOf(name, names);
+      for (mlir::Value candidate : names)
+        for (mlir::OpOperand &use : candidate.getUses()) {
+          mlir::Operation *reader = ancestorInRegion(use.getOwner(), region);
+          if (!reader || reader == selfOp || reader == consume)
+            continue;
+          if (mlir::isa<mlir::cf::BranchOp, mlir::cf::CondBranchOp>(reader))
+            continue;
+          if (!countConsumes && consumingUseEndsThisToken(use, candidate))
+            continue;
+          readBlocks.insert(reader->getBlock());
+        }
+    }
+    readBlocks.erase(defBlock);
+    if (readBlocks.empty())
+      return false;
+    std::optional<RegionExceptionEdges> localEdges;
+    const RegionExceptionEdges &exceptionEdges =
+        ExceptionEdgeMemo::of(region, localEdges);
+    llvm::SmallVector<mlir::Block *, 16> worklist;
+    llvm::SmallPtrSet<mlir::Block *, 16> seen;
+    auto visit = [&](mlir::Block *block) {
+      if (block != defBlock && seen.insert(block).second)
+        worklist.push_back(block);
+    };
+    for (mlir::Block *successor : consumeBlock->getSuccessors())
+      visit(successor);
+    // Only the unwinds that leave after the consume: one before it, or from
+    // the consume itself, leaves with the token still in hand.
+    llvm::DenseMap<std::int64_t, mlir::Block *> handlerById;
+    for (mlir::Operation *op = consume->getNextNode(); op;
+         op = op->getNextNode()) {
+      auto marker = mlir::dyn_cast<mlir::func::CallOp>(op);
+      if (!marker || marker.getCallee() != "LyEH_TryCallSiteMarker")
+        continue;
+      std::optional<std::int64_t> id = own::exceptionMarkerId(marker);
+      if (!id)
+        continue;
+      if (handlerById.empty())
+        handlerById = own::collectExceptionHandlerEntries(*region);
+      if (auto found = handlerById.find(*id); found != handlerById.end())
+        visit(found->second);
+    }
+    while (!worklist.empty()) {
+      mlir::Block *block = worklist.pop_back_val();
+      if (readBlocks.contains(block))
+        return true;
+      for (mlir::Block *successor : block->getSuccessors())
+        visit(successor);
+      if (auto found = exceptionEdges.edges.find(block);
+          found != exceptionEdges.edges.end())
+        for (mlir::Block *handler : found->second)
+          visit(handler);
+    }
+    return false;
+  };
 
   llvm::SmallVector<mlir::Operation *, 4> consumeSites;
   llvm::SmallVector<mlir::Operation *, 4> consumingOps;
@@ -2239,10 +2325,41 @@ bool releaseOwnedGroupByLiveness(
     for (mlir::Operation *op : consumingOps)
       if (op->getBlock() != consumingOps.front()->getBlock())
         sameBlock = false;
-    if (!sameBlock) {
-      // ⛔ Ordering across blocks is a reachability question, not
-      // `isBeforeInBlock`. Keep the old reading -- every consume a death --
-      // so an unhandled shape stays a refusal rather than becoming a guess.
+    bool slotConsume = false;
+    for (mlir::Operation *op : consumingOps)
+      if (auto label =
+              op->getAttrOfType<mlir::StringAttr>(own::kAggregateReleaseAttr);
+          label && !label.getValue().ends_with(".source"))
+        slotConsume = true;
+    if (!sameBlock && !slotConsume) {
+      // Across blocks the order is a reachability question: a consume that
+      // reaches a read, or another consume, is not the token's death and
+      // takes the reference it gives away; one that reaches neither is.
+      //
+      //     try:
+      //         del env[name]     # inlined: `raise KeyError(key)`
+      //     except KeyError:
+      //         pass
+      //     env.pop(name)         # inlined again, a second KeyError(key)
+      for (mlir::Operation *op : consumingOps) {
+        bool laterConsumeHere = false;
+        for (mlir::Operation *other : consumingOps)
+          if (other != op && other->getBlock() == op->getBlock() &&
+              op->isBeforeInBlock(other))
+            laterConsumeHere = true;
+        if (laterConsumeHere || readFollowsConsumeInBlock(op) ||
+            readFollowsConsumeAcrossBlocks(op, true)) {
+          unfoldRetainBefore.push_back(op);
+          continue;
+        }
+        groupHasConsumingCall = true;
+        consumeSites.push_back(op);
+      }
+    } else if (!sameBlock) {
+      // ⛔ A slot release among the consumes discharges a container's
+      // reference rather than this token, and the credit for it is counted
+      // only in one block (below). Keep the old reading -- every consume a
+      // death -- so that shape stays a refusal rather than becoming a guess.
       for (mlir::Operation *op : consumingOps) {
         groupHasConsumingCall = true;
         consumeSites.push_back(op);
@@ -2252,7 +2369,8 @@ bool releaseOwnedGroupByLiveness(
         return a->isBeforeInBlock(b);
       });
       mlir::Operation *last = consumingOps.back();
-      bool readsFollow = readFollowsConsumeInBlock(last);
+      bool readsFollow = readFollowsConsumeInBlock(last) ||
+                         readFollowsConsumeAcrossBlocks(last, false);
       unsigned needed =
           static_cast<unsigned>(consumingOps.size()) + (readsFollow ? 1u : 0u);
       // The credit is asked for only when it can change the answer, so the
