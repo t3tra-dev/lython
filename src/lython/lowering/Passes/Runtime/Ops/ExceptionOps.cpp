@@ -235,9 +235,12 @@ void RuntimeBundleLowerer::pushInlinedTracebackFrames(
                                ? enclosing
                                : llvm::StringRef(frame.functionName);
     mlir::Value function = materializeByteBuffer(loc, name);
+    mlir::Value frameFile = frame.filename.empty()
+                                ? file
+                                : materializeByteBuffer(loc, frame.filename);
     mlir::func::CallOp::create(
         builder, loc, tracebackPush,
-        mlir::ValueRange{file, function, i32Const(frame.line),
+        mlir::ValueRange{frameFile, function, i32Const(frame.line),
                          i32Const(frame.column), i32Const(frame.endLine),
                          i32Const(frame.endColumn),
                          i32Const(frame.noAnchor ? 0 : 1)});

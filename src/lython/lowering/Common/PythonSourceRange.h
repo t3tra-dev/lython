@@ -17,6 +17,9 @@ namespace py {
 // function, which only the lowering can name.
 struct PythonInlineFrame {
   std::string functionName;
+  // The file the call is written in, when it is not the range's own: a method
+  // of another module inlined into this one. Empty means the range's file.
+  std::string filename;
   std::int32_t line = 0;
   std::int32_t column = 0;
   std::int32_t endLine = 0;
@@ -93,6 +96,9 @@ sourceRangeFromDict(mlir::DictionaryAttr dict) {
       if (auto function = mlir::dyn_cast_or_null<mlir::StringAttr>(
               frameDict.get("function")))
         frame.functionName = function.getValue().str();
+      if (auto file =
+              mlir::dyn_cast_or_null<mlir::StringAttr>(frameDict.get("file")))
+        frame.filename = file.getValue().str();
       frame.line = pythonSourceI32Attr(frameDict, "start_line").value_or(0);
       frame.column = pythonSourceI32Attr(frameDict, "start_col").value_or(0);
       frame.endLine = pythonSourceI32Attr(frameDict, "end_line").value_or(0);

@@ -5,3 +5,13 @@ beta
 beta
 beta
 gamma
+deltaTrue
+ValueError('deltaTrue')
+deltaTrue
+ValueError('deltaFalse')
+deltaFalse
+caught
+epsilon2!
+del 'zeta0'
+pop 'zeta0'
+zeta0!

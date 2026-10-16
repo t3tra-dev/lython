@@ -4727,6 +4727,7 @@ Value ModuleEmitter::emitInlineMethodBody(
     const llvm::StringMap<Value> &keywords) {
   if (!method.method)
     return emitNone(anchor);
+  const std::string callerSourceName = sourceName;
   // A frozen dataclass refuses field stores everywhere EXCEPT the constructor
   // that fills them -- CPython's own __init__ goes around the block with
   // object.__setattr__, and the synthesized one here is inlined through this
@@ -5451,6 +5452,7 @@ Value ModuleEmitter::emitInlineMethodBody(
   frame.calleeName = ast::string(*method.method, "name").value_or("<lambda>");
   if (!inlineFrames.empty())
     frame.callerName = inlineFrames.back().calleeName;
+  frame.callerFile = callerSourceName;
   frame.line = anchor.range.start.line;
   frame.column = anchor.range.start.column;
   frame.endLine = anchor.range.end.line;

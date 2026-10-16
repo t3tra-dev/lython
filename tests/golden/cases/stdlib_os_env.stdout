@@ -1,8 +1,9 @@
 False
 fallback
-True
-first
-first
+False
+None
+fallback
+second
 second
 True
 True
@@ -11,7 +12,13 @@ False
 fallback
 True
 False
-False True
-True
-LYTHON_GOLDEN_OS_ENV=in-vector
-True
+KeyError 'LYTHON_GOLDEN_OS_ENV'
+KeyError 'LYTHON_GOLDEN_OS_ENV'
+LYTHON_GOLDEN_OS_ENV_A
+LYTHON_GOLDEN_OS_ENV_B
+LYTHON_GOLDEN_OS_ENV_A a
+LYTHON_GOLDEN_OS_ENV_B b
+a c
+c False
+dict a
+True _Environ
