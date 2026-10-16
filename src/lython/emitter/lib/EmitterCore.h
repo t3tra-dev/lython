@@ -1175,6 +1175,10 @@ private:
   Value emitContainerLiteral(const parser::Node &expr,
                              mlir::Type expected = {});
   Value emitSetLiteral(const parser::Node &expr, mlir::Type expected = {});
+  // The set displays CPython uses as a frozenset constant without building a
+  // set from it (ConstantSetFold.h), over every module this emitter emits.
+  const llvm::DenseSet<const parser::Node *> &frozensetSetDisplays();
+  std::optional<llvm::DenseSet<const parser::Node *>> frozensetSetDisplaysMemo;
   // `and`/`or` over non-bool operands: CPython's operand-value result,
   // restricted to operand combinations whose join is statically representable
   // (R1). The all-bool fast path stays in emitExpr.

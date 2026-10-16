@@ -2378,6 +2378,20 @@ std::optional<Value> ModuleEmitter::tryEmitContainerConstructorCall(
     if (!argumentContract)
       return std::nullopt;
     llvm::StringRef name = argumentContract.getContractName();
+    // ⭐ A SET IS MERGED, AND A FROZENSET IS ITSELF, as make_new_set does:
+    // set_update_local takes a set argument by set_merge, whose table the
+    // set-of-elements route below (adds) does not reproduce, and
+    // `frozenset(fs)` returns `fs` for an exact frozenset.
+    if (name == "builtins.frozenset")
+      return emitExpr(frozenArgs->front().get());
+    if (name == "builtins.set") {
+      NodePtr frozen = synth::call(
+          synth::attribute(frozenArgs->front(), std::string("__ly_frozen__"),
+                           expr.range),
+          std::vector<NodePtr>{}, expr.range);
+      synthesizedIteratorDefs.push_back(frozen);
+      return emitExpr(frozen.get());
+    }
     // ⛔ AN ALLOWLIST, not "everything but set and list". `set(x)` is what
     // this wraps with, and it does not accept every argument -- a generator
     // expression is "unsupported expression kind 'GeneratorExp'", and wrapping
@@ -2552,6 +2566,22 @@ std::optional<Value> ModuleEmitter::tryEmitContainerConstructorCall(
       mlir::dyn_cast_if_present<py::ContractType>(argumentType);
   llvm::StringRef argClass =
       argContract ? argContract.getContractName() : llvm::StringRef();
+
+  // ⭐ `set(s)` OF A SET OR FROZENSET IS set_merge INTO THE NEW SET, which is
+  // the table `copy` builds; the comprehension below adds element by element
+  // and lands on another order.
+  if (ctor == "set" &&
+      (argClass == "builtins.set" || argClass == "builtins.frozenset")) {
+    NodePtr merged = synth::call(
+        synth::attribute(argNode,
+                         std::string(argClass == "builtins.set"
+                                         ? "copy"
+                                         : "__ly_thawed__"),
+                         range),
+        std::vector<NodePtr>{}, range);
+    synthesizedIteratorDefs.push_back(merged);
+    return emitExpr(merged.get());
+  }
 
   // ⭐ A call whose type the INFERENCE cannot see, but the emission can: the
   // lazy builtin iterators (zip/enumerate/map/filter/reversed) synthesize a

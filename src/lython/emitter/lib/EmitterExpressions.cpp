@@ -9,6 +9,7 @@
 #include "TypeSystemSolver.h"
 
 #include "AstAccess.h"
+#include "ConstantSetFold.h"
 #include "Contracts.h"
 
 #include "llvm/ADT/ScopeExit.h"
@@ -4059,6 +4060,44 @@ Value ModuleEmitter::emitSetLiteral(const parser::Node &expr,
     emitStatement(*statement);
   }
 
+  // ⭐ A DISPLAY CPYTHON FOLDS IS MERGED INTO AN EMPTY SET, as the bytecode
+  // runs it: `BUILD_SET 0; LOAD_CONST frozenset(...); SET_UPDATE`. The
+  // frozenset was built by adds, as the literal above is, and set_merge
+  // re-places its entries into a table that resizes on another schedule, so
+  // `{0, 7, 14, 21, 28}` prints {0, 21, 7, 28, 14}. Whether it folds is the
+  // compiler's question, not the value's: `{a, 7, 14, 21, 28}` with `a = 0`
+  // is not folded and prints in add order.
+  // ⛔ Not where CPython uses the frozenset itself -- iterated by a `for` or
+  // a comprehension, or searched by `in` -- which keeps the add order.
+  if (cpythonFoldsSetDisplay(expr) && !frozensetSetDisplays().contains(&expr)) {
+    std::string merged = "__setlit" + std::to_string(++listCompCounter);
+    auto empty = py::PackOp::create(builder, loc(expr), containerType,
+                                    mlir::ValueRange{});
+    std::optional<Value> priorMerged;
+    if (auto found = values.find(merged); found != values.end())
+      priorMerged = found->second;
+    values[merged] = Value{empty.getResult(), containerType};
+    emitStatement(*synth::exprStmt(
+        synth::call(synth::attribute(synth::name(merged, expr.range),
+                                     std::string("update"), expr.range),
+                    std::vector<parser::NodePtr>{synth::name(tmp, expr.range)},
+                    expr.range),
+        expr.range));
+    auto mergedValue = values.find(merged);
+    Value result = mergedValue != values.end()
+                       ? mergedValue->second
+                       : Value{empty.getResult(), containerType};
+    if (priorMerged)
+      values[merged] = *priorMerged;
+    else
+      values.erase(merged);
+    if (priorBinding)
+      values[tmp] = *priorBinding;
+    else
+      values.erase(tmp);
+    return result;
+  }
+
   auto built = values.find(tmp);
   Value result = built != values.end()
                      ? built->second
@@ -4068,6 +4107,19 @@ Value ModuleEmitter::emitSetLiteral(const parser::Node &expr,
   else
     values.erase(tmp);
   return result;
+}
+
+const llvm::DenseSet<const parser::Node *> &
+ModuleEmitter::frozensetSetDisplays() {
+  if (!frozensetSetDisplaysMemo) {
+    frozensetSetDisplaysMemo.emplace();
+    collectFrozensetSetDisplays(moduleNode, *frozensetSetDisplaysMemo);
+    for (const EmitOptions::SourceModule &source : options.sourceModules)
+      if (source.moduleNode)
+        collectFrozensetSetDisplays(*source.moduleNode,
+                                    *frozensetSetDisplaysMemo);
+  }
+  return *frozensetSetDisplaysMemo;
 }
 
 // The value-returning `and`/`or` (R1): the deciding operand's VALUE flows

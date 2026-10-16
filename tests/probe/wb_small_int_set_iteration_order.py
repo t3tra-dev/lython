@@ -52,9 +52,9 @@
 # ⭐ AND IT FOUND A SECOND, SEPARATE DIVERGENCE, which is NOT the set's:
 # CPython's COMPILER folds an all-constant set literal of more than two
 # elements into a frozenset constant and emits BUILD_SET 0 + SET_UPDATE, so the
-# literal's table is built by a merge rather than by the adds. See
-# tests/probe/wb_const_set_literal_fold.py. Everything below agrees with
-# python3.14 today.
+# literal's table is built by a merge rather than by the adds. Fixed in the
+# emitter (golden: tests/golden/cases/a_constant_set_display_is_merged.py).
+# Everything below agrees with python3.14 today.
 #
 # golden: tests/golden/cases/set_table_order.py (red-checked against the
 # pre-fix binary; also in LYTHON_LEAK_GATE_CASES, since the table is a second
