@@ -1899,6 +1899,7 @@ void TypeSystem::seedBuiltins() {
       "open", "_io.open",
       table.freeFunctionContract("_io.open")
           .value_or(contract("builtins.function")));
+  builtinCanonicalBindings["open"] = "_io.open";
   bindClass("nullcontext", contract("contextlib.nullcontext"));
   bindClass("range", contract("builtins.range"));
   bindClass("slice", contract("builtins.slice"));
@@ -2678,6 +2679,22 @@ TypeSystem::genericClassSubscript(const parser::Node *node) const {
     arguments.push_back(annotationType(slice));
   }
   return resolveGenericClass(contractType.getContractName(), arguments);
+}
+
+std::optional<py::CallableType>
+TypeSystem::importedCallable(llvm::StringRef name) const {
+  std::optional<std::string> canonical = lookupCanonicalBinding(name);
+  if (!canonical)
+    return std::nullopt;
+  auto builtin = builtinCanonicalBindings.find(name);
+  if (builtin != builtinCanonicalBindings.end() && builtin->second == *canonical)
+    return std::nullopt;
+  std::optional<mlir::Type> bound = lookupSymbol(name);
+  if (!bound)
+    return std::nullopt;
+  if (auto callable = mlir::dyn_cast<py::CallableType>(*bound))
+    return callable;
+  return std::nullopt;
 }
 
 std::optional<mlir::Type> TypeSystem::lookupClass(llvm::StringRef name) const {
@@ -4620,6 +4637,16 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
             return inference.resultType;
           return fail(inference.failureReason);
         }
+      }
+      // ⭐ Before every per-name rule below: each answers for the BUILTIN of
+      // its spelling (`range` is `builtins.range`, `len` an int), and an
+      // imported function under that spelling is what the call reaches.
+      if (std::optional<py::CallableType> imported = importedCallable(name)) {
+        CallInferenceResult inference =
+            inferCallWithEvidence(*imported, positional, keywords);
+        if (inference)
+          return inference.resultType;
+        return fail(inference.failureReason);
       }
       if (name == "isinstance")
         return boolType();

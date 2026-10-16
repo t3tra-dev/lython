@@ -604,6 +604,10 @@ private:
   // a top-level `def` is absent from `values` and the fast paths are selected
   // by arity.
   bool programBindsName(llvm::StringRef name) const;
+  // A function imported under the name (`from helpers import range`): a
+  // competing callable that outranks a class of that spelling, as a
+  // top-level `def` does.
+  bool importBindsCallable(llvm::StringRef name) const;
   // A call to the builtin `name` that the program has not rebound: the gate
   // every builtin interception opens with.
   bool callsUnshadowedBuiltin(const parser::Node *calleeNode,

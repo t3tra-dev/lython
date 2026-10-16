@@ -312,6 +312,11 @@ public:
                            mlir::Type type);
   std::optional<mlir::Type> lookupSymbol(llvm::StringRef name) const;
   std::optional<std::string> lookupCanonicalBinding(llvm::StringRef name) const;
+  // The callable a program IMPORTED under `name` (`from helpers import
+  // range`), which outranks every builtin meaning of the spelling -- its class
+  // and the inference's per-name rules alike. Not the builtins' own canonical
+  // bindings (`open` is `_io.open`).
+  std::optional<py::CallableType> importedCallable(llvm::StringRef name) const;
   void bindClass(llvm::StringRef name, mlir::Type instanceType);
   std::optional<mlir::Type> lookupClass(llvm::StringRef name) const;
   // The hierarchy AS WRITTEN, from the module pre-pass. Registered before any
@@ -583,6 +588,9 @@ private:
   // Static-method signatures, keyed "<class>.<method>".
   llvm::StringMap<mlir::Type> classStaticMethodTypes;
   llvm::StringMap<std::string> canonicalBindings;
+  // The canonical bindings the builtins scope itself makes, so an import
+  // under the same name can be told from them.
+  llvm::StringMap<std::string> builtinCanonicalBindings;
   llvm::StringMap<std::string> annotationAliases;
   llvm::StringMap<mlir::Type> annotationTypeAliases;
   mutable llvm::SmallVector<llvm::StringMap<mlir::Type>, 8> scopes;

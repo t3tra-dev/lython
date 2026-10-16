@@ -203,7 +203,9 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     // Without this the reference materializes a py.type_object and the call
     // fails in lowering as "calling a type object held in a value", which is
     // loud but describes the compiler's confusion rather than the program.
-    if (auto cls = moduleFunctionNames.count(name)
+    // An imported def under the name outranks it the same way.
+    if (auto cls = (moduleFunctionNames.count(name) ||
+                    importBindsCallable(name))
                        ? std::optional<mlir::Type>()
                        : types.lookupClass(name)) {
       // A monomorphized generic has no single class object to materialize:
