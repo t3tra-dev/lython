@@ -65,13 +65,23 @@ module attributes {
   // Layout follows the shared header contract: [refcount, class_id, value].
   // The refcount starts at the immortal marker; generic retains/releases may
   // drift it but it never reaches zero, and the deallocator is a no-op.
-  memref.global "private" @__ly_bool_box_true : memref<3xi64> = dense<[9223372036854775807, 22, 1]> {ly.class_of = "builtins.bool"}
-  memref.global "private" @__ly_bool_box_false : memref<3xi64> = dense<[9223372036854775807, 22, 0]> {ly.class_of = "builtins.bool"}
+  //
+  // ⭐ AND THE INT LAYOUT AROUND IT, as CPython's bool is an int object: words
+  // 2-3 are an int's meta (sign, digit count) and word 4 holds its one 30-bit
+  // digit, so the value word IS the sign (1 for True, 0 for False, with no
+  // digit). A bool stored where an int is declared -- `xs: list[int]`, then
+  // `xs[0] = True` -- is read back by int's own primitives, and those read
+  // meta and digits: with three words they read past the object (`sum(xs)`
+  // aborted in the allocator, `max(xs)` segfaulted, `min(xs)` answered 2).
+  memref.global "private" @__ly_bool_box_true : memref<5xi64> = dense<[9223372036854775807, 22, 1, 1, 1]> {ly.class_of = "builtins.bool"}
+  memref.global "private" @__ly_bool_box_false : memref<5xi64> = dense<[9223372036854775807, 22, 0, 0, 0]> {ly.class_of = "builtins.bool"}
 
   // box: canonical i1 -> the boxed singleton (no allocation).
   func.func @LyBool_Box(%value: i1) -> memref<3xi64> attributes {ly.runtime.class, ly.runtime.contract = "builtins.bool", ly.runtime.primitive = "box"} {
-    %true_box = memref.get_global @__ly_bool_box_true : memref<3xi64>
-    %false_box = memref.get_global @__ly_bool_box_false : memref<3xi64>
+    %true_global = memref.get_global @__ly_bool_box_true : memref<5xi64>
+    %false_global = memref.get_global @__ly_bool_box_false : memref<5xi64>
+    %true_box = memref.reinterpret_cast %true_global to offset: [0], sizes: [3], strides: [1] : memref<5xi64> to memref<3xi64>
+    %false_box = memref.reinterpret_cast %false_global to offset: [0], sizes: [3], strides: [1] : memref<5xi64> to memref<3xi64>
     %box = arith.select %value, %true_box, %false_box : memref<3xi64>
     func.return %box : memref<3xi64>
   }

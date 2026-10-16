@@ -624,6 +624,9 @@ set(LYTHON_LEAK_GATE_RUNNER "${CMAKE_CURRENT_SOURCE_DIR}/leak_gate.py")
 #     dict literal family whose dict side was repaired earlier and which
 #     rfc/test-suite-debt.md listed as still leaking. Both are net zero now.
 set(LYTHON_LEAK_GATE_CASES
+    # A bool where an int is declared: viewed as an int header, kept as its
+    # object in slots -- immortal, so any count the views take is no leak.
+    a_bool_held_where_an_int_is_declared
     # A parameter returned through a finally as an Optional: the retain at
     # the return is the one the caller's result owns.
     a_parameter_returned_as_optional_through_finally

@@ -17,6 +17,7 @@ module attributes {
   // ===== declared here, defined in another runtime file or built by the lowering =====
   func.func private @__ly_bytes_alloc(%len: i64) -> memref<4xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytes"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.primitive = "alloc"}
   func.func private @__ly_bytes_payload(%self: memref<4xi64>) -> memref<?xi8> attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.interior_word, ly.runtime.primitive = "payload_view"}
+  func.func private @LyBool_Repr(%value: i1) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bool", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"}
   func.func private @__ly_tuple_alloc(%length: i64) -> memref<5xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.tuple"], ly.ownership.owned_results = [0]}
   func.func private @__ly_tuple_items(%self: memref<5xi64>) -> memref<?xi64> attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.interior_word, ly.runtime.primitive = "items_view"}
   func.func private @__ly_tuple_store_long(%items: memref<?xi64>, %slot: index, %h: memref<2xi64>)
@@ -1203,7 +1204,23 @@ module attributes {
   // i64's word when the i64 is the value, dropping that reference (the held
   // object is the stand-in, or an object of the same value that an edge
   // carried along), else the held object's, keeping it.
-  func.func @LyLong_SlotWordTakingDeferred(%value: i64, %valid: i1, %held: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "slot_word_taking_deferred"} {
+  // Whether an int-typed header is a bool object (bool.mlir gives it the int
+  // layout). A slot keeps a bool's OBJECT, never its value as an immediate:
+  // the immediate would read back as the int 1, and `sorted({3, True})` would
+  // print [1, 3] where CPython prints [True, 3].
+  func.func private @__ly_long_is_bool(%header: memref<2xi64>) -> i1 {
+    %class_slot = arith.constant 1 : index
+    %bool_class = arith.constant {ly.class_of = "builtins.bool"} 22 : i64
+    %class_word = memref.load %header[%class_slot] : memref<2xi64>
+    %is_bool = arith.cmpi eq, %class_word, %bool_class : i64
+    func.return %is_bool : i1
+  }
+
+  func.func @LyLong_SlotWordTakingDeferred(%value: i64, %valid_read: i1, %held: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "slot_word_taking_deferred"} {
+    %held_is_bool = func.call @__ly_long_is_bool(%held) : (memref<2xi64>) -> i1
+    %not_bool = arith.constant true
+    %keeps_value = arith.xori %held_is_bool, %not_bool : i1
+    %valid = arith.andi %valid_read, %keeps_value : i1
     %word = scf.if %valid -> (i64) {
       %w = func.call @LyLong_SlotWordFromI64(%value) : (i64) -> i64
       func.call @LyLong_DecRef(%held) : (memref<2xi64>) -> ()
@@ -1220,7 +1237,11 @@ module attributes {
   func.func @LyLong_SlotWordTakingRef(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "slot_word_taking_ref"} {
     %value, %ok = func.call @LyLong_TryAsI64(%header) : (memref<2xi64>) -> (i64, i1)
     %narrow = func.call @__ly_int_immediate_fits(%value) : (i64) -> i1
-    %fits = arith.andi %ok, %narrow : i1
+    %is_bool = func.call @__ly_long_is_bool(%header) : (memref<2xi64>) -> i1
+    %not_bool = arith.constant true
+    %int_object = arith.xori %is_bool, %not_bool : i1
+    %fits_value = arith.andi %ok, %narrow : i1
+    %fits = arith.andi %fits_value, %int_object : i1
     %word = scf.if %fits -> (i64) {
       func.call @LyLong_DecRef(%header) : (memref<2xi64>) -> ()
       %w = func.call @__ly_int_to_immediate(%value) : (i64) -> i64
@@ -4052,7 +4073,31 @@ module attributes {
     func.return %str_header, %str_bytes : memref<2xi64>, memref<?xi8>
   }
 
+  // ⭐ A bool reaches int's repr when an int was declared and True was stored
+  // (bool objects carry the int layout, bool.mlir): it prints as itself, as
+  // `type(x).__repr__` would. Static dispatch picked int's body; the class word
+  // says which class's body CPython would have run.
   func.func @LyLong_Repr(%header: memref<2xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
+    %class_slot = arith.constant 1 : index
+    %bool_class = arith.constant {ly.class_of = "builtins.bool"} 22 : i64
+    %class_word = memref.load %header[%class_slot] : memref<2xi64>
+    %is_bool = arith.cmpi eq, %class_word, %bool_class : i64
+    %result:2 = scf.if %is_bool -> (memref<2xi64>, memref<?xi8>) {
+      %value_view = memref.reinterpret_cast %header to offset: [0], sizes: [3], strides: [1] : memref<2xi64> to memref<3xi64>
+      %value_slot = arith.constant 2 : index
+      %word = memref.load %value_view[%value_slot] : memref<3xi64>
+      %zero_word = arith.constant 0 : i64
+      %truth = arith.cmpi ne, %word, %zero_word : i64
+      %bh, %bb = func.call @LyBool_Repr(%truth) : (i1) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %bh, %bb : memref<2xi64>, memref<?xi8>
+    } else {
+      %ih, %ib = func.call @__ly_long_repr_digits(%header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %ih, %ib : memref<2xi64>, memref<?xi8>
+    }
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func private @__ly_long_repr_digits(%header: memref<2xi64>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %meta_raw, %digits_raw = func.call @__ly_long_parts(%header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %meta, %digits = func.call @__ly_long_operand_view(%meta_raw, %digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
     %zero = arith.constant 0 : i64
@@ -4296,7 +4341,7 @@ module attributes {
     %negative = arith.cmpi slt, %sgn, %zero : i64
     %is_dec = arith.ori %t_d, %t_n : i1
     %nb:2 = scf.if %is_dec -> (memref<?xi32>, i64) {
-      %rh, %rb = func.call @LyLong_Repr(%header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi8>)
+      %rh, %rb = func.call @__ly_long_repr_digits(%header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi8>)
       %c0i = arith.constant 0 : index
       %rdim = memref.dim %rb, %c0i : memref<?xi8>
       %rlen = arith.index_cast %rdim : index to i64
@@ -4371,7 +4416,30 @@ module attributes {
     func.return %header_r, %bytes_r : memref<2xi64>, memref<?xi8>
   }
 
+  // ⭐ A bool with an EMPTY spec formats as `str(b)` (int.__format__'s own
+  // rule, which bool inherits); any other spec formats its value as an int,
+  // which the digits below do -- `f"{b:>3}"` is "  1".
   func.func @LyLong_Format(%header: memref<2xi64> {ly.ownership.object_header}, %spec_header: memref<2xi64> {ly.ownership.object_header}, %spec_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__format__", ly.runtime.result_contract = "builtins.str"} {
+    %class_slot = arith.constant 1 : index
+    %bool_class = arith.constant {ly.class_of = "builtins.bool"} 22 : i64
+    %class_word = memref.load %header[%class_slot] : memref<2xi64>
+    %is_bool = arith.cmpi eq, %class_word, %bool_class : i64
+    %spec_dim_at = arith.constant 0 : index
+    %spec_len = memref.dim %spec_bytes, %spec_dim_at : memref<?xi8>
+    %no_spec_len = arith.constant 0 : index
+    %empty_spec = arith.cmpi eq, %spec_len, %no_spec_len : index
+    %as_str = arith.andi %is_bool, %empty_spec : i1
+    %result:2 = scf.if %as_str -> (memref<2xi64>, memref<?xi8>) {
+      %sh, %sb = func.call @LyLong_Repr(%header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %sh, %sb : memref<2xi64>, memref<?xi8>
+    } else {
+      %fh, %fb = func.call @__ly_long_format_spec(%header, %spec_header, %spec_bytes) : (memref<2xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %fh, %fb : memref<2xi64>, memref<?xi8>
+    }
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func private @__ly_long_format_spec(%header: memref<2xi64>, %spec_header: memref<2xi64>, %spec_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %spec_store = memref.alloca() : memref<10xi64>
     %spec = memref.cast %spec_store : memref<10xi64> to memref<?xi64>
     %ok = func.call @__ly_fmt_parse_spec(%spec_header, %spec_bytes, %spec) : (memref<2xi64>, memref<?xi8>, memref<?xi64>) -> i1

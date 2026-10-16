@@ -394,6 +394,30 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
         op, symbol, functionType, inputIndex, widened, operands);
   }
 
+  // ⭐ AND A BOXED bool, which is what a container slot holds. A list declared
+  // `list[int]` may hold True (bool is an int); the element read hands back
+  // the bool object, and `xs[0] + 1` reached int's `__add__` with three lanes
+  // where it takes two -- "cannot adapt builtins.bool to runtime input 0 of
+  // builtins.int.__add__". Unboxed to the truth bit, it is the arm above.
+  if (source.contractName() == "builtins.bool" && !sourceValues.empty() &&
+      !sourceValues.front().getType().isInteger(1) && !expected.isInteger(1))
+    if (std::optional<RuntimeSymbol> unbox =
+            manifest.primitive("builtins.bool", "unbox")) {
+      mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+          op->getLoc(), *unbox, sourceValues);
+      if (call.getNumResults() == 1 && call.getResult(0).getType().isInteger(1)) {
+        mlir::Value wide = mlir::arith::ExtUIOp::create(
+            builder, op->getLoc(), builder.getI64Type(), call.getResult(0));
+        RuntimeBundle widened;
+        if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
+                op, runtimeContractType(context, "builtins.int"), wide,
+                constantBool(builder, op->getLoc(), true), widened)))
+          return mlir::failure();
+        return RuntimeBundleLowerer::appendRuntimeSource(
+            op, symbol, functionType, inputIndex, widened, operands);
+      }
+    }
+
   {
     auto diag = op->emitError()
                 << "cannot adapt " << source.contractName()
