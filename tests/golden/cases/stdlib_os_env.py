@@ -1,64 +1,59 @@
-# os's environment surface. `os.environ` is absent (a container-typed module
-# global is not visible across an import boundary yet), so getenv/putenv/
-# unsetenv talk to the process environment directly and `has_env` /
-# `environ_entries` stand in for the mapping -- see os.py's docstring. That
-# makes putenv IMMEDIATELY visible to getenv, which is where this diverges
-# from CPython: there putenv bypasses os.environ, which is what getenv reads.
+# os's environment surface: `os.environ` is a snapshot taken when os is
+# imported, `environ[k] = v` / `del environ[k]` write through to the process,
+# and `getenv` reads the snapshot -- so a bare `putenv` is NOT visible to it.
 # Everything is printed as a bool or a value the case itself set, so the output
 # does not depend on the host's environment.
 import os
 
 name = "LYTHON_GOLDEN_OS_ENV"
 
-print(os.has_env(name))
+print(name in os.environ)
 print(os.getenv(name, "fallback"))
 
+# ⛔ putenv bypasses os.environ, which is what getenv reads. This port read
+# the process environment directly and printed "first" here.
 os.putenv(name, "first")
-print(os.has_env(name))
+print(name in os.environ)
 print(os.getenv(name))
 print(os.getenv(name, "fallback"))
 
-os.putenv(name, "second")
+os.environ[name] = "second"
 print(os.getenv(name))
+print(os.environ[name])
 
-# An empty value is SET, which is exactly what has_env distinguishes and a
-# `getenv(...) == ""` test cannot.
-os.putenv(name, "")
-print(os.has_env(name))
+# An empty value is SET, which `in` distinguishes and a `getenv(...) == ""`
+# test cannot.
+os.environ[name] = ""
+print(name in os.environ)
 print(os.getenv(name) == "")
 print(os.getenv(name, "fallback") == "")
 
-os.unsetenv(name)
-print(os.has_env(name))
+del os.environ[name]
+print(name in os.environ)
 print(os.getenv(name, "fallback"))
-# ⛔ An UNSET variable reads back as None, which is CPython's answer and was
-# not this port's: `getenv` defaulted to '' on the reasoning that an
-# Optional[str] return had no physical layout across the native boundary. That
-# made an unset variable indistinguishable from one set to the empty string --
-# the very distinction `has_env` exists for -- and `os.getenv(k) is None`
-# answered False where CPython answers True. The native call still returns a
-# str; the None is the Python-level default and never crosses the boundary.
+# An UNSET variable reads back as None, not as ''.
 print(os.getenv(name) is None)
 print(os.getenv(name) == "")
-os.putenv(name, "")
-print(os.getenv(name) is None, os.getenv(name) == "")
-os.unsetenv(name)
 
-# The raw vector, every entry of which is a "KEY=VALUE" string. Scanned from a
-# helper: the list has to be bound before the loop reads it, and the matched
-# entry has to be copied rather than aliased.
-def entry_for(key: str) -> str:
-    entries = os.environ_entries()
-    found = ""
-    for entry in entries:
-        if entry.startswith(key + "="):
-            found = entry + ""
-    return found
+try:
+    os.environ[name]
+except KeyError as e:
+    print("KeyError", e)
+try:
+    del os.environ[name]
+except KeyError as e:
+    print("KeyError", e)
 
-
-entries = os.environ_entries()
-print(len(entries) > 0)
-os.putenv(name, "in-vector")
-print(entry_for(name))
-os.unsetenv(name)
-print(entry_for(name) == "")
+os.environ[name + "_A"] = "a"
+os.environ[name + "_B"] = "b"
+for key in os.environ:
+    if key.startswith(name):
+        print(key)
+for key, value in os.environ.items():
+    if key.startswith(name):
+        print(key, value)
+print(os.environ.setdefault(name + "_A", "z"), os.environ.setdefault(name, "c"))
+print(os.environ.pop(name), name in os.environ)
+snapshot = os.environ.copy()
+print(type(snapshot).__name__, snapshot[name + "_A"])
+print(len(os.environ) > 0, type(os.environ).__name__)

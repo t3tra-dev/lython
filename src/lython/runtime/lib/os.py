@@ -23,19 +23,23 @@ This exports:
   - os.altsep stays unsupported (None on posix; not a static string)
 
 Deviations from CPython:
-  - `environ` (and `environb`, `getenvb`) is absent. It is a computed dict,
-    and a container-typed module global is not yet visible across an import
-    boundary (reported to the Wave 3 foundation track). `getenv` / `putenv` /
-    `unsetenv` read and write the process environment directly, so they stay
-    consistent with each other; `environ_entries()` exposes the raw
-    "KEY=VALUE" vector for callers that need to enumerate.
+  - `environ` is `_Environ` below: CPython's class, a snapshot of the process
+    environment taken when `os` is imported, written back through `putenv` /
+    `unsetenv` on `environ[k] = v` / `del environ[k]`. `getenv` reads it, so
+    a bare `putenv` is NOT visible to `getenv`, as in CPython. It is not a
+    `MutableMapping` (collections.abc is not ported), so the mixins are
+    written out: `keys()` / `items()` / `values()` are lists copied from the
+    snapshot, which iterate as CPython's views do but do not track later
+    writes and print as lists rather than `KeysView(environ(...))`. `environb` and `getenvb` are absent
+    (no bytes keys).
+  - `has_env(key)` and `environ_entries()` are this port's: `key in environ`
+    under another name, and the raw "KEY=VALUE" vector of the process
+    environment (which, unlike `environ`, does see a bare `putenv`).
   - `getenv(key, default=None)` is CPython's, including the None. This said
     until 2026-08-17 that an `Optional[str]` return had no physical layout
     across the native boundary and defaulted to `''` -- which made an UNSET
     variable indistinguishable from one set to the empty string, so
-    `os.getenv(k) is None` answered False where CPython answers True. The
-    native call still returns a str; the None is the Python-level default and
-    never crosses the boundary. `has_env(key)` remains the direct question.
+    `os.getenv(k) is None` answered False where CPython answers True.
   - `stat()` returns the `stat_result` class below, a plain class with the
     ten `st_*` attributes rather than a structseq (no tuple indexing, no
     `st_atime_ns` family, no `st_birthtime`). Each attribute read costs one
@@ -59,13 +63,15 @@ Deviations from CPython:
 
 import sys
 import posixpath as path
+from typing import Iterator
 
 __all__ = [
     "name", "curdir", "pardir", "extsep", "sep", "pathsep", "defpath",
     "linesep", "devnull", "getpid", "getppid", "getuid", "geteuid", "getgid",
     "getegid", "getcwd", "chdir", "listdir", "mkdir", "makedirs", "rmdir",
     "remove", "unlink", "rename", "replace", "access", "stat", "lstat",
-    "stat_result", "strerror", "getenv", "putenv", "unsetenv", "has_env",
+    "stat_result", "strerror", "environ", "getenv", "putenv", "unsetenv",
+    "has_env",
     "environ_entries", "walk", "F_OK", "R_OK", "W_OK", "X_OK",
 ]
 
@@ -159,34 +165,104 @@ def replace(src: str, dst: str) -> None:
     rename(src, dst)
 
 
+class _Environ:
+    """os.environ: the process environment as a mapping of str to str."""
+
+    def __init__(self, entries: list[str]) -> None:
+        # ⛔ Not `posix.environ`: CPython builds this from a dict posixmodule.c
+        # fills at import, and the native boundary here hands back the raw
+        # vector instead, so the split happens on this side.
+        self._data: dict[str, str] = {}
+        for entry in entries:
+            i = entry.find("=")
+            if i > 0:
+                self._data[entry[:i]] = entry[i + 1:]
+
+    def __getitem__(self, key: str) -> str:
+        if key not in self._data:
+            raise KeyError(key)
+        return self._data[key]
+
+    def __setitem__(self, key: str, value: str) -> None:
+        putenv(key, value)
+        self._data[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        unsetenv(key)
+        if key not in self._data:
+            raise KeyError(key)
+        del self._data[key]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._data
+
+    def __iter__(self) -> Iterator[str]:
+        # CPython's copies the keys first too, so the loop may set or delete.
+        return iter(list(self._data))
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __repr__(self) -> str:
+        return "environ(" + repr(self._data) + ")"
+
+    def get(self, key: str, default: str | None = None) -> str | None:
+        # ⛔ Two returns rather than `return default`; see getenv below.
+        if key in self._data:
+            return self._data[key]
+        if default is None:
+            return None
+        return default
+
+    def keys(self) -> list[str]:
+        # ⛔ Not the dict view: a view is supported only where it is consumed,
+        # so it cannot be a return value. A list iterates the same, but does
+        # not track later writes and prints as a list.
+        return list(self._data.keys())
+
+    def items(self) -> list[tuple[str, str]]:
+        return list(self._data.items())
+
+    def values(self) -> list[str]:
+        return list(self._data.values())
+
+    def copy(self) -> dict[str, str]:
+        return dict(self._data)
+
+    def setdefault(self, key: str, value: str) -> str:
+        if key not in self._data:
+            self[key] = value
+        return self._data[key]
+
+    def pop(self, key: str) -> str:
+        value = self[key]
+        del self[key]
+        return value
+
+
+environ: _Environ = _Environ(posix._environ_entries())
+
+
 def getenv(key: str, default: str | None = None) -> str | None:
     """Get an environment variable, returning `default` if it doesn't exist.
 
-    ⛔ The last two lines are `if default is None: return None` / `return
-    default` rather than one `return default`, and that is not a style. A
-    borrowed union PARAMETER returned as an owned union RESULT leaks its str
-    member -- 43 B, measured -- while the same function returning the narrowed
-    member does not. Reproducer and the shape of the underlying defect are in
-    tests/probe/wb_grid_leftovers_2026_08_16.py.
+    ⛔ The last two lines of `_Environ.get` are `if default is None: return
+    None` / `return default` rather than one `return default`, and that is not
+    a style. A borrowed union PARAMETER returned as an owned union RESULT
+    leaks its str member -- 43 B, measured -- while the same function
+    returning the narrowed member does not. Reproducer and the shape of the
+    underlying defect are in tests/probe/wb_grid_leftovers_2026_08_16.py.
     """
-    if posix._has_env(key):
-        return posix._getenv(key)
-    if default is None:
-        return None
-    return default
+    return environ.get(key, default)
 
 
 def has_env(key: str) -> bool:
     """True when the environment variable is set, even to the empty string."""
-    return posix._has_env(key)
+    return key in environ
 
 
 def environ_entries() -> list[str]:
-    """The process environment as raw "KEY=VALUE" strings.
-
-    Stands in for `os.environ` until a container-typed module global survives
-    an import boundary.
-    """
+    """The process environment as raw "KEY=VALUE" strings."""
     return posix._environ_entries()
 
 

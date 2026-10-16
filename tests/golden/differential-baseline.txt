@@ -422,7 +422,8 @@ stdlib_json_accessors.py EXTRA
 stdlib_json_build.py EXTRA
 stdlib_json_errors.py AGREE
 stdlib_json_roundtrip.py AGREE
-stdlib_os_env.py EXTRA
+stdlib_os_env.py AGREE
+stdlib_os_env_extras.py EXTRA
 stdlib_os_fs.py AGREE
 stdlib_os_path.py AGREE
 stdlib_pathlib.py AGREE

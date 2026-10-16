@@ -14,11 +14,11 @@
 // LyHost_* wrapper instead of libc directly.
 //
 // Deviations from CPython:
-// - `environ` is absent. It is a computed dict, and a container-typed module
-//   global is not visible across an import boundary yet (reported to the
-//   Wave 3 foundation track); `_environ_entries()` hands os.py the raw
-//   "KEY=VALUE" vector for when it becomes expressible, and
-//   getenv/putenv/unsetenv go straight to the process environment meanwhile.
+// - `environ` is not here: CPython's is a dict of bytes that os.py wraps in
+//   `_Environ`, and this boundary hands os.py the raw "KEY=VALUE" vector
+//   (`_environ_entries()`) instead, which os.py splits into its `_Environ`.
+//   `putenv` / `unsetenv` write the process environment and nothing else, as
+//   CPython's do.
 // - `stat()` is not a structseq here. `_stat_field(path, follow, index)`
 //   returns ONE os.stat_result field (or `-errno`, never raising), and os.py
 //   assembles the `stat_result` class from it. os.path's predicates need only
