@@ -1121,10 +1121,12 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
   };
 
   // Same rule as the bare-Name constructor path below: a top-level `def int`
-  // outranks the builtin class contract of that spelling. A bare Name has a
-  // qualified spelling equal to itself, so this branch sees `int` first.
+  // -- or one imported under that name -- outranks the builtin class contract
+  // of that spelling. A bare Name has a qualified spelling equal to itself, so
+  // this branch sees `int` first.
   if (!calleeQualified.empty() && !moduleFunctionNames.count(calleeQualified) &&
-      !boundTypeObject(calleeQualified))
+      !boundTypeObject(calleeQualified) &&
+      !importBindsCallable(calleeQualified))
     if (auto cls = types.lookupClass(calleeQualified)) {
       if (std::optional<llvm::StringRef> symbol = contractName(*cls)) {
         if (std::optional<Value> v =
@@ -1144,14 +1146,12 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     // that happens to share a class's spelling keeps reaching the constructor
     // as it does today, because only a `def` introduces a competing callable
     // under the same top-level name.
-    // ⛔ AN IMPORTED def UNDER A CLASS SPELLING IS NOT COVERED, and adding it
-    // here was measured to change nothing: `from helpers import str` never
-    // reaches this gate, because a builtin spelling is bound as a CLASS in the
-    // type system and the canonical binding an import leaves is not consulted
-    // on this path at all. Recorded in
-    // tests/probe/wb_a_builtin_shadowed_by_an_import.py with the three
-    // spellings that still miss.
-    if (auto cls = (moduleFunctionNames.count(name) || boundTypeObject(name))
+    // An imported def under a class spelling is the same competing callable
+    // (`importBindsCallable`). It was once added only here and measured to
+    // change nothing: a bare Name reaches the qualified-spelling gate above
+    // first, which is where it has to be asked too.
+    if (auto cls = (moduleFunctionNames.count(name) || boundTypeObject(name) ||
+                    importBindsCallable(name))
                        ? std::optional<mlir::Type>()
                        : types.lookupClass(name)) {
       if (std::optional<llvm::StringRef> symbol = contractName(*cls)) {

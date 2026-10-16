@@ -296,6 +296,13 @@ void ModuleEmitter::collectTopLevelBindings() {
 //
 // A canonical binding is what an import leaves behind (`bindCanonicalSymbol`),
 // and nothing else in a main module makes one.
+// The import binds the name to the function's callable type and leaves a
+// canonical binding; the class of that spelling stays in the type system,
+// which is what a lookup by class finds first.
+bool ModuleEmitter::importBindsCallable(llvm::StringRef name) const {
+  return types.importedCallable(name).has_value();
+}
+
 bool ModuleEmitter::programBindsName(llvm::StringRef name) const {
   return values.find(name) != values.end() || moduleFunctionNames.count(name) ||
          moduleClassNames.count(name) ||
