@@ -1400,6 +1400,14 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
         callable.getPositionalTypes().end());
     if (callable.hasVararg())
       bodyArguments.push_back(callable.getVarargType());
+    // ⭐ AND THE CAPTURES, which the body takes as entry arguments after its
+    // own and the callable type does not list. A nested generator capturing
+    // a local had a resume clone typed one argument short of its entry block
+    // ("generator resume clone entry was not seeded as a primitive-i64
+    // callable"); the creation site already passes the captures as frame
+    // sources (`binding.getCaptures()`), so each needs its lane.
+    for (mlir::Type closure : RuntimeBundleLowerer::callableClosureTypes(body))
+      bodyArguments.push_back(closure);
     // Arguments: int rides the legacy (i64, i1) evidence pair; any object
     // contract with a lane shape rides its physical span (the lazy iterator
     // desugars pass lists/strs/tuples into synthetic generators, and a source
@@ -1867,6 +1875,11 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
         /*kwargsType=*/mlir::Type(), resultTypes);
     clone->setAttr(ownership::kCallableTypeAttr,
                    mlir::TypeAttr::get(newCallable));
+    // The captures are positional lanes of the clone now (`bodyArguments`);
+    // left in place, the inherited closure attributes would make
+    // `callableLogicalInputTypes` append them a second time.
+    clone->removeAttr("closure_types");
+    clone->removeAttr("closure_names");
     clone.setFunctionType(
         mlir::FunctionType::get(context, argTypes, resultTypes));
     mlir::Block &cloneEntry = clone.getBody().front();

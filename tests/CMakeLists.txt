@@ -703,6 +703,10 @@ set(LYTHON_LEAK_GATE_CASES
     # arguments; exactly one of them may take its token, and only a leak check
     # says the other's retain was paid back.
     a_short_circuit_on_an_object_inside_a_generator
+    # A nested generator's captures ride its frame as argument lanes: each
+    # cell or captured object is held for the generator's life and given back
+    # once.
+    a_nested_generator_captures_its_locals
     # A container mutated across a back edge: the computed-index form used to
     # retain and release different objects.
     container_mutated_across_a_back_edge
