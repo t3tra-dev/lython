@@ -624,6 +624,9 @@ set(LYTHON_LEAK_GATE_RUNNER "${CMAKE_CURRENT_SOURCE_DIR}/leak_gate.py")
 #     dict literal family whose dict side was repaired earlier and which
 #     rfc/test-suite-debt.md listed as still leaking. Both are net zero now.
 set(LYTHON_LEAK_GATE_CASES
+    # A parameter returned through a finally as an Optional: the retain at
+    # the return is the one the caller's result owns.
+    a_parameter_returned_as_optional_through_finally
     # A raise from inside a loop whose carried value is forwarded on the
     # other edge of the same branch: the raise edge releases it.
     a_recursive_descent_parser_raises_mid_expression
