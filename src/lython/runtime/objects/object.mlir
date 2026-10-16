@@ -1380,8 +1380,39 @@ module attributes {
             %c = func.call @LyBytes_EqBool(%lh, %rh) : (memref<4xi64>, memref<4xi64>) -> i1
             scf.yield %c : i1
           } else {
-            %eq, %handled = func.call @__ly_eq_boxed_by_contract(%lhs, %rhs, %lhs_class, %rhs_class) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
-            %same_result = arith.andi %eq, %handled : i1
+            // ⭐ do_richcompare's order, as `__ly_box_order` has it: a right
+            // operand of a STRICT SUBCLASS of the left's class is asked first,
+            // then the left, then the right if it was not asked yet. Only the
+            // left was asked, so `b in [s]` with `s` a Sub ran Base's __eq__.
+            %different = arith.cmpi ne, %lhs_class, %rhs_class : i64
+            %derives = func.call @__ly_class_derives_strictly(%rhs_class, %lhs_class) : (i64, i64) -> i1
+            %reflect_first = arith.andi %different, %derives : i1
+            %first:2 = scf.if %reflect_first -> (i1, i1) {
+              %v, %h = func.call @__ly_eq_boxed_by_contract(%rhs, %lhs, %rhs_class, %lhs_class) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
+              scf.yield %v, %h : i1, i1
+            } else {
+              scf.yield %false, %false : i1, i1
+            }
+            %same_result = scf.if %first#1 -> (i1) {
+              scf.yield %first#0 : i1
+            } else {
+              %eq, %handled = func.call @__ly_eq_boxed_by_contract(%lhs, %rhs, %lhs_class, %rhs_class) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
+              %answer = scf.if %handled -> (i1) {
+                scf.yield %eq : i1
+              } else {
+                %not_tried = arith.xori %reflect_first, %true : i1
+                %asked = arith.andi %not_tried, %different : i1
+                %rv = scf.if %asked -> (i1) {
+                  %w, %k = func.call @__ly_eq_boxed_by_contract(%rhs, %lhs, %rhs_class, %lhs_class) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
+                  %got = arith.andi %w, %k : i1
+                  scf.yield %got : i1
+                } else {
+                  scf.yield %false : i1
+                }
+                scf.yield %rv : i1
+              }
+              scf.yield %answer : i1
+            }
             scf.yield %same_result : i1
           }
           scf.yield %by_content : i1

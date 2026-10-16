@@ -224,6 +224,17 @@ private:
       unsigned argumentCount, bool asProperty = false,
       llvm::ArrayRef<std::string> keywordNames = {}, bool asAttribute = false,
       bool asSetter = false, bool asField = false);
+  // `lhs <op> rhs` over two source-class values where the right one's runtime
+  // class may strictly derive the left's and answer the reflected comparison
+  // first. Null when no pair of the program's classes reaches that.
+  const VirtualDispatchHelper *subclassFirstCompareFor(const parser::Node &anchor,
+                                                       Value lhs, Value rhs,
+                                                       llvm::StringRef opKind);
+  // Non-zero while such a dispatcher's body is emitted: its arms are the
+  // one-receiver comparisons.
+  unsigned subclassFirstSuppressed = 0;
+  void emitDispatcherBody(const parser::Node &def, const std::string &symbol,
+                          const FunctionSignature &sig, bool suppressGate);
   // A base's instance FIELD read where a subclass makes the name readable
   // another way (a class attribute with a value, a property).
   std::optional<Value> tryEmitVirtualFieldRead(const parser::Node &anchor,

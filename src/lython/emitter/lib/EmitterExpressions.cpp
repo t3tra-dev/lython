@@ -1689,6 +1689,14 @@ Value ModuleEmitter::emitCompare(const parser::Node &expr) {
 
 Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
                                        Value rhs, const parser::Node *op) {
+  if (op)
+    if (const VirtualDispatchHelper *helper =
+            subclassFirstCompareFor(expr, lhs, rhs, op->kind)) {
+      Value callee = emitBindingRef(expr, helper->symbol, helper->callable);
+      return emitCallableDispatch(
+          expr, callee,
+          emitCallOperands(expr, {lhs, rhs}, /*includeAstArguments=*/false));
+    }
   if (std::optional<Value> primitive = emitPrimitiveCompare(expr, lhs, rhs, op))
     return *primitive;
   // bool-vs-bool equality lowers through the values' truth bits: the runtime

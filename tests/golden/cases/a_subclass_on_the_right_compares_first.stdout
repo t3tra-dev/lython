@@ -1,0 +1,32 @@
+Bx Bx True False False False
+Bx S False True True False
+Bx L False True True False
+Bx Bs True False False True
+Bx Bp True True False True
+S Bx False True False True
+S S False True False True
+S L False True True True
+S Bs False True False True
+S Bp False True False True
+L Bx False True False True
+L S False True True True
+L L False True False True
+L Bs False True False True
+L Bp False True False True
+Bs Bx True False True False
+Bs S True False True False
+Bs L True False True False
+Bs Bs True False False False
+Bs Bp True False False True
+Bp Bx True True True False
+Bp S True True True False
+Bp L True True True False
+Bp Bs True True True False
+Bp Bp True True False False
+False False False False
+False True none
+False True
+False
+[2, 1, 3]
+1
+True True
