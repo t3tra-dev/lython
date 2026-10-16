@@ -3173,34 +3173,37 @@ void TypeSystem::restoreAnnotationDiagnostics(parser::Diagnostics diagnostics) {
 // folded `max(sum(r) for r in rows)` and the inference had nothing to say
 // about the inner `sum(r)`, so the outer fold was refused for an element type
 // it could not see.
+mlir::Type TypeSystem::iterableElementType(mlir::Type iterableType) const {
+  if (!iterableType)
+    return {};
+  CallInferenceResult iterInference = inferMethodCallWithEvidence(
+      widenLiteral(iterableType), "__iter__", {});
+  if (!iterInference) {
+    // ⭐ THE SEQUENCE PROTOCOL. A class with `__len__` and `__getitem__` and
+    // no `__iter__` is iterable -- CPython's `iter()` falls back to indexing
+    // from 0 -- and the element is what the subscript answers. The loop
+    // rewrite that runs it lives in EmitterLoops.cpp; this is the same rule
+    // for the walks that only need the TYPE (a comprehension's target, a
+    // reducer's accumulator).
+    if (inferMethodCallWithEvidence(widenLiteral(iterableType), "__len__",
+                                    {}))
+      if (CallInferenceResult indexed = inferMethodCallWithEvidence(
+              widenLiteral(iterableType), "__getitem__", {intType()}))
+        return widenLiteral(indexed.resultType);
+    return {};
+  }
+  CallInferenceResult nextInference = inferMethodCallWithEvidence(
+      iterInference.resultType, "__next__", {});
+  if (!nextInference)
+    return {};
+  return widenLiteral(nextInference.resultType);
+}
+
 mlir::Type TypeSystem::iterationElementType(const parser::Node *arg) const {
   if (!arg)
     return {};
   auto iterationElement = [&](const parser::Node *iterable) -> mlir::Type {
-    mlir::Type iterableType = inferExpr(iterable);
-    if (!iterableType)
-      return {};
-    CallInferenceResult iterInference = inferMethodCallWithEvidence(
-        widenLiteral(iterableType), "__iter__", {});
-    if (!iterInference) {
-      // ⭐ THE SEQUENCE PROTOCOL. A class with `__len__` and `__getitem__` and
-      // no `__iter__` is iterable -- CPython's `iter()` falls back to indexing
-      // from 0 -- and the element is what the subscript answers. The loop
-      // rewrite that runs it lives in EmitterLoops.cpp; this is the same rule
-      // for the walks that only need the TYPE (a comprehension's target, a
-      // reducer's accumulator).
-      if (inferMethodCallWithEvidence(widenLiteral(iterableType), "__len__",
-                                      {}))
-        if (CallInferenceResult indexed = inferMethodCallWithEvidence(
-                widenLiteral(iterableType), "__getitem__", {intType()}))
-          return widenLiteral(indexed.resultType);
-      return {};
-    }
-    CallInferenceResult nextInference = inferMethodCallWithEvidence(
-        iterInference.resultType, "__next__", {});
-    if (!nextInference)
-      return {};
-    return widenLiteral(nextInference.resultType);
+    return iterableElementType(inferExpr(iterable));
   };
   if (arg->kind != "GeneratorExp")
     return iterationElement(arg);
@@ -4534,10 +4537,25 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         if (leftOperand == floatType() || rightOperand == floatType())
           return contract("builtins.tuple", {floatType(), floatType()});
       }
+      // ⭐ A PLAIN ITERABLE IS TYPED BY THIS WALK, not by
+      // `iterationElementType`, which infers with no context: a loop target
+      // or a local the walk has bound is unknown there, so
+      //
+      //     for row in rows:
+      //         yield max(row)       # in a generator
+      //
+      // typed the yield as nothing and refused the generator ("annotated
+      // Iterator[int] but yields None"), while `m = max(row); yield m` and
+      // `yield len(row)` compiled. A generator expression keeps its own walk,
+      // which binds its targets.
+      auto reducedElement = [&](const parser::Node *argument) -> mlir::Type {
+        if (argument->kind == "GeneratorExp")
+          return iterationElementType(argument);
+        return iterableElementType(widenLiteral(lenientRecurse(argument)));
+      };
       if ((reducer == "sum" || reducer == "max" || reducer == "min") &&
           oneArgument)
-        if (mlir::Type element =
-                iterationElementType(reducerArgs->front().get()))
+        if (mlir::Type element = reducedElement(reducerArgs->front().get()))
           return element;
       // ⭐ `sorted(x, reverse=True)` HAS `sorted(x)`'s TYPE. The keyword form
       // is a SUGAR rewrite in the emitter, so this walk had nothing for it and
@@ -4554,8 +4572,7 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       // the type. `key=` does not change the answer either -- the result holds
       // the argument's elements, whatever the key ordered them by.
       if (reducer == "sorted" && oneArgument)
-        if (mlir::Type element =
-                iterationElementType(reducerArgs->front().get()))
+        if (mlir::Type element = reducedElement(reducerArgs->front().get()))
           return contract("builtins.list", {widenLiteral(element)});
       // The lazy-iterator builtins are the same story one step further:
       // the emitter synthesizes a generator function for each of them, so

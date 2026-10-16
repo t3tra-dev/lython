@@ -1,3 +1,20 @@
+# RE-MEASURED 2026-10-16: NOT A GENERATOR DEFECT. The same refusal comes from
+# an unannotated nested function that calls itself, generator or not:
+#
+#     def outer(n: int) -> int:
+#         def f(k: int):                 # no return annotation
+#             if k > 0: return k + f(k - 1)
+#             return 0
+#         return f(n)                    # "builtins.object is not callable"
+#
+# and goes away with `-> Iterator[int]` (or `-> int`) on the nested def. A
+# TOP-LEVEL unannotated recursive function gets its result from the module
+# fixpoint (`resultTypeOverrides`); a nested def's signature is inferred once,
+# while its own name is still unbound. So this is the annotation-required
+# boundary (cf. wb_an_unannotated_parameter_of_a_local_function), and what is
+# wrong today is the message, which names the compiler's bookkeeping rather
+# than the missing annotation. The note below is the 2026-09 reading.
+#
 # A nested generator that delegates to itself is refused:
 #
 #   emit error: static type !py.contract<"builtins.object"> is not callable:

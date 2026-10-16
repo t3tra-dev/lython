@@ -436,6 +436,9 @@ public:
   // The element an iteration over `node` yields (a generator expression or a
   // plain iterable); null when it cannot be seen.
   mlir::Type iterationElementType(const parser::Node *node) const;
+  // What iterating a value of `iterableType` yields: `__iter__` then
+  // `__next__`, or the sequence protocol. Null when it is not iterable.
+  mlir::Type iterableElementType(mlir::Type iterableType) const;
   mlir::Type inferExpr(const parser::Node *node) const;
   mlir::Type inferExpr(const parser::Node *node,
                        const ExprInferenceContext &ctx) const;

@@ -22,6 +22,7 @@ add_library(LythonRuntimeLowering STATIC
     ../common/Native.cpp
     Passes/Runtime/Calls/Builtin.cpp
     Passes/Runtime/Calls/Operands.cpp
+    Passes/Runtime/Cleanup/DualEdges.cpp
     Passes/Runtime/Cleanup/EH.cpp
     Passes/Runtime/Cleanup/UnreachableBodies.cpp
     Passes/Runtime/Core/Dispatch.cpp

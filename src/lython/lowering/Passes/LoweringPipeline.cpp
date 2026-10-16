@@ -534,6 +534,23 @@ LogicalResult runLoweringPipeline(ModuleOp module,
   }
   dumpMLIRForPass(irDump, "coroutine-erasure", module);
 
+  // Phase 8e: every edge into a block gets a terminator of its own.
+  //
+  // ⛔ Before the runtime lowering, not only before the refcount insertion
+  // (which splits them too, for a place to put an edge's retain): expanding
+  // a logical block argument splices each edge's physical operands behind
+  // its logical one and finds the edges still to do by what follows it. Two
+  // edges of one cond_br into one block, forwarding the same logical value,
+  // are told apart by nothing but their successor index, and in a generator
+  // -- whose resume threads every carried local through the merge -- the
+  // splices landed on the wrong edge: `print(max(xs))` in a generator body
+  // left four logical operands behind ("non-lowered users ... py.add").
+  {
+    PerfScope perf("lowering.split-dual-edges");
+    lowering::runtime::cleanup::splitDualEdges(module);
+  }
+  dumpMLIRForPass(irDump, "split-dual-edges", module);
+
   // Phase 9: lower Py dialect values into runtime bundles and calls.
   if (failed(runPhase("runtime-lowering", [&](PassManager &pm) {
         pm.addPass(createRuntimeLoweringPass());

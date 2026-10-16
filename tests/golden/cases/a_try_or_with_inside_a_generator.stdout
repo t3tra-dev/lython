@@ -1,0 +1,19 @@
+fin 1
+fin 2
+caught v
+[1, 2] [1, 3]
+enter
+exit
+enter
+exit
+enter
+5
+exit
+enter
+5
+exit
+enter
+exit
+enter
+exit
+[5] [1] [2] [0] [6, 7]
