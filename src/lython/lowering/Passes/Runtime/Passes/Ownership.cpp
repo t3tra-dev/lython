@@ -3261,9 +3261,20 @@ forwardedBlockArgGroupOnEdge(mlir::Operation *terminator,
   mlir::SuccessorOperands ops = branch.getSuccessorOperands(successorIndex);
   llvm::SmallVector<mlir::Value, 4> destArgs(group.size());
   unsigned n = std::min<unsigned>(successor->getNumArguments(), ops.size());
+  // ⭐ THE LOWEST ARGUMENT, when the edge forwards a value into two. That is
+  // the one the edge's token goes to everywhere else -- the transfer claims
+  // below and the affine verifier's rename both take the first -- and this
+  // took the LAST. A generator threads a local through a short-circuit's
+  // merge beside the `and` value that IS that local:
+  //
+  //     if c and buf: ...      # ^merge(%tag, %bool, %buf_as_value, %buf)
+  //
+  // so the carried local became the candidate, the value argument never did,
+  // and the verifier, following the token into the value argument, found it
+  // never released ("still owned when a call may unwind").
   for (unsigned a = 0; a < n; ++a)
     for (unsigned j = 0; j < group.size(); ++j)
-      if (ops[a] && aliases.same(ops[a], group[j]))
+      if (!destArgs[j] && ops[a] && aliases.same(ops[a], group[j]))
         destArgs[j] = successor->getArgument(a);
   for (mlir::Value arg : destArgs)
     if (!arg)
