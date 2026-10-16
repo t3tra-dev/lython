@@ -3398,3 +3398,48 @@ TEST(DriverTest, ALibrarysModuleAliasIsNotTheProgramsName) {
             std::string::npos)
       << unbound.diagnostics;
 }
+
+// What: a list literal of n floats and one of n strings build no unwind
+// cleanup and no invoke per element -- the counts at 40 elements are the
+// counts at 8 -- because the calls that box a float and view a static str
+// cannot raise, and both say so at the LLVM layer too.
+TEST(DriverTest, ALiteralsElementsAreBuiltWithNoUnwindEdges) {
+  auto literalProgram = [](int count) {
+    std::string floats, strings;
+    for (int i = 0; i < count; ++i) {
+      floats += (i ? ", " : "") + std::to_string(i) + ".5";
+      strings += (i ? ", '" : "'") + std::string("s") + std::to_string(i) + "'";
+    }
+    return "data = [" + floats + "]\nnames = [" + strings +
+           "]\nprint(len(data), len(names))\n";
+  };
+  struct Counts {
+    unsigned cleanups = 0;
+    unsigned invokes = 0;
+  };
+  auto countsFor = [&](int count) -> Counts {
+    CompileResult result = compileSource(literalProgram(count));
+    EXPECT_TRUE(result.succeeded) << result.diagnostics;
+    Counts counts;
+    if (!result.verified.llvmModule)
+      return counts;
+    llvm::Module &module = *result.verified.llvmModule;
+    for (const llvm::Function &function : module)
+      if (!function.isDeclaration() &&
+          function.getName().starts_with("__ly_unwind_cleanup_"))
+        ++counts.cleanups;
+    if (const llvm::Function *main = module.getFunction("__main__"))
+      for (const llvm::BasicBlock &block : *main)
+        for (const llvm::Instruction &instruction : block)
+          counts.invokes += llvm::isa<llvm::InvokeInst>(instruction);
+    for (llvm::StringRef name : {"LyFloat_FromF64", "LyUnicode_FromStatic"}) {
+      const llvm::Function *callee = module.getFunction(name);
+      EXPECT_TRUE(callee && callee->doesNotThrow()) << name.str();
+    }
+    return counts;
+  };
+  Counts few = countsFor(8);
+  Counts many = countsFor(40);
+  EXPECT_EQ(few.cleanups, many.cleanups);
+  EXPECT_EQ(few.invokes, many.invokes);
+}

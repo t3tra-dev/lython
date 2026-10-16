@@ -342,6 +342,12 @@ bool isNonRaisingRuntimeSymbol(llvm::StringRef name);
 
 bool mayRaisePythonException(mlir::func::FuncOp function);
 
+// Set on a runtime body that reaches no raise: no call in it, however deep,
+// can propagate a Python exception (Cleanup/CannotRaise.cpp). Read by
+// `mayRaisePythonException` before its name test, which assumes every `Ly*`
+// symbol may raise.
+inline constexpr llvm::StringLiteral kCannotRaiseAttr{"ly.eh.cannot_raise"};
+
 // For `%c = call @LyEH_TryCatchAnchor(id); cf.cond_br %c, ^handler, ^tail`
 // where ^tail leads with a same-id call-site marker: the marker's guarded
 // call. The anchor's true edge is never taken at runtime -- control reaches
