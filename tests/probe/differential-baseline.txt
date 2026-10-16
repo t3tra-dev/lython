@@ -293,7 +293,6 @@ wb_bool_argument_to_numeric_builtin.py AGREE
 wb_borrowed_param_rebound_local.py AGREE
 wb_callable_field_store.py AGREE
 wb_conditional_rebind_element_leak.py SKIP
-wb_const_set_literal_fold.py WRONG-DECLARED
 wb_dispatch_findings_2026_08_21.py AGREE
 wb_duplicate_literal_element_delitem_leak.py AGREE
 wb_finally_loop_local_unwind.py AGREE

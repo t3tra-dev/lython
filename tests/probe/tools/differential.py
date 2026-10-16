@@ -78,8 +78,8 @@ def declared_wrong(source: Path) -> str | None:
     """Does the program itself say its divergence is the point?
 
     `# differential: expect-wrong <reason>` was already being written in the
-    corpus before anything read it, so wb_const_set_literal_fold.py -- forty
-    lines documenting a CPython codegen fold this compiler does not do -- was
+    corpus before anything read it, so a probe of forty lines documenting a
+    CPython codegen fold this compiler did not do (since fixed) was
     reported as a fresh WRONG and, being newer than the baseline, as a
     REGRESSION. A survey that calls a documented difference a regression is the
     failure mode these tools exist to avoid, so the marker is honoured: it is

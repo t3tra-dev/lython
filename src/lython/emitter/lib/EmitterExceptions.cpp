@@ -1627,7 +1627,7 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
   for (auto [index, local] : llvm::enumerate(postCarriedLocals)) {
     values[local.name] =
         Value{tryOp.getResult(static_cast<unsigned>(index)), local.type};
-    types.bindSymbol(local.name, local.type);
+    bindStoredLocalType(local.name, local.type);
   }
   if (usesFinallyCompletion) {
     const unsigned flagBase = hasElse ? 1u : 0u;
@@ -1797,7 +1797,7 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
         values[local.name] =
             Value{tryOp.getResult(1 + static_cast<unsigned>(index)),
                   local.type};
-        types.bindSymbol(local.name, local.type);
+        bindStoredLocalType(local.name, local.type);
       }
       emitStatements(orelse);
     }

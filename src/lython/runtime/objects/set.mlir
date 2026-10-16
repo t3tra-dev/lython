@@ -53,7 +53,13 @@ module attributes {
                     "symmetric_difference", "issubset", "issuperset",
                     "isdisjoint", "__eq__", "__ne__", "__or__", "__and__",
                     "__sub__", "__xor__", "__le__", "__lt__", "__ge__",
-                    "__gt__"],
+                    "__gt__",
+                    // ⛔ NOT A CPython METHOD: `frozenset(s)` reaches it by
+                    // name, the way `__ly_iadd__` is reached (a program that
+                    // writes it gets the same answer). frozenset's initializer
+                    // takes elements, and CPython builds `frozenset(s)` by
+                    // set_merge, whose order the elements cannot reproduce.
+                    "__ly_frozen__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"builtins.set">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.set">, !py.contract<"$T">] -> [!py.literal<None>]>,
@@ -84,7 +90,8 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.set">, !py.contract<"builtins.set">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.set">, !py.contract<"builtins.set">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.set">, !py.contract<"builtins.set">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.set">, !py.contract<"builtins.set">] -> [!py.contract<"builtins.bool">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.set">, !py.contract<"builtins.set">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.set">] -> [!py.contract<"builtins.frozenset", [!py.contract<"$T">]>]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
@@ -93,7 +100,7 @@ module attributes {
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
-                    "instance", "instance"]
+                    "instance", "instance", "instance"]
   } {}
 
   py.class @frozenset attributes {
@@ -111,7 +118,10 @@ module attributes {
                     "union", "intersection", "difference",
                     "symmetric_difference", "issubset", "issuperset",
                     "isdisjoint", "__or__", "__and__", "__sub__", "__xor__",
-                    "__le__", "__lt__", "__ge__", "__gt__", "__new__", "__init__"],
+                    "__le__", "__lt__", "__ge__", "__gt__", "__new__", "__init__",
+                    // ⛔ NOT A CPython METHOD: `set(fs)` reaches it by name
+                    // (see set's `__ly_frozen__`).
+                    "__ly_thawed__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.frozenset">>, !py.contract<"builtins.set", [!py.contract<"$T">]>] -> [!py.self]>,
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.frozenset">>, !py.contract<"builtins.list", [!py.contract<"$T">]>] -> [!py.self]>,
@@ -139,7 +149,8 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.frozenset">>] -> [!py.self]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">] -> [!py.literal<None>]>
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">] -> [!py.contract<"builtins.set", [!py.contract<"$T">]>]>
     ],
     method_kinds = ["classmethod", "classmethod", "instance", "instance",
                     "instance",
@@ -147,7 +158,8 @@ module attributes {
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance", "instance", "classmethod", "instance"]
+                    "instance", "instance", "instance", "instance", "classmethod", "instance",
+                    "instance"]
   } {}
 
   // set.__repr__ / frozenset.__repr__: `{e0, e1, ...}`, `set()` and
@@ -1258,6 +1270,12 @@ module attributes {
   // dropping the two fast paths disagrees with python3.14 on 274 of 2000
   // measured `set.copy()` pairs, and dropping the up-front resize on 1342.
   func.func private @__ly_set_raw_merge_set(%self: memref<?xi64>, %other: memref<?xi64>) {
+    // ⭐ THE SOURCE IS PUT IN TABLE ORDER FIRST. Every branch below reads its
+    // dense array as the table's order -- the wholesale copy takes it (and not
+    // its order flag) verbatim, the duplicate-possible branch inserts in it --
+    // and an append leaves it out of that order until a reader reorders it.
+    // `b.update(a)` after `a` was filled by adds printed neither order.
+    func.call @__ly_set_raw_reorder(%other) : (memref<?xi64>) -> ()
     %low32 = arith.constant 4294967295 : i64
     %thirty_two = arith.constant 32 : i64
     %zero = arith.constant 0 : i64
@@ -1437,6 +1455,9 @@ module attributes {
   // scan is over %a's DENSE array, which is its table order, so the result is
   // built in the order CPython's set_next hands the entries out.
   func.func private @__ly_set_raw_select(%self: memref<?xi64>, %a: memref<?xi64>, %b: memref<?xi64>, %want_present: i1) {
+    // In table order, as set_intersection's set_next walks it (see
+    // @__ly_set_raw_merge_set).
+    func.call @__ly_set_raw_reorder(%a) : (memref<?xi64>) -> ()
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16_i64 = func.call @__ly_box_word_count() : () -> i64
@@ -1506,6 +1527,9 @@ module attributes {
   // its dense array is a stable walk -- the `so is other` case is a clear and
   // never reaches here.
   func.func private @__ly_set_raw_toggle(%self: memref<?xi64>, %other: memref<?xi64>) {
+    // In table order, as set_symmetric_difference_update's set_next walks it
+    // (see @__ly_set_raw_merge_set).
+    func.call @__ly_set_raw_reorder(%other) : (memref<?xi64>) -> ()
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %true = arith.constant true
@@ -1680,12 +1704,6 @@ module attributes {
   // byte-identical; going through a bulk fill of the dense array instead would
   // give the copy no table at all.
   func.func private @__ly_set_copy_alloc(%src: memref<?xi64>) -> memref<9xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.set"], ly.ownership.owned_results = [0]} {
-    // The merge below can take the source's table and dense array VERBATIM,
-    // which copies whatever order the source is in; every other path rebuilds
-    // the order through `place` and gets it back at the next repr. So the
-    // source is put in order first, and the copy inherits one that is already
-    // right.
-    func.call @__ly_set_raw_reorder(%src) : (memref<?xi64>) -> ()
     %zero = arith.constant 0 : i64
     %self = func.call @__ly_set_alloc(%zero) : (i64) -> memref<9xi64>
     %raw = memref.cast %self : memref<9xi64> to memref<?xi64>
@@ -1813,6 +1831,24 @@ module attributes {
     %raw = memref.cast %self : memref<9xi64> to memref<?xi64>
     %copy = func.call @__ly_set_copy_alloc(%raw) : (memref<?xi64>) -> memref<9xi64>
     func.return %copy : memref<9xi64>
+  }
+
+  // `frozenset(s)` and `set(fs)`: make_new_set's set_update_local, which for a
+  // set argument is set_merge into the empty new set -- the order `copy`
+  // produces, in the other kind.
+  func.func @LySet_Frozen(%self: memref<9xi64> {ly.ownership.object_header}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.set", ly.runtime.method = "__ly_frozen__", ly.runtime.result_contract = "builtins.frozenset"} {
+    %zero = arith.constant 0 : i64
+    %raw = memref.cast %self : memref<9xi64> to memref<?xi64>
+    %result = func.call @__ly_frozenset_alloc(%zero) : (i64) -> memref<9xi64>
+    %rraw = memref.cast %result : memref<9xi64> to memref<?xi64>
+    func.call @__ly_set_raw_merge_set(%rraw, %raw) : (memref<?xi64>, memref<?xi64>) -> ()
+    func.return %result : memref<9xi64>
+  }
+
+  func.func @LyFrozenSet_Thawed(%self: memref<9xi64> {ly.ownership.object_header}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "__ly_thawed__", ly.runtime.result_contract = "builtins.set"} {
+    %raw = memref.cast %self : memref<9xi64> to memref<?xi64>
+    %result = func.call @__ly_set_copy_alloc(%raw) : (memref<?xi64>) -> memref<9xi64>
+    func.return %result : memref<9xi64>
   }
 
   // set_union: a copy of the receiver, then set_merge of the argument.

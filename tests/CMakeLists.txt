@@ -624,6 +624,10 @@ set(LYTHON_LEAK_GATE_RUNNER "${CMAKE_CURRENT_SOURCE_DIR}/leak_gate.py")
 #     dict literal family whose dict side was repaired earlier and which
 #     rfc/test-suite-debt.md listed as still leaking. Both are net zero now.
 set(LYTHON_LEAK_GATE_CASES
+    # A loop that leaves through IndexError / StopIteration from a class's
+    # `__getitem__`, in a for, a comprehension and the lazy combinators: each
+    # exit holds the sequence and the element it was reading.
+    a_getitem_sequence_ends_at_index_error
     # The same raise for a field that admits None and for an exception's
     # field; None itself is immortal and never released.
     a_field_admitting_none_read_before_a_store_raises

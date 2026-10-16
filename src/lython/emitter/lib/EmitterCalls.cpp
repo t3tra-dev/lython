@@ -3652,38 +3652,7 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
     types.bindRootSymbol(symbol, sig.publicCallable);
     bool suppressGate = readsWithoutCall || asSetter;
     auto emitBody = [this, def, symbol, sig, suppressGate] {
-      // ⛔ The dispatcher is a FUNCTION, even when the call that needed it was
-      // inside an inlined method body. Emitting it under the inliner's state
-      // made its `return` branch to the INLINER's continuation block --
-      // "reference to block defined in another region", from a `self.area()`
-      // inside a base method. The loop and super contexts are cleared for the
-      // same reason: none of them belong to this body.
-      auto savedLoops = std::move(loopControlContexts);
-      loopControlContexts.clear();
-      auto savedInlineReturns = std::move(inlineReturnContexts);
-      inlineReturnContexts.clear();
-      auto savedSupers = std::move(superContexts);
-      superContexts.clear();
-      auto savedInlining = std::move(methodsBeingInlined);
-      methodsBeingInlined.clear();
-      // A real function gets a real LLVM function, so its traceback frame comes
-      // from that; the inline stack belongs to the body being interrupted.
-      auto savedInlineFrames = std::move(inlineFrames);
-      inlineFrames.clear();
-      if (suppressGate)
-        ++virtualPropertyBodyDepth;
-      llvm::scope_exit restoreSuppression([&, suppressGate] {
-        if (suppressGate)
-          --virtualPropertyBodyDepth;
-      });
-      llvm::scope_exit restoreContexts([&] {
-        loopControlContexts = std::move(savedLoops);
-        inlineReturnContexts = std::move(savedInlineReturns);
-        superContexts = std::move(savedSupers);
-        methodsBeingInlined = std::move(savedInlining);
-        inlineFrames = std::move(savedInlineFrames);
-      });
-      emitCallableFunction(*def, symbol, sig, {}, /*isLambda=*/false);
+      emitDispatcherBody(*def, symbol, sig, suppressGate);
     };
     // ⭐ THE BODY WAITS FOR EVERY CLASS IT NAMES. Its arms call methods of
     // candidates gathered from every module's declarations, and a candidate
@@ -4007,6 +3976,254 @@ ModuleEmitter::tryEmitVirtualPropertyRead(const parser::Node &anchor,
   return emitCallableDispatch(
       anchor, callee,
       emitCallOperands(anchor, {receiver}, /*includeAstArguments=*/false));
+}
+
+void ModuleEmitter::emitDispatcherBody(const parser::Node &def,
+                                       const std::string &symbol,
+                                       const FunctionSignature &sig,
+                                       bool suppressGate) {
+  // ⛔ The dispatcher is a FUNCTION, even when the call that needed it was
+  // inside an inlined method body. Emitting it under the inliner's state
+  // made its `return` branch to the INLINER's continuation block --
+  // "reference to block defined in another region", from a `self.area()`
+  // inside a base method. The loop and super contexts are cleared for the
+  // same reason: none of them belong to this body.
+  auto savedLoops = std::move(loopControlContexts);
+  loopControlContexts.clear();
+  auto savedInlineReturns = std::move(inlineReturnContexts);
+  inlineReturnContexts.clear();
+  auto savedSupers = std::move(superContexts);
+  superContexts.clear();
+  auto savedInlining = std::move(methodsBeingInlined);
+  methodsBeingInlined.clear();
+  // A real function gets a real LLVM function, so its traceback frame comes
+  // from that; the inline stack belongs to the body being interrupted.
+  auto savedInlineFrames = std::move(inlineFrames);
+  inlineFrames.clear();
+  if (suppressGate)
+    ++virtualPropertyBodyDepth;
+  llvm::scope_exit restoreSuppression([&, suppressGate] {
+    if (suppressGate)
+      --virtualPropertyBodyDepth;
+  });
+  llvm::scope_exit restoreContexts([&] {
+    loopControlContexts = std::move(savedLoops);
+    inlineReturnContexts = std::move(savedInlineReturns);
+    superContexts = std::move(savedSupers);
+    methodsBeingInlined = std::move(savedInlining);
+    inlineFrames = std::move(savedInlineFrames);
+  });
+  emitCallableFunction(def, symbol, sig, {}, /*isLambda=*/false);
+}
+
+// ⭐ THE RIGHT OPERAND GOES FIRST WHEN ITS CLASS STRICTLY DERIVES THE LEFT'S,
+// as do_richcompare decides: `b == a` with `a` a Sub and `b` a Base asks
+// `a.__eq__(b)` before `b.__eq__(a)`. The one-receiver dispatcher answers
+// "which body runs for this receiver" and cannot ask a question about two
+// runtime classes, so `b == a` ran Base's body -- silently.
+//
+// The body pins the LEFT's runtime class by testing every class of its line
+// most-derived first (the first `isinstance` that holds names the exact class,
+// because every subclass was tested before it), then asks the same of the
+// right among that class's strict subclasses. An arm whose right class would
+// answer the reflected comparison writes it the other way round; every other
+// arm writes the comparison as the program did. Both are emitted with this
+// synthesis switched off, so each is the one-receiver dispatch it always was.
+//
+// ⛔ Only where some pair of the program's classes can reach the reflected
+// arm: everywhere else the comparison is emitted exactly as before.
+// ⛔ Only a comparison whose every candidate method is annotated `-> bool`:
+// the dispatcher has one return annotation to write.
+// ⛔ Not the arithmetic operators: CPython reflects those first only when the
+// subclass OVERRIDES the reflected method (`method_is_overloaded`), and a
+// subclass that does so is already what the probe measured correct.
+const ModuleEmitter::VirtualDispatchHelper *
+ModuleEmitter::subclassFirstCompareFor(const parser::Node &anchor, Value lhs,
+                                       Value rhs, llvm::StringRef opKind) {
+  if (subclassFirstSuppressed)
+    return nullptr;
+  static constexpr std::array<std::array<llvm::StringLiteral, 3>, 6> kOps{{
+      {"Eq", "__eq__", "Eq"},
+      {"NotEq", "__ne__", "NotEq"},
+      {"Lt", "__lt__", "Gt"},
+      {"LtE", "__le__", "GtE"},
+      {"Gt", "__gt__", "Lt"},
+      {"GtE", "__ge__", "LtE"}}};
+  llvm::StringRef mirrorKind;
+  llvm::StringRef reflected;
+  for (const auto &entry : kOps)
+    if (entry[0] == opKind) {
+      mirrorKind = entry[2];
+      for (const auto &mirror : kOps)
+        if (mirror[0] == mirrorKind)
+          reflected = mirror[1];
+    }
+  if (reflected.empty())
+    return nullptr;
+  auto leftContract =
+      mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(lhs.type));
+  auto rightContract =
+      mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(rhs.type));
+  if (!leftContract || !rightContract ||
+      !isSourceClassContract(leftContract) ||
+      !isSourceClassContract(rightContract) ||
+      !leftContract.getArguments().empty() ||
+      !rightContract.getArguments().empty())
+    return nullptr;
+  llvm::StringRef leftClass = leftContract.getContractName();
+  llvm::StringRef rightClass = rightContract.getContractName();
+
+  auto ancestorsOf = [&](llvm::StringRef cls) {
+    llvm::StringSet<> seen;
+    llvm::SmallVector<llvm::StringRef, 8> worklist{cls};
+    while (!worklist.empty()) {
+      auto bases = declaredClassBases.find(worklist.pop_back_val());
+      if (bases == declaredClassBases.end())
+        continue;
+      for (const std::string &base : bases->second)
+        if (seen.insert(base).second)
+          worklist.push_back(base);
+    }
+    return seen;
+  };
+  // Every declared class with its strict ancestors, most-derived first.
+  struct Line {
+    std::string name;
+    llvm::StringSet<> ancestors;
+  };
+  std::vector<Line> lines;
+  for (const auto &entry : declaredClassBases)
+    lines.push_back(Line{entry.getKey().str(), ancestorsOf(entry.getKey())});
+  llvm::sort(lines, [](const Line &a, const Line &b) {
+    if (a.ancestors.size() != b.ancestors.size())
+      return a.ancestors.size() > b.ancestors.size();
+    return a.name < b.name;
+  });
+  auto derives = [](const Line &line, llvm::StringRef cls) {
+    return line.name == cls || line.ancestors.contains(cls);
+  };
+  auto returnsBool = [&](const MethodBinding &binding) {
+    const parser::Node *returns =
+        binding.method ? ast::node(*binding.method, "returns") : nullptr;
+    return returns && returns->kind == "Name" &&
+           ast::nameSpelling(*returns) == "bool";
+  };
+  // Whether an instance of exactly `cls` answers the reflected comparison
+  // from a body of the program's: `!=` falls back on `__eq__`, as
+  // object.__ne__ does.
+  bool unannotated = false;
+  auto answers = [&](llvm::StringRef cls) {
+    for (llvm::StringRef method :
+         {reflected, reflected == "__ne__" ? llvm::StringRef("__eq__")
+                                          : llvm::StringRef()}) {
+      if (method.empty())
+        continue;
+      std::optional<MethodBinding> binding = resolveMroMethod(cls, method);
+      if (!binding || !binding->method || binding->kind != "instance")
+        continue;
+      if (!returnsBool(*binding))
+        unannotated = true;
+      return true;
+    }
+    return false;
+  };
+
+  const parser::SourceRange range = anchor.range;
+  auto left = [&] { return synth::name("__ly_l", range); };
+  auto right = [&] { return synth::name("__ly_r", range); };
+  auto asWritten = [&] {
+    return synth::returnStmt(synth::compare(left(), opKind, right(), range),
+                             range);
+  };
+  auto isinstanceOf = [&](parser::NodePtr subject, llvm::StringRef cls) {
+    return synth::call(synth::name("isinstance", range),
+                       {std::move(subject), synth::name(cls, range)}, range);
+  };
+  // First the arms, then which left classes need one: a class whose line
+  // holds a reflecting pair, and every class below one -- so that an
+  // ancestor's arm does not claim its instances.
+  struct LeftArm {
+    const Line *line;
+    std::vector<parser::NodePtr> arms;
+    bool reflects = false;
+  };
+  std::vector<LeftArm> leftArms;
+  llvm::StringSet<> reflecting;
+  for (const Line &leftLine : lines) {
+    if (!derives(leftLine, leftClass))
+      continue;
+    LeftArm entry{&leftLine, {}, false};
+    for (const Line &rightLine : lines) {
+      if (!rightLine.ancestors.contains(leftLine.name))
+        continue;
+      // Only a class an operand of the right's static type can be.
+      if (!derives(rightLine, rightClass) &&
+          !llvm::any_of(lines, [&](const Line &line) {
+            return line.name == rightClass &&
+                   line.ancestors.contains(rightLine.name);
+          }))
+        continue;
+      bool first = answers(rightLine.name);
+      entry.reflects = entry.reflects || first;
+      std::vector<parser::NodePtr> inner;
+      inner.push_back(
+          first ? synth::returnStmt(
+                      synth::compare(right(), mirrorKind, left(), range), range)
+                : asWritten());
+      entry.arms.push_back(synth::ifStmt(isinstanceOf(right(), rightLine.name),
+                                         std::move(inner), {}, range));
+    }
+    if (entry.reflects)
+      reflecting.insert(leftLine.name);
+    leftArms.push_back(std::move(entry));
+  }
+  if (reflecting.empty() || unannotated)
+    return nullptr;
+  std::vector<parser::NodePtr> body;
+  for (LeftArm &entry : leftArms) {
+    bool below = llvm::any_of(entry.line->ancestors, [&](const auto &a) {
+      return reflecting.contains(a.getKey());
+    });
+    if (!entry.reflects && !below)
+      continue;
+    std::vector<parser::NodePtr> arm;
+    if (entry.reflects)
+      arm = std::move(entry.arms);
+    arm.push_back(asWritten());
+    body.push_back(synth::ifStmt(isinstanceOf(left(), entry.line->name),
+                                 std::move(arm), {}, range));
+  }
+  body.push_back(asWritten());
+
+  std::string key =
+      ("cmp:" + leftClass + "," + rightClass + "," + opKind).str();
+  auto memo = virtualDispatchHelpers.find(key);
+  if (memo != virtualDispatchHelpers.end())
+    return memo->second.callable ? &memo->second : nullptr;
+
+  std::string symbol =
+      "__lysubfirst$" + std::to_string(++syntheticFunctionCounter);
+  llvm::SmallVector<synth::Param, 2> params{
+      synth::Param{"__ly_l", synth::name(leftClass, range)},
+      synth::Param{"__ly_r", synth::name(rightClass, range)}};
+  parser::NodePtr def =
+      synth::functionDef(symbol, params, {}, std::move(body),
+                         synth::name("bool", range), {}, range);
+  synthesizedIteratorDefs.push_back(def);
+  FunctionSignature sig = types.functionSignature(*def);
+  virtualDispatchHelpers[key] = VirtualDispatchHelper{symbol, sig.publicCallable};
+  types.bindRootSymbol(symbol, sig.publicCallable);
+  auto emitBody = [this, def, symbol, sig] {
+    ++subclassFirstSuppressed;
+    llvm::scope_exit restore([&] { --subclassFirstSuppressed; });
+    emitDispatcherBody(*def, symbol, sig, /*suppressGate=*/false);
+  };
+  if (classDeclarationsEmitted)
+    emitBody();
+  else
+    deferredDispatcherBodies.push_back(std::move(emitBody));
+  memo = virtualDispatchHelpers.find(key);
+  return memo->second.callable ? &memo->second : nullptr;
 }
 
 std::optional<Value> ModuleEmitter::tryEmitVirtualDispatchWithValues(

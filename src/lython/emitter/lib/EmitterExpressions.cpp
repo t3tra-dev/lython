@@ -9,6 +9,7 @@
 #include "TypeSystemSolver.h"
 
 #include "AstAccess.h"
+#include "ConstantSetFold.h"
 #include "Contracts.h"
 
 #include "llvm/ADT/ScopeExit.h"
@@ -1541,9 +1542,10 @@ ModuleEmitter::tryEmitIterableMembership(const parser::Node &expr) {
     return std::nullopt;
   if (lookupClassMethod(contract, "__contains__"))
     return std::nullopt;
+  // ⛔ No `__len__` in it: the sequence protocol is `__getitem__` alone
+  // (`iteratesBySequenceProtocol`, the rule the loop runs).
   bool iterable = lookupClassMethod(contract, "__iter__").has_value() ||
-                  (lookupClassMethod(contract, "__len__").has_value() &&
-                   lookupClassMethod(contract, "__getitem__").has_value());
+                  iteratesBySequenceProtocol(contract);
   if (!iterable || programBindsName("any"))
     return std::nullopt;
 
@@ -1689,6 +1691,14 @@ Value ModuleEmitter::emitCompare(const parser::Node &expr) {
 
 Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
                                        Value rhs, const parser::Node *op) {
+  if (op)
+    if (const VirtualDispatchHelper *helper =
+            subclassFirstCompareFor(expr, lhs, rhs, op->kind)) {
+      Value callee = emitBindingRef(expr, helper->symbol, helper->callable);
+      return emitCallableDispatch(
+          expr, callee,
+          emitCallOperands(expr, {lhs, rhs}, /*includeAstArguments=*/false));
+    }
   if (std::optional<Value> primitive = emitPrimitiveCompare(expr, lhs, rhs, op))
     return *primitive;
   // bool-vs-bool equality lowers through the values' truth bits: the runtime
@@ -3842,19 +3852,13 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
       CallInferenceResult iterInference =
           types.inferMethodCallWithEvidence(iterableType, "__iter__", {});
       // ⭐ THE SEQUENCE PROTOCOL, the same fallback the for statement takes:
-      // `__len__` + `__getitem__` with no `__iter__` is iterable, and the
-      // element is what the subscript answers. `types.iterationElementType`
-      // knows this rule; this walk asks the two questions itself because it
-      // needs the iterator type as well, so it needs the fallback too.
+      // `__getitem__` with no `__iter__` is iterable, and the element is what
+      // the subscript answers -- asked of `iterableElementType`, which owns
+      // the rule. ⛔ Not restated here: it was, with `__len__` required, and
+      // went on requiring it after the loop stopped asking.
       mlir::Type iterationElement;
-      if (!iterInference) {
-        if (types.inferMethodCallWithEvidence(types.widenLiteral(iterableType),
-                                              "__len__", {}))
-          if (CallInferenceResult indexed = types.inferMethodCallWithEvidence(
-                  types.widenLiteral(iterableType), "__getitem__",
-                  {types.intType()}))
-            iterationElement = types.widenLiteral(indexed.resultType);
-      }
+      if (!iterInference)
+        iterationElement = types.iterableElementType(iterableType);
       if (!iterationElement) {
         if (!requireStaticEvidence(expr, iterInference))
           return emitNone(expr);
@@ -4051,6 +4055,44 @@ Value ModuleEmitter::emitSetLiteral(const parser::Node &expr,
     emitStatement(*statement);
   }
 
+  // ⭐ A DISPLAY CPYTHON FOLDS IS MERGED INTO AN EMPTY SET, as the bytecode
+  // runs it: `BUILD_SET 0; LOAD_CONST frozenset(...); SET_UPDATE`. The
+  // frozenset was built by adds, as the literal above is, and set_merge
+  // re-places its entries into a table that resizes on another schedule, so
+  // `{0, 7, 14, 21, 28}` prints {0, 21, 7, 28, 14}. Whether it folds is the
+  // compiler's question, not the value's: `{a, 7, 14, 21, 28}` with `a = 0`
+  // is not folded and prints in add order.
+  // ⛔ Not where CPython uses the frozenset itself -- iterated by a `for` or
+  // a comprehension, or searched by `in` -- which keeps the add order.
+  if (cpythonFoldsSetDisplay(expr) && !frozensetSetDisplays().contains(&expr)) {
+    std::string merged = "__setlit" + std::to_string(++listCompCounter);
+    auto empty = py::PackOp::create(builder, loc(expr), containerType,
+                                    mlir::ValueRange{});
+    std::optional<Value> priorMerged;
+    if (auto found = values.find(merged); found != values.end())
+      priorMerged = found->second;
+    values[merged] = Value{empty.getResult(), containerType};
+    emitStatement(*synth::exprStmt(
+        synth::call(synth::attribute(synth::name(merged, expr.range),
+                                     std::string("update"), expr.range),
+                    std::vector<parser::NodePtr>{synth::name(tmp, expr.range)},
+                    expr.range),
+        expr.range));
+    auto mergedValue = values.find(merged);
+    Value result = mergedValue != values.end()
+                       ? mergedValue->second
+                       : Value{empty.getResult(), containerType};
+    if (priorMerged)
+      values[merged] = *priorMerged;
+    else
+      values.erase(merged);
+    if (priorBinding)
+      values[tmp] = *priorBinding;
+    else
+      values.erase(tmp);
+    return result;
+  }
+
   auto built = values.find(tmp);
   Value result = built != values.end()
                      ? built->second
@@ -4060,6 +4102,19 @@ Value ModuleEmitter::emitSetLiteral(const parser::Node &expr,
   else
     values.erase(tmp);
   return result;
+}
+
+const llvm::DenseSet<const parser::Node *> &
+ModuleEmitter::frozensetSetDisplays() {
+  if (!frozensetSetDisplaysMemo) {
+    frozensetSetDisplaysMemo.emplace();
+    collectFrozensetSetDisplays(moduleNode, *frozensetSetDisplaysMemo);
+    for (const EmitOptions::SourceModule &source : options.sourceModules)
+      if (source.moduleNode)
+        collectFrozensetSetDisplays(*source.moduleNode,
+                                    *frozensetSetDisplaysMemo);
+  }
+  return *frozensetSetDisplaysMemo;
 }
 
 // The value-returning `and`/`or` (R1): the deciding operand's VALUE flows

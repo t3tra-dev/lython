@@ -224,6 +224,17 @@ private:
       unsigned argumentCount, bool asProperty = false,
       llvm::ArrayRef<std::string> keywordNames = {}, bool asAttribute = false,
       bool asSetter = false, bool asField = false);
+  // `lhs <op> rhs` over two source-class values where the right one's runtime
+  // class may strictly derive the left's and answer the reflected comparison
+  // first. Null when no pair of the program's classes reaches that.
+  const VirtualDispatchHelper *subclassFirstCompareFor(const parser::Node &anchor,
+                                                       Value lhs, Value rhs,
+                                                       llvm::StringRef opKind);
+  // Non-zero while such a dispatcher's body is emitted: its arms are the
+  // one-receiver comparisons.
+  unsigned subclassFirstSuppressed = 0;
+  void emitDispatcherBody(const parser::Node &def, const std::string &symbol,
+                          const FunctionSignature &sig, bool suppressGate);
   // A base's instance FIELD read where a subclass makes the name readable
   // another way (a class attribute with a value, a property).
   std::optional<Value> tryEmitVirtualFieldRead(const parser::Node &anchor,
@@ -625,6 +636,12 @@ private:
   // in both loop and value position.
   bool hasIndexWalkableEvidence(mlir::Type type);
   bool hasIndexableEvidence(const parser::Node *expr);
+  bool iteratesBySequenceProtocol(mlir::Type type);
+  void appendSequenceProtocolRead(parser::NodePtr source, parser::NodePtr index,
+                                  const std::string &element,
+                                  const std::string &done,
+                                  std::vector<parser::NodePtr> &body,
+                                  parser::SourceRange range);
   // `a, b = xs`: the length comparison CPython's UNPACK_SEQUENCE makes
   // (EmitterStatements.cpp, beside the assignment target walk it guards).
   void emitStarredUnpack(const parser::Node &target,
@@ -1164,6 +1181,10 @@ private:
   Value emitContainerLiteral(const parser::Node &expr,
                              mlir::Type expected = {});
   Value emitSetLiteral(const parser::Node &expr, mlir::Type expected = {});
+  // The set displays CPython uses as a frozenset constant without building a
+  // set from it (ConstantSetFold.h), over every module this emitter emits.
+  const llvm::DenseSet<const parser::Node *> &frozensetSetDisplays();
+  std::optional<llvm::DenseSet<const parser::Node *>> frozensetSetDisplaysMemo;
   // `and`/`or` over non-bool operands: CPython's operand-value result,
   // restricted to operand combinations whose join is statically representable
   // (R1). The all-bool fast path stays in emitExpr.
@@ -1205,6 +1226,9 @@ private:
   // R6 nonlocal cells: a boxed local's storage is an instance of a
   // synthesized one-field class ("__ly_cell$N" with field "v").
   static bool isCellContract(mlir::Type type);
+  // Binds `name`'s type for inference from the type of its STORAGE: a cell or
+  // slot binds its content, as every read of the name produces.
+  void bindStoredLocalType(llvm::StringRef name, mlir::Type storage);
   mlir::Type cellContentType(mlir::Type cellType);
   // A cell that also records whether its content was ever written: the storage
   // for a name only SOME paths bind. Reading one is guarded.

@@ -20,6 +20,7 @@ add_library(LythonEmitter STATIC
     lib/EmitterStrings.cpp
     lib/EmitterSupport.cpp
     lib/EmitterWith.cpp
+    lib/ConstantSetFold.cpp
     lib/EmptyLiteralSeed.cpp
     lib/PrimitiveTypes.cpp
     lib/Emitter.cpp

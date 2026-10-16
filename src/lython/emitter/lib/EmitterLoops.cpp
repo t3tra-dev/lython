@@ -338,7 +338,7 @@ void ModuleEmitter::bindCarriedLoopLocals(
     llvm::ArrayRef<CarriedLoopLocal> carried, mlir::Block *block) {
   for (auto [index, local] : llvm::enumerate(carried)) {
     values[local.name] = Value{block->getArgument(index), local.type};
-    types.bindSymbol(local.name, local.type);
+    bindStoredLocalType(local.name, local.type);
   }
 }
 
@@ -843,10 +843,107 @@ bool ModuleEmitter::emitSequenceProtocolFor(const parser::Node &statement,
     return false;
   if (lookupClassMethod(sourceType, "__iter__"))
     return false;
-  if (!lookupClassMethod(sourceType, "__len__") ||
-      !lookupClassMethod(sourceType, "__getitem__"))
+  if (!lookupClassMethod(sourceType, "__getitem__"))
     return false;
-  return emitIndexedFor(statement, iterNode);
+  // ⭐ THE OLD SEQUENCE PROTOCOL ENDS AT THE FIRST IndexError, NOT AT `len`.
+  // CPython's iterator (iterobject.c) calls `__getitem__(0)`, `(1)`, ... and
+  // stops when one raises IndexError or StopIteration; `__len__` is never
+  // asked. This was the index loop bounded by `len(seq)`, so a class whose
+  // two disagree answered differently, silently, and a class with
+  // `__getitem__` alone could not be iterated at all.
+  //
+  //     __lyseq = <source>
+  //     __lyidx = 0
+  //     __lydone = False
+  //     while not __lydone:
+  //         try:
+  //             <target> = __lyseq[__lyidx]
+  //         except (IndexError, StopIteration):
+  //             __lydone = True
+  //         __lyidx += 1
+  //         if not __lydone:
+  //             <body>
+  //     else:
+  //         <orelse>
+  //
+  // The flag and the body after the try are `emitSourceIteratorFor`'s, for
+  // its reasons (a `break` out of a handler, a tuple target). The increment
+  // comes before the body so a `continue` still advances.
+  const parser::Field *targetField = parser::findField(statement, "target");
+  const parser::Field *iterField = parser::findField(statement, "iter");
+  const auto *body = ast::nodeList(statement, "body");
+  if (!targetField || !iterField || !body ||
+      !std::holds_alternative<parser::NodePtr>(targetField->value) ||
+      !std::holds_alternative<parser::NodePtr>(iterField->value))
+    return false;
+  parser::NodePtr target = std::get<parser::NodePtr>(targetField->value);
+  parser::NodePtr source = std::get<parser::NodePtr>(iterField->value);
+  if (!target || !source)
+    return false;
+  parser::SourceRange range = statement.range;
+  unsigned serial = ++listCompCounter;
+  std::string sequenceName = "__lyseq" + std::to_string(serial);
+  std::string indexName = "__lyseqidx" + std::to_string(serial);
+  std::string doneName = "__lyseqdone" + std::to_string(serial);
+
+  parser::NodePtr handler = parser::makeNode("ExceptHandler", range);
+  parser::addField(
+      *handler, "type",
+      synth::tuple({synth::name(std::string("IndexError"), range),
+                    synth::name(std::string("StopIteration"), range)},
+                   range));
+  parser::addField(*handler, "body",
+                   std::vector<parser::NodePtr>{synth::assign(
+                       synth::name(doneName, range),
+                       synth::constantBool(true, range), range)});
+  parser::NodePtr tryNode = parser::makeNode("Try", range);
+  parser::addField(
+      *tryNode, "body",
+      std::vector<parser::NodePtr>{synth::assign(
+          target,
+          synth::subscript(synth::name(sequenceName, range),
+                           synth::name(indexName, range), range),
+          range)});
+  parser::addField(*tryNode, "handlers",
+                   std::vector<parser::NodePtr>{std::move(handler)});
+  parser::addField(*tryNode, "orelse", std::vector<parser::NodePtr>{});
+  parser::addField(*tryNode, "finalbody", std::vector<parser::NodePtr>{});
+
+  std::vector<parser::NodePtr> guarded;
+  for (const parser::NodePtr &each : *body)
+    if (each)
+      guarded.push_back(each);
+  if (guarded.empty())
+    guarded.push_back(parser::makeNode("Pass", range));
+
+  std::vector<parser::NodePtr> loopBody{std::move(tryNode)};
+  loopBody.push_back(synth::assign(
+      synth::name(indexName, range),
+      synth::binOp(synth::name(indexName, range), "Add",
+                   synth::intConstant(1, range), range),
+      range));
+  loopBody.push_back(synth::ifStmt(
+      synth::notOp(synth::name(doneName, range), range), std::move(guarded), {},
+      range));
+
+  std::vector<parser::NodePtr> loopElse;
+  if (const auto *orelse = ast::nodeList(statement, "orelse"))
+    for (const parser::NodePtr &each : *orelse)
+      if (each)
+        loopElse.push_back(each);
+  parser::NodePtr loop = synth::whileStmt(
+      synth::notOp(synth::name(doneName, range), range), std::move(loopBody),
+      std::move(loopElse), range);
+  runWithScratchNames({sequenceName, indexName, doneName}, [&] {
+    emitStatement(*synth::assign(synth::name(sequenceName, range), source,
+                                 range));
+    emitStatement(*synth::assign(synth::name(indexName, range),
+                                 synth::intConstant(0, range), range));
+    emitStatement(*synth::assign(synth::name(doneName, range),
+                                 synth::constantBool(false, range), range));
+    emitStatement(*loop);
+  });
+  return true;
 }
 
 // ⭐ `__iter__` WRITTEN AS A GENERATOR. It is the ordinary way to make a tree
@@ -1671,7 +1768,7 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
     ScopedEmitterScope scope(values, types);
     for (auto [index, local] : llvm::enumerate(carried)) {
       values[local.name] = Value{postTestValues[index], local.type};
-      types.bindSymbol(local.name, local.type);
+      bindStoredLocalType(local.name, local.type);
     }
     // The body sees what the condition proves: `while n is not None:`
     // narrows n for its own body, the same fact the if statement and the
@@ -1739,7 +1836,7 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
   } else {
     for (auto [index, local] : llvm::enumerate(carried)) {
       values[local.name] = Value{postTestValues[index], local.type};
-      types.bindSymbol(local.name, local.type);
+      bindStoredLocalType(local.name, local.type);
     }
     // ⭐ THE EXIT EDGE CARRIES THE TEST'S NEGATIVE FACT, exactly as an `if`'s
     // fall-through does: the loop leaves when the test is FALSE, so after
@@ -1955,7 +2052,7 @@ void ModuleEmitter::emitAsyncFor(const parser::Node &statement) {
     mlir::Value result = tryOp.getResult(static_cast<unsigned>(index) + 1);
     nextCarriedValues.push_back(result);
     values[local.name] = Value{result, local.type};
-    types.bindSymbol(local.name, local.type);
+    bindStoredLocalType(local.name, local.type);
   }
   mlir::cf::CondBranchOp::create(builder, loc(statement), keepGoing, loopBlock,
                                  nextCarriedValues, afterBlock,
