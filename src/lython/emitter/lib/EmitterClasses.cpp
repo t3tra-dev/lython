@@ -5781,6 +5781,22 @@ bool ModuleEmitter::isCellContract(mlir::Type type) {
           contract.getContractName().starts_with(kSlotClassPrefix));
 }
 
+// ⭐ A CARRIED LOCAL REBOUND AFTER A LOOP OR A TRY IS BOUND BY ITS CONTENT.
+// The region's results carry the STORAGE, which for a name bound on only some
+// paths is its slot, and binding that made the inference read the slot class
+// where the program reads the value: `out.append((i, v))` with `v` bound in a
+// try was "no signature that accepts tuple[int, __ly_slot$1]", while
+// `print((i, v))` on the line above ran.
+void ModuleEmitter::bindStoredLocalType(llvm::StringRef name,
+                                        mlir::Type storage) {
+  if (isCellContract(storage))
+    if (mlir::Type content = cellContentType(storage)) {
+      types.bindSymbol(name, content);
+      return;
+    }
+  types.bindSymbol(name, storage);
+}
+
 mlir::Type ModuleEmitter::cellContentType(mlir::Type cellType) {
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(cellType);
   if (!contract)

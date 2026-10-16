@@ -636,6 +636,12 @@ private:
   // in both loop and value position.
   bool hasIndexWalkableEvidence(mlir::Type type);
   bool hasIndexableEvidence(const parser::Node *expr);
+  bool iteratesBySequenceProtocol(mlir::Type type);
+  void appendSequenceProtocolRead(parser::NodePtr source, parser::NodePtr index,
+                                  const std::string &element,
+                                  const std::string &done,
+                                  std::vector<parser::NodePtr> &body,
+                                  parser::SourceRange range);
   // `a, b = xs`: the length comparison CPython's UNPACK_SEQUENCE makes
   // (EmitterStatements.cpp, beside the assignment target walk it guards).
   void emitStarredUnpack(const parser::Node &target,
@@ -1220,6 +1226,9 @@ private:
   // R6 nonlocal cells: a boxed local's storage is an instance of a
   // synthesized one-field class ("__ly_cell$N" with field "v").
   static bool isCellContract(mlir::Type type);
+  // Binds `name`'s type for inference from the type of its STORAGE: a cell or
+  // slot binds its content, as every read of the name produces.
+  void bindStoredLocalType(llvm::StringRef name, mlir::Type storage);
   mlir::Type cellContentType(mlir::Type cellType);
   // A cell that also records whether its content was ever written: the storage
   // for a name only SOME paths bind. Reading one is guarded.

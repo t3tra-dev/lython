@@ -1542,9 +1542,10 @@ ModuleEmitter::tryEmitIterableMembership(const parser::Node &expr) {
     return std::nullopt;
   if (lookupClassMethod(contract, "__contains__"))
     return std::nullopt;
+  // ⛔ No `__len__` in it: the sequence protocol is `__getitem__` alone
+  // (`iteratesBySequenceProtocol`, the rule the loop runs).
   bool iterable = lookupClassMethod(contract, "__iter__").has_value() ||
-                  (lookupClassMethod(contract, "__len__").has_value() &&
-                   lookupClassMethod(contract, "__getitem__").has_value());
+                  iteratesBySequenceProtocol(contract);
   if (!iterable || programBindsName("any"))
     return std::nullopt;
 
@@ -3851,19 +3852,13 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
       CallInferenceResult iterInference =
           types.inferMethodCallWithEvidence(iterableType, "__iter__", {});
       // ⭐ THE SEQUENCE PROTOCOL, the same fallback the for statement takes:
-      // `__len__` + `__getitem__` with no `__iter__` is iterable, and the
-      // element is what the subscript answers. `types.iterationElementType`
-      // knows this rule; this walk asks the two questions itself because it
-      // needs the iterator type as well, so it needs the fallback too.
+      // `__getitem__` with no `__iter__` is iterable, and the element is what
+      // the subscript answers -- asked of `iterableElementType`, which owns
+      // the rule. ⛔ Not restated here: it was, with `__len__` required, and
+      // went on requiring it after the loop stopped asking.
       mlir::Type iterationElement;
-      if (!iterInference) {
-        if (types.inferMethodCallWithEvidence(types.widenLiteral(iterableType),
-                                              "__len__", {}))
-          if (CallInferenceResult indexed = types.inferMethodCallWithEvidence(
-                  types.widenLiteral(iterableType), "__getitem__",
-                  {types.intType()}))
-            iterationElement = types.widenLiteral(indexed.resultType);
-      }
+      if (!iterInference)
+        iterationElement = types.iterableElementType(iterableType);
       if (!iterationElement) {
         if (!requireStaticEvidence(expr, iterInference))
           return emitNone(expr);

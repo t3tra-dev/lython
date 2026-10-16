@@ -255,8 +255,19 @@ bool ModuleEmitter::isBuiltinIteratorName(llvm::StringRef name) const {
 
 // Sequence evidence for index-driven rewrites: __len__() plus
 // __getitem__(int) must statically resolve.
+//
+// ⛔ NEVER A CLASS THAT ITERATES BY THE SEQUENCE PROTOCOL. Its iteration ends
+// at the first IndexError from `__getitem__` and `len` is not asked:
+// `zip(xs, seq)` walked `seq` to `len(seq)` and stopped early where CPython
+// kept going, silently. Such a class is walked by `appendSequenceProtocolRead`
+// where a combinator can, and refused where it cannot.
+// ⚠️ A class WITH `__iter__` is still walked by `len` and `__getitem__`, which
+// assumes the three agree; nothing proves it. Walking it by its iterator
+// needs a non-leading iterator in each combinator, which none has yet.
 bool ModuleEmitter::hasIndexWalkableEvidence(mlir::Type type) {
   if (!type)
+    return false;
+  if (iteratesBySequenceProtocol(type))
     return false;
   if (!types.inferMethodCallWithEvidence(type, "__len__", {}))
     return false;
@@ -289,6 +300,62 @@ bool ModuleEmitter::hasIndexableEvidence(const parser::Node *expr) {
   if (!expr)
     return false;
   return hasIndexWalkableEvidence(types.inferExpr(expr));
+}
+
+// A class of the program's that iterates by the old sequence protocol: a
+// `__getitem__` and no `__iter__`.
+bool ModuleEmitter::iteratesBySequenceProtocol(mlir::Type type) {
+  mlir::Type widened = types.widenLiteral(type);
+  return isSourceClassContract(widened) &&
+         !lookupClassMethod(widened, "__iter__") &&
+         lookupClassMethod(widened, "__getitem__").has_value();
+}
+
+// One step of the sequence protocol inside a combinator's loop: read
+// `source[index]` into `element`, and leave the loop when the read raises
+// IndexError or StopIteration, as CPython's iterator does.
+//
+//     done = False
+//     try:
+//         element = source[index]
+//     except (IndexError, StopIteration):
+//         done = True
+//     if done:
+//         break
+//
+// ⛔ The `break` after the try, not in the handler: a jump out of a handler
+// in a loop with carried locals is not supported below the emitter
+// (`emitSourceIteratorFor` says why).
+void ModuleEmitter::appendSequenceProtocolRead(
+    parser::NodePtr source, parser::NodePtr index, const std::string &element,
+    const std::string &done, std::vector<parser::NodePtr> &body,
+    parser::SourceRange range) {
+  body.push_back(synth::assign(synth::name(done, range),
+                               synth::constantBool(false, range), range));
+  parser::NodePtr handler = parser::makeNode("ExceptHandler", range);
+  parser::addField(
+      *handler, "type",
+      synth::tuple({synth::name(std::string("IndexError"), range),
+                    synth::name(std::string("StopIteration"), range)},
+                   range));
+  parser::addField(*handler, "body",
+                   std::vector<parser::NodePtr>{synth::assign(
+                       synth::name(done, range),
+                       synth::constantBool(true, range), range)});
+  parser::NodePtr tryNode = parser::makeNode("Try", range);
+  parser::addField(*tryNode, "body",
+                   std::vector<parser::NodePtr>{synth::assign(
+                       synth::name(element, range),
+                       synth::subscript(std::move(source), std::move(index),
+                                        range),
+                       range)});
+  parser::addField(*tryNode, "handlers",
+                   std::vector<parser::NodePtr>{std::move(handler)});
+  parser::addField(*tryNode, "orelse", std::vector<parser::NodePtr>{});
+  parser::addField(*tryNode, "finalbody", std::vector<parser::NodePtr>{});
+  body.push_back(std::move(tryNode));
+  body.push_back(synth::ifStmt(synth::name(done, range),
+                               {parser::makeNode("Break", range)}, {}, range));
 }
 
 // ⭐ A FILE ITERATES BY `readline`, which is what CPython's own file iterator
@@ -654,7 +721,8 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
     // later iterator would consume one extra element from it whenever an
     // earlier sequence stops the zip).
     for (std::size_t index = 1; index < args->size(); ++index)
-      if (!hasIndexableEvidence(argAt(index).get()))
+      if (!hasIndexableEvidence(argAt(index).get()) &&
+          !iteratesBySequenceProtocol(types.inferExpr(argAt(index).get())))
         return reject(
             "zip() supports one leading iterator; the remaining iterables "
             "must be indexable sequences (list/str/tuple/bytes) — convert "
@@ -672,6 +740,13 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
     // rather than answered from a length nobody can ask for.
     llvm::SmallVector<NodePtr, 4> strictChecks;
     if (strictZip) {
+      // ⛔ A class that iterates by `__getitem__` has no length to compare:
+      // its end is the IndexError, not `len`.
+      for (std::size_t index = 1; index < args->size(); ++index)
+        if (iteratesBySequenceProtocol(types.inferExpr(argAt(index).get())))
+          return reject("zip(strict=True) needs every argument to be an "
+                        "indexable sequence (list/str/tuple/bytes); a class "
+                        "iterated by __getitem__ has no length to compare");
       if (!hasIndexableEvidence(argAt(0).get()))
         return reject("zip(strict=True) needs every argument to be an "
                       "indexable sequence (list/str/tuple/bytes); the leading "
@@ -713,6 +788,16 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
         scratchNames.push_back(sourceName);
         sourceRef = synth::name(sourceName, range);
         prologue.push_back(synth::assign(sourceRef, source, range));
+      }
+      if (iteratesBySequenceProtocol(types.inferExpr(source.get()))) {
+        std::string elementName = scratch(("e" + std::to_string(index)).c_str());
+        std::string doneName = scratch(("d" + std::to_string(index)).c_str());
+        scratchNames.push_back(elementName);
+        scratchNames.push_back(doneName);
+        appendSequenceProtocolRead(sourceRef, indexRef, elementName, doneName,
+                                   body, range);
+        elements.push_back(synth::name(elementName, range));
+        continue;
       }
       // if __j >= len(S): break  — the shortest input stops the loop.
       body.push_back(synth::ifStmt(
@@ -830,7 +915,16 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
   if (name == "reversed") {
     if (!args || args->size() != 1 || (keywords && !keywords->empty()))
       return reject("reversed() requires exactly one sequence argument");
-    if (!hasIndexableEvidence(argAt(0).get()))
+    // ⭐ A CLASS OF THE PROGRAM'S IS REVERSED BY `len` AND `__getitem__`,
+    // which is what CPython's reversed() asks of it when it has no
+    // `__reversed__` -- unlike forward iteration, here `len` IS the protocol.
+    mlir::Type reversedType = types.widenLiteral(types.inferExpr(argAt(0).get()));
+    bool reversedBySequence =
+        isSourceClassContract(reversedType) &&
+        !lookupClassMethod(reversedType, "__reversed__") &&
+        lookupClassMethod(reversedType, "__len__") &&
+        lookupClassMethod(reversedType, "__getitem__");
+    if (!reversedBySequence && !hasIndexableEvidence(argAt(0).get()))
       return reject("reversed() requires an indexable sequence "
                     "(list/str/tuple/bytes)");
     NodePtr source = argAt(0);
@@ -979,7 +1073,17 @@ ModuleEmitter::tryEmitLazyIteratorValueCall(const parser::Node &expr,
     return iterableValues.front();
 
   for (const Value &value : iterableValues) {
-    if (!hasIndexWalkableEvidence(types.widenLiteral(value.type)))
+    // `reversed` reads `len` as its protocol; everything else here walks
+    // forward, where a class iterated by `__getitem__` ends at IndexError.
+    mlir::Type widened = types.widenLiteral(value.type);
+    bool sequenceClass =
+        name == "reversed"
+            ? isSourceClassContract(widened) &&
+                  !lookupClassMethod(widened, "__reversed__") &&
+                  lookupClassMethod(widened, "__len__") &&
+                  lookupClassMethod(widened, "__getitem__")
+            : iteratesBySequenceProtocol(widened);
+    if (!hasIndexWalkableEvidence(widened) && !sequenceClass)
       return rejectValue(
           std::string(name) +
           "() as a value requires indexable sequences (list/str/tuple/"
@@ -1033,12 +1137,24 @@ ModuleEmitter::tryEmitLazyIteratorValueCall(const parser::Node &expr,
     NodePtr indexRef = synth::name("__lyi", bodyRange);
 
     std::vector<NodePtr> loopBody;
-    for (unsigned index = 0; index < iterableCount; ++index)
+    llvm::SmallVector<std::string, 4> readNames(iterableCount);
+    for (unsigned index = 0; index < iterableCount; ++index) {
+      if (name != "reversed" &&
+          iteratesBySequenceProtocol(iterableValues[index].type)) {
+        readNames[index] = "__lye" + std::to_string(index);
+        appendSequenceProtocolRead(param(index), indexRef, readNames[index],
+                                   "__lyd" + std::to_string(index), loopBody,
+                                   bodyRange);
+        continue;
+      }
       loopBody.push_back(
           synth::ifStmt(synth::compare(indexRef, "GtE", synth::lenCall(param(index), bodyRange),
                              bodyRange),
                  {parser::makeNode("Break", bodyRange)}, {}, bodyRange));
+    }
     auto elementAt = [&](unsigned index) {
+      if (!readNames[index].empty())
+        return synth::name(readNames[index], bodyRange);
       return synth::subscript(param(index), indexRef, bodyRange);
     };
 

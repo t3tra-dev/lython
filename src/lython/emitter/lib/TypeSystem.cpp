@@ -3179,17 +3179,16 @@ mlir::Type TypeSystem::iterableElementType(mlir::Type iterableType) const {
   CallInferenceResult iterInference = inferMethodCallWithEvidence(
       widenLiteral(iterableType), "__iter__", {});
   if (!iterInference) {
-    // ⭐ THE SEQUENCE PROTOCOL. A class with `__len__` and `__getitem__` and
-    // no `__iter__` is iterable -- CPython's `iter()` falls back to indexing
-    // from 0 -- and the element is what the subscript answers. The loop
+    // ⭐ THE SEQUENCE PROTOCOL. A class with `__getitem__` and no `__iter__`
+    // is iterable -- CPython's `iter()` falls back to indexing from 0 until
+    // IndexError -- and the element is what the subscript answers. The loop
     // rewrite that runs it lives in EmitterLoops.cpp; this is the same rule
     // for the walks that only need the TYPE (a comprehension's target, a
-    // reducer's accumulator).
-    if (inferMethodCallWithEvidence(widenLiteral(iterableType), "__len__",
-                                    {}))
-      if (CallInferenceResult indexed = inferMethodCallWithEvidence(
-              widenLiteral(iterableType), "__getitem__", {intType()}))
-        return widenLiteral(indexed.resultType);
+    // reducer's accumulator). ⛔ `__len__` is not part of it: CPython never
+    // asks, and requiring it here refused a class the loop runs.
+    if (CallInferenceResult indexed = inferMethodCallWithEvidence(
+            widenLiteral(iterableType), "__getitem__", {intType()}))
+      return widenLiteral(indexed.resultType);
     return {};
   }
   CallInferenceResult nextInference = inferMethodCallWithEvidence(
