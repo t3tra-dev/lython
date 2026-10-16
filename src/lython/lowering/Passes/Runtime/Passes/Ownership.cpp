@@ -2904,10 +2904,18 @@ bool releaseOwnedGroupByLiveness(
         // forwarding edges — the remaining edges exit the block with the
         // token still owned and the values dead, so they need edge releases
         // (the replaced lane of a conditional reassignment).
+        //
+        // ⛔ NOT ONLY WHEN THE GROUP HAS NO CONSUMING CALL ANYWHERE, which is
+        // what this asked: a consume in ANOTHER block -- the loop body's
+        // decref-on-replace -- then skipped every remaining edge here, and
+        // `cond_br %c, ^raise, ^exit(%value)` raised with the carried value
+        // still owned (a recursive-descent parser: `value = value +
+        // self.factor()` in a loop, a raise in the inlined factor). A consume
+        // in THIS block is `collectEdgeDeaths`'s own first test.
         mlir::Operation *terminator = block->getTerminator();
         auto it = lastUse.find(block);
-        if (!groupHasConsumingCall && it != lastUse.end() &&
-            it->second == terminator && forwardsGroupAnywhere(terminator))
+        if (it != lastUse.end() && it->second == terminator &&
+            forwardsGroupAnywhere(terminator))
           collectEdgeDeaths(terminator);
         continue;
       }

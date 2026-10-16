@@ -1,0 +1,11 @@
+1+2*3 = 7
+(1+2)*3 = 9
+10/3 = 3
+2*(3+4)-5 = 9
+((7)) = 7
+'1+' -> expected a number at 2
+'(1+2' -> expected )
+'2*(3+' -> expected a number at 5
+'((1)' -> expected )
+'1+(2*' -> expected a number at 5
+'*' -> expected a number at 0
