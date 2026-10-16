@@ -1,0 +1,9 @@
+3|4|6|3 not bool
+True|2|2|True yes|False|True
+False|1|0|False no|True|False
+10000000000000000000000000|10000000000000000000000001|20000000000000000000000000|10000000000000000000000000 not bool
+-7|-6|-14|-7 not bool
+not int not bool
+not int not bool
+not int not bool
+['i:0', 'b:True', 's:a', 'b:False', 'i:-1', '?']

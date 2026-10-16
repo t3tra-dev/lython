@@ -2157,6 +2157,7 @@ void TypeSystem::registerModule(const parser::Node &moduleNode) {
     if (!name)
       continue;
     indexByName[*name] = static_cast<unsigned>(functions.size());
+    topLevelFunctionDefs[*name] = statement.get();
     functions.push_back(
         TopLevelFunction{statement.get(), std::string(*name), {}});
   }
@@ -2362,7 +2363,22 @@ void TypeSystem::registerModule(const parser::Node &moduleNode) {
                                            /*strict=*/true};
     llvm::SaveAndRestore<bool> duringCallSites(defaultsDescribeParameters,
                                                false);
+    // ⭐ THE REST OF THE MODULE IS THE SUITE an empty literal is seeded from,
+    // as a function body's rest is for the body walk: `h = []` then
+    // `put(h, 5)` typed `h` as the erased list here, and the parameter it was
+    // handed took that element -- while the emitter, which does scan, built
+    // `h` as `list[int]` and refused the call.
+    llvm::DenseMap<const parser::Node *, std::size_t> moduleIndex;
+    const auto *moduleBody = ast::nodeList(moduleNode, "body");
+    if (moduleBody)
+      for (auto [index, statement] : llvm::enumerate(*moduleBody))
+        moduleIndex[statement.get()] = index;
     for (const StatementCalls &entry : moduleCalls) {
+      moduleScope.suites.clear();
+      if (auto found = moduleIndex.find(entry.statement);
+          moduleBody && found != moduleIndex.end())
+        moduleScope.suites.push_back(
+            SuiteCursor{moduleBody, found->second + 1});
       // ⛔ NOT a `def` or a `class`: the walk would bind the name to the
       // signature AS IT READS TODAY, and `localSymbols` SHADOWS the symbol
       // table — so a call site would resolve the callee to a frozen copy
