@@ -1,0 +1,19 @@
+checked
+checked
+1 1000000000000000000000000000000
+named True
+named False
+w0 None
+named True
+named False
+w1 None
+named True
+named False
+w2 None
+guarded ab
+guarded abcdef
+ab None
+looped
+[2, 3]
+named True
+kept31 kept31

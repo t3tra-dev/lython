@@ -5,6 +5,7 @@
 #include "Runtime/ABI/BoxLayout.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
 namespace py::lowering {
@@ -99,8 +100,20 @@ mlir::LogicalResult RuntimeBundleLowerer::bindEvidenceObjectResult(
            contract.getContractName() == "builtins.function" &&
            mlir::isa<py::CallableType>(resultValue.getType());
   };
+  // ⭐ A bool IS AN int, and a local `dict[str, int]` that was given True
+  // holds the bool object. The bundle keeps the bool contract -- its shape is
+  // not int's, and `print(d["b"])` must still say True -- and an int input
+  // that receives it unboxes the truth bit (`appendRuntimeSource`), as the
+  // list read already did.
+  auto boolReadAsInt = [&] {
+    auto contract = mlir::dyn_cast_if_present<py::ContractType>(value.contract);
+    auto result = mlir::dyn_cast<py::ContractType>(resultValue.getType());
+    return contract && result &&
+           contract.getContractName() == "builtins.bool" &&
+           result.getContractName() == "builtins.int";
+  };
   if (!py::isAssignableTo(value.contract, resultValue.getType(), op) &&
-      !erasedFunctionEvidence())
+      !erasedFunctionEvidence() && !boolReadAsInt())
     return op->emitError() << label << " evidence contract " << value.contract
                            << " is not assignable to result "
                            << resultValue.getType();
@@ -971,6 +984,60 @@ RuntimeBundleLowerer::selectEvidenceObjectByMatch(
       }
       candidates = widened;
     }
+  }
+
+  // ⭐ AN int RESULT VIEWS A bool CANDIDATE AS THE int IT IS. A bool object
+  // carries the int layout (objects/bool.mlir), so its header's first two
+  // words ARE an int header: the view keeps the object -- `sorted(t)` still
+  // prints True -- and gives it int's lanes, which the uniformity check below
+  // demands. `t: tuple[int, ...] = (1, True, 3)` then `sum(t)` reported
+  // "candidate 1 contract 'builtins.bool' is not assignable to result".
+  // ⛔ Not by unboxing to the value and making an int: that prints 1.
+  llvm::SmallVector<RuntimeValue, 4> viewed;
+  if (auto resultContract =
+          mlir::dyn_cast<py::ContractType>(resultValue.getType());
+      resultContract &&
+      resultContract.getContractName() == "builtins.int" &&
+      llvm::any_of(candidates, [](const RuntimeValue &candidate) {
+        auto contract =
+            mlir::dyn_cast_if_present<py::ContractType>(candidate.contract);
+        return contract && contract.getContractName() == "builtins.bool";
+      })) {
+    auto intHeader = mlir::MemRefType::get({2}, builder.getI64Type());
+    for (const RuntimeValue &candidate : candidates) {
+      auto contract =
+          mlir::dyn_cast_if_present<py::ContractType>(candidate.contract);
+      if (!contract || contract.getContractName() != "builtins.bool" ||
+          candidate.values.size() != 1) {
+        viewed.push_back(candidate);
+        continue;
+      }
+      mlir::Value object = candidate.values.front();
+      if (object.getType().isInteger(1)) {
+        std::optional<RuntimeSymbol> box =
+            manifest.primitive("builtins.bool", "box");
+        if (!box)
+          return op->emitError() << "runtime manifest has no bool box";
+        object = RuntimeBundleLowerer::createRuntimeCall(op->getLoc(), *box,
+                                                         {object})
+                     .getResult(0);
+      }
+      auto objectType = mlir::dyn_cast<mlir::MemRefType>(object.getType());
+      if (!objectType || objectType.getRank() != 1 ||
+          !objectType.hasStaticShape() || objectType.getDimSize(0) < 2) {
+        viewed.push_back(candidate);
+        continue;
+      }
+      mlir::Value header = mlir::memref::ReinterpretCastOp::create(
+          builder, op->getLoc(), intHeader, object, /*offset=*/0,
+          /*sizes=*/llvm::ArrayRef<std::int64_t>{2},
+          /*strides=*/llvm::ArrayRef<std::int64_t>{1});
+      viewed.push_back(RuntimeValue{
+          resultValue.getType(), llvm::SmallVector<mlir::Value, 4>{header},
+          ownership::logicalOwnershipKind(resultValue.getType(),
+                                          /*ownsObject=*/false)});
+    }
+    candidates = viewed;
   }
 
   const RuntimeValue &first = candidates.front();

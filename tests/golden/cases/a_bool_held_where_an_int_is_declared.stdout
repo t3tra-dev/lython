@@ -1,0 +1,18 @@
+[True, 5, True, 2, False] 9 False 5 [False, True, True, 2, 5]
+2 0 True True [True, 5, True, 2, False, 7] [False, 2, True, 5, True] [5, True, 2, False]
+[2, 6, 2, 3, 1] ['True', '5', 'True', '2', 'False'] [True, 5, True, 2]
+False True [5, True, 2]
+[5, 2]
+[2, 5]
+[5, 2]
+[False, True, 4, 9] 14 False 9 4 True [False, 9, 4, True]
+[False, 4, 9]
+{'a': 2, 't': True, 'f': False} 3 2 [False, True, 2] [('a', 2), ('t', True), ('f', False)]
+a 2 20
+t True 10
+f False 0
+{True: 4}
+(1, True, 3) 5 [1, True, 3] 2 3
+{'a': 1, 'b': True} 11 2
+[True, 3] 4
+2 True   1 True 1

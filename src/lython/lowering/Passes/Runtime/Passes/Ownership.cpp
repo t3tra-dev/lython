@@ -354,6 +354,27 @@ bool valueAliasesEntryArgument(mlir::Value value, mlir::Block &entry,
   return false;
 }
 
+// The static dead placeholder a path that produced no value carries in its
+// place (`materializeDeadObjectValue`, ABI/RuntimeABI.cpp): a read-only
+// immortal global, viewed through casts. It owns nothing and names nothing.
+bool isDeadPlaceholderValue(mlir::Value value) {
+  for (unsigned depth = 0; value && depth < 4; ++depth) {
+    mlir::Operation *definition = value.getDefiningOp();
+    if (!definition)
+      return false;
+    if (auto global = mlir::dyn_cast<mlir::memref::GetGlobalOp>(definition)) {
+      llvm::StringRef name = global.getName();
+      return name.starts_with("__ly_dead_header_") ||
+             name.starts_with("__ly_dead_payload_");
+    }
+    if (!mlir::isa<mlir::memref::ReinterpretCastOp, mlir::memref::CastOp>(
+            definition))
+      return false;
+    value = definition->getOperand(0);
+  }
+  return false;
+}
+
 bool valueDerivedFromEntryArgument(
     mlir::Value value, mlir::Block &entry, own::AliasAnalysis &aliases,
     unsigned depth = 0,
@@ -410,6 +431,24 @@ bool valueDerivedFromEntryArgument(
     if (!pending->insert(value.getAsOpaquePointer()).second)
       return true;
     unsigned index = argument.getArgNumber();
+    // ⭐ AN EDGE THAT CARRIES THE DEAD PLACEHOLDER INTRODUCES NOTHING. A
+    // `return` through a `finally` merges the real return with the default
+    // the not-returning path carries in its completion payload, and for an
+    // Optional that default is the dead None placeholder:
+    //
+    //     def pick(flag: int) -> "int | None":
+    //         try:
+    //             return flag
+    //         finally:
+    //             print("checked")
+    //
+    // was "borrowed entry argument 0 of @pick is returned as owned without a
+    // dominating retain" -- the merge was neither the parameter nor owned.
+    // The retain at the return then also retains the placeholder on a path
+    // that never returns, which an immortal header ignores.
+    // ⛔ At least one edge must carry the parameter: a merge of placeholders
+    // only is not a borrow of anything.
+    bool sawSource = false;
     for (mlir::Block *pred : owner->getPredecessors()) {
       auto branch =
           mlir::dyn_cast<mlir::BranchOpInterface>(pred->getTerminator());
@@ -423,15 +462,18 @@ bool valueDerivedFromEntryArgument(
         mlir::SuccessorOperands operands = branch.getSuccessorOperands(successor);
         if (index >= operands.size() || !operands[index])
           return false;
+        reaches = true;
+        if (isDeadPlaceholderValue(operands[index]))
+          continue;
         if (!valueDerivedFromEntryArgument(operands[index], entry, aliases,
                                            depth + 1, pending))
           return false;
-        reaches = true;
+        sawSource = true;
       }
       if (!reaches)
         return false;
     }
-    return true;
+    return sawSource;
   }
   return false;
 }
@@ -2904,10 +2946,18 @@ bool releaseOwnedGroupByLiveness(
         // forwarding edges — the remaining edges exit the block with the
         // token still owned and the values dead, so they need edge releases
         // (the replaced lane of a conditional reassignment).
+        //
+        // ⛔ NOT ONLY WHEN THE GROUP HAS NO CONSUMING CALL ANYWHERE, which is
+        // what this asked: a consume in ANOTHER block -- the loop body's
+        // decref-on-replace -- then skipped every remaining edge here, and
+        // `cond_br %c, ^raise, ^exit(%value)` raised with the carried value
+        // still owned (a recursive-descent parser: `value = value +
+        // self.factor()` in a loop, a raise in the inlined factor). A consume
+        // in THIS block is `collectEdgeDeaths`'s own first test.
         mlir::Operation *terminator = block->getTerminator();
         auto it = lastUse.find(block);
-        if (!groupHasConsumingCall && it != lastUse.end() &&
-            it->second == terminator && forwardsGroupAnywhere(terminator))
+        if (it != lastUse.end() && it->second == terminator &&
+            forwardsGroupAnywhere(terminator))
           collectEdgeDeaths(terminator);
         continue;
       }
