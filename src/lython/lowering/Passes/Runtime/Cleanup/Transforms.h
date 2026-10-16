@@ -15,4 +15,12 @@ unsigned stripUnreachableManifestBodies(mlir::ModuleOp module);
 // block has a terminator of its own. Answers how many it split.
 unsigned splitDualEdges(mlir::ModuleOp module);
 
+// Marks every function body from which no Python exception can propagate
+// with `ownership::kCannotRaiseAttr`, by a fixpoint over the call graph.
+// Answers how many it marked.
+unsigned markCannotRaiseFunctions(mlir::ModuleOp module);
+
+// Gives every converted function so marked LLVM's `nounwind`.
+void markCannotRaiseNoUnwind(mlir::ModuleOp module);
+
 } // namespace py::lowering::runtime::cleanup

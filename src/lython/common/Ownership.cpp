@@ -1944,7 +1944,7 @@ bool mayRaisePythonException(mlir::func::FuncOp function) {
   // reaches them; they are release compositions, and asking for a cleanup
   // around the call that IS the cleanup makes the affine verifier refuse 42
   // programs that compile.
-  if (isNonRaisingRuntimeSymbol(name))
+  if (isNonRaisingRuntimeSymbol(name) || function->hasAttr(kCannotRaiseAttr))
     return false;
   // Python-level callables can always raise (any call inside them can).
   if (function->hasAttr(kCallableTypeAttr) && !function.isDeclaration())

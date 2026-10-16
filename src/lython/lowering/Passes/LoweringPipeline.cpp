@@ -558,6 +558,13 @@ LogicalResult runLoweringPipeline(ModuleOp module,
     return failure();
   dumpMLIRForPass(irDump, "runtime-lowering", module);
 
+  // ⛔ Not later: the unreachable-body strip below empties the bodies this
+  // reads, and the region-exit flattening is already asking which calls raise.
+  {
+    PerfScope perf("lowering.cannot-raise");
+    lowering::runtime::cleanup::markCannotRaiseFunctions(module);
+  }
+
   if (failed(runVerifierPhase("runtime-native-verifier", [&](PassManager &pm) {
         pm.addPass(createNativeVerificationPass());
         // Between the pass that mints frame-ownership tokens and the one that
@@ -728,6 +735,7 @@ LogicalResult runLoweringPipeline(ModuleOp module,
     {
       PerfScope perf("lowering.final-llvm-cleanup");
       optimizer::pipeline::finalLLVMCleanup(module);
+      lowering::runtime::cleanup::markCannotRaiseNoUnwind(module);
     }
     {
       PerfScope perf("lowering.type-objects");

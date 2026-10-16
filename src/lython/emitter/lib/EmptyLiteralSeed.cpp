@@ -78,7 +78,32 @@ void collectStatementNames(const parser::Node &node, StatementNames &names) {
     if (std::optional<std::string_view> attr = ast::string(node, "attr"))
       names.mentioned.insert(*attr);
   } else if (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
-             node.kind == "ClassDef" || node.kind == "ExceptHandler") {
+             node.kind == "ClassDef") {
+    // ⭐ A DEF IS ITS NAME AND ITS HEADER. The scan does not enter a body
+    // (its binding order is its own), so what a body binds and reads is
+    // nothing the slice has to follow.
+    // ⛔ Its body's locals counted as the suite's: in a module of joined
+    // cases every common local (`i`, `result`) bound in one def made every
+    // other def that reads one "needed", and each kept def costs the scan a
+    // signature -- 24 joined goldens spent 9 s in this scan.
+    if (std::optional<std::string_view> bound = ast::string(node, "name"))
+      names.stored.insert(*bound);
+    for (const parser::Field &field : node.fields) {
+      if (field.name == "body")
+        continue;
+      if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+        if (*child)
+          collectStatementNames(**child, names);
+        continue;
+      }
+      if (const auto *children =
+              std::get_if<std::vector<parser::NodePtr>>(&field.value))
+        for (const parser::NodePtr &child : *children)
+          if (child)
+            collectStatementNames(*child, names);
+    }
+    return;
+  } else if (node.kind == "ExceptHandler") {
     // A binding the AST spells as a string rather than a Name.
     if (std::optional<std::string_view> bound = ast::string(node, "name"))
       names.stored.insert(*bound);
