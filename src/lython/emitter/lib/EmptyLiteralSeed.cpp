@@ -628,10 +628,75 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
       // element of its own. `print(xs)` takes `object` and `len(xs)` takes a
       // structural bound; neither says anything about an element, and reading
       // them as if they did is the mistake the protocol repairs describe.
+      // ⭐ AND A CALLEE THAT DOES NOT DECLARE IT, BY WHAT ITS BODY DOES. An
+      // unannotated parameter takes its type from the call sites, and this
+      // call site IS the container being decided -- so `def put(heap, value):
+      // heap.append(value)` typed `heap` as the erased list the literal
+      // started as, and `h[0] + 1` was refused. The callee's body is scanned
+      // for the parameter as this scan scans a suite for a name, with its
+      // other parameters bound to what THIS call passes them.
+      // ⛔ A top-level def only, by its own name, and depth-bounded like the
+      // nested-literal recursion: a callee that hands the container on is
+      // followed, a cycle of them is not.
+      auto seedThroughCallee = [&](const parser::Node &callNode,
+                                   std::size_t argIndex) -> bool {
+        const parser::Node *calleeNode = ast::node(callNode, "func");
+        if (depth >= 3 || !calleeNode || calleeNode->kind != "Name")
+          return false;
+        const parser::Node *def =
+            types.topLevelFunction(ast::nameSpelling(*calleeNode));
+        const parser::Node *arguments = def ? ast::node(*def, "args") : nullptr;
+        const auto *callArgs = ast::nodeList(callNode, "args");
+        if (!arguments || !callArgs)
+          return false;
+        llvm::SmallVector<const parser::Node *, 6> params;
+        for (llvm::StringRef field : {"posonlyargs", "args"})
+          if (const auto *list = ast::nodeList(*arguments, field))
+            for (const parser::NodePtr &param : *list)
+              params.push_back(param.get());
+        if (argIndex >= params.size() || !params[argIndex] ||
+            ast::node(*params[argIndex], "annotation"))
+          return false;
+        llvm::StringMap<mlir::Type> calleeLocals;
+        for (auto [index, param] : llvm::enumerate(params)) {
+          if (!param || index == argIndex || index >= callArgs->size() ||
+              !(*callArgs)[index])
+            continue;
+          mlir::Type type =
+              ast::node(*param, "annotation")
+                  ? types.annotationType(ast::node(*param, "annotation"))
+                  : types.widenLiteral(inferHere((*callArgs)[index].get()));
+          if (type && !py::isPyObjectType(type))
+            calleeLocals[ast::nameSpelling(*param)] = type;
+        }
+        const auto *body = ast::nodeList(*def, "body");
+        if (!body)
+          return false;
+        SuiteCursor cursor;
+        cursor.suite = body;
+        mlir::Type seeded = emptyLiteralSeedTypeIn(
+            types, ast::nameSpelling(*params[argIndex]), literalKind,
+            llvm::ArrayRef<SuiteCursor>(cursor), &calleeLocals, depth + 1);
+        auto contract = mlir::dyn_cast_if_present<py::ContractType>(seeded);
+        if (!contract)
+          return false;
+        llvm::ArrayRef<mlir::Type> seededArgs = contract.getArguments();
+        if (isMapping && seededArgs.size() == 2) {
+          note(key, seededArgs[0]);
+          note(element, seededArgs[1]);
+        } else if (!isMapping && seededArgs.size() == 1) {
+          note(element, seededArgs.front());
+        } else {
+          return false;
+        }
+        return true;
+      };
       if (call->kind == "Call" && !disagreed)
         if (const auto *callArgs = ast::nodeList(*call, "args"))
           for (auto [argIndex, argument] : llvm::enumerate(*callArgs)) {
             if (!argument || !namesTheContainer(argument.get()))
+              continue;
+            if (seedThroughCallee(*call, argIndex))
               continue;
             auto callable = mlir::dyn_cast_if_present<py::CallableType>(
                 types.widenLiteral(inferHere(ast::node(*call, "func"))));

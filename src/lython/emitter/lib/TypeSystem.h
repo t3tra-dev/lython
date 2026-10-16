@@ -292,6 +292,11 @@ public:
   // regardless of declaration order. Emit stays declaration-ordered; it hits
   // the memo through functionSignature.
   void registerModule(const parser::Node &moduleNode);
+  // A function defined at the top of a registered module, by name.
+  const parser::Node *topLevelFunction(llvm::StringRef name) const {
+    auto found = topLevelFunctionDefs.find(name);
+    return found == topLevelFunctionDefs.end() ? nullptr : found->second;
+  }
 
   Scope pushScope() const;
   ScopeIsolation isolateScopes() const;
@@ -552,6 +557,7 @@ private:
   // lambdas, and imported source modules run under caller-specific scope
   // contexts a node-keyed cache would conflate.
   llvm::DenseMap<const parser::Node *, FunctionSignature> signatureMemo;
+  llvm::StringMap<const parser::Node *> topLevelFunctionDefs;
   // Functions whose numeric RETURN annotation is being re-read against their
   // body right now. A cycle -- direct or mutual recursion -- takes the
   // annotation and stops, which is what the annotation is for.
