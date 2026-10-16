@@ -5808,6 +5808,31 @@ mlir::Type ModuleEmitter::cellContentType(mlir::Type cellType) {
   return field == fields->second.end() ? mlir::Type() : field->second;
 }
 
+// A `type[X]` whose X is one of the program's classes that nothing derives
+// from: the type alone says which class object the value is.
+bool ModuleEmitter::typeValueIsStatic(mlir::Type type) const {
+  auto typeType = mlir::dyn_cast_if_present<py::TypeType>(type);
+  if (!typeType)
+    return false;
+  auto instance =
+      mlir::dyn_cast_if_present<py::ContractType>(typeType.getInstanceType());
+  if (!instance || !instance.getArguments().empty())
+    return false;
+  llvm::StringRef name = instance.getContractName();
+  if (!declaredClassBases.count(name))
+    return false;
+  for (const auto &entry : declaredClassBases)
+    if (llvm::is_contained(entry.getValue(), name))
+      return false;
+  return true;
+}
+
+// A slot whose content has no word: None, or a class object its type names.
+// It holds the binding flag alone.
+bool ModuleEmitter::zeroWidthSlotContent(mlir::Type content) const {
+  return isNoneTypeLike(content) || typeValueIsStatic(content);
+}
+
 bool ModuleEmitter::cellTracksBinding(mlir::Type cellType) const {
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(cellType);
   return contract &&
@@ -5840,15 +5865,26 @@ mlir::Type ModuleEmitter::ensureCellClass(mlir::Type contentType,
           .str();
   mlir::Type contract = types.contract(cellName);
 
-  llvm::SmallVector<std::string, 8> fieldNames{"v"};
-  llvm::SmallVector<mlir::Type, 2> fieldTypes{contentType};
+  // ⭐ A None CONTENT HAS NO WORD, so its slot is the binding flag alone; the
+  // content type is still recorded for `cellContentType`, and the load and
+  // store below never touch a `v` that a None slot does not have.
+  const bool zeroWidth = tracksBinding && zeroWidthSlotContent(contentType);
+  classFieldBindings[cellName]["v"] = contentType;
+  llvm::SmallVector<std::string, 8> fieldNames;
+  llvm::SmallVector<mlir::Type, 2> fieldTypes;
+  if (!zeroWidth) {
+    fieldNames.push_back("v");
+    fieldTypes.push_back(contentType);
+  }
   // ⛔ THE ERASED STORAGE CONTRACT IS THE CELL'S, not every slot's. A cell is
   // read back through `lowerCellAttrGet`, which rebuilds the content from the
   // box and knows the declared type; an ORDINARY field read compares the
   // storage contract against the result and reported "attribute evidence
   // 'builtins.object' is not assignable to result 'builtins.int'".
-  llvm::SmallVector<mlir::Type, 8> fieldStorage{
-      ordinaryStorage ? contentType : types.contract("builtins.object")};
+  llvm::SmallVector<mlir::Type, 8> fieldStorage;
+  if (!zeroWidth)
+    fieldStorage.push_back(ordinaryStorage ? contentType
+                                           : types.contract("builtins.object"));
   if (tracksBinding) {
     fieldNames.push_back(kBindingFieldName.str());
     fieldTypes.push_back(types.contract("builtins.bool"));
@@ -5907,11 +5943,13 @@ Value ModuleEmitter::emitCellAlloc(const parser::Node &anchor, Value initial,
                                    bool tracksBinding) {
   mlir::Type content = types.widenLiteral(initial.type);
   mlir::Type cellType = ensureCellClass(content, anchor, tracksBinding);
-  Value coerced = coerceValue(initial, content, anchor);
+  const bool zeroWidth = tracksBinding && zeroWidthSlotContent(content);
   mlir::Type classType = types.typeObject(cellType);
   auto classObject =
       py::TypeObjectOp::create(builder, loc(anchor), classType, cellType);
-  llvm::SmallVector<Value, 2> initialFields{coerced};
+  llvm::SmallVector<Value, 2> initialFields;
+  if (!zeroWidth)
+    initialFields.push_back(coerceValue(initial, content, anchor));
   if (tracksBinding) {
     auto falseOp = py::BoolConstantOp::create(
         builder, loc(anchor), types.literal("False"), builder.getBoolAttr(false));
@@ -5933,11 +5971,16 @@ Value ModuleEmitter::emitCellAlloc(const parser::Node &anchor, Value initial,
   newOp->setAttr("ly.constructor.new_kind", builder.getStringAttr("class"));
   // Field-record initialization (the no-__init__ construction rule): the
   // initial content boxes into the cell's slot during lowerInit.
-  llvm::SmallVector<mlir::Type, 3> positional{cellType, content};
+  llvm::SmallVector<mlir::Type, 3> positional{cellType};
   llvm::SmallVector<mlir::StringAttr, 3> positionalNames{
-      builder.getStringAttr("self"), builder.getStringAttr("v")};
+      builder.getStringAttr("self")};
   llvm::SmallVector<mlir::BoolAttr, 3> positionalDefaults{
-      builder.getBoolAttr(false), builder.getBoolAttr(true)};
+      builder.getBoolAttr(false)};
+  if (!zeroWidth) {
+    positional.push_back(content);
+    positionalNames.push_back(builder.getStringAttr("v"));
+    positionalDefaults.push_back(builder.getBoolAttr(true));
+  }
   if (tracksBinding) {
     positional.push_back(types.contract("builtins.bool"));
     positionalNames.push_back(builder.getStringAttr(kBindingFieldName));
@@ -6016,6 +6059,14 @@ Value ModuleEmitter::emitCellLoad(const parser::Node &anchor,
         "internal: nonlocal cell has no registered content type"});
     return emitNone(anchor);
   }
+  if (cellTracksBinding(cell.type) && isNoneTypeLike(content))
+    return emitNone(anchor);
+  if (cellTracksBinding(cell.type) && typeValueIsStatic(content)) {
+    auto typeType = mlir::cast<py::TypeType>(content);
+    auto op = py::TypeObjectOp::create(builder, loc(anchor), content,
+                                       typeType.getInstanceType());
+    return {op.getResult(), content};
+  }
   auto op =
       py::AttrGetOp::create(builder, loc(anchor), content, cell.value, "v");
   op->setAttr("ly.attr.kind", builder.getStringAttr("field"));
@@ -6042,10 +6093,13 @@ void ModuleEmitter::emitCellStore(const parser::Node &anchor, const Value &cell,
         "type"});
     return;
   }
-  auto op = py::AttrSetOp::create(builder, loc(anchor), cell.value, "v",
-                                  coerced.value);
-  op->setAttr("ly.attr.kind", builder.getStringAttr("field"));
   auto contract = mlir::cast<py::ContractType>(cell.type);
+  mlir::Operation *op = nullptr;
+  if (!(cellTracksBinding(cell.type) && zeroWidthSlotContent(content))) {
+    op = py::AttrSetOp::create(builder, loc(anchor), cell.value, "v",
+                               coerced.value);
+    op->setAttr("ly.attr.kind", builder.getStringAttr("field"));
+  }
   if (cellTracksBinding(cell.type)) {
     auto trueOp = py::BoolConstantOp::create(
         builder, loc(anchor), types.literal("True"), builder.getBoolAttr(true));
@@ -6057,8 +6111,9 @@ void ModuleEmitter::emitCellStore(const parser::Node &anchor, const Value &cell,
     mark->setAttr("ly.attr.owner",
                   builder.getStringAttr(contract.getContractName()));
   }
-  op->setAttr("ly.attr.owner",
-              builder.getStringAttr(contract.getContractName()));
+  if (op)
+    op->setAttr("ly.attr.owner",
+                builder.getStringAttr(contract.getContractName()));
 }
 
 } // namespace lython::emitter

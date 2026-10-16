@@ -1648,16 +1648,11 @@ mlir::Type ModuleEmitter::inferConditionalLocalType(
   // the erased top is excluded for the opposite reason: the slot would accept
   // every write and refuse every read.
   //
-  // ⛔ AND `None`, which reads like a missing arm and is the same wall
-  // measured (2026-09-06): letting it through turns "unresolved name 'v'" into
-  // "field 'v' of '!py.literal<None>' has no instance body word" out of the
-  // LOWERING, for `v = None` first bound inside a for/while/try/with and read
-  // after. A None expands to NO physical values, so the slot's field has no
-  // word -- what it needs is the written FLAG alone, which the field layout
-  // has no shape for. The `if` spelling works because a plain `if` joins
-  // through block arguments and never takes a slot at all; an int in the same
-  // position works because it has a word. Recorded in
-  // tests/probe/wb_a_none_first_bound_inside_a_region.py.
+  // ⭐ AND `None`, which reads like a missing arm: it has NO physical values,
+  // so a slot field for it has no word ("field 'v' of '!py.literal<None>' has
+  // no instance body word" when it was let through as a contract). It gets a
+  // slot of the written FLAG alone, below. The `if` spelling never needed one:
+  // a plain `if` joins through block arguments.
   // ⭐ AND A CALLABLE, which the `def` branch at the top of this function has
   // been returning all along -- it hands back `sig.publicCallable` and never
   // reaches this gate. So a slot for a function object demonstrably works, and
@@ -1674,6 +1669,19 @@ mlir::Type ModuleEmitter::inferConditionalLocalType(
   if (mlir::isa_and_nonnull<py::CallableType>(joined))
     return joined;
   if (mlir::isa_and_nonnull<py::UnionType>(joined) && regionSlotsTakeUnions)
+    return joined;
+  // ⭐ None GETS A SLOT OF ITS FLAG ALONE (2026-10-17). The note above was
+  // right that the field has no word; the slot is now built without one
+  // (`ensureCellClass`), and a read of it is the None constant behind the
+  // unbound guard.
+  if (isNoneTypeLike(joined))
+    return types.none();
+  // ⭐ AND A CLASS OBJECT THAT NAMES ONE CLASS: `type[X]` has no word either,
+  // and when nothing derives from X its value is decided by its type, so the
+  // read rebuilds it (`emitCellLoad`).
+  // ⛔ Not a class something derives from: then which class the slot holds is
+  // a runtime fact with nowhere to live (tests/probe/wb_subclassed_type_object).
+  if (typeValueIsStatic(joined))
     return joined;
 
   if (!mlir::isa_and_nonnull<py::ContractType>(joined) ||
