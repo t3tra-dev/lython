@@ -3810,12 +3810,51 @@ void ModuleEmitter::collectClassFields(
     // else the target names another class's field, which this walk does not
     // own and must not decide.
     if (!ast::isName(*object, "self")) {
-      if (object->kind != "Name" || collectFieldsRefineOnly == false)
-        return;
       mlir::Type ownerType = types.widenLiteral(types.inferExpr(object));
-      auto contract = mlir::dyn_cast_if_present<py::ContractType>(ownerType);
-      if (ownContractName.empty() || !contract ||
-          contract.getContractName() != llvm::StringRef(ownContractName))
+      // ⭐ A STORE INTO ANOTHER CLASS'S FIELD IS THAT CLASS'S EVIDENCE, and
+      // this walk is the only one that sees it: `self.tail.nxt = node` inside
+      // `Queue` is how a linked structure links, and `Cell.nxt` -- seeded
+      // `None` in its own constructor -- stayed NoneType ("attribute value
+      // 'Cell' is not assignable to field '!py.literal<None>'"). Recorded
+      // here, applied once every class is declared
+      // (`applyForeignFieldWrites`): the other class may be declared before
+      // this one, as Cell is before Queue.
+      // ⛔ Through an Optional owner too: a store through it only happens when
+      // it is not None.
+      mlir::Type ownerClass =
+          mlir::isa_and_nonnull<py::UnionType>(ownerType)
+              ? removeNoneFromType(ownerType, types)
+              : ownerType;
+
+      auto ownerContract =
+          mlir::dyn_cast_if_present<py::ContractType>(ownerClass);
+      bool ownClass =
+          ownerContract && !ownContractName.empty() &&
+          ownerContract.getContractName() == llvm::StringRef(ownContractName);
+      if (!ownClass) {
+        // ⭐ THE OWNER IS RESOLVED LATER, BY ITS PATH. While this walk runs,
+        // `self.tail` is still the `None` its constructor seeded -- this
+        // class's own stores widen it at the end of the walk, and a branch
+        // that tested it against None is not narrowed here -- so the owner
+        // is recorded as a root (a name, typed now) and the attributes from
+        // it, and followed once every field is known.
+        std::vector<std::string> path;
+        const parser::Node *root = object;
+        while (root && root->kind == "Attribute") {
+          path.insert(path.begin(),
+                      std::string(ast::string(*root, "attr").value_or("")));
+          root = ast::node(*root, "value");
+        }
+        auto attr = ast::string(target, "attr");
+        if (type && attr && root && root->kind == "Name")
+          if (mlir::Type rootType =
+                  types.widenLiteral(types.inferExpr(root)))
+            foreignFieldWrites.push_back(ForeignFieldWrite{
+                rootType, std::move(path), std::string(*attr),
+                types.widenLiteral(type)});
+        return;
+      }
+      if (object->kind != "Name" || collectFieldsRefineOnly == false)
         return;
     }
     if (auto attr = ast::string(target, "attr")) {
@@ -5806,6 +5845,96 @@ mlir::Type ModuleEmitter::cellContentType(mlir::Type cellType) {
     return {};
   auto field = fields->second.find("v");
   return field == fields->second.end() ? mlir::Type() : field->second;
+}
+
+// The stores `collectClassFields` saw into ANOTHER class's field, applied now
+// that every class is declared: a field still `None` from its own constructor
+// becomes `T | None` -- the rule `optionalPair` gives a same-class store --
+// in every place the declaration recorded it (the field bindings, the
+// protocol table, the class op) and in the subclasses that inherited it.
+// ⛔ Only a field that is exactly None: any other disagreement is a store this
+// compiler still refuses where it is written.
+void ModuleEmitter::applyForeignFieldWrites() {
+  if (foreignFieldWrites.empty())
+    return;
+  std::vector<ForeignFieldWrite> writes = std::move(foreignFieldWrites);
+  foreignFieldWrites.clear();
+  // A field's type, through the class's MRO.
+  auto fieldOf = [&](llvm::StringRef cls,
+                     llvm::StringRef name) -> mlir::Type {
+    llvm::SmallVector<std::string, 4> line{cls.str()};
+    if (auto mro = classMros.find(cls); mro != classMros.end())
+      line.assign(mro->second.begin(), mro->second.end());
+    for (const std::string &each : line)
+      if (auto fields = classFieldBindings.find(each);
+          fields != classFieldBindings.end())
+        if (auto found = fields->second.find(name);
+            found != fields->second.end())
+          return found->second;
+    return {};
+  };
+  auto ownerClassOf = [&](mlir::Type type) -> std::string {
+    auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+        mlir::isa_and_nonnull<py::UnionType>(type)
+            ? removeNoneFromType(type, types)
+            : type);
+    if (!contract || !isSourceClassContract(contract))
+      return {};
+    return contract.getContractName().str();
+  };
+  for (const ForeignFieldWrite &write : writes) {
+    if (!write.type || write.type == types.none() ||
+        py::isPyObjectType(write.type) ||
+        !mlir::isa<py::ContractType>(write.type))
+      continue;
+    std::string owner = ownerClassOf(write.root);
+    for (const std::string &step : write.path) {
+      if (owner.empty())
+        break;
+      owner = ownerClassOf(fieldOf(owner, step));
+    }
+    if (owner.empty())
+      continue;
+    mlir::Type widened = types.join({write.type, types.none()});
+    for (auto &entry : classFieldBindings) {
+      llvm::StringRef cls = entry.getKey();
+      if (cls != owner) {
+        auto mro = classMros.find(cls);
+        if (mro == classMros.end() || !llvm::is_contained(mro->second, owner))
+          continue;
+      }
+      auto field = entry.getValue().find(write.field);
+      if (field == entry.getValue().end() || field->second != types.none())
+        continue;
+      field->second = widened;
+      if (const py::protocols::ProtocolInfo *info =
+              py::protocols::Table::get(context).lookup(cls)) {
+        py::protocols::ProtocolInfo updated = *info;
+        updated.fields[write.field] = widened;
+        py::protocols::Table::getMutable(context).registerClass(
+            cls, std::move(updated));
+      }
+      module.walk([&](py::ClassOp classOp) {
+        if (classOp.getSymName() != cls)
+          return;
+        auto names = classOp->getAttrOfType<mlir::ArrayAttr>("field_names");
+        if (!names)
+          return;
+        for (llvm::StringRef attrName : {"field_types", "field_contract_types"}) {
+          auto typesAttr = classOp->getAttrOfType<mlir::ArrayAttr>(attrName);
+          if (!typesAttr || typesAttr.size() != names.size())
+            continue;
+          llvm::SmallVector<mlir::Attribute, 8> updated(typesAttr.begin(),
+                                                        typesAttr.end());
+          for (auto [index, name] : llvm::enumerate(names))
+            if (mlir::cast<mlir::StringAttr>(name).getValue() == write.field)
+              updated[index] = mlir::TypeAttr::get(widened);
+          classOp->setAttr(attrName,
+                           mlir::ArrayAttr::get(&context, updated));
+        }
+      });
+    }
+  }
 }
 
 // A `type[X]` whose X is one of the program's classes that nothing derives

@@ -1230,6 +1230,15 @@ private:
   // slot binds its content, as every read of the name produces.
   void bindStoredLocalType(llvm::StringRef name, mlir::Type storage);
   bool typeValueIsStatic(mlir::Type type) const;
+  struct ForeignFieldWrite {
+    mlir::Type root;                // the owner path's root name, typed
+    std::vector<std::string> path;  // attributes from the root to the owner
+    std::string field;
+    mlir::Type type;
+  };
+  // Stores `collectClassFields` saw into another class's field.
+  std::vector<ForeignFieldWrite> foreignFieldWrites;
+  void applyForeignFieldWrites();
   bool zeroWidthSlotContent(mlir::Type content) const;
   mlir::Type cellContentType(mlir::Type cellType);
   // A cell that also records whether its content was ever written: the storage

@@ -8,15 +8,24 @@ namespace {
 
 std::optional<unsigned>
 RuntimeBundleLowerer::findUnionMemberIndex(py::UnionType unionType,
-                                           mlir::Type member) const {
+                                           mlir::Type member,
+                                           mlir::Operation *from) const {
   for (auto [index, candidate] : llvm::enumerate(unionType.getMemberTypes()))
     if (candidate == member)
       return static_cast<unsigned>(index);
 
+  // ⭐ WITH THE MODULE, when there is one: a source class's bases are in its
+  // class op, and without it a subclass is assignable to nothing. An upcast
+  // is a retyping that keeps the object's own contract on the bundle, so
+  // `self.first = leaf` with a SubLeaf argument inlined into a `Leaf |
+  // None` field reached here as SubLeaf and found no member.
   std::optional<unsigned> found;
   for (auto [index, candidate] : llvm::enumerate(unionType.getMemberTypes())) {
-    if (!py::isAssignableTo(member, candidate) &&
-        !py::isAssignableTo(candidate, member))
+    bool assignable = from ? py::isAssignableTo(member, candidate, from) ||
+                                 py::isAssignableTo(candidate, member, from)
+                           : py::isAssignableTo(member, candidate) ||
+                                 py::isAssignableTo(candidate, member);
+    if (!assignable)
       continue;
     if (found)
       return std::nullopt;
@@ -29,7 +38,7 @@ mlir::FailureOr<unsigned> RuntimeBundleLowerer::requireUnionMemberIndex(
     mlir::Operation *op, py::UnionType unionType, mlir::Type member,
     llvm::StringRef purpose) const {
   std::optional<unsigned> index =
-      RuntimeBundleLowerer::findUnionMemberIndex(unionType, member);
+      RuntimeBundleLowerer::findUnionMemberIndex(unionType, member, op);
   if (!index)
     return op->emitError() << purpose << " cannot map " << member
                            << " into union " << unionType;

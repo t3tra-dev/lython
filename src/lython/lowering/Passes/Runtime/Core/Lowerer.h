@@ -288,7 +288,8 @@ private:
                                  llvm::StringRef slotName,
                                  mlir::func::FuncOp mutation);
   std::optional<unsigned> findUnionMemberIndex(py::UnionType unionType,
-                                               mlir::Type member) const;
+                                               mlir::Type member,
+                                               mlir::Operation *from = nullptr) const;
   mlir::FailureOr<unsigned>
   requireUnionMemberIndex(mlir::Operation *op, py::UnionType unionType,
                           mlir::Type member, llvm::StringRef purpose) const;

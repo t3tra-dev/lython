@@ -2291,6 +2291,7 @@ void ModuleEmitter::emitTopLevelDeclarations() {
         if (auto name = ast::string(*statement, "name"))
           emitClassNow(*name);
       }
+      applyForeignFieldWrites();
       for (const parser::NodePtr &statement : *body) {
         if (!statement)
           continue;
