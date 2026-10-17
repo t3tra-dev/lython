@@ -237,4 +237,6 @@ tools/.ucd-cache/
 # --- Nix ---
 result
 result-*
+build/
+build-*/
 .direnv/
