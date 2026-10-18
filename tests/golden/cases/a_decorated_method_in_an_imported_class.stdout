@@ -1,0 +1,14 @@
+['registered']
+run helper:b
+run helper:b
+setup b
+run sub-helper:s
+run sub-helper:s
+sub plain
+plain s
+run sub-helper:s
+run sub-helper:s
+setup s
+sub plain
+plain s
+1

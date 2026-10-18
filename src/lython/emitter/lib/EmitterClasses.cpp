@@ -384,7 +384,8 @@ ModuleEmitter::bindingDecoratorCallee(const parser::NodePtr &decorator) {
 // ⛔ The application runs after the class statement and not in its body:
 // CPython runs it before the class name is bound, which only a decorator
 // with a side effect interleaved with the rest of the body could tell.
-void ModuleEmitter::desugarMethodDecorators(const parser::Node &moduleNode) {
+void ModuleEmitter::desugarMethodDecorators(
+    const parser::Node &moduleNode, const EmitOptions::SourceModule *source) {
   auto *body = const_cast<std::vector<parser::NodePtr> *>(
       ast::nodeList(moduleNode, "body"));
   if (!body)
@@ -484,6 +485,11 @@ void ModuleEmitter::desugarMethodDecorators(const parser::Node &moduleNode) {
       split.cellName = "__ly_decorated$" + className + "$" + name;
       split.decorators = binding;
       split.range = range;
+      split.source = source;
+      split.globalName =
+          source ? source->moduleName + "." + split.cellName : split.cellName;
+      split.contractName =
+          source ? source->moduleName + "." + className : className;
       // The method of the written name: its parameters, defaults and
       // markers, forwarding every argument to what the decorators returned.
       parser::NodePtr forwarder = synth::cloneTree(*method);
@@ -531,7 +537,7 @@ ModuleEmitter::decoratedMethodApplication(const DecoratedMethod &method,
 
 void ModuleEmitter::applyMethodDecorators(const parser::Node &classDef) {
   for (const DecoratedMethod &method : decoratedMethods) {
-    if (method.classDef != &classDef || !method.typed)
+    if (method.classDef != &classDef || !method.typed || method.source)
       continue;
     parser::NodePtr applied = synth::assign(
         synth::name(method.cellName, method.range),
@@ -2175,9 +2181,23 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       symbolName.empty() ? std::string(*name) : symbolName.str();
   llvm::StringRef contractName(classSymbol);
   checkDecorators(classDef, DecoratorRole::Class);
-  for (DecoratedMethod &method : decoratedMethods)
-    if (method.classDef == &classDef)
-      typeDecoratedMethod(method, /*reportFailure=*/true);
+  for (DecoratedMethod &method : decoratedMethods) {
+    if (method.classDef != &classDef)
+      continue;
+    // An imported module's class: typed here, in its module's scope, and
+    // applied with that module's other globals, before the importer's
+    // first statement -- where CPython runs the class statement.
+    bool typedBefore = method.typed;
+    if (typeDecoratedMethod(method, /*reportFailure=*/true) && method.source &&
+        !typedBefore) {
+      parser::NodePtr applied = decoratedMethodApplication(
+          method, synth::attribute(synth::name(method.className, method.range),
+                                   method.hiddenName, method.range));
+      importedModuleGlobalInits.push_back(PendingModuleGlobalInit{
+          applied.get(), method.globalName, method.source});
+      synthesizedIteratorDefs.push_back(std::move(applied));
+    }
+  }
 
   // @dataclass: init/repr/eq synthesize below (default True); frozen/order
   // are accepted only as explicit False.

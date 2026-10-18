@@ -155,6 +155,41 @@ TEST(EmitterTest, RefusesAStatementInAnImportedModuleBody) {
       << emitted.diagnostics;
 }
 
+// What: what an imported module's decorated method or function-local class
+// cannot be is refused in that module's file: a diagnostic with no file was
+// printed against the main module's name.
+TEST(EmitterTest, AnImportedModuleIsRefusedInItsOwnFile) {
+  ImportedModuleEmit decorated = emitWithImportedModule(
+      "decorated",
+      "from typing import Callable\n\n"
+      "def wrapped[T](f: Callable[[T, int], int]) -> Callable[[T, int], int]:\n"
+      "    def inner(x: T, n: int) -> int:\n        return f(x, n)\n"
+      "    return inner\n\n"
+      "class A:\n"
+      "    @wrapped\n"
+      "    def m(self, n: int = 2) -> int:\n        return n\n",
+      "from decorated import A\nprint(A().m(1))\n");
+  EXPECT_FALSE(decorated.succeeded);
+  EXPECT_NE(decorated.diagnostics.find(
+                "decorated.py:9:5: emit error: method 'm' declares default "
+                "values"),
+            std::string::npos)
+      << decorated.diagnostics;
+
+  ImportedModuleEmit local = emitWithImportedModule(
+      "local",
+      "def f() -> int:\n"
+      "    class A:\n"
+      "        items: list[int] = []\n"
+      "    return 1\n",
+      "import local\nprint(local.f())\n");
+  EXPECT_FALSE(local.succeeded);
+  EXPECT_NE(local.diagnostics.find("local.py:3:8: emit error: class 'A' is "
+                                   "written in a function"),
+            std::string::npos)
+      << local.diagnostics;
+}
+
 // What: a decorator on a function in an imported module. It was dropped and the
 // undecorated function answered under the decorated name, so the refusal is
 // what keeps the wrong answer from happening.

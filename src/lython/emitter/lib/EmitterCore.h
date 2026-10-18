@@ -571,7 +571,9 @@ private:
   // `@contextlib.contextmanager` defs become a generator and a def that
   // wraps it (EmitterWith.cpp).
   void desugarContextManagers(const parser::Node &moduleNode);
-  void desugarMethodDecorators(const parser::Node &moduleNode);
+  void desugarMethodDecorators(
+      const parser::Node &moduleNode,
+      const EmitOptions::SourceModule *source = nullptr);
   // A method the desugar split: its body under `hiddenName`, and the cell
   // `cellName` holding what its decorators returned, which the method of the
   // written name forwards to.
@@ -584,12 +586,19 @@ private:
     std::vector<parser::NodePtr> decorators;
     parser::SourceRange range;
     bool typed = false;
+    // The module that declares the class, null for the main module; there
+    // the cell is the module global `<module>.<cellName>` and the class the
+    // contract `<module>.<className>`.
+    const EmitOptions::SourceModule *source = nullptr;
+    std::string globalName;
+    std::string contractName;
   };
   std::vector<DecoratedMethod> decoratedMethods;
   parser::NodePtr decoratedMethodApplication(const DecoratedMethod &method,
                                              parser::NodePtr subject);
   void applyMethodDecorators(const parser::Node &classDef);
   bool typeDecoratedMethod(DecoratedMethod &method, bool reportFailure);
+  void bindDecoratedMethodCell(const DecoratedMethod &method, mlir::Type type);
   // Parsed trees a desugar spliced into a module, alive as long as it is.
   std::vector<parser::NodePtr> synthesizedHelperTrees;
   // The classes that were declared as protocols, by their own name.
@@ -1833,6 +1842,12 @@ private:
     ImporterModuleScope(const ImporterModuleScope &) = delete;
     ImporterModuleScope &operator=(const ImporterModuleScope &) = delete;
     ~ImporterModuleScope() {
+      // And what the scope DECLARED of them outlives it, for the same
+      // reason: a decorated method's cell is typed in its module's scope
+      // and read by every importer that inlines the method.
+      for (const auto &entry : emitter->moduleGlobals)
+        if (entry.getKey().contains('.') && !globals.count(entry.getKey()))
+          globals[entry.getKey()] = entry.getValue();
       emitter->moduleGlobals = std::move(globals);
       emitter->moduleConstantBindings = std::move(constants);
       emitter->primitiveConstants = std::move(primitives);

@@ -156,8 +156,11 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
   // And a decorated METHOD's cell (desugarMethodDecorators): typed by its
   // application, like a decorated function's -- here when its decorators'
   // types are known already, else when its class is emitted.
+  // An imported module's are typed in its own scope, where its decorators
+  // are named (emitClassContract).
   for (DecoratedMethod &method : decoratedMethods)
-    typeDecoratedMethod(method, /*reportFailure=*/false);
+    if (!method.source)
+      typeDecoratedMethod(method, /*reportFailure=*/false);
   for (const parser::NodePtr &statement : *body) {
     if (!statement || statement->kind != "AnnAssign")
       continue;
@@ -550,7 +553,7 @@ bool ModuleEmitter::typeDecoratedMethod(DecoratedMethod &method,
   mlir::Type decoratedType;
   mlir::Type undecoratedType;
   if (std::optional<mlir::Type> classType =
-          types.lookupClass(method.className);
+          types.lookupClass(method.contractName);
       classType && method.hiddenDef) {
     std::optional<llvm::StringRef> selfName;
     if (const parser::Node *arguments = ast::node(*method.hiddenDef, "args"))
@@ -603,10 +606,8 @@ bool ModuleEmitter::typeDecoratedMethod(DecoratedMethod &method,
                 .drop_front(llvm::StringRef("__ly_undecorated$").size())
                 .str() +
             droppedDefaults});
-    if (undecoratedType) {
-      moduleGlobals[method.cellName] = undecoratedType;
-      types.bindSymbol(method.cellName, undecoratedType);
-    }
+    if (undecoratedType)
+      bindDecoratedMethodCell(method, undecoratedType);
     return false;
   }
   if (!mlir::isa_and_nonnull<py::CallableType>(decoratedType)) {
@@ -629,16 +630,22 @@ bool ModuleEmitter::typeDecoratedMethod(DecoratedMethod &method,
             "what its decorators return, and only a callable can be"});
     // The forwarder still names the cell; typed as the method itself, it
     // adds no second sentence to the one above.
-    if (undecoratedType) {
-      moduleGlobals[method.cellName] = undecoratedType;
-      types.bindSymbol(method.cellName, undecoratedType);
-    }
+    if (undecoratedType)
+      bindDecoratedMethodCell(method, undecoratedType);
     return false;
   }
   method.typed = true;
-  moduleGlobals[method.cellName] = decoratedType;
-  types.bindSymbol(method.cellName, decoratedType);
+  bindDecoratedMethodCell(method, decoratedType);
   return true;
+}
+
+void ModuleEmitter::bindDecoratedMethodCell(const DecoratedMethod &method,
+                                            mlir::Type type) {
+  moduleGlobals[method.globalName] = type;
+  if (method.source)
+    types.bindCanonicalSymbol(method.cellName, method.globalName, type);
+  else
+    types.bindSymbol(method.cellName, type);
 }
 
 } // namespace lython::emitter
