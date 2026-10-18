@@ -3425,6 +3425,20 @@ mlir::Type TypeSystem::annotationType(const parser::Node *node) const {
     return literal(literalSpelling(*node));
   }
   if (node->kind == "Attribute") {
+    // ⭐ `P.args` AND `P.kwargs` ARE WHAT `Callable[P, R]` ERASES P TO: any
+    // arguments. They were fabricated into contracts named "P.args", which no
+    // argument is, so `addCleanup(f, "x")` against `*args: P.args` was "this
+    // call does not determine the type arguments". The arguments are checked
+    // where the body forwards them to the callable, against its real
+    // signature.
+    if (const parser::Node *owner = ast::node(*node, "value");
+        owner && owner->kind == "Name")
+      if (auto attr = ast::string(*node, "attr");
+          attr && (*attr == "args" || *attr == "kwargs"))
+        if (std::optional<mlir::Type> bound =
+                lookupSymbol(ast::nameSpelling(*owner));
+            bound && mlir::isa<py::ParamSpecType>(*bound))
+          return any();
     std::string qualified = ast::qualifiedName(node);
     std::string_view spelling = ast::nameSpelling(*node);
     std::string resolved = resolveAnnotationName(

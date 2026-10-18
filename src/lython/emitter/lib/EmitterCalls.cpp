@@ -208,6 +208,20 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
                               valueNode,
                               expectedFor(operands.positionalTypes.size()))
                         : emitExpr(valueNode);
+      // ⭐ AN INLINED METHOD'S OWN `*args` IS THE VALUES ITS CALL GAVE. A pack
+      // of one has no arity in its type (`tuple[str]` is also the
+      // homogeneous spelling), so it is forwarded as those values, not
+      // unpacked as a tuple.
+      if (unpacked)
+        if (auto pack = staticPositionalPacks.find(value.value);
+            pack != staticPositionalPacks.end()) {
+          for (const Value &element : pack->second) {
+            operands.positional.push_back(element);
+            operands.positionalUnpacked.push_back(0);
+            operands.positionalTypes.push_back(element.type);
+          }
+          continue;
+        }
       operands.positional.push_back(value);
       operands.positionalUnpacked.push_back(unpacked ? 1 : 0);
       if (unpacked) {
@@ -247,7 +261,24 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
       // whose keys are literals, and `g(**kwargs)` forwarding a parameter that
       // is itself a dict -- because each needs the callee's keyword ABI, and
       // this is the boundary that has to refuse first either way.
-      emitExpr(ast::node(*keyword, "value"));
+      // ⭐ EXCEPT AN INLINED METHOD'S OWN `**kwargs`, whose names are the
+      // call site's and whose body only reads it: forwarded as those
+      // keywords, one by one.
+      Value mapping = emitExpr(ast::node(*keyword, "value"));
+      if (auto pack = staticKeywordPacks.find(mapping.value);
+          pack != staticKeywordPacks.end()) {
+        for (const auto &[packedName, packedValue] : pack->second) {
+          mlir::Type literal = types.literal("\"" + packedName + "\"");
+          auto stringOp = py::StrConstantOp::create(
+              builder, loc(*keyword), literal,
+              builder.getStringAttr(packedName));
+          operands.keywordNames.push_back({stringOp.getResult(), literal});
+          operands.keywordValues.push_back(packedValue);
+          operands.keywordTypes.push_back(
+              CallKeywordType{packedName, packedValue.type});
+        }
+        continue;
+      }
       operands.valid = false;
       operands.failureReason =
           "`**` call arguments require statically known keyword names; spell "

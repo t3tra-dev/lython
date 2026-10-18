@@ -1001,6 +1001,14 @@ private:
                          mlir::Type resultType);
   // A `def` with PEP 695 type parameters of its own.
   static bool hasTypeParameters(const parser::Node &def);
+  // A def whose body spells its own `*args` or `**kwargs` into a call
+  // (`f(*args, **kwargs)`): their arity and names are the call site's.
+  static bool forwardsItsPacks(const parser::Node &def);
+  // The defs whose body is typed only where a call is: a generic one, and
+  // one that forwards its packs. Neither has a standalone body.
+  static bool specializedAtEachCall(const parser::Node &def) {
+    return hasTypeParameters(def) || forwardsItsPacks(def);
+  }
   // An isinstance/issubclass operand, or an element of a tuple of them, that
   // is a class value the static type does not decide.
   bool targetHasDynamicClassValue(const parser::Node *node);
@@ -1479,6 +1487,23 @@ private:
   // Ints and floats an inlined method bound to a parameter declared
   // `object`: their truth test is an object's, which R1 does not refuse.
   llvm::DenseSet<mlir::Value> numbersHeldAsObject;
+  // The values an inlined method packed into its `*args` and `**kwargs`,
+  // keyed by the pack's own value: a call in the body that spells the pack
+  // forwards these one by one, with the arity and the names the call site
+  // gave.
+  llvm::DenseMap<mlir::Value, llvm::SmallVector<Value, 4>>
+      staticPositionalPacks;
+  llvm::DenseMap<mlir::Value,
+                 llvm::SmallVector<std::pair<std::string, Value>, 4>>
+      staticKeywordPacks;
+  // Whether `def` reads its `**name` dict and nothing else: forwards it,
+  // looks keys up, iterates it -- so the names the call gave are still its
+  // names wherever the body forwards it.
+  static bool keywordPackIsOnlyRead(const parser::Node &def,
+                                    llvm::StringRef name);
+  // A copy of `lambda` whose calls spell out the static packs they forward,
+  // through names bound to the packed values; null when it forwards none.
+  parser::NodePtr lambdaWithPacksSpelledOut(const parser::Node &lambda);
 
   template <typename Op>
   Value emitBinarySpecial(const parser::Node &anchor, llvm::StringRef method,

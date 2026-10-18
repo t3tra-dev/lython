@@ -589,6 +589,46 @@ TEST(EmitterTest, ImplicitTruthOfAnIntIsRefusedOnlyWhereTheIntIsDeclared) {
   }
 }
 
+// A method forwarding its packs is specialized at each call; what cannot be
+// forwarded exactly -- a dict the body rewrites, a list starred into a method,
+// the method taken as a value -- is refused with the reason.
+TEST(EmitterTest, AMethodForwardingItsPacksIsRefusedWhereItCannotBeExact) {
+  mlir::MLIRContext context(testRegistry());
+  const char *prefix =
+      "from typing import Callable\n"
+      "def show(a: int, c: float = 1.5) -> str:\n"
+      "    return str(a)\n"
+      "class T:\n"
+      "    def call(self, f: Callable[..., str], *args: object,\n"
+      "             **kwargs: object) -> str:\n";
+  lython::emitter::EmitResult forwarded = emitSource(
+      std::string(prefix) + "        return f(*args, **kwargs)\n"
+                            "print(T().call(show, 1), T().call(show, 2, c=0.5))\n",
+      context);
+  EXPECT_TRUE(forwarded.ok());
+  struct Refused {
+    const char *body;
+    const char *reason;
+  };
+  for (const Refused &refused : std::initializer_list<Refused>{
+           {"        kwargs[\"c\"] = 9.5\n"
+            "        return f(*args, **kwargs)\n"
+            "print(T().call(show, 1))\n",
+            "`**` call arguments require statically known keyword names"},
+           {"        return f(*args, **kwargs)\n"
+            "xs = [1]\n"
+            "print(T().call(show, *xs))\n",
+            "unless their length is known here"},
+           {"        return f(*args, **kwargs)\n"
+            "m = T().call\n",
+            "it forwards its *args or **kwargs"}}) {
+    std::string source = std::string(prefix) + refused.body;
+    lython::emitter::EmitResult result = emitSource(source, context);
+    EXPECT_FALSE(result.ok()) << source;
+    EXPECT_TRUE(reportsDiagnostic(result, refused.reason)) << source;
+  }
+}
+
 TEST(EmitterTest, RejectsMethodArgumentThatViolatesTheDeclaredParameter) {
   mlir::MLIRContext context(testRegistry());
   lython::emitter::EmitResult method = emitSource(

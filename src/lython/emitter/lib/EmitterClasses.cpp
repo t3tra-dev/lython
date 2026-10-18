@@ -2775,7 +2775,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       // a call site solves T, which the inlining does.
       if (kind != "class" && kind != "classmethod" &&
           !isExceptionBackedClass(contractName) &&
-          !hasTypeParameters(*statement)) {
+          !specializedAtEachCall(*statement)) {
         pendingBodies.push_back(statement.get());
         pendingBodySigs.push_back(bodySig);
         pendingBodySymbols.push_back(symbolName);
@@ -2877,7 +2877,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
                                       ? specialized.publicCallable
                                       : specialized.callable);
         methodSymbols.push_back(symbolName);
-        if (hasTypeParameters(*inherited.method))
+        if (specializedAtEachCall(*inherited.method))
           continue;
         pendingBodies.push_back(inherited.method);
         pendingBodySigs.push_back(specialized);
@@ -4679,9 +4679,47 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
   if (const auto *args = ast::nodeList(expr, "args")) {
     for (const parser::NodePtr &arg : *args) {
       if (arg && arg->kind == "Starred") {
+        // ⭐ A STARRED ARGUMENT WHOSE VALUES ARE KNOWN IS THOSE VALUES: an
+        // inlined method's own `*args` (the values its call gave), or a tuple
+        // whose type says how many it holds, read by position. Anything else
+        // has an arity only the run time knows, and an inlined body binds
+        // its parameters here.
+        Value starred = emitExpr(ast::node(*arg, "value"));
+        if (auto pack = staticPositionalPacks.find(starred.value);
+            pack != staticPositionalPacks.end()) {
+          positional.append(pack->second.begin(), pack->second.end());
+          continue;
+        }
+        auto tuple = mlir::dyn_cast_if_present<py::ContractType>(
+            types.widenLiteral(starred.type));
+        if (tuple && tuple.getContractName() == "builtins.tuple" &&
+            tuple.getArguments().size() >= 2) {
+          for (unsigned index = 0; index < tuple.getArguments().size();
+               ++index) {
+            mlir::Type indexType = types.literal(std::to_string(index));
+            Value indexValue{
+                py::IntConstantOp::create(builder, loc(*arg), indexType,
+                                          builder.getStringAttr(
+                                              std::to_string(index)))
+                    .getResult(),
+                indexType};
+            CallInferenceResult inference = types.inferMethodCallWithEvidence(
+                starred.type, "__getitem__", {indexValue.type});
+            if (!requireStaticEvidence(*arg, inference))
+              break;
+            auto item = py::GetItemOp::create(
+                builder, loc(*arg), inference.resultType,
+                mlir::FlatSymbolRefAttr::get(&context, "__getitem__"),
+                callProtocolFor(inference), starred.value, indexValue.value);
+            positional.push_back(Value{item.getResult(), inference.resultType});
+          }
+          continue;
+        }
         diagnostics.push_back(parser::Diagnostic{
             parser::Severity::Error, arg->range.start,
-            "starred arguments are not supported for inlined class methods"});
+            "starred arguments are not supported for inlined class methods "
+            "unless their length is known here (a tuple of two or more, or "
+            "the method's own *args)"});
         continue;
       }
       mlir::Type expected = declaredPositional(positional.size());
@@ -4706,10 +4744,18 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
                      : emitExpr(ast::node(*keyword, "value"));
         continue;
       }
+      // The inlined caller's own `**kwargs`, forwarded by name.
+      Value mapping = emitExpr(ast::node(*keyword, "value"));
+      if (auto pack = staticKeywordPacks.find(mapping.value);
+          pack != staticKeywordPacks.end()) {
+        for (const auto &[packedName, packedValue] : pack->second)
+          keywords[packedName] = packedValue;
+        continue;
+      }
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, keyword->range.start,
           "variadic keyword arguments are not supported for inlined class "
-          "methods"});
+          "methods unless they are the calling method's own **kwargs"});
     }
   }
 
@@ -4844,6 +4890,138 @@ bool ModuleEmitter::hasTypeParameters(const parser::Node &def) {
   return params && !params->empty();
 }
 
+bool ModuleEmitter::keywordPackIsOnlyRead(const parser::Node &def,
+                                          llvm::StringRef name) {
+  auto isPack = [&](const parser::Node *node) {
+    return node && node->kind == "Name" &&
+           llvm::StringRef(ast::nameSpelling(*node)) == name;
+  };
+  static const llvm::StringSet<> kReaders = {"get", "items", "keys", "values",
+                                             "copy"};
+  static const llvm::StringSet<> kReadingBuiltins = {
+      "len", "sorted", "list", "tuple", "set", "dict", "repr", "str", "bool"};
+  unsigned seen = 0;
+  unsigned read = 0;
+  std::function<void(const parser::Node &)> visit =
+      [&](const parser::Node &node) {
+        if (isPack(&node))
+          ++seen;
+        if (node.kind == "Call") {
+          const parser::Node *func = ast::node(node, "func");
+          if (const auto *keywords = ast::nodeList(node, "keywords"))
+            for (const parser::NodePtr &keyword : *keywords)
+              if (keyword && !ast::string(*keyword, "arg") &&
+                  isPack(ast::node(*keyword, "value")))
+                ++read;
+          if (func && func->kind == "Attribute" &&
+              isPack(ast::node(*func, "value")))
+            if (auto attr = ast::string(*func, "attr");
+                attr && kReaders.contains(*attr))
+              ++read;
+          const auto *args = ast::nodeList(node, "args");
+          if (func && func->kind == "Name" &&
+              kReadingBuiltins.contains(ast::nameSpelling(*func)) && args &&
+              args->size() == 1 && isPack(args->front().get()))
+            ++read;
+        } else if (node.kind == "Subscript") {
+          if (isPack(ast::node(node, "value")))
+            ++read;
+        } else if (node.kind == "Compare") {
+          if (const auto *comparators = ast::nodeList(node, "comparators"))
+            for (const parser::NodePtr &comparator : *comparators)
+              if (isPack(comparator.get()))
+                ++read;
+        } else if (node.kind == "For" || node.kind == "comprehension") {
+          if (isPack(ast::node(node, "iter")))
+            ++read;
+        } else if (node.kind == "Assign" || node.kind == "AugAssign" ||
+                   node.kind == "AnnAssign" || node.kind == "Delete") {
+          // A subscript STORE through the pack reads as a Subscript below,
+          // so it is taken back here: the pack is then not only read.
+          auto storesThrough = [&](const parser::Node *target) {
+            return target && target->kind == "Subscript" &&
+                   isPack(ast::node(*target, "value"));
+          };
+          if (const auto *targets = ast::nodeList(node, "targets"))
+            for (const parser::NodePtr &target : *targets)
+              if (storesThrough(target.get()))
+                seen += 2;
+          if (storesThrough(ast::node(node, "target")))
+            seen += 2;
+        }
+        for (const parser::Field &field : node.fields) {
+          if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+            if (*child)
+              visit(**child);
+          } else if (const auto *list =
+                         std::get_if<std::vector<parser::NodePtr>>(
+                             &field.value)) {
+            for (const parser::NodePtr &item : *list)
+              if (item)
+                visit(*item);
+          }
+        }
+      };
+  if (const auto *body = ast::nodeList(def, "body"))
+    for (const parser::NodePtr &statement : *body)
+      if (statement)
+        visit(*statement);
+  return seen == read;
+}
+
+bool ModuleEmitter::forwardsItsPacks(const parser::Node &def) {
+  const parser::Node *arguments = ast::node(def, "args");
+  if (!arguments)
+    return false;
+  auto packName = [&](llvm::StringRef field) -> std::string {
+    const parser::Node *pack = ast::node(*arguments, field);
+    return pack ? std::string(ast::nameSpelling(*pack)) : std::string();
+  };
+  std::string varargName = packName("vararg");
+  std::string kwargName = packName("kwarg");
+  if (varargName.empty() && kwargName.empty())
+    return false;
+  bool forwards = false;
+  std::function<void(const parser::Node &)> visit =
+      [&](const parser::Node &node) {
+        if (forwards)
+          return;
+        if (node.kind == "Call") {
+          if (const auto *args = ast::nodeList(node, "args"))
+            for (const parser::NodePtr &arg : *args)
+              if (arg && arg->kind == "Starred")
+                if (const parser::Node *value = ast::node(*arg, "value");
+                    value && value->kind == "Name" && !varargName.empty() &&
+                    ast::nameSpelling(*value) == varargName)
+                  forwards = true;
+          if (const auto *keywords = ast::nodeList(node, "keywords"))
+            for (const parser::NodePtr &keyword : *keywords)
+              if (keyword && !ast::string(*keyword, "arg"))
+                if (const parser::Node *value = ast::node(*keyword, "value");
+                    value && value->kind == "Name" && !kwargName.empty() &&
+                    ast::nameSpelling(*value) == kwargName)
+                  forwards = true;
+        }
+        for (const parser::Field &field : node.fields) {
+          if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+            if (*child)
+              visit(**child);
+          } else if (const auto *list =
+                         std::get_if<std::vector<parser::NodePtr>>(
+                             &field.value)) {
+            for (const parser::NodePtr &item : *list)
+              if (item)
+                visit(*item);
+          }
+        }
+      };
+  if (const auto *body = ast::nodeList(def, "body"))
+    for (const parser::NodePtr &statement : *body)
+      if (statement)
+        visit(*statement);
+  return forwards;
+}
+
 Value ModuleEmitter::emitInlineMethodBody(
     const parser::Node &anchor, Value receiver, bool bindDescriptorReceiver,
     const MethodBinding &method, llvm::ArrayRef<Value> positional,
@@ -4891,10 +5069,12 @@ Value ModuleEmitter::emitInlineMethodBody(
   // overridden method into a base-class call. Here the callee is the method
   // already being inlined, so its class is the one the recursion is in.
   if (llvm::is_contained(methodsBeingInlined, method.method) &&
-      hasTypeParameters(*method.method)) {
+      specializedAtEachCall(*method.method)) {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, anchor.range.start,
-        "the generic method '" +
+        std::string(hasTypeParameters(*method.method)
+                        ? "the generic method '"
+                        : "the method '") +
             std::string(ast::string(*method.method, "name").value_or("")) +
             "' calls itself: its body is specialized at each call site, and a "
             "call cycle has no base case to stop the expansion"});
@@ -5198,9 +5378,14 @@ Value ModuleEmitter::emitInlineMethodBody(
   // Forgotten when the body is done: a value of this emission means nothing
   // to the next one, and an erased op's address can be reused.
   llvm::SmallVector<mlir::Value, 2> heldAsObject;
+  llvm::SmallVector<mlir::Value, 2> heldPacks;
   llvm::scope_exit forgetHeldAsObject([&] {
     for (mlir::Value held : heldAsObject)
       numbersHeldAsObject.erase(held);
+    for (mlir::Value held : heldPacks) {
+      staticPositionalPacks.erase(held);
+      staticKeywordPacks.erase(held);
+    }
   });
   auto checkArgument = [&](llvm::StringRef name, mlir::Type declared,
                            Value argument) {
@@ -5398,8 +5583,28 @@ Value ModuleEmitter::emitInlineMethodBody(
           sig.varargType);
     else
       packed = emitPack(variadic);
-    if (sig.varargType && packed.type != sig.varargType)
+    // ⭐ A PACK EVERY VALUE FITS KEEPS WHAT IT HOLDS. `*args: object` (and a
+    // ParamSpec's `P.args`, which arrives as Any) takes anything, and coercing
+    // the pack to the declared `tuple[object]` erased its arity, so the one
+    // thing such a parameter is for -- `f(*args)` -- was "starred call
+    // arguments require a statically sized tuple". The arguments are bound as
+    // they came, as an inlined method binds every other argument.
+    auto acceptsEverything = [&](mlir::Type vararg) {
+      auto tuple = mlir::dyn_cast_if_present<py::ContractType>(vararg);
+      if (!tuple || tuple.getContractName() != "builtins.tuple" ||
+          tuple.getArguments().size() != 1)
+        return false;
+      auto element = mlir::dyn_cast_if_present<py::ContractType>(
+          tuple.getArguments().front());
+      return element && (element.getContractName() == "builtins.object" ||
+                         element.getContractName() == "typing.Any");
+    };
+    if (sig.varargType && packed.type != sig.varargType &&
+        !(!variadic.empty() && acceptsEverything(sig.varargType)))
       packed = coerceValue(packed, sig.varargType, anchor);
+    else if (packed.value &&
+             staticPositionalPacks.try_emplace(packed.value, variadic).second)
+      heldPacks.push_back(packed.value);
     bind(*sig.varargName, packed);
   }
 
@@ -5484,6 +5689,15 @@ Value ModuleEmitter::emitInlineMethodBody(
                                : emitExpr(dictNode.get());
     if (sig.kwargType && packedKeywords.type != sig.kwargType)
       packedKeywords = coerceValue(packedKeywords, sig.kwargType, anchor);
+    if (packedKeywords.value &&
+        keywordPackIsOnlyRead(*method.method, *sig.kwargName)) {
+      llvm::SmallVector<std::pair<std::string, Value>, 4> named;
+      for (auto [index, name] : llvm::enumerate(variadicKeywordNames))
+        named.push_back({name, variadicKeywordValues[index]});
+      if (staticKeywordPacks.try_emplace(packedKeywords.value, std::move(named))
+              .second)
+        heldPacks.push_back(packedKeywords.value);
+    }
     bind(*sig.kwargName, packedKeywords);
   }
 

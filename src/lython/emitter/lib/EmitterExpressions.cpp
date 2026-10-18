@@ -2934,14 +2934,18 @@ Value ModuleEmitter::emitMethodObject(const parser::Node &anchor, Value object,
     return emitNone(anchor);
   // A generic method has no body of its own until a call solves its type
   // parameters, so there is no function for the value to be.
-  if (methodBinding.method && hasTypeParameters(*methodBinding.method)) {
+  if (methodBinding.method && specializedAtEachCall(*methodBinding.method)) {
+    bool generic = hasTypeParameters(*methodBinding.method);
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, anchor.range.start,
-        "the generic method '" +
+        std::string(generic ? "the generic method '" : "the method '") +
             std::string(ast::string(*methodBinding.method, "name")
                             .value_or("")) +
-            "' cannot be used as a value: its type parameters are solved by "
-            "each call, so only a call has a body to run"});
+            "' cannot be used as a value: " +
+            (generic ? "its type parameters are solved by each call"
+                     : "it forwards its *args or **kwargs, whose arity is "
+                       "each call's") +
+            ", so only a call has a body to run"});
     return emitNone(anchor);
   }
 

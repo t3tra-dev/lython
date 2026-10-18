@@ -349,25 +349,7 @@ llvm::SmallVector<std::string, 4> parameterNames(const parser::Node &def) {
 
 namespace {
 
-parser::NodePtr cloneTree(const parser::Node &node) {
-  parser::NodePtr clone = parser::makeNode(node.kind, node.range);
-  for (const parser::Field &field : node.fields) {
-    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
-      parser::addField(*clone, field.name,
-                       *child ? cloneTree(**child) : parser::NodePtr());
-    } else if (const auto *children =
-                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
-      std::vector<parser::NodePtr> copies;
-      copies.reserve(children->size());
-      for (const parser::NodePtr &element : *children)
-        copies.push_back(element ? cloneTree(*element) : element);
-      parser::addField(*clone, field.name, std::move(copies));
-    } else {
-      parser::addField(*clone, field.name, field.value);
-    }
-  }
-  return clone;
-}
+using synth::cloneTree;
 
 // CPython's contextlib._GeneratorContextManager, which every desugared
 // @contextmanager function returns: enter runs the generator to its yield,

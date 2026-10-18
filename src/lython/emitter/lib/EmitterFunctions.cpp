@@ -1399,8 +1399,140 @@ const llvm::StringSet<> &ModuleEmitter::reboundModuleNames() {
   return reboundModuleNamesCache;
 }
 
+// ⭐ A LAMBDA THAT FORWARDS AN INLINED METHOD'S PACKS FORWARDS THEIR VALUES.
+// `addCleanup(self, function, /, *args, **kwargs)` keeps
+// `lambda: function(*args, **kwargs)`, and the lambda's body is a function of
+// its own: what it captures is a tuple whose arity a one-element pack does not
+// carry and a dict whose keys no type carries, so the call in it was refused.
+// The call site's values are what the packs hold, so the lambda is emitted as
+// a copy whose calls name them -- each bound here, each captured like any
+// other name it reads.
+// ⛔ A pack the lambda shadows with a parameter of its own is that parameter.
+parser::NodePtr
+ModuleEmitter::lambdaWithPacksSpelledOut(const parser::Node &lambda) {
+  if (staticPositionalPacks.empty() && staticKeywordPacks.empty())
+    return nullptr;
+  llvm::StringSet<> shadowed;
+  if (const parser::Node *arguments = ast::node(lambda, "args"))
+    for (llvm::StringRef group :
+         {"posonlyargs", "args", "kwonlyargs"})
+      if (const auto *list = ast::nodeList(*arguments, group))
+        for (const parser::NodePtr &argument : *list)
+          if (argument)
+            if (auto name = ast::string(*argument, "arg"))
+              shadowed.insert(*name);
+  auto packed = [&](const parser::Node *node) -> mlir::Value {
+    if (!node || node->kind != "Name")
+      return {};
+    llvm::StringRef name(ast::nameSpelling(*node));
+    if (shadowed.contains(name))
+      return {};
+    auto bound = values.find(name);
+    return bound == values.end() ? mlir::Value() : bound->second.value;
+  };
+  bool forwards = false;
+  std::function<void(const parser::Node &)> scan =
+      [&](const parser::Node &node) {
+        if (node.kind == "Call") {
+          if (const auto *args = ast::nodeList(node, "args"))
+            for (const parser::NodePtr &arg : *args)
+              if (arg && arg->kind == "Starred" &&
+                  staticPositionalPacks.count(
+                      packed(ast::node(*arg, "value"))))
+                forwards = true;
+          if (const auto *keywords = ast::nodeList(node, "keywords"))
+            for (const parser::NodePtr &keyword : *keywords)
+              if (keyword && !ast::string(*keyword, "arg") &&
+                  staticKeywordPacks.count(
+                      packed(ast::node(*keyword, "value"))))
+                forwards = true;
+        }
+        for (const parser::Field &field : node.fields)
+          if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+            if (*child)
+              scan(**child);
+          } else if (const auto *list =
+                         std::get_if<std::vector<parser::NodePtr>>(
+                             &field.value)) {
+            for (const parser::NodePtr &item : *list)
+              if (item)
+                scan(*item);
+          }
+      };
+  if (const parser::Node *body = ast::node(lambda, "body"))
+    scan(*body);
+  if (!forwards)
+    return nullptr;
+  parser::NodePtr copy = synth::cloneTree(lambda);
+  auto bindHidden = [&](const Value &value) {
+    std::string hidden =
+        "__ly_packed" + std::to_string(++syntheticFunctionCounter);
+    values[hidden] = value;
+    types.bindSymbol(hidden, value.type);
+    return hidden;
+  };
+  std::function<void(parser::Node &)> rewrite = [&](parser::Node &node) {
+    if (node.kind == "Call") {
+      if (parser::Field *field = parser::findField(node, "args"))
+        if (auto *args = std::get_if<std::vector<parser::NodePtr>>(
+                &field->value)) {
+          std::vector<parser::NodePtr> spelled;
+          for (parser::NodePtr &arg : *args) {
+            if (arg && arg->kind == "Starred")
+              if (auto pack = staticPositionalPacks.find(
+                      packed(ast::node(*arg, "value")));
+                  pack != staticPositionalPacks.end()) {
+                for (const Value &element : pack->second)
+                  spelled.push_back(
+                      synth::name(bindHidden(element), arg->range));
+                continue;
+              }
+            spelled.push_back(arg);
+          }
+          *args = std::move(spelled);
+        }
+      if (parser::Field *field = parser::findField(node, "keywords"))
+        if (auto *keywords = std::get_if<std::vector<parser::NodePtr>>(
+                &field->value)) {
+          std::vector<parser::NodePtr> spelled;
+          for (parser::NodePtr &keyword : *keywords) {
+            if (keyword && !ast::string(*keyword, "arg"))
+              if (auto pack = staticKeywordPacks.find(
+                      packed(ast::node(*keyword, "value")));
+                  pack != staticKeywordPacks.end()) {
+                for (const auto &[name, value] : pack->second)
+                  spelled.push_back(synth::keyword(
+                      name, synth::name(bindHidden(value), keyword->range),
+                      keyword->range));
+                continue;
+              }
+            spelled.push_back(keyword);
+          }
+          *keywords = std::move(spelled);
+        }
+    }
+    for (parser::Field &field : node.fields)
+      if (auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+        if (*child)
+          rewrite(**child);
+      } else if (auto *list =
+                     std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+        for (parser::NodePtr &item : *list)
+          if (item)
+            rewrite(*item);
+      }
+  };
+  if (parser::Field *body = parser::findField(*copy, "body"))
+    if (auto *node = std::get_if<parser::NodePtr>(&body->value); node && *node)
+      rewrite(**node);
+  synthesizedIteratorDefs.push_back(copy);
+  return copy;
+}
+
 Value ModuleEmitter::emitLambda(const parser::Node &expr,
                                 py::CallableType expected) {
+  if (parser::NodePtr spelled = lambdaWithPacksSpelledOut(expr))
+    return emitLambda(*spelled, expected);
   llvm::SmallVector<Capture, 4> captures;
   // ⭐ A capture is the value the name holds NOW, and at module scope a
   // rebound name goes stale in it. CPython reads the binding at CALL time:
