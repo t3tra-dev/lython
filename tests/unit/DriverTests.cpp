@@ -2016,6 +2016,34 @@ TEST(DriverTest, AnOptionalFieldIsBoxedLikeThePayloadAlone) {
 // holds -- and a class that names itself through one has no finite layout and
 // is refused. The refusal is what keeps the expansion from recursing until the
 // compiler dies with SIGILL and no diagnostic, which is what it did.
+// A slot records only the class of what it holds, so a union whose members
+// are the same class at run time cannot be read back out of one; a member that
+// is a subclass of another can, and so can a union of distinct classes.
+TEST(DriverTest, AUnionOfTwoTuplesCannotBeReadBackFromASlot) {
+  CompileResult same = compileSource(
+      "def f(xs: list[tuple[int, int] | tuple[str, str]]) -> None:\n"
+      "    for x in xs:\n"
+      "        print(x)\n"
+      "f([(1, 1), (\"s\", \"t\")])\n");
+  EXPECT_FALSE(same.succeeded);
+  EXPECT_NE(same.diagnostics.find("are the same class at run time"),
+            std::string::npos)
+      << same.diagnostics;
+  CompileResult distinct = compileSource(
+      "def f(xs: list[tuple[int, int] | str]) -> None:\n"
+      "    for x in xs:\n"
+      "        print(x)\n"
+      "f([(1, 1), \"s\"])\n");
+  EXPECT_TRUE(distinct.succeeded) << distinct.diagnostics;
+  CompileResult subclass = compileSource(
+      "class A:\n    pass\nclass B(A):\n    pass\n"
+      "def f(xs: list[A | B]) -> None:\n"
+      "    for x in xs:\n"
+      "        print(type(x).__name__)\n"
+      "f([A(), B()])\n");
+  EXPECT_TRUE(subclass.succeeded) << subclass.diagnostics;
+}
+
 TEST(DriverTest, AUnionOfTwoObjectsCannotReachItsOwnClass) {
   CompileResult result =
       compileSource("class Leaf:\n"

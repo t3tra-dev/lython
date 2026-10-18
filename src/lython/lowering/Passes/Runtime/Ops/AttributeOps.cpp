@@ -2755,6 +2755,44 @@ mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::unionTagFromBoxWords(
     }
   }
 
+  // ⛔ TWO MEMBERS ONE CLASS ANSWERS FOR CANNOT BE TOLD APART HERE. A box
+  // records the class of what it holds and nothing else, so a slot of
+  // `tuple[int, int] | tuple[str, str]` read back as whichever member is
+  // tested last: a `(1, 1)` decoded as `tuple[str, str]` printed two empty
+  // strings, and unpacking one read a str's lanes as an int's. Refused rather
+  // than guessed. A subclass member is not this: the class word IS the more
+  // specific answer, and either reading is the same object.
+  {
+    llvm::SmallVector<std::pair<mlir::Type, llvm::SmallVector<std::string, 8>>,
+                      4>
+        claims;
+    for (auto [index, member] : llvm::enumerate(unionType.getMemberTypes())) {
+      if (mlir::isa<py::TypeType>(member) ||
+          static_cast<std::int64_t>(index) == laneLessTag.value_or(-1))
+        continue;
+      mlir::FailureOr<llvm::SmallVector<std::string, 8>> classes =
+          RuntimeBundleLowerer::runtimeClassesForNominalTarget(op, member);
+      if (mlir::failed(classes))
+        return mlir::failure();
+      for (const auto &[other, otherClasses] : claims) {
+        bool shared = llvm::any_of(*classes, [&](const std::string &name) {
+          return llvm::is_contained(otherClasses, name);
+        });
+        if (shared && !py::isAssignableTo(member, other, op) &&
+            !py::isAssignableTo(other, member, op))
+          return op->emitError()
+                 << "a value of " << unionType
+                 << " cannot be read back from a container slot or a boxed "
+                    "field: "
+                 << other << " and " << member
+                 << " are the same class at run time, and the slot records "
+                    "only the class it holds; declare one type that covers "
+                    "both (a tuple of unions rather than a union of tuples)";
+      }
+      claims.push_back({member, std::move(*classes)});
+    }
+  }
+
   for (auto [index, member] : llvm::enumerate(unionType.getMemberTypes())) {
     mlir::Value matched =
         mlir::arith::ConstantIntOp::create(builder, loc, 0, 1).getResult();

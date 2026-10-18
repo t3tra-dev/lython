@@ -5678,6 +5678,36 @@ mlir::Type TypeSystem::join(mlir::ArrayRef<mlir::Type> types) const {
     return base;
   if (mlir::Type callable = commonCallableJoin(present))
     return callable;
+  // ⭐ TUPLES OF ONE ARITY JOIN POSITION BY POSITION. `[(1, 1), ("s", "t")]`
+  // inferred `list[tuple[int, int] | tuple[str, str]]`, and a slot holding one
+  // of those says only that it holds a tuple -- both members are `tuple` at
+  // run time -- so an element read back was decoded as whichever member came
+  // last, and `for a, b in xs` read a str's lanes as an int's. Position by
+  // position, each element is a box whose own class tells int from str.
+  // ⛔ Not an arity-erased `tuple[T]`, which is the homogeneous spelling and
+  // says nothing about positions.
+  if (present.size() >= 2 &&
+      llvm::all_of(present, [&](mlir::Type member) {
+        auto tuple = mlir::dyn_cast<py::ContractType>(member);
+        return tuple && tuple.getContractName() == "builtins.tuple" &&
+               tuple.getArguments().size() >= 2 &&
+               tuple.getArguments().size() ==
+                   mlir::cast<py::ContractType>(present.front())
+                       .getArguments()
+                       .size();
+      })) {
+    unsigned arity = static_cast<unsigned>(
+        mlir::cast<py::ContractType>(present.front()).getArguments().size());
+    llvm::SmallVector<mlir::Type, 4> positions;
+    for (unsigned index = 0; index < arity; ++index) {
+      llvm::SmallVector<mlir::Type, 4> held;
+      for (mlir::Type member : present)
+        held.push_back(
+            mlir::cast<py::ContractType>(member).getArguments()[index]);
+      positions.push_back(join(held));
+    }
+    return py::ContractType::get(&context, "builtins.tuple", positions);
+  }
   // ⭐ CLASS VALUES JOIN AT THE CLASS VALUE OF THEIR INSTANCES' JOIN.
   // `[A, B]` with `class B(A)` is a `list[type[A]]`, the list a loop that
   // constructs through each element needs; a union of two class values has
