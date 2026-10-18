@@ -512,24 +512,46 @@ module attributes {
   func.func private @__ly_global_view_f64(%pointer: i64, %size: i64) -> memref<?xf64>
   func.func private @__ly_global_view_i8(%pointer: i64, %size: i64) -> memref<?xi8>
 
-  // Per-program class-name table (synthesized by the lowering, one entry per
-  // class the program declares, keyed by the id its instances carry in header
-  // word 1). Null for an id the program does not know.
+  // A class's name and its length, read off the type object the class word
+  // is the address of (lowering/Common/TypeObjects.h); null and 0 for a word
+  // that names no class.
   func.func private @LyType_Name(%class_word: i64) -> !llvm.ptr
+  func.func private @LyType_NameLength(%class_word: i64) -> i64
+
+  // Where a class's `__name__` starts in its name and where the name ends:
+  // the last component, after the module and any scopes it is nested in.
+  func.func private @__ly_class_leaf(%class_word: i64) -> (index, index) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %dot = arith.constant 46 : i8
+    %name_ptr = func.call @LyType_Name(%class_word) : (i64) -> !llvm.ptr
+    %length = func.call @LyType_NameLength(%class_word) : (i64) -> i64
+    %end = arith.index_cast %length : i64 to index
+    %start = scf.for %i = %c0 to %end step %c1 iter_args(%from = %c0) -> (index) {
+      %i_i64 = arith.index_cast %i : index to i64
+      %slot = llvm.getelementptr %name_ptr[%i_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
+      %byte = llvm.load %slot : !llvm.ptr -> i8
+      %is_dot = arith.cmpi eq, %byte, %dot : i8
+      %past = arith.addi %i, %c1 : index
+      %next = arith.select %is_dot, %past, %from : index
+      scf.yield %next : index
+    }
+    func.return %start, %end : index, index
+  }
 
   // ⭐ `type(v).__name__` FOR A VALUE WHOSE STATIC CLASS IS NOT ITS OWN. The
   // header's word 1 is the class word -- the word `isinstance` reads -- so the
-  // dynamic name is a table lookup, and the only thing that has to happen here
-  // is turning a NUL-terminated pointer into a str.
+  // dynamic name is read off its type object.
   //
   // ⛔ A null pointer is not an error: it is an id this program never declared
   // (a manifest object reaching here), and "object" is what CPython would print
   // for it.
+  // ⛔ Not a scan to a NUL under a fixed cap: the type object says how long
+  // the name is, and the leaf of what fit under a 64-byte cap was a wrong
+  // name, printed.
   func.func @LyObject_ClassNameFromId(%class_word: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "class_name_from_id", ly.runtime.result_contract = "builtins.str"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %zero_i8 = arith.constant 0 : i8
-    %cap = arith.constant 64 : index
     %name_ptr = func.call @LyType_Name(%class_word) : (i64) -> !llvm.ptr
     %null = llvm.mlir.zero : !llvm.ptr
     %is_null = llvm.icmp "eq" %name_ptr, %null : !llvm.ptr
@@ -543,37 +565,19 @@ module attributes {
     func.return %fh, %fb : memref<2xi64>, memref<?xi8>
 
   ^known:
-    %buffer = memref.alloca() : memref<64xi8>
-    %true_scan = arith.constant true
-    %dot = arith.constant 46 : i8
-    // ⛔ The table entry is the class's QUALIFIED name ("__main__.A",
-    // "lib.Base") because the repr needs the module; `__name__` is always the
-    // leaf, so the scan also carries where the last '.' left off.
-    %scan:3 = scf.while (%i = %c0, %go = %true_scan, %start = %c0) : (index, i1, index) -> (index, i1, index) {
-      %in_bounds = arith.cmpi ult, %i, %cap : index
-      %continue = arith.andi %in_bounds, %go : i1
-      scf.condition(%continue) %i, %go, %start : index, i1, index
-    } do {
-    ^bb0(%i: index, %go: i1, %start: index):
-      %i_i64 = arith.index_cast %i : index to i64
-      %slot = llvm.getelementptr %name_ptr[%i_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
+    %leaf:2 = func.call @__ly_class_leaf(%class_word) : (i64) -> (index, index)
+    %leaf_len = arith.subi %leaf#1, %leaf#0 : index
+    %buffer = memref.alloc(%leaf_len) : memref<?xi8>
+    scf.for %k = %c0 to %leaf_len step %c1 {
+      %from = arith.addi %leaf#0, %k : index
+      %from_i64 = arith.index_cast %from : index to i64
+      %slot = llvm.getelementptr %name_ptr[%from_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
       %byte = llvm.load %slot : !llvm.ptr -> i8
-      %is_nul = arith.cmpi eq, %byte, %zero_i8 : i8
-      %true_x = arith.constant true
-      %not_nul = arith.xori %is_nul, %true_x : i1
-      scf.if %not_nul {
-        memref.store %byte, %buffer[%i] : memref<64xi8>
-      }
-      %next = arith.addi %i, %c1 : index
-      %kept = arith.select %is_nul, %i, %next : index
-      %is_dot = arith.cmpi eq, %byte, %dot : i8
-      %next_start = arith.select %is_dot, %next, %start : index
-      scf.yield %kept, %not_nul, %next_start : index, i1, index
+      memref.store %byte, %buffer[%k] : memref<?xi8>
     }
-    %leaf_len_index = arith.subi %scan#0, %scan#2 : index
-    %name_len = arith.index_cast %leaf_len_index : index to i64
-    %name_dyn = memref.cast %buffer : memref<64xi8> to memref<?xi8>
-    %nh, %nb = func.call @__ly_unicode_from_valid_utf8(%name_dyn, %scan#2, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %name_len = arith.index_cast %leaf_len : index to i64
+    %nh, %nb = func.call @__ly_unicode_from_valid_utf8(%buffer, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    memref.dealloc %buffer : memref<?xi8>
     func.return %nh, %nb : memref<2xi64>, memref<?xi8>
   }
 
@@ -602,74 +606,51 @@ module attributes {
 
   // The address-keyed core, callable from paths that hold only a raw box
   // pointer (a container rendering its elements).
+  // ⛔ "<", the name and " object at 0x" in a buffer the name's length sizes:
+  // a fixed one kept the first 64 bytes of a long name and printed them as
+  // the class.
   func.func private @__ly_default_repr_dynamic_from_addr(%ptr: i64, %class_word: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "default_repr_dynamic_addr", ly.runtime.result_contract = "builtins.str"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c6 = arith.constant 6 : index
     %c13 = arith.constant 13 : index
-    %c64 = arith.constant 64 : index
-    %zero_i8 = arith.constant 0 : i8
     %name_ptr = func.call @LyType_Name(%class_word) : (i64) -> !llvm.ptr
-    %buffer = memref.alloca() : memref<128xi8>
     %null = llvm.mlir.zero : !llvm.ptr
     %is_null = llvm.icmp "eq" %name_ptr, %null : !llvm.ptr
-    cf.cond_br %is_null, ^unknown, ^known
-
-  ^unknown:
-    %plain = memref.get_global @__ly_repr_prefix_plain : memref<1xi8>
-    %plain_byte = memref.load %plain[%c0] : memref<1xi8>
-    memref.store %plain_byte, %buffer[%c0] : memref<128xi8>
-    %object_name = memref.get_global @__ly_class_name_object : memref<6xi8>
-    scf.for %i = %c0 to %c6 step %c1 {
-      %byte = memref.load %object_name[%i] : memref<6xi8>
-      %slot = arith.addi %i, %c1 : index
-      memref.store %byte, %buffer[%slot] : memref<128xi8>
-    }
-    %unknown_len = arith.constant 7 : index
-    cf.br ^suffix(%unknown_len : index)
-
-  ^known:
-    // ⛔ Only "<": the table entry is the qualified name, so pasting
-    // "__main__." here printed "<__main__.lib.Base object at ...>" for a class
-    // imported from another source module.
+    %known_len = func.call @LyType_NameLength(%class_word) : (i64) -> i64
+    %object_len = arith.constant 6 : i64
+    %name_len = arith.select %is_null, %object_len, %known_len : i64
+    %name_len_index = arith.index_cast %name_len : i64 to index
+    %opened = arith.addi %name_len_index, %c1 : index
+    %total_index = arith.addi %opened, %c13 : index
+    %buffer = memref.alloc(%total_index) : memref<?xi8>
     %open = memref.get_global @__ly_repr_prefix_plain : memref<1xi8>
     %open_byte = memref.load %open[%c0] : memref<1xi8>
-    memref.store %open_byte, %buffer[%c0] : memref<128xi8>
-    %true_scan = arith.constant true
-    %scan:2 = scf.while (%i = %c0, %go = %true_scan) : (index, i1) -> (index, i1) {
-      %in_bounds = arith.cmpi ult, %i, %c64 : index
-      %continue = arith.andi %in_bounds, %go : i1
-      scf.condition(%continue) %i, %go : index, i1
-    } do {
-    ^bb0(%i: index, %go: i1):
-      %i_i64 = arith.index_cast %i : index to i64
-      %slot = llvm.getelementptr %name_ptr[%i_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
-      %byte = llvm.load %slot : !llvm.ptr -> i8
-      %is_nul = arith.cmpi eq, %byte, %zero_i8 : i8
-      %true_x = arith.constant true
-      %not_nul = arith.xori %is_nul, %true_x : i1
-      scf.if %not_nul {
+    memref.store %open_byte, %buffer[%c0] : memref<?xi8>
+    scf.if %is_null {
+      %object_name = memref.get_global @__ly_class_name_object : memref<6xi8>
+      scf.for %i = %c0 to %name_len_index step %c1 {
+        %byte = memref.load %object_name[%i] : memref<6xi8>
         %at = arith.addi %i, %c1 : index
-        memref.store %byte, %buffer[%at] : memref<128xi8>
+        memref.store %byte, %buffer[%at] : memref<?xi8>
       }
-      %next = arith.addi %i, %c1 : index
-      %kept = arith.select %is_nul, %i, %next : index
-      scf.yield %kept, %not_nul : index, i1
+    } else {
+      scf.for %i = %c0 to %name_len_index step %c1 {
+        %i_i64 = arith.index_cast %i : index to i64
+        %slot = llvm.getelementptr %name_ptr[%i_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
+        %byte = llvm.load %slot : !llvm.ptr -> i8
+        %at = arith.addi %i, %c1 : index
+        memref.store %byte, %buffer[%at] : memref<?xi8>
+      }
     }
-    %known_len = arith.addi %scan#0, %c1 : index
-    cf.br ^suffix(%known_len : index)
-
-  ^suffix(%len: index):
     %tail = memref.get_global @__ly_repr_suffix : memref<13xi8>
     scf.for %i = %c0 to %c13 step %c1 {
       %byte = memref.load %tail[%i] : memref<13xi8>
-      %slot = arith.addi %i, %len : index
-      memref.store %byte, %buffer[%slot] : memref<128xi8>
+      %at = arith.addi %i, %opened : index
+      memref.store %byte, %buffer[%at] : memref<?xi8>
     }
-    %total_index = arith.addi %len, %c13 : index
     %total = arith.index_cast %total_index : index to i64
-    %buffer_dyn = memref.cast %buffer : memref<128xi8> to memref<?xi8>
-    %h, %b = func.call @__ly_default_repr_from_addr(%ptr, %buffer_dyn, %total) : (i64, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %h, %b = func.call @__ly_default_repr_from_addr(%ptr, %buffer, %total) : (i64, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    memref.dealloc %buffer : memref<?xi8>
     func.return %h, %b : memref<2xi64>, memref<?xi8>
   }
 
@@ -1676,16 +1657,13 @@ module attributes {
     func.return %end : index
   }
 
-  // Append a class's name -- the leaf of the table's qualified entry, at most
+  // Append a class's name -- the leaf of its type object's name, at most
   // 100 bytes as CPython's "%.100s" -- or "object" for an id the program did
   // not declare (`LyObject_ClassNameFromId`'s rule).
   func.func private @__ly_msg_append_class_name(%buffer: memref<?xi8>, %at: index, %class_word: i64) -> index {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %cap = arith.constant 256 : index
     %most = arith.constant 100 : index
-    %zero_i8 = arith.constant 0 : i8
-    %dot = arith.constant 46 : i8
     %name_ptr = func.call @LyType_Name(%class_word) : (i64) -> !llvm.ptr
     %null = llvm.mlir.zero : !llvm.ptr
     %is_null = llvm.icmp "eq" %name_ptr, %null : !llvm.ptr
@@ -1696,30 +1674,12 @@ module attributes {
       %e = func.call @__ly_msg_append(%buffer, %at, %object_name, %c6) : (memref<?xi8>, index, memref<?xi8>, index) -> (index)
       scf.yield %e : index
     } else {
-      // Where the NUL is and where the last '.' left off.
-      %true = arith.constant true
-      %scan:3 = scf.while (%i = %c0, %go = %true, %start = %c0) : (index, i1, index) -> (index, i1, index) {
-        %in_bounds = arith.cmpi ult, %i, %cap : index
-        %continue = arith.andi %in_bounds, %go : i1
-        scf.condition(%continue) %i, %go, %start : index, i1, index
-      } do {
-      ^bb0(%i: index, %go: i1, %start: index):
-        %i_i64 = arith.index_cast %i : index to i64
-        %slot = llvm.getelementptr %name_ptr[%i_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
-        %byte = llvm.load %slot : !llvm.ptr -> i8
-        %is_nul = arith.cmpi eq, %byte, %zero_i8 : i8
-        %not_nul = arith.xori %is_nul, %true : i1
-        %next = arith.addi %i, %c1 : index
-        %kept = arith.select %is_nul, %i, %next : index
-        %is_dot = arith.cmpi eq, %byte, %dot : i8
-        %next_start = arith.select %is_dot, %next, %start : index
-        scf.yield %kept, %not_nul, %next_start : index, i1, index
-      }
-      %leaf = arith.subi %scan#0, %scan#2 : index
-      %over = arith.cmpi ugt, %leaf, %most : index
-      %count = arith.select %over, %most, %leaf : index
+      %leaf:2 = func.call @__ly_class_leaf(%class_word) : (i64) -> (index, index)
+      %length = arith.subi %leaf#1, %leaf#0 : index
+      %over = arith.cmpi ugt, %length, %most : index
+      %count = arith.select %over, %most, %length : index
       scf.for %k = %c0 to %count step %c1 {
-        %from = arith.addi %scan#2, %k : index
+        %from = arith.addi %leaf#0, %k : index
         %from_i64 = arith.index_cast %from : index to i64
         %slot = llvm.getelementptr %name_ptr[%from_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
         %byte = llvm.load %slot : !llvm.ptr -> i8

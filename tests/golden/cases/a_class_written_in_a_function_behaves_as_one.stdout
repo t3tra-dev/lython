@@ -1,0 +1,15 @@
+Rect 6
+square: Square 16
+Rect 25
+[Version(0, 9), Version(1, 0), Version(1, 2)]
+2
+True True
+Version
+True False True False
+True False
+s! 42
+outer.<locals>.inner.<locals>.Point
+outer.<locals>.Host.make.<locals>.Part
+49
+['Item(0)', 'Item(1)', 'Item(2)']
+first first.<locals>.Same second second.<locals>.Same

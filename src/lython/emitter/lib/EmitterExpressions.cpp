@@ -3194,10 +3194,9 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   // `C.__class__` are all still refused, and this fold deliberately does not
   // pretend otherwise.
   // ⭐ AND `__qualname__` AND `__module__`, the other two names a report
-  // spells a class by (unittest's `strclass` is "%s.%s" of them). A class
-  // here is always a module-level statement, so the qualified name is the
-  // name; the module is the contract's prefix -- `__main__` for the
-  // program's own, `builtins` for a builtin.
+  // spells a class by (unittest's `strclass` is "%s.%s" of them). The module
+  // is the contract's prefix -- `__main__` for the program's own, `builtins`
+  // for a builtin -- and the qualified name what follows it.
   // ⭐ A CLASS VALUE THE STATIC TYPE DOES NOT DECIDE ANSWERS AT RUN TIME, from
   // the type object it names: `t.__name__` for a `t: type[Base]` that holds a
   // subclass is the subclass's name.
@@ -3212,15 +3211,18 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
               builder.getStringAttr(*attr));
           return Value{dynamic.getResult(), strType};
         }
+        // A class written in a function encodes its qualified name in its
+        // contract (Contracts.h).
         llvm::StringRef qualified = contract.getContractName();
-        llvm::StringRef simple = qualified;
         llvm::StringRef moduleName = "__main__";
-        if (auto dot = qualified.rfind('.'); dot != llvm::StringRef::npos) {
-          simple = qualified.drop_front(dot + 1);
+        if (auto dot = qualified.rfind('.'); dot != llvm::StringRef::npos)
           moduleName = qualified.take_front(dot);
-        }
-        llvm::StringRef answer = *attr == "__module__" ? moduleName : simple;
-        mlir::Type type = types.literal("\"" + answer.str() + "\"");
+        std::string answer =
+            *attr == "__module__" ? moduleName.str()
+            : *attr == "__qualname__"
+                ? py::contracts::pythonQualnameForContract(qualified)
+                : py::contracts::pythonClassNameForContract(qualified);
+        mlir::Type type = types.literal("\"" + answer + "\"");
         auto constant = py::StrConstantOp::create(
             builder, loc(expr), type, builder.getStringAttr(answer));
         return Value{constant.getResult(), type};

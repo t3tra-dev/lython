@@ -103,23 +103,62 @@ inline std::string manifestClassNameForContract(llvm::StringRef name) {
   return name.str();
 }
 
+// A class written inside a function is declared at its module's top level
+// under its qualified name, with `$` for `.` -- `f.<locals>.A` is the contract
+// `f$<locals>$A`, and `pkg.mod.f$<locals>$A` when `pkg.mod` declares it -- so
+// a contract's last dot still ends its module, as every module-level class's
+// does, and no source identifier can spell it.
+inline constexpr llvm::StringLiteral kLocalClassScopeMarker{"$<locals>$"};
+
+inline std::string localClassContractName(llvm::StringRef qualname) {
+  std::string out = qualname.str();
+  for (char &c : out)
+    if (c == '.')
+      c = '$';
+  return out;
+}
+
 // The class name a PROGRAM sees. A monomorphized generic class contract is
 // named "<class>$spec<N>", an internal symbol that must never surface: repr,
 // exception names and diagnostics all have to read as the class the source
 // wrote. Kept separate from manifestClassNameForContract because that one also
 // feeds manifest LOOKUPS, which need the specialization's own name.
+// A class declared in a function reads as its qualified name
+// (`f.<locals>.A`), which is what CPython's repr and messages print.
 inline std::string displayClassNameForContract(llvm::StringRef name) {
   std::string display = manifestClassNameForContract(name);
   std::size_t marker = display.rfind("$spec");
-  if (marker == std::string::npos || marker == 0)
-    return display;
-  llvm::StringRef index(display.c_str() + marker + 5);
-  if (index.empty() || !llvm::all_of(index, [](char c) {
-        return c >= '0' && c <= '9';
-      }))
-    return display;
-  display.resize(marker);
+  if (marker != std::string::npos && marker != 0) {
+    llvm::StringRef index(display.c_str() + marker + 5);
+    if (!index.empty() && llvm::all_of(index, [](char c) {
+          return c >= '0' && c <= '9';
+        }))
+      display.resize(marker);
+  }
+  if (llvm::StringRef(display).contains(kLocalClassScopeMarker)) {
+    // Only the part after the module's last dot is the encoded name.
+    std::size_t dot = display.rfind('.');
+    for (std::size_t at = dot == std::string::npos ? 0 : dot + 1;
+         at < display.size(); ++at)
+      if (display[at] == '$')
+        display[at] = '.';
+  }
   return display;
+}
+
+// CPython's `__qualname__` of the class a contract names: what follows the
+// contract's module, read back from its encoding.
+inline std::string pythonQualnameForContract(llvm::StringRef name) {
+  if (std::size_t dot = name.rfind('.'); dot != llvm::StringRef::npos)
+    name = name.drop_front(dot + 1);
+  return displayClassNameForContract(name);
+}
+
+// CPython's `__name__`: the last component of the qualified name.
+inline std::string pythonClassNameForContract(llvm::StringRef name) {
+  std::string qualname = pythonQualnameForContract(name);
+  std::size_t dot = qualname.rfind('.');
+  return dot == std::string::npos ? qualname : qualname.substr(dot + 1);
 }
 
 std::string runtimeContractName(mlir::Type type);

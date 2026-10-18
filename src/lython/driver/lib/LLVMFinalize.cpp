@@ -1,4 +1,5 @@
 #include "DriverCodeGen.h"
+#include "Mangling.h"
 
 #include "Common/PythonSourceRange.h"
 #include "Common/UnwindABI.h"
@@ -207,27 +208,16 @@ LogicalResult installAOTEntryPoint(llvm::Module &llvmModule,
     return failure();
   }
 
+  // A program's `def main()` is not this symbol: every function the program
+  // defines is mangled (common/Mangling.h), so a definition here is no
+  // Python function and nothing the C entry may replace.
   if (llvm::Function *existing = llvmModule.getFunction("main")) {
-    if (existing->isDeclaration()) {
-      existing->eraseFromParent();
-    } else {
-      // `def main()` IS the ordinary Python idiom, and the definition standing
-      // here is the user's function, not a second C entry: the C one is created
-      // below and there is nothing else in the module that could have claimed
-      // the name. Move it aside instead of refusing the program.
-      //
-      // Renaming is safe because LLVM references are by Value*, not by symbol
-      // name -- every call site keeps pointing at the same Function -- and the
-      // symbol has no external meaning: a Python function is reached through
-      // this module's own calls, never through the C name.
-      //
-      // Why NOT mangle Python function symbols in the emitter instead: the
-      // clash exists only in the AOT link, since JIT installs no C `main`, so
-      // mangling would rename a symbol everywhere for a conflict that arises in
-      // one of the two output modes -- and that name is what `--emit-llvm`
-      // output and every backtrace are read by.
-      existing->setName("__ly_py_main");
+    if (!existing->isDeclaration()) {
+      diag << "error: cannot build executable: symbol 'main' already "
+              "exists\n";
+      return failure();
     }
+    existing->eraseFromParent();
   }
   constexpr llvm::StringLiteral kAOTEntryThunkName = "__lython_aot_entry";
   if (llvm::Function *existing = llvmModule.getFunction(kAOTEntryThunkName)) {
@@ -423,6 +413,11 @@ void attachPythonDebugInfo(ModuleOp module) {
     StringRef linkageName = function.getSymName();
     StringRef displayName =
         linkageName == "__main__" ? "<module>" : linkageName;
+    // A definition's frame is named as CPython names it, not by its mangled
+    // symbol (common/Mangling.h); the traceback reads this name back.
+    if (auto python = function->getAttrOfType<StringAttr>(
+            py::mangling::kFunctionNameAttr))
+      displayName = python.getValue();
     uint32_t flagBits =
         static_cast<uint32_t>(LLVM::DISubprogramFlags::Definition) |
         static_cast<uint32_t>(LLVM::DISubprogramFlags::Optimized);

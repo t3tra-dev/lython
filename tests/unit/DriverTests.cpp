@@ -8,6 +8,7 @@
 
 #include "Driver.h"
 #include "DriverCodeGen.h"
+#include "Mangling.h"
 
 #include "Common/RuntimeLibrary.h"
 #include "Common/LibcPrototypes.h"
@@ -131,6 +132,12 @@ std::string matmulSource(int m, int k, int n, llvm::StringRef element) {
          "print(from_prim(c[0, 0]))\n";
 }
 
+
+// The symbol a main-module definition is emitted under (common/Mangling.h).
+static std::string mainSymbol(llvm::StringRef qualname) {
+  return py::mangling::pythonDefinitionSymbol("__main__", qualname);
+}
+
 TEST(DriverTest, CompilesHelloToVerifiedLLVMIR) {
   CompileResult result = compileSource("print(\"hello driver\")\n");
   ASSERT_TRUE(result.succeeded) << result.diagnostics;
@@ -138,13 +145,10 @@ TEST(DriverTest, CompilesHelloToVerifiedLLVMIR) {
   EXPECT_NE(result.verified.llvmModule->getFunction("__main__"), nullptr);
 }
 
-// A Python `def main()` still links as an executable.
-//
-// The AOT entry point installs a C `main`, and the user's function is lowered
-// under its Python name, so the two collided and the driver refused the program
-// with "symbol 'main' already exists". `def main()` is the single most ordinary
-// function name in Python, and it compiled under JIT the whole time -- the two
-// output modes disagreed on a valid program.
+// What: a Python `def main()` links as an executable beside the C `main` the
+// AOT entry point installs -- the function is emitted under its mangled
+// symbol, so the C name is the entry's alone and the Python function is still
+// there and still called.
 //
 // Why here and not in the leak gate (the only other stage that links AOT): that
 // gate reports an unbuildable subject as "could not measure", which ctest maps
@@ -156,7 +160,10 @@ TEST(DriverTest, InstallsAOTEntryPointBesideAPythonMain) {
                                        "main()\n");
   ASSERT_TRUE(result.succeeded) << result.diagnostics;
   ASSERT_TRUE(result.verified.llvmModule);
-  llvm::Function *pythonMain = result.verified.llvmModule->getFunction("main");
+  // The Python function is mangled, so nothing holds the C name yet.
+  EXPECT_EQ(result.verified.llvmModule->getFunction("main"), nullptr);
+  llvm::Function *pythonMain =
+      result.verified.llvmModule->getFunction(mainSymbol("main"));
   ASSERT_NE(pythonMain, nullptr);
   ASSERT_FALSE(pythonMain->isDeclaration());
 
@@ -173,8 +180,10 @@ TEST(DriverTest, InstallsAOTEntryPointBesideAPythonMain) {
   EXPECT_EQ(entry->arg_size(), 2u);
   EXPECT_TRUE(entry->getReturnType()->isIntegerTy(32));
   EXPECT_NE(entry, pythonMain);
-  // The Python function is still in the module, still called: renaming moved
-  // the symbol, it did not drop the definition.
+  // The Python function is still in the module, under its own symbol, and
+  // still called.
+  EXPECT_EQ(result.verified.llvmModule->getFunction(mainSymbol("main")),
+            pythonMain);
   EXPECT_FALSE(pythonMain->isDeclaration());
   EXPECT_FALSE(pythonMain->use_empty());
 }
@@ -431,7 +440,7 @@ TEST(DriverTest, ALoopBodyLoweredEarlyKeepsItsInitOrder) {
                                        "print(f())\n");
   ASSERT_TRUE(result.succeeded) << result.diagnostics;
   // And the call reads `__init__`'s result, which is what makes it run.
-  const llvm::Function *f = result.verified.llvmModule->getFunction("f");
+  const llvm::Function *f = result.verified.llvmModule->getFunction(mainSymbol("f"));
   ASSERT_NE(f, nullptr);
   const llvm::CallBase *init = nullptr;
   const llvm::CallBase *tell = nullptr;
@@ -673,7 +682,7 @@ TEST(DriverTest, AnIntLoopInAnOrdinaryFunctionBoxesNoComputedValue) {
       "print(count([1, 2]))\n");
   ASSERT_TRUE(result.succeeded) << result.diagnostics;
   const llvm::Function *function =
-      result.verified.llvmModule->getFunction("count");
+      result.verified.llvmModule->getFunction(mainSymbol("count"));
   ASSERT_NE(function, nullptr);
   unsigned standIns = 0;
   for (const llvm::BasicBlock &block : *function)
@@ -703,7 +712,7 @@ TEST(DriverTest, AnIntSlowArmIsOneDeferredCall) {
       "print(mix([1, 2], 3))\n");
   ASSERT_TRUE(result.succeeded) << result.diagnostics;
   const llvm::Function *function =
-      result.verified.llvmModule->getFunction("mix");
+      result.verified.llvmModule->getFunction(mainSymbol("mix"));
   ASSERT_NE(function, nullptr);
   unsigned binary = 0, compare = 0;
   for (const llvm::BasicBlock &block : *function)
@@ -737,7 +746,7 @@ TEST(DriverTest, AGeneratorFrameKeepsAnIntAsItsWord) {
       "print(sum(gen(5)))\n");
   ASSERT_TRUE(result.succeeded) << result.diagnostics;
   const llvm::Function *function =
-      result.verified.llvmModule->getFunction("gen__lyrt_gen_resume");
+      result.verified.llvmModule->getFunction(mainSymbol("gen") + "__lyrt_gen_resume");
   ASSERT_NE(function, nullptr);
   unsigned made = 0;
   for (const llvm::BasicBlock &block : *function)
@@ -766,7 +775,7 @@ TEST(DriverTest, AFloatLoopInAnOrdinaryFunctionMakesNoObjects) {
       "print(sumsq([1.0, 2.0]))\n");
   ASSERT_TRUE(result.succeeded) << result.diagnostics;
   const llvm::Function *function =
-      result.verified.llvmModule->getFunction("sumsq");
+      result.verified.llvmModule->getFunction(mainSymbol("sumsq"));
   ASSERT_NE(function, nullptr);
   unsigned boxes = 0;
   for (const llvm::BasicBlock &block : *function)
@@ -810,21 +819,21 @@ TEST(DriverTest, AFloatFunctionRunsUnboxedInItsClone) {
       "print(escape(-0.5, 0.5, 50), integrate(0.0, 2.0, 100))\n");
   ASSERT_TRUE(result.succeeded) << result.diagnostics;
   const llvm::Module &module = *result.verified.llvmModule;
-  const llvm::Function *clone = module.getFunction("escape__lyrt_prim_i64");
+  const llvm::Function *clone =
+      module.getFunction(mainSymbol("escape") + "__lyrt_prim_i64");
   ASSERT_NE(clone, nullptr) << "no clone was made for a float function";
   // integrate's clone passes a computed float to f's clone: the argument
   // must stay a lane, not be boxed for the call.
-  for (llvm::StringRef name :
-       {"escape__lyrt_prim_i64", "integrate__lyrt_prim_i64"}) {
+  for (llvm::StringRef base : {"escape", "integrate"}) {
+    std::string name = mainSymbol(base) + "__lyrt_prim_i64";
     const llvm::Function *function = module.getFunction(name);
-    ASSERT_NE(function, nullptr) << "no clone " << name.str();
+    ASSERT_NE(function, nullptr) << "no clone " << name;
     for (const llvm::BasicBlock &block : *function)
       for (const llvm::Instruction &instruction : block)
         if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
           if (const llvm::Function *callee = call->getCalledFunction())
             EXPECT_FALSE(callee->getName().starts_with("Ly"))
-                << name.str()
-                << " calls the runtime: " << callee->getName().str();
+                << name << " calls the runtime: " << callee->getName().str();
   }
   const llvm::Function *main = module.getFunction("__main__");
   ASSERT_NE(main, nullptr);
@@ -1247,7 +1256,7 @@ TEST(DriverTest, AModuleGlobalsPointerCellHoldsAPointer) {
   EXPECT_EQ(pointerCells, 2u);
 
   const llvm::Function *reader =
-      result.verified.llvmModule->getFunction("read_global");
+      result.verified.llvmModule->getFunction(mainSymbol("read_global"));
   ASSERT_NE(reader, nullptr);
   for (const llvm::BasicBlock &block : *reader)
     for (const llvm::Instruction &instruction : block) {
@@ -1996,8 +2005,8 @@ TEST(DriverTest, AnOptionalFieldIsBoxedLikeThePayloadAlone) {
                                       "\n"
                                       "take(Node(1))\n");
   ASSERT_TRUE(plain.succeeded) << plain.diagnostics;
-  llvm::Function *optionalTake = optional.verified.llvmModule->getFunction("take");
-  llvm::Function *plainTake = plain.verified.llvmModule->getFunction("take");
+  llvm::Function *optionalTake = optional.verified.llvmModule->getFunction(mainSymbol("take"));
+  llvm::Function *plainTake = plain.verified.llvmModule->getFunction(mainSymbol("take"));
   ASSERT_NE(optionalTake, nullptr);
   ASSERT_NE(plainTake, nullptr);
   // The two modules are compiled in separate LLVM contexts, so identical types
@@ -2152,8 +2161,8 @@ TEST(DriverTest, AnOptionalResultCarriesItsPayloadOnce) {
                                        "print('ok')\n");
   ASSERT_TRUE(result.succeeded) << result.diagnostics;
   ASSERT_TRUE(result.verified.llvmModule);
-  llvm::Function *one = result.verified.llvmModule->getFunction("one");
-  llvm::Function *maybe = result.verified.llvmModule->getFunction("maybe");
+  llvm::Function *one = result.verified.llvmModule->getFunction(mainSymbol("one"));
+  llvm::Function *maybe = result.verified.llvmModule->getFunction(mainSymbol("maybe"));
   ASSERT_NE(one, nullptr);
   ASSERT_NE(maybe, nullptr);
 
@@ -2896,10 +2905,14 @@ TEST(DriverTest, APythonFunctionIsNotAnExternalSymbol) {
                                        "\n"
                                        "print(write(1))\n");
   ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  // Mangled, so libc's `write` keeps its name; and local, so the linker
+  // cannot hand it out either way.
   const llvm::Function *write =
-      result.verified.llvmModule->getFunction("write");
+      result.verified.llvmModule->getFunction(mainSymbol("write"));
   ASSERT_NE(write, nullptr);
   EXPECT_TRUE(write->hasLocalLinkage());
+  const llvm::Function *libc = result.verified.llvmModule->getFunction("write");
+  EXPECT_TRUE(!libc || libc->isDeclaration());
   const llvm::Function *main =
       result.verified.llvmModule->getFunction("__main__");
   ASSERT_NE(main, nullptr);

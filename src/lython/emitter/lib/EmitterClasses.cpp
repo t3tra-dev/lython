@@ -499,10 +499,12 @@ void ModuleEmitter::desugarMethodDecorators(const parser::Node &moduleNode) {
           range));
       if (parser::Field *field = parser::findField(*forwarder, "body"))
         field->value = std::move(forwardingBody);
-      // The body, under the hidden name and undecorated.
+      // The body, under the hidden name and undecorated -- the def CPython
+      // runs, called what it was written as.
       decorators->clear();
       if (parser::Field *field = parser::findField(*method, "name"))
         field->value = split.hiddenName;
+      pythonNameOverrides[method.get()] = name;
       members->insert(members->begin() + static_cast<std::ptrdiff_t>(index) + 1,
                       std::move(forwarder));
       ++index;
@@ -1281,33 +1283,47 @@ bool ModuleEmitter::subclassRedeclares(
 // `class Both(Base, Mixin)` was refused by the gate (Mixin declares it) and
 // then found no candidate to dispatch to -- one question, two predicates, and
 // a valid program in the gap between them.
+// Ancestors as WRITTEN, from the pre-pass rather than from the MRO map the
+// class emission fills: the answer must not depend on where in the file the
+// question is asked (`collectTopLevelBindings`).
+// ⭐ AND PAST A RUNTIME BASE, through its own: `class E(Exception)` is a
+// BaseException too, and a gate asked about a `BaseException` receiver
+// walked from E to Exception and stopped -- `except (E, F) as e: str(e)`
+// then printed the args where CPython calls E's `__str__`.
+// ⛔ Not to `object`, which no program class names as written either: an
+// `object` value is answered at run time by its class's slot, and a gate
+// that saw E below it refused `repr(o)` for every `o: object`.
+void ModuleEmitter::collectDeclaredAncestors(llvm::StringRef cls,
+                                             llvm::StringSet<> &out) const {
+  llvm::SmallVector<llvm::StringRef, 8> worklist{cls};
+  while (!worklist.empty()) {
+    llvm::StringRef current = worklist.pop_back_val();
+    auto bases = declaredClassBases.find(current);
+    if (bases == declaredClassBases.end()) {
+      for (const std::string &ancestor :
+           llvm::drop_begin(manifestLinearization(current)))
+        if (ancestor != "builtins.object")
+          out.insert(ancestor);
+      continue;
+    }
+    for (const std::string &base : bases->second)
+      if (out.insert(base).second)
+        worklist.push_back(base);
+  }
+}
+
 bool ModuleEmitter::candidateRedeclares(
     const llvm::StringMap<llvm::StringSet<>> &declarations,
     llvm::StringRef receiverClass, llvm::StringRef candidate,
     llvm::StringRef name) const {
-  // Ancestors as WRITTEN, from the pre-pass rather than from the MRO map the
-  // class emission fills: the answer must not depend on where in the file the
-  // question is asked (`collectTopLevelBindings`).
-  auto ancestors = [&](llvm::StringRef cls, llvm::StringSet<> &out) {
-    llvm::SmallVector<llvm::StringRef, 8> worklist{cls};
-    while (!worklist.empty()) {
-      llvm::StringRef current = worklist.pop_back_val();
-      auto bases = declaredClassBases.find(current);
-      if (bases == declaredClassBases.end())
-        continue;
-      for (const std::string &base : bases->second)
-        if (out.insert(base).second)
-          worklist.push_back(base);
-    }
-  };
   if (candidate == receiverClass)
     return false;
   llvm::StringSet<> candidateAncestors;
-  ancestors(candidate, candidateAncestors);
+  collectDeclaredAncestors(candidate, candidateAncestors);
   if (!candidateAncestors.contains(receiverClass))
     return false;
   llvm::StringSet<> receiverAncestors;
-  ancestors(receiverClass, receiverAncestors);
+  collectDeclaredAncestors(receiverClass, receiverAncestors);
   llvm::SmallVector<llvm::StringRef, 8> reachable{candidate};
   for (const auto &ancestor : candidateAncestors)
     reachable.push_back(ancestor.getKey());
@@ -2782,20 +2798,19 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   llvm::StringSet<> propertyNames = classPropertyNames(classDef);
   if (const auto *body = ast::nodeList(classDef, "body")) {
     for (const parser::NodePtr &statement : *body) {
-      // ⭐ A NESTED CLASS IS DROPPED, and only its USE said so. The refusal for
-      // a class declared inside a function lives in `emitStatement`, which
-      // never sees a class BODY -- so `class Outer: class Inner: ...` was
-      // accepted, the inner class was never emitted, and `Outer.Inner()`
-      // reported "static type !py.type<Outer> does not provide manifest method
+      // ⭐ A NESTED CLASS IS DROPPED, and only its USE said so. The refusals
+      // for a class statement elsewhere live in `emitStatement`, which never
+      // sees a class BODY -- so `class Outer: class Inner: ...` was accepted,
+      // the inner class was never emitted, and `Outer.Inner()` reported
+      // "static type !py.type<Outer> does not provide manifest method
       // 'Inner'": a sentence about a method, for a class the source declares.
-      // The same limitation, said at the same boundary, in the same words.
       if (statement && statement->kind == "ClassDef") {
         diagnostics.push_back(parser::Diagnostic{
             parser::Severity::Error, statement->range.start,
-            "a class defined inside a function or another class is not "
-            "supported: a class is a module-level contract here, so declare '" +
+            "a class defined inside another class is not supported: a class "
+            "is a module-level contract here, so declare '" +
                 std::string(ast::nameSpelling(*statement)) +
-                "' at module scope"});
+                "' at module scope or in a function"});
         continue;
       }
       // ⭐ AND A STATEMENT THAT WOULD HAVE RUN. A class body executes in
@@ -2993,8 +3008,15 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       // __init__ (an ownership violation the verifier rejects). Nor does a
       // generic method (`def m[T](self, x: T)`): its body has no type until
       // a call site solves T, which the inlining does.
+      // ⭐ Except an exception's text, `__str__` and `__repr__`: a boxed
+      // exception -- an element printed with its list -- is rendered through
+      // its class's slot, which only a standalone body can fill, and without
+      // one it printed BaseException's text for a class that declares its
+      // own.
+      bool exceptionText =
+          *methodName == "__str__" || *methodName == "__repr__";
       if (kind != "class" && kind != "classmethod" &&
-          !isExceptionBackedClass(contractName) &&
+          (exceptionText || !isExceptionBackedClass(contractName)) &&
           !specializedAtEachCall(*statement)) {
         pendingBodies.push_back(statement.get());
         pendingBodySigs.push_back(bodySig);
@@ -3241,20 +3263,22 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
           std::move(sig));
     }
     if (dataclassRepr && !userDefines("__repr__")) {
-      // ⭐ `__qualname__`, WHICH HAS NO MODULE IN IT. CPython's dataclass and
-      // NamedTuple reprs print the class's qualified NAME, not its module
-      // path, so an imported `Point(3, 4)` renders as `Point(x=3, y=4)` there
-      // and rendered as `data.Point(x=3, y=4)` here -- a silent wrong answer
-      // for every imported dataclass printed.
+      // ⭐ `__qualname__`, WHICH HAS NO MODULE IN IT. CPython's dataclass
+      // repr prints the class's qualified NAME, not its module path, so an
+      // imported `Point(3, 4)` renders as `Point(x=3, y=4)` there and
+      // rendered as `data.Point(x=3, y=4)` here -- a silent wrong answer for
+      // every imported dataclass printed.
       //
       // ⛔ NOT the same as the default object repr beside it, which CPython
       // spells `<data.Point object at 0x...>` WITH the module and which this
       // compiler was taught to qualify for exactly that reason. The two reprs
       // read different attributes and disagree on purpose.
+      // ⛔ And not a NamedTuple's, which prints `__name__`: the two differ for
+      // a class written in a function (`f.<locals>.P(x=1)`, `P(x=1)`).
       std::string className =
-          py::contracts::displayClassNameForContract(contractName);
-      if (std::size_t dot = className.rfind('.'); dot != std::string::npos)
-        className = className.substr(dot + 1);
+          isNamedTuple
+              ? py::contracts::pythonClassNameForContract(contractName)
+              : py::contracts::pythonQualnameForContract(contractName);
       parser::NodePtr expr;
       if (order.empty()) {
         expr = synth::strConstant(className + "()", range);

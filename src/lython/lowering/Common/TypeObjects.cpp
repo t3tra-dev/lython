@@ -56,7 +56,7 @@ std::optional<Definition> recordedSource(mlir::ModuleOp module,
     return std::nullopt;
   for (mlir::Attribute entry : recorded) {
     auto fields = mlir::dyn_cast<mlir::ArrayAttr>(entry);
-    if (!fields || fields.size() < 3)
+    if (!fields || fields.size() < 4)
       continue;
     auto text = [&](unsigned index) {
       auto attr = mlir::dyn_cast<mlir::StringAttr>(fields[index]);
@@ -64,8 +64,9 @@ std::optional<Definition> recordedSource(mlir::ModuleOp module,
     };
     if (text(0) != qualifiedName)
       continue;
-    Definition definition{text(0), text(1), text(2), {}};
-    for (unsigned index = 3; index < fields.size(); ++index)
+    Definition definition{text(0), text(1), 0, text(2), {}};
+    llvm::StringRef(text(3)).getAsInteger(10, definition.moduleLength);
+    for (unsigned index = 4; index < fields.size(); ++index)
       definition.mro.push_back(text(index));
     return definition;
   }
@@ -116,7 +117,11 @@ mlir::LogicalResult defineOne(mlir::ModuleOp module, const Definition &definitio
     appendImageAddress(fields, symbolFor(definition.base));
   }
   appendImageAddress(fields, nameSymbol);
-  appendImageWord(fields, static_cast<std::int64_t>(definition.name.size()));
+  appendImageWord(
+      fields,
+      static_cast<std::int64_t>(definition.name.size()) |
+          static_cast<std::int64_t>(definition.moduleLength)
+              << kModuleLengthShift);
   std::string mroSymbol = ("__ly_type_mro." + definition.qualifiedName);
   appendImageAddress(fields, mroSymbol);
   mlir::DictionaryAttr slots;
@@ -350,6 +355,9 @@ std::optional<Definition> runtimeDefinition(llvm::StringRef contract) {
   // io.UnsupportedOperation is defined by io, not _io.
   if (contract == "_io.UnsupportedOperation")
     definition.name = "io.UnsupportedOperation";
+  // No runtime class is nested in another: its module ends at its last dot.
+  if (std::size_t dot = definition.name.rfind('.'); dot != std::string::npos)
+    definition.moduleLength = dot;
   if (contract == "builtins.object")
     return definition;
   definition.base = runtimeBases(contract).front();
@@ -363,8 +371,9 @@ void recordSource(mlir::ModuleOp module, const Definition &definition) {
   llvm::SmallVector<mlir::Attribute, 16> entries;
   if (auto recorded = module->getAttrOfType<mlir::ArrayAttr>(kSourceTypesAttr))
     entries.append(recorded.begin(), recorded.end());
+  std::string moduleLength = std::to_string(definition.moduleLength);
   llvm::SmallVector<llvm::StringRef, 8> fields{
-      definition.qualifiedName, definition.name, definition.base};
+      definition.qualifiedName, definition.name, definition.base, moduleLength};
   for (const std::string &ancestor : definition.mro)
     fields.push_back(ancestor);
   entries.push_back(builder.getStrArrayAttr(fields));
@@ -459,7 +468,12 @@ mlir::LogicalResult defineSlotHooks(mlir::ModuleOp module) {
     function.setLinkage(mlir::LLVM::Linkage::External);
     mlir::Block *entry = function.addEntryBlock(builder);
     mlir::Region &body = function.getBody();
-    mlir::Block *read = builder.createBlock(&body);
+    mlir::Block *resolve = builder.createBlock(&body);
+    mlir::Block *precise = builder.createBlock(&body);
+    // (class, whether a miss walks on to the base)
+    mlir::Block *read =
+        builder.createBlock(&body, body.end(), {i64, i1}, {loc, loc});
+    mlir::Block *inherit = builder.createBlock(&body);
     mlir::Block *call = builder.createBlock(&body, body.end(), {ptrType}, {loc});
     mlir::Block *miss = builder.createBlock(&body);
     mlir::Value classWord = entry->getArgument(hook.binary ? 2 : 1);
@@ -471,11 +485,50 @@ mlir::LogicalResult defineSlotHooks(mlir::ModuleOp module) {
         builder, loc,
         mlir::LLVM::ICmpOp::create(builder, loc, mlir::LLVM::ICmpPredicate::eq,
                                    classWord, zero),
-        miss, read);
+        miss, resolve);
+
+    // ⭐ AN EXCEPTION IS ASKED BY ITS OWN CLASS. Its header's word 1 is the
+    // class of its LAYOUT, BaseException, which is what a box or a list slot
+    // copies; the class it was made of is word 2. Dispatching on word 1 sent
+    // every boxed exception to BaseException's text: `print(errs)` and
+    // `repr(o)` for an `o: object` printed `Coded('x')` over a `__repr__`
+    // the class declares. A class with no slot of its own then takes its
+    // base's, up to the layout's, which is how a builtin exception's own text
+    // still answers for a program subclass that declares none.
+    builder.setInsertionPointToEnd(resolve);
+    declare(module, "builtins.BaseException");
+    mlir::Value layout = mlir::LLVM::PtrToIntOp::create(
+        builder, loc, i64,
+        mlir::LLVM::AddressOfOp::create(builder, loc, ptrType,
+                                        symbolFor("builtins.BaseException")));
+    mlir::Value isException =
+        mlir::LLVM::ICmpOp::create(builder, loc, mlir::LLVM::ICmpPredicate::eq,
+                                   classWord, layout);
+    mlir::Value notWalking = mlir::LLVM::ConstantOp::create(
+        builder, loc, i1, builder.getBoolAttr(false));
+    mlir::Value walking = mlir::LLVM::ConstantOp::create(
+        builder, loc, i1, builder.getBoolAttr(true));
+    mlir::LLVM::CondBrOp::create(builder, loc, isException, precise,
+                                 mlir::ValueRange{}, read,
+                                 mlir::ValueRange{classWord, notWalking});
+
+    builder.setInsertionPointToEnd(precise);
+    mlir::Value entity = mlir::LLVM::LoadOp::create(
+        builder, loc, i64, entry->getArgument(0), /*alignment=*/8);
+    mlir::Value header =
+        mlir::LLVM::IntToPtrOp::create(builder, loc, ptrType, entity);
+    mlir::Value preciseAt = mlir::LLVM::GEPOp::create(
+        builder, loc, ptrType, i64, header,
+        llvm::ArrayRef<mlir::LLVM::GEPArg>{std::int32_t{2}});
+    mlir::Value preciseClass = mlir::LLVM::LoadOp::create(
+        builder, loc, i64, preciseAt, /*alignment=*/8);
+    mlir::LLVM::BrOp::create(builder, loc,
+                             mlir::ValueRange{preciseClass, walking}, read);
 
     builder.setInsertionPointToEnd(read);
+    mlir::Value current = read->getArgument(0);
     mlir::Value type0 =
-        mlir::LLVM::IntToPtrOp::create(builder, loc, ptrType, classWord);
+        mlir::LLVM::IntToPtrOp::create(builder, loc, ptrType, current);
     mlir::Value slotAt = mlir::LLVM::GEPOp::create(
         builder, loc, ptrType, i64, type0,
         llvm::ArrayRef<mlir::LLVM::GEPArg>{
@@ -487,7 +540,36 @@ mlir::LogicalResult defineSlotHooks(mlir::ModuleOp module) {
         builder, loc,
         mlir::LLVM::ICmpOp::create(builder, loc, mlir::LLVM::ICmpPredicate::eq,
                                    slot, none),
-        miss, mlir::ValueRange{}, call, mlir::ValueRange{slot});
+        inherit, mlir::ValueRange{}, call, mlir::ValueRange{slot});
+
+    // The base's slot, while the walk has not passed the layout's class.
+    builder.setInsertionPointToEnd(inherit);
+    mlir::Value atLayout =
+        mlir::LLVM::ICmpOp::create(builder, loc, mlir::LLVM::ICmpPredicate::eq,
+                                   current, layout);
+    mlir::Value stop = mlir::LLVM::OrOp::create(
+        builder, loc, atLayout,
+        mlir::LLVM::XOrOp::create(builder, loc, read->getArgument(1), walking));
+    mlir::Block *base = builder.createBlock(&body);
+    builder.setInsertionPointToEnd(inherit);
+    mlir::LLVM::CondBrOp::create(builder, loc, stop, miss, base);
+    builder.setInsertionPointToEnd(base);
+    mlir::Value baseAt = mlir::LLVM::GEPOp::create(
+        builder, loc, ptrType, i64, type0,
+        llvm::ArrayRef<mlir::LLVM::GEPArg>{
+            static_cast<std::int32_t>(kBaseWord)});
+    mlir::Value baseClass =
+        mlir::LLVM::LoadOp::create(builder, loc, i64, baseAt, /*alignment=*/8);
+    mlir::Block *next = builder.createBlock(&body);
+    builder.setInsertionPointToEnd(base);
+    mlir::LLVM::CondBrOp::create(
+        builder, loc,
+        mlir::LLVM::ICmpOp::create(builder, loc, mlir::LLVM::ICmpPredicate::eq,
+                                   baseClass, zero),
+        miss, next);
+    builder.setInsertionPointToEnd(next);
+    mlir::LLVM::BrOp::create(builder, loc,
+                             mlir::ValueRange{baseClass, walking}, read);
 
     builder.setInsertionPointToEnd(call);
     llvm::SmallVector<mlir::Type, 3> slotParams{ptrType};

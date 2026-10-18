@@ -200,6 +200,10 @@ private:
   bool subclassRedeclares(const llvm::StringMap<llvm::StringSet<>> &declarations,
                           llvm::StringRef receiverClass,
                           llvm::StringRef name) const;
+  // Every ancestor of a class: the program's as written, and a runtime
+  // base's own (EmitterClasses.cpp).
+  void collectDeclaredAncestors(llvm::StringRef cls,
+                                llvm::StringSet<> &out) const;
   // The one gate every method dispatch goes through: emits the diagnostic and
   // returns true when the receiver's static class cannot answer the call
   // (EmitterClasses.cpp).
@@ -307,6 +311,10 @@ private:
   // method that dispatches on itself terminates. Filled BEFORE the body is
   // emitted for that second reason.
   llvm::StringMap<VirtualDispatchHelper> virtualDispatchHelpers;
+  // A dispatcher's last arm for an exception's text: the `str(__ly_recv)` or
+  // `repr(__ly_recv)` call it synthesized, which the builtin's own text
+  // answers from the static type (virtualDispatcherFor).
+  llvm::DenseSet<const parser::Node *> builtinTextFallbacks;
   // True when `type` is a SOURCE class whose linearization provides
   // `methodName` only through builtins.object — i.e. it inherits object's
   // default. The question is not "does the method resolve" (since the class's
@@ -1571,6 +1579,37 @@ private:
   // the emitted symbol keeps the two entities distinguishable at the only
   // layer that can tell them apart -- the one that knows which is which.
   llvm::StringMap<std::string> shadowedBuiltinSymbols;
+  // What CPython calls each `def`, `lambda` and `class` of the program's
+  // modules: its module, `__qualname__` and `__name__`, read off the tree once
+  // the desugars are done (recordPythonDefinitionNames). A desugar that
+  // renames a def it split out says what the def is called in
+  // `pythonNameOverrides`.
+  struct PythonDefinitionName {
+    std::string module;
+    std::string qualname;
+    std::string name;
+  };
+  llvm::DenseMap<const parser::Node *, PythonDefinitionName>
+      pythonDefinitionNames;
+  llvm::DenseMap<const parser::Node *, std::string> pythonNameOverrides;
+  // A class written in a function, declared at its module's top level
+  // (EmitterLocalClasses.cpp): the qualified-name prefix of where it was
+  // written, and the ones refused there.
+  llvm::DenseMap<const parser::Node *, std::string> hoistedClassPrefixes;
+  llvm::DenseSet<const parser::Node *> refusedLocalClasses;
+  void hoistFunctionLocalClasses(const parser::Node &moduleNode,
+                                 llvm::StringRef moduleName);
+  void recordPythonDefinitionNames(const parser::Node &moduleNode,
+                                   llvm::StringRef moduleName);
+  // Each function emitted for a definition, under the symbol the emitter
+  // names it by, in emission order -- the order its `.N` is given in.
+  struct EmittedPythonDefinition {
+    std::string symbol;
+    std::string module;
+    std::string qualname;
+  };
+  std::vector<EmittedPythonDefinition> emittedPythonDefinitions;
+  void manglePythonDefinitionSymbols();
   // The call whose traceback frame must draw no `~~~^^^` underline, recognized
   // while its statement is emitted and read back by `loc`.
   //

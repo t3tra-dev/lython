@@ -1,0 +1,20 @@
+Coded[1] | Coded(1) | Coded[1]
+Coded[1] | Coded(1)
+Coded[1] | Coded(1)
+Coded[1]
+p | Plain('p') | p
+p | Plain('p')
+p | Plain('p')
+p
+'k' | KeyError('k') | 'k'
+'k' | KeyError('k')
+'k' | KeyError('k')
+'k'
+v | ValueError('v') | v
+v | ValueError('v')
+v | ValueError('v')
+v
+caught Coded[2] Coded(2)
+caught q Plain('q')
+[Coded(3), Plain('r'), KeyError('k2')]
+[Coded(4), 5, Plain('s')]

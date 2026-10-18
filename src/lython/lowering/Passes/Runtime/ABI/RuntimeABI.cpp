@@ -182,7 +182,10 @@ std::string defaultReprTypeName(llvm::StringRef contract) {
   // another source module carries it in the contract ("lib.Base"), which is
   // the module CPython names in the repr. Prefixing those too printed
   // "<__main__.lib.Base object at ...>".
-  if (display.find('.') != std::string::npos)
+  // ⛔ But a contract with no module is the main module's, whatever its
+  // display: a class written in a function displays as its qualified name,
+  // dots and all ("f.<locals>.A").
+  if (contract.contains('.') && display.find('.') != std::string::npos)
     return display;
   return "__main__." + display;
 }
@@ -489,6 +492,11 @@ mlir::LogicalResult RuntimeBundleLowerer::recordSourceTypeObjects() {
     type_objects::Definition definition;
     definition.qualifiedName = *qualified;
     definition.name = defaultReprTypeName(classOp.getSymName());
+    std::string qualname =
+        contracts::pythonQualnameForContract(classOp.getSymName());
+    if (definition.name.size() > qualname.size() &&
+        llvm::StringRef(definition.name).ends_with("." + qualname))
+      definition.moduleLength = definition.name.size() - qualname.size() - 1;
     bool exception =
         RuntimeBundleLowerer::exceptionAncestorContract(classOp).has_value();
     if (exception) {
@@ -2736,6 +2744,15 @@ bool RuntimeBundleLowerer::boxMayHoldContract(
   mlir::Type type = runtimeContractType(context, contract);
   for (const auto &entry : *reprReachableContracts)
     if (table.isManifestSubclassOf(type, entry.getKey()))
+      return true;
+  // ⭐ AND A BASE OF ONE: a class with no slot of its own is answered by its
+  // base's, so BaseException's `__repr__` is what a held ValueError or a
+  // program exception without one reaches. Pruned, that slot stopped the
+  // program -- `print(errs)` over a `list[Exception]` aborted with "a class
+  // judged unreachable ... reached it".
+  for (const auto &entry : *reprReachableContracts)
+    if (table.isManifestSubclassOf(
+            runtimeContractType(context, entry.getKey()), contract))
       return true;
   for (py::ProtocolType protocol : reprReachableProtocols)
     if (table.structurallyAccepts(type, protocol.getProtocolName(),

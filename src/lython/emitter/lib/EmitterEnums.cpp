@@ -4,6 +4,7 @@
 #include <cctype>
 
 #include "AstAccess.h"
+#include "Contracts.h"
 
 #include "llvm/ADT/StringSet.h"
 
@@ -367,6 +368,12 @@ void ModuleEmitter::collectEnumMembers(const parser::Node &classDef,
   EnumInfo info;
   info.kind = kind;
   info.name = std::string(*className);
+  // What CPython's enum prints: `__name__` in a member's str and repr,
+  // `__qualname__` in its messages -- both the source's spelling, where the
+  // tree may hold a class's contract (EmitterLocalClasses.cpp).
+  std::string shownName = py::contracts::pythonClassNameForContract(info.name);
+  std::string shownQualname =
+      py::contracts::pythonQualnameForContract(info.name);
   std::int64_t autoCounter = 0;
   const auto *classBody = ast::nodeList(classDef, "body");
   if (!classBody)
@@ -434,7 +441,7 @@ void ModuleEmitter::collectEnumMembers(const parser::Node &classDef,
     if (!info.members.empty() && info.members.front().isStr != member.isStr) {
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, value->range.start,
-          "enum '" + info.name +
+          "enum '" + shownQualname +
               "' mixes int and str member values; a single value type is "
               "required for the static member layout"});
       continue;
@@ -455,7 +462,7 @@ void ModuleEmitter::collectEnumMembers(const parser::Node &classDef,
     if (member.isAlias && requireUnique) {
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, statement->range.start,
-          "duplicate values found in <enum '" + info.name + "'>: " +
+          "duplicate values found in <enum '" + shownName + "'>: " +
               member.name + " -> " + member.aliasOf});
       continue;
     }
@@ -464,7 +471,7 @@ void ModuleEmitter::collectEnumMembers(const parser::Node &classDef,
   if (info.members.empty()) {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, classDef.range.start,
-        "enum '" + info.name + "' has no members (an empty enum has no "
+        "enum '" + shownQualname + "' has no members (an empty enum has no "
         "statically instantiable members)"});
     return;
   }
@@ -479,6 +486,9 @@ void ModuleEmitter::rewriteEnumClassDef(const parser::Node &classDef) {
   parser::Node &mutableClassDef = const_cast<parser::Node &>(classDef);
   parser::SourceRange range = classDef.range;
   bool isStr = info.members.front().isStr;
+  std::string shownName = py::contracts::pythonClassNameForContract(info.name);
+  std::string shownQualname =
+      py::contracts::pythonQualnameForContract(info.name);
 
   // Names the user defined explicitly win over the synthesized versions, as
   // in CPython's Enum (a member's __str__ override is honored).
@@ -584,7 +594,7 @@ void ModuleEmitter::rewriteEnumClassDef(const parser::Node &classDef) {
     synthTextDispatch("__str__", [&](const EnumMember &member) -> std::string {
       switch (info.kind) {
       case EnumKind::Plain:
-        return info.name + "." + canonicalMemberOf(member).name;
+        return shownName + "." + canonicalMemberOf(member).name;
       case EnumKind::Int:
         return std::to_string(member.intValue);
       case EnumKind::Str:
@@ -596,7 +606,7 @@ void ModuleEmitter::rewriteEnumClassDef(const parser::Node &classDef) {
   if (!userMethods.contains("__repr__"))
     synthTextDispatch("__repr__", [&](const EnumMember &member) {
       const EnumMember &canonical = canonicalMemberOf(member);
-      return "<" + info.name + "." + canonical.name + ": " +
+      return "<" + shownName + "." + canonical.name + ": " +
              memberValueText(canonical) + ">";
     });
   if (!userMethods.contains("__eq__")) {
@@ -629,7 +639,7 @@ void ModuleEmitter::rewriteEnumClassDef(const parser::Node &classDef) {
     // exception type and the enum name are preserved; the value is not.
     body.push_back(synth::raiseStmt(
         synth::call(synth::name("ValueError", range),
-                  {synth::strConstant("not a valid " + info.name, range)}, range),
+                  {synth::strConstant("not a valid " + shownQualname, range)}, range),
         range));
     synthesized.push_back(synth::functionDef(
         kFromValueMethod, {synth::Param{"value", valueAnnotation()}}, {}, std::move(body),

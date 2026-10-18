@@ -4976,9 +4976,26 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
     fallbackClass = "object";
     returns = synth::name(methodName == "__hash__" ? "int" : "str", range);
   }
+  // ⭐ AN EXCEPTION'S TEXT DISPATCHES TOO, under a static class whose text is
+  // the builtin's. `except (A, B) as e` and `e: Exception` hold a program
+  // exception whose `__str__` or `__repr__` the builtin's text knows nothing
+  // of, and `str(e)` printed the args where CPython calls the override. The
+  // last arm is the builtin's own text, which the runtime class still picks
+  // (KeyError's quotes its key).
+  // ⛔ Not spelled `BaseException.__str__(__ly_recv)`: that is BaseException's
+  // text whatever the class, a KeyError's included.
+  bool builtinTextFallback =
+      !objectDefaultFallback && !asAttribute && !asField && !asProperty &&
+      !asSetter && argumentCount == 0 && keywordNames.empty() &&
+      (methodName == "__str__" || methodName == "__repr__") &&
+      !lookupClassMethod(receiver.type, methodName) &&
+      isExceptionContractType(receiver.type);
+  if (builtinTextFallback)
+    returns = synth::name("str", range);
   // The body the STATIC type resolves to: its signature is the one the
   // dispatcher restates, and its declaring class is how the fallback names it.
-  if (!asAttribute && !asField && !objectDefaultFallback) {
+  if (!asAttribute && !asField && !objectDefaultFallback &&
+      !builtinTextFallback) {
   // ⭐ A `@property` WRITE IS A DISPATCH TOO, and the assignment path had no
   // gate at all: `x.v = 5` inlined the setter the STATIC class resolves to, so
   // a base-typed receiver ran the BASE's setter while `x.v` one line over
@@ -5084,8 +5101,15 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
   llvm::SmallVector<std::string, 4> parameterNames;
   llvm::SmallVector<synth::Param, 4> params;
   llvm::SmallVector<std::string, 2> keywordParameters;
-  params.push_back(synth::Param{"__ly_recv", synth::name(receiverClass, range)});
-  if (!asAttribute && !asField && !objectDefaultFallback) {
+  // A builtin receiver is spelled as the source spells it: `Exception`.
+  llvm::StringRef receiverSpelling = receiverClass;
+  if (receiverSpelling.starts_with("builtins.") &&
+      !receiverSpelling.drop_front(9).contains('.'))
+    receiverSpelling = receiverSpelling.drop_front(9);
+  params.push_back(
+      synth::Param{"__ly_recv", synth::name(receiverSpelling, range)});
+  if (!asAttribute && !asField && !objectDefaultFallback &&
+      !builtinTextFallback) {
   // A staticmethod declares no receiver, so there is no first parameter to
   // skip -- `__ly_recv` above is the dispatcher's own, not the method's.
   // A classmethod's first parameter is `cls`, which the arm supplies by
@@ -5195,24 +5219,11 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
                      !candidateRedeclares(declarations, receiverClass,
                                           candidate, methodName)))
         continue;
-      unsigned depth = 0;
-      llvm::SmallVector<llvm::StringRef, 8> worklist{candidate};
       llvm::StringSet<> seen;
-      bool derived = false;
-      while (!worklist.empty()) {
-        llvm::StringRef current = worklist.pop_back_val();
-        auto bases = declaredClassBases.find(current);
-        if (bases == declaredClassBases.end())
-          continue;
-        for (const std::string &base : bases->second)
-          if (seen.insert(base).second) {
-            worklist.push_back(base);
-            derived = derived || base == receiverClass;
-          }
-      }
-      if (!derived)
+      collectDeclaredAncestors(candidate, seen);
+      if (!seen.contains(receiverClass))
         continue;
-      depth = seen.size();
+      unsigned depth = seen.size();
       if (types.lookupClass(candidate) == mlir::Type())
         return nullptr;
       candidates.push_back({depth, candidate.str()});
@@ -5370,6 +5381,12 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
     } else if (staticKind || classKind) {
       body.push_back(
           synth::returnStmt(read(synth::name(fallbackClass, range)), range));
+    } else if (builtinTextFallback) {
+      parser::NodePtr text = synth::call(
+          synth::name(methodName == "__str__" ? "str" : "repr", range),
+          {synth::name("__ly_recv", range)}, range);
+      builtinTextFallbacks.insert(text.get());
+      body.push_back(synth::returnStmt(std::move(text), range));
     } else {
       std::vector<parser::NodePtr> fallbackArguments;
       fallbackArguments.push_back(synth::name("__ly_recv", range));
@@ -6649,6 +6666,21 @@ ModuleEmitter::tryEmitStrCall(const parser::Node &expr,
                 : CallInferenceResult()) {
       Value argument =
           coerceValue(emitExpr(strArgs->front().get()), argumentType, expr);
+      // ⛔ Not the builtin's text when a program exception under it declares
+      // `__str__`: the argument may be that one. Every other spelling of
+      // the question -- `print(e)`, `repr(e)`, `f"{e}"` -- asked the gate,
+      // and this one printed the args.
+      if (isExceptionContractType(argumentType) &&
+          !builtinTextFallbacks.contains(&expr) &&
+          dispatchIsUnresolvable(argument, "__str__", strArgs->front().get(),
+                                 /*throughSuper=*/false)) {
+        if (std::optional<Value> dispatched =
+                tryEmitVirtualDispatchWithValues(expr, argument, "__str__", {}))
+          return *dispatched;
+        if (refuseUnresolvableDispatch(expr, argument, "__str__",
+                                       strArgs->front().get()))
+          return emitNone(expr);
+      }
       auto op = py::StrOp::create(
           builder, loc(expr), strType,
           mlir::FlatSymbolRefAttr::get(&context, "__str__"),
@@ -8330,7 +8362,8 @@ ModuleEmitter::tryEmitReprCall(const parser::Node &expr,
     if (auto argumentContract =
             mlir::dyn_cast_if_present<py::ContractType>(argumentType)) {
       llvm::StringRef wanted = name == "print" ? "__str__" : "__repr__";
-      if (subclassOverridesMethod(argumentContract.getContractName(), wanted)) {
+      if (subclassOverridesMethod(argumentContract.getContractName(), wanted) &&
+          !builtinTextFallbacks.contains(&expr)) {
         Value argument = emitExpr(args->front().get());
         if (dispatchIsUnresolvable(argument, wanted, /*receiverNode=*/nullptr,
                                    /*throughSuper=*/false)) {
