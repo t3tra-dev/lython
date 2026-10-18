@@ -406,6 +406,29 @@ void buildClassName(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{b.nullPtr()});
 }
 
+// i64 LyType_NameLength(i64 class): the length of the name a class's type
+// object keeps (word 4), without its NUL; 0 for a word that names no class.
+void buildClassNameLength(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyType_NameLength",
+                            b.builder.getFunctionType({b.i64()}, {b.i64()}));
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Value word = entry->getArgument(0);
+  mlir::Block *read = b.builder.createBlock(&body);
+  mlir::Block *none = b.builder.createBlock(&body);
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc, b.cmpi(mlir::arith::CmpIPredicate::eq, word, b.iconst(0)),
+      none, mlir::ValueRange{}, read, mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(read);
+  mlir::func::ReturnOp::create(
+      b.builder, b.loc,
+      mlir::ValueRange{
+          b.typeObjectWord(word, py::type_objects::kNameLengthWord)});
+  b.builder.setInsertionPointToEnd(none);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{b.iconst(0)});
+}
+
 // i1 raw_bytes_equal(i64 p1, i64 n1, i64 p2, i64 n2): byte-equality of two raw
 // buffers. Control/logic in scf/arith; the raw byte loads are the irreducible
 // pointer part (llvm dialect). Shared with objects/bytes.mlir (bytes ==).
@@ -4146,6 +4169,7 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   buildIntRound(support);
   buildIsSubtype(support);
   buildClassName(support);
+  buildClassNameLength(support);
   buildRawBytesEqual(support);
   buildBoxedSlotPtr(support);
   buildBoxedLoadI64(support);
