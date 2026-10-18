@@ -946,6 +946,9 @@ private:
                                                      std::string &why) const;
   std::optional<Value> tryEmitDirCall(const parser::Node &expr,
                                       const parser::Node *calleeNode);
+  // `object.__repr__(x)` and its siblings: object's own slot, not x's.
+  std::optional<Value> tryEmitObjectSlotCall(const parser::Node &expr,
+                                             const parser::Node *calleeNode);
   std::optional<Value> tryEmitHasattrCall(const parser::Node &expr,
                                           const parser::Node *calleeNode);
   std::optional<std::string> unhashableClassName(mlir::Type type) const;

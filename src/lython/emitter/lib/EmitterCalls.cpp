@@ -981,6 +981,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
 
   if (std::optional<Value> v = tryEmitTypeCall(expr, calleeNode))
     return *v;
+  if (std::optional<Value> v = tryEmitObjectSlotCall(expr, calleeNode))
+    return *v;
   if (std::optional<Value> v = tryEmitHasattrCall(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitCallableCall(expr, calleeNode))
@@ -3855,6 +3857,109 @@ ModuleEmitter::tryEmitDirCall(const parser::Node &expr,
       synth::call(synth::name(symbol, range), {argument}, range);
   synthesizedIteratorDefs.push_back(call);
   return emitExpr(call.get());
+}
+
+// ⭐ `object.__repr__(x)` IS OBJECT'S OWN SLOT, NOT x's. It is how a
+// class's `__repr__` reaches the default it overrides, and how unittest's
+// `safe_repr` falls back when `repr(x)` raises -- and it reached the manifest
+// `object.__repr__`, whose body dispatches through the class's slot: it
+// answered "A()" for an A that overrides `__repr__`, and "1" for an int,
+// where CPython prints `<__main__.A object at 0x...>` and `<int object at
+// 0x...>`. Each spelling here is what CPython's object does:
+//   __repr__  `<{module}.{qualname} object at {hex(id(x))}>`, the module left
+//             out for a builtin (object_repr);
+//   __str__   `repr(x)` -- type(x).__repr__ (object_str);
+//   __hash__  the pointer hash of x, past the class's own `__hash__`.
+// ⛔ `__eq__` and `__ne__` are refused: for two different objects they answer
+// NotImplemented, which this compiler has no value for.
+std::optional<Value>
+ModuleEmitter::tryEmitObjectSlotCall(const parser::Node &expr,
+                                     const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Attribute")
+    return std::nullopt;
+  const parser::Node *owner = ast::node(*calleeNode, "value");
+  if (!owner || owner->kind != "Name" ||
+      ast::nameSpelling(*owner) != "object" || programBindsName("object"))
+    return std::nullopt;
+  std::optional<std::string_view> attr = ast::string(*calleeNode, "attr");
+  if (!attr)
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if ((keywords && !keywords->empty()) || !args ||
+      llvm::any_of(*args, [](const parser::NodePtr &arg) {
+        return !arg || arg->kind == "Starred";
+      }))
+    return std::nullopt;
+  parser::SourceRange range = expr.range;
+  if (*attr == "__eq__" || *attr == "__ne__") {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, range.start,
+        "object." + std::string(*attr) +
+            "(a, b) answers NotImplemented for two different objects, which "
+            "this compiler has no value for; compare with `a is b`"});
+    return emitNone(expr);
+  }
+  if ((*attr != "__repr__" && *attr != "__str__" && *attr != "__hash__") ||
+      args->size() != 1)
+    return std::nullopt;
+  if (*attr == "__str__") {
+    parser::NodePtr call = synth::reprCall(args->front(), range);
+    synthesizedIteratorDefs.push_back(call);
+    return emitExpr(call.get());
+  }
+  Value subject = emitExpr(args->front().get());
+  if (*attr == "__hash__") {
+    Value boxed = coerceValue(subject, types.object(), expr);
+    CallInferenceResult inference = types.inferMethodCallWithEvidence(
+        types.object(), "__ly_identity_hash__", {});
+    if (!inference)
+      return std::nullopt;
+    Value posPack = emitPack({});
+    Value namePack = emitPack({});
+    Value valuePack = emitPack({});
+    auto call = py::CallOp::create(
+        builder, loc(expr), mlir::TypeRange{inference.resultType},
+        callProtocolFor(inference), boxed.value, posPack.value,
+        namePack.value, valuePack.value);
+    call->setAttr("ly.bound_method",
+                  builder.getStringAttr("__ly_identity_hash__"));
+    return Value{call.getResults().front(), inference.resultType};
+  }
+  std::string temp =
+      "__ly_objrepr" + std::to_string(++syntheticFunctionCounter);
+  values[temp] = subject;
+  types.bindSymbol(temp, subject.type);
+  auto forget = llvm::scope_exit([&] { values.erase(temp); });
+  auto classOf = [&] {
+    return synth::call(synth::name("type", range), {synth::name(temp, range)},
+                       range);
+  };
+  auto classAttribute = [&](llvm::StringRef name) {
+    return synth::attribute(classOf(), name, range);
+  };
+  parser::NodePtr className = synth::ifExp(
+      synth::compare(classAttribute("__module__"), "Eq",
+                     synth::strConstant("builtins", range), range),
+      classAttribute("__qualname__"),
+      synth::binOp(synth::binOp(classAttribute("__module__"), "Add",
+                                synth::strConstant(".", range), range),
+                   "Add", classAttribute("__qualname__"), range),
+      range);
+  parser::NodePtr address = synth::call(
+      synth::name("hex", range),
+      {synth::call(synth::name("id", range), {synth::name(temp, range)},
+                   range)},
+      range);
+  parser::NodePtr text = synth::binOp(
+      synth::binOp(
+          synth::binOp(synth::binOp(synth::strConstant("<", range), "Add",
+                                    std::move(className), range),
+                       "Add", synth::strConstant(" object at ", range), range),
+          "Add", std::move(address), range),
+      "Add", synth::strConstant(">", range), range);
+  synthesizedIteratorDefs.push_back(text);
+  return emitExpr(text.get());
 }
 
 std::optional<Value>

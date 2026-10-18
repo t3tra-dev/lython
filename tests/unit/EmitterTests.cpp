@@ -544,6 +544,26 @@ TEST(EmitterTest, AComputedAttributeNameIsRefusedWhereItCannotBeAnswered) {
   }
 }
 
+// object's own __eq__/__ne__ answer NotImplemented for two different
+// objects, which has no value here; the call is refused with that reason.
+TEST(EmitterTest, ObjectsOwnEqualityIsRefusedForItsNotImplemented) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult accepted = emitSource(
+      "class A:\n    pass\na = A()\n"
+      "print(object.__repr__(a), object.__str__(a), object.__hash__(a))\n",
+      context);
+  EXPECT_TRUE(accepted.ok());
+  for (const char *spelling : {"__eq__", "__ne__"}) {
+    std::string source = std::string("class A:\n    pass\n"
+                                     "print(object.") +
+                         spelling + "(A(), A()))\n";
+    lython::emitter::EmitResult result = emitSource(source, context);
+    EXPECT_FALSE(result.ok()) << spelling;
+    EXPECT_TRUE(reportsDiagnostic(result, "answers NotImplemented"))
+        << spelling;
+  }
+}
+
 TEST(EmitterTest, RejectsMethodArgumentThatViolatesTheDeclaredParameter) {
   mlir::MLIRContext context(testRegistry());
   lython::emitter::EmitResult method = emitSource(
