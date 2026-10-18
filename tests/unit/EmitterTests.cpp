@@ -759,6 +759,18 @@ TEST(EmitterTest, AGenericDecoratorFactoryIsSolvedWhereItIsApplied) {
                "(Case) -> str"));
 }
 
+// What: `sys.exc_info()` outside an `except` block is refused, saying where
+// it is answered: which exception is being handled there is the handler
+// active at run time.
+TEST(EmitterTest, SysExcInfoIsAnsweredInsideAnExceptBlock) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult refused =
+      emitSource("import sys\nprint(sys.exc_info())\n", context);
+  EXPECT_FALSE(refused.ok());
+  EXPECT_TRUE(reportsDiagnostic(
+      refused, "sys.exc_info() is answered inside an except block"));
+}
+
 // What: `Container` is covariant, as typeshed declares it, so a method taking
 // `Container[object]` accepts a list[int], a dict, a set and a tuple, while a
 // `Container[str]` parameter still refuses a list[int].

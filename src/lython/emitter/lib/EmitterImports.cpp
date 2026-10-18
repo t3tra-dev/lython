@@ -26,7 +26,7 @@ namespace {
 // `$` cannot appear in an identifier a program writes.
 constexpr llvm::StringLiteral kJsBridgeModule = "_js_bridge";
 constexpr llvm::StringLiteral kJsBridgeName = "__ly_js_bridge$";
-constexpr llvm::StringLiteral kFinalizerTracebackName = "__ly_traceback";
+constexpr llvm::StringLiteral kFinalizerTracebackName = kTracebackModuleBinding;
 constexpr llvm::StringLiteral kJsFrameName = "__ly_js_frame$";
 constexpr llvm::StringLiteral kJsGlobalObjectName = "__ly_js_global$";
 
@@ -1517,7 +1517,9 @@ void ModuleEmitter::predeclareSourceModules() {
   // body inlined from it re-binds its imports, and binding traceback reads the
   // signatures of all it imports -- `import asyncio`, whose futures have
   // finalizers, took 24 s to compile that way.
-  if (options.hasFinalizers && lookupSourceModule("traceback"))
+  // And what `sys.exc_info()` builds its traceback with.
+  if ((options.hasFinalizers || options.usesExcInfo) &&
+      lookupSourceModule("traceback"))
     bindSourceModuleNamespace("traceback", kFinalizerTracebackName);
   // `await` on a host Promise reaches asyncio by this name, whatever the
   // program calls it (emitAwaitValue).

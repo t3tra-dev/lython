@@ -42,6 +42,9 @@ struct EmitOptions {
   // A class of the program defines __del__: traceback is bound for the
   // method that runs each one (predeclareSourceModules).
   bool hasFinalizers = false;
+  // The program calls `sys.exc_info()`, whose traceback traceback builds
+  // (ModuleEmitter::emitExcInfo): traceback is bound for it.
+  bool usesExcInfo = false;
   std::vector<SourceModule> sourceModules;
 };
 

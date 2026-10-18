@@ -170,6 +170,34 @@ static bool callsBinaryOpen(const lython::parser::Node &node) {
   return false;
 }
 
+// Does the tree name `exc_info` -- `sys.exc_info()`, or one imported from
+// sys? Its traceback is built by traceback (ModuleEmitter::emitExcInfo).
+static bool namesExcInfo(const lython::parser::Node &node) {
+  if (node.kind == "Attribute") {
+    std::optional<std::string> attr = stringField(node, "attr");
+    if (attr && *attr == "exc_info")
+      return true;
+  }
+  if (node.kind == "alias") {
+    std::optional<std::string> name = stringField(node, "name");
+    if (name && *name == "exc_info")
+      return true;
+  }
+  for (const lython::parser::Field &field : node.fields) {
+    if (const auto *child = std::get_if<lython::parser::NodePtr>(&field.value)) {
+      if (*child && namesExcInfo(**child))
+        return true;
+    } else if (const auto *children =
+                   std::get_if<std::vector<lython::parser::NodePtr>>(
+                       &field.value)) {
+      for (const lython::parser::NodePtr &item : *children)
+        if (item && namesExcInfo(*item))
+          return true;
+    }
+  }
+  return false;
+}
+
 static std::optional<bool> staticPlatformTest(const lython::parser::Node &test,
                                               const llvm::Triple &triple,
                                               bool hasJsHost) {
@@ -733,7 +761,15 @@ LogicalResult emitMLIRFromSource(StringRef source, StringRef sourcePath,
   for (ParsedLocalSourceModule &source : localSources)
     if (!source.isStub)
       finalizers |= addFinalizerWrappers(*source.parsed.tree, options);
-  if (finalizers) {
+  // And a program that calls `sys.exc_info()`, whose traceback traceback
+  // builds.
+  bool excInfo = namesExcInfo(*parsed.tree) ||
+                 std::any_of(localSources.begin(), localSources.end(),
+                             [](const ParsedLocalSourceModule &source) {
+                               return !source.isEmbedded &&
+                                      namesExcInfo(*source.parsed.tree);
+                             });
+  if (finalizers || excInfo) {
     lython::parser::ParseResult tracebackImport =
         lython::parser::parse("import traceback\n", sourcePath.str(), options);
     if (!tracebackImport.ok() ||
@@ -771,6 +807,7 @@ LogicalResult emitMLIRFromSource(StringRef source, StringRef sourcePath,
         codeGenTripleForTarget({}, driverOptions).normalize();
     emitOptions.jsHost = hasJsHost;
     emitOptions.hasFinalizers = finalizers;
+    emitOptions.usesExcInfo = excInfo;
     emitOptions.sourceModules.reserve(localSources.size());
     for (const ParsedLocalSourceModule &source : localSources) {
       emitOptions.sourceModules.push_back(

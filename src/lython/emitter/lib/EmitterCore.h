@@ -16,6 +16,10 @@
 
 namespace lython::emitter {
 
+// The name the traceback module is bound under when the program needs it for
+// itself -- a finalizer's report, `sys.exc_info()`'s traceback.
+inline constexpr llvm::StringLiteral kTracebackModuleBinding{"__ly_traceback"};
+
 // What a stub's contracts make of what TypeScript left untyped (`t.Any`):
 // left alone, or a type for each direction a value crosses.
 struct StubContractPolicy {
@@ -909,6 +913,7 @@ private:
   sourceModuleForClass(llvm::StringRef className) const;
   std::optional<Value> tryEmitCurriedGenericCall(const parser::Node &expr,
                                                  const parser::Node &factoryCall);
+  Value emitExcInfo(const parser::Node &expr);
   Value emitGenericCall(const parser::Node &expr,
                         const parser::Node &calleeNode,
                         GenericFunctionInfo &generic);
