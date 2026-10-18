@@ -30,10 +30,10 @@ module attributes {
   } {}
   py.class @Container attributes {
     base_names = ["Protocol"], ly.typing.abstract, ly.typing.protocol,
-    ly.typing.params = ["T"], ly.typing.param_variance = ["contravariant"],
+    ly.typing.params = ["T"], ly.typing.param_variance = ["covariant"],
     method_names = ["__contains__"],
     method_contracts = [
-      !py.protocol<"Callable", [!py.protocol<"Container", [!py.contract<"$T">]>, !py.contract<"$T">] -> [!py.contract<"builtins.bool">]>
+      !py.protocol<"Callable", [!py.protocol<"Container", [!py.contract<"$T">]>, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>
     ],
     method_kinds = ["instance"]
   } {}

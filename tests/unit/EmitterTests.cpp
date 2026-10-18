@@ -589,6 +589,34 @@ TEST(EmitterTest, ImplicitTruthOfAnIntIsRefusedOnlyWhereTheIntIsDeclared) {
   }
 }
 
+// What: `Container` is covariant, as typeshed declares it, so a method taking
+// `Container[object]` accepts a list[int], a dict, a set and a tuple, while a
+// `Container[str]` parameter still refuses a list[int].
+TEST(EmitterTest, AContainerOfObjectsTakesAContainerOfAnything) {
+  mlir::MLIRContext accepting(testRegistry());
+  lython::emitter::EmitResult accepted = emitSource(
+      "from typing import Container\n"
+      "class T:\n"
+      "    def has(self, member: object, c: Container[object]) -> bool:\n"
+      "        return member in c\n"
+      "t = T()\n"
+      "print(t.has(1, [1, 2]), t.has(\"k\", {\"k\": 1}), t.has(2, {2}),\n"
+      "      t.has(3, (1, 2)))\n",
+      accepting);
+  EXPECT_TRUE(accepted.ok());
+
+  mlir::MLIRContext refusing(testRegistry());
+  lython::emitter::EmitResult refused = emitSource(
+      "from typing import Container\n"
+      "class T:\n"
+      "    def has(self, member: str, c: Container[str]) -> bool:\n"
+      "        return member in c\n"
+      "print(T().has(\"a\", [1, 2]))\n",
+      refusing);
+  EXPECT_FALSE(refused.ok());
+  EXPECT_TRUE(reportsDiagnostic(refused, "argument 'c' of 'has' is declared"));
+}
+
 // A method forwarding its packs is specialized at each call; what cannot be
 // forwarded exactly -- a dict the body rewrites, a list starred into a method,
 // the method taken as a value -- is refused with the reason.
