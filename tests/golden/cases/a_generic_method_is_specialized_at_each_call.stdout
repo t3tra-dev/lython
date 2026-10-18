@@ -1,0 +1,5 @@
+1 != 2
+{'a': 1} != {'a': 2} : dicts
+True False True
+4 X (1, 'a') ('k', [1.5])
+[1] True

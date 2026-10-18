@@ -950,6 +950,8 @@ private:
                                                llvm::StringRef attribute);
   Value emitClassOfValue(const parser::Node &anchor, Value value,
                          mlir::Type resultType);
+  // A `def` with PEP 695 type parameters of its own.
+  static bool hasTypeParameters(const parser::Node &def);
   // An isinstance/issubclass operand, or an element of a tuple of them, that
   // is a class value the static type does not decide.
   bool targetHasDynamicClassValue(const parser::Node *node);

@@ -1243,6 +1243,48 @@ TEST(EmitterTest, AClassValueIsStoredOnlyWhereItsBaseIsDeclared) {
   EXPECT_TRUE(accepted.ok());
 }
 
+// What: a generic method is specialized where it is called, so the two uses
+// that have no call -- the method calling itself, and the method read as a
+// value -- are refused at emit with a sentence that says why, and an ordinary
+// call compiles.
+TEST(EmitterTest, AGenericMethodHasABodyOnlyWhereItIsCalled) {
+  struct Case {
+    const char *source;
+    const char *message;
+  };
+  for (const Case &shape :
+       {Case{"class C:\n"
+             "    def count[T](self, xs: list[T], i: int) -> int:\n"
+             "        if i == len(xs):\n"
+             "            return 0\n"
+             "        return 1 + self.count(xs, i + 1)\n"
+             "print(C().count([1, 2], 0))\n",
+             "the generic method 'count' calls itself"},
+        Case{"class C:\n"
+             "    def show[T](self, x: T) -> str:\n"
+             "        return repr(x)\n"
+             "m = C().show\n",
+             "the generic method 'show' cannot be used as a value"}}) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult result = emitSource(shape.source, context);
+    EXPECT_FALSE(result.ok()) << shape.source;
+    bool told = false;
+    for (const lython::parser::Diagnostic &diagnostic : result.diagnostics)
+      told = told ||
+             diagnostic.message.find(shape.message) != std::string::npos;
+    EXPECT_TRUE(told) << shape.source;
+  }
+
+  mlir::MLIRContext called(testRegistry());
+  lython::emitter::EmitResult accepted = emitSource(
+      "class C:\n"
+      "    def same[T](self, a: T, b: T) -> bool:\n"
+      "        return a == b\n"
+      "print(C().same(1, 1), C().same(\"a\", \"b\"))\n",
+      called);
+  EXPECT_TRUE(accepted.ok());
+}
+
 TEST(EmitterTest, AnAttributeASourceClassDoesNotHaveIsRefusedAtEmit) {
   // Nothing resolves the read -- not a field, a class attribute, a method or
   // a property -- and it used to be emitted anyway and die in the lowering as

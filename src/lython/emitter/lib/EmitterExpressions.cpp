@@ -2932,6 +2932,18 @@ Value ModuleEmitter::emitMethodObject(const parser::Node &anchor, Value object,
                                       const MethodBinding &methodBinding) {
   if (methodBinding.symbolName.empty())
     return emitNone(anchor);
+  // A generic method has no body of its own until a call solves its type
+  // parameters, so there is no function for the value to be.
+  if (methodBinding.method && hasTypeParameters(*methodBinding.method)) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, anchor.range.start,
+        "the generic method '" +
+            std::string(ast::string(*methodBinding.method, "name")
+                            .value_or("")) +
+            "' cannot be used as a value: its type parameters are solved by "
+            "each call, so only a call has a body to run"});
+    return emitNone(anchor);
+  }
 
   bool bindReceiver = methodBindingBindsReceiver(methodBinding);
   if (methodBinding.kind == "instance" && mlir::isa<py::TypeType>(object.type))
