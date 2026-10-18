@@ -5524,6 +5524,16 @@ Value ModuleEmitter::emitInlineMethodBody(
   // class's contract name. Inside the cross-module isolation above, so an
   // imported generic keeps them too.
   bindClassTypeArguments(method.definingClass);
+  // And the method's own, solved above: the isolation hid the scope they
+  // were bound in, so a def nested in an imported generic method spelled
+  // `T` as a class of that name (`builtins.T`) -- a closure the call then
+  // found no target for, `@skip("...")` through an imported `skip` with a
+  // generic `__call__`.
+  if (methodSource)
+    for (const auto &binding : typeArguments) {
+      types.bindLocalSymbol(binding.first, binding.second);
+      types.bindLocalTypeParameter(binding.first, binding.second);
+    }
   // ⭐ AN INLINED BODY IS STILL A FUNCTION BODY, and a nested `def` inside it
   // needs the same promotion a free function's gets. `emitCallableFunction`
   // computes `nonlocalBoxedNames` so that a local a nested function declares
