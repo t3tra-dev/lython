@@ -2745,6 +2745,15 @@ bool RuntimeBundleLowerer::boxMayHoldContract(
   for (const auto &entry : *reprReachableContracts)
     if (table.isManifestSubclassOf(type, entry.getKey()))
       return true;
+  // ⭐ AND A BASE OF ONE: a class with no slot of its own is answered by its
+  // base's, so BaseException's `__repr__` is what a held ValueError or a
+  // program exception without one reaches. Pruned, that slot stopped the
+  // program -- `print(errs)` over a `list[Exception]` aborted with "a class
+  // judged unreachable ... reached it".
+  for (const auto &entry : *reprReachableContracts)
+    if (table.isManifestSubclassOf(
+            runtimeContractType(context, entry.getKey()), contract))
+      return true;
   for (py::ProtocolType protocol : reprReachableProtocols)
     if (table.structurallyAccepts(type, protocol.getProtocolName(),
                                   protocol.getArguments()))

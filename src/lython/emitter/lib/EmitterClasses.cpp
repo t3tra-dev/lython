@@ -1283,33 +1283,47 @@ bool ModuleEmitter::subclassRedeclares(
 // `class Both(Base, Mixin)` was refused by the gate (Mixin declares it) and
 // then found no candidate to dispatch to -- one question, two predicates, and
 // a valid program in the gap between them.
+// Ancestors as WRITTEN, from the pre-pass rather than from the MRO map the
+// class emission fills: the answer must not depend on where in the file the
+// question is asked (`collectTopLevelBindings`).
+// ⭐ AND PAST A RUNTIME BASE, through its own: `class E(Exception)` is a
+// BaseException too, and a gate asked about a `BaseException` receiver
+// walked from E to Exception and stopped -- `except (E, F) as e: str(e)`
+// then printed the args where CPython calls E's `__str__`.
+// ⛔ Not to `object`, which no program class names as written either: an
+// `object` value is answered at run time by its class's slot, and a gate
+// that saw E below it refused `repr(o)` for every `o: object`.
+void ModuleEmitter::collectDeclaredAncestors(llvm::StringRef cls,
+                                             llvm::StringSet<> &out) const {
+  llvm::SmallVector<llvm::StringRef, 8> worklist{cls};
+  while (!worklist.empty()) {
+    llvm::StringRef current = worklist.pop_back_val();
+    auto bases = declaredClassBases.find(current);
+    if (bases == declaredClassBases.end()) {
+      for (const std::string &ancestor :
+           llvm::drop_begin(manifestLinearization(current)))
+        if (ancestor != "builtins.object")
+          out.insert(ancestor);
+      continue;
+    }
+    for (const std::string &base : bases->second)
+      if (out.insert(base).second)
+        worklist.push_back(base);
+  }
+}
+
 bool ModuleEmitter::candidateRedeclares(
     const llvm::StringMap<llvm::StringSet<>> &declarations,
     llvm::StringRef receiverClass, llvm::StringRef candidate,
     llvm::StringRef name) const {
-  // Ancestors as WRITTEN, from the pre-pass rather than from the MRO map the
-  // class emission fills: the answer must not depend on where in the file the
-  // question is asked (`collectTopLevelBindings`).
-  auto ancestors = [&](llvm::StringRef cls, llvm::StringSet<> &out) {
-    llvm::SmallVector<llvm::StringRef, 8> worklist{cls};
-    while (!worklist.empty()) {
-      llvm::StringRef current = worklist.pop_back_val();
-      auto bases = declaredClassBases.find(current);
-      if (bases == declaredClassBases.end())
-        continue;
-      for (const std::string &base : bases->second)
-        if (out.insert(base).second)
-          worklist.push_back(base);
-    }
-  };
   if (candidate == receiverClass)
     return false;
   llvm::StringSet<> candidateAncestors;
-  ancestors(candidate, candidateAncestors);
+  collectDeclaredAncestors(candidate, candidateAncestors);
   if (!candidateAncestors.contains(receiverClass))
     return false;
   llvm::StringSet<> receiverAncestors;
-  ancestors(receiverClass, receiverAncestors);
+  collectDeclaredAncestors(receiverClass, receiverAncestors);
   llvm::SmallVector<llvm::StringRef, 8> reachable{candidate};
   for (const auto &ancestor : candidateAncestors)
     reachable.push_back(ancestor.getKey());
@@ -2994,8 +3008,15 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       // __init__ (an ownership violation the verifier rejects). Nor does a
       // generic method (`def m[T](self, x: T)`): its body has no type until
       // a call site solves T, which the inlining does.
+      // ⭐ Except an exception's text, `__str__` and `__repr__`: a boxed
+      // exception -- an element printed with its list -- is rendered through
+      // its class's slot, which only a standalone body can fill, and without
+      // one it printed BaseException's text for a class that declares its
+      // own.
+      bool exceptionText =
+          *methodName == "__str__" || *methodName == "__repr__";
       if (kind != "class" && kind != "classmethod" &&
-          !isExceptionBackedClass(contractName) &&
+          (exceptionText || !isExceptionBackedClass(contractName)) &&
           !specializedAtEachCall(*statement)) {
         pendingBodies.push_back(statement.get());
         pendingBodySigs.push_back(bodySig);
