@@ -384,7 +384,8 @@ ModuleEmitter::bindingDecoratorCallee(const parser::NodePtr &decorator) {
 // ⛔ The application runs after the class statement and not in its body:
 // CPython runs it before the class name is bound, which only a decorator
 // with a side effect interleaved with the rest of the body could tell.
-void ModuleEmitter::desugarMethodDecorators(const parser::Node &moduleNode) {
+void ModuleEmitter::desugarMethodDecorators(
+    const parser::Node &moduleNode, const EmitOptions::SourceModule *source) {
   auto *body = const_cast<std::vector<parser::NodePtr> *>(
       ast::nodeList(moduleNode, "body"));
   if (!body)
@@ -484,6 +485,11 @@ void ModuleEmitter::desugarMethodDecorators(const parser::Node &moduleNode) {
       split.cellName = "__ly_decorated$" + className + "$" + name;
       split.decorators = binding;
       split.range = range;
+      split.source = source;
+      split.globalName =
+          source ? source->moduleName + "." + split.cellName : split.cellName;
+      split.contractName =
+          source ? source->moduleName + "." + className : className;
       // The method of the written name: its parameters, defaults and
       // markers, forwarding every argument to what the decorators returned.
       parser::NodePtr forwarder = synth::cloneTree(*method);
@@ -505,6 +511,7 @@ void ModuleEmitter::desugarMethodDecorators(const parser::Node &moduleNode) {
       if (parser::Field *field = parser::findField(*method, "name"))
         field->value = split.hiddenName;
       pythonNameOverrides[method.get()] = name;
+      decoratedMethodBodies.insert(method.get());
       members->insert(members->begin() + static_cast<std::ptrdiff_t>(index) + 1,
                       std::move(forwarder));
       ++index;
@@ -530,7 +537,7 @@ ModuleEmitter::decoratedMethodApplication(const DecoratedMethod &method,
 
 void ModuleEmitter::applyMethodDecorators(const parser::Node &classDef) {
   for (const DecoratedMethod &method : decoratedMethods) {
-    if (method.classDef != &classDef || !method.typed)
+    if (method.classDef != &classDef || !method.typed || method.source)
       continue;
     parser::NodePtr applied = synth::assign(
         synth::name(method.cellName, method.range),
@@ -806,7 +813,11 @@ bool ModuleEmitter::dispatchIsUnresolvable(Value receiver,
   // receiver has a known dynamic class at this site; `methodsBeingInlined` is
   // where that is recorded, because an inlining is precisely the case where
   // `self` is somebody else's value.
-  if (!superContexts.empty() && methodsBeingInlined.empty())
+  // ⛔ Not a decorated method's body: what the decorator returned calls it
+  // with an instance of any subclass, and `self.helper()` in it ran the
+  // defining class's `helper` over a subclass's override.
+  if (!superContexts.empty() && methodsBeingInlined.empty() &&
+      superContexts.back().selfIsExact)
     if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(receiver.value))
       if (argument.getArgNumber() == 0 && argument.getOwner() &&
           argument.getOwner()->isEntryBlock())
@@ -1620,7 +1631,8 @@ void ModuleEmitter::emitDeferredMethodBodies() {
     auto emitBody = [&] {
       if (instanceBody)
         superContexts.push_back(SuperContext{
-            entry.contractName, entry.signature.positionalNames.front()});
+            entry.contractName, entry.signature.positionalNames.front(),
+            !decoratedMethodBodies.contains(entry.statement)});
       emitCallableFunction(*entry.statement, entry.symbolName,
                            entry.signature, {}, /*isLambda=*/false);
       if (instanceBody)
@@ -2169,9 +2181,23 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       symbolName.empty() ? std::string(*name) : symbolName.str();
   llvm::StringRef contractName(classSymbol);
   checkDecorators(classDef, DecoratorRole::Class);
-  for (DecoratedMethod &method : decoratedMethods)
-    if (method.classDef == &classDef)
-      typeDecoratedMethod(method, /*reportFailure=*/true);
+  for (DecoratedMethod &method : decoratedMethods) {
+    if (method.classDef != &classDef)
+      continue;
+    // An imported module's class: typed here, in its module's scope, and
+    // applied with that module's other globals, before the importer's
+    // first statement -- where CPython runs the class statement.
+    bool typedBefore = method.typed;
+    if (typeDecoratedMethod(method, /*reportFailure=*/true) && method.source &&
+        !typedBefore) {
+      parser::NodePtr applied = decoratedMethodApplication(
+          method, synth::attribute(synth::name(method.className, method.range),
+                                   method.hiddenName, method.range));
+      importedModuleGlobalInits.push_back(PendingModuleGlobalInit{
+          applied.get(), method.globalName, method.source});
+      synthesizedIteratorDefs.push_back(std::move(applied));
+    }
+  }
 
   // @dataclass: init/repr/eq synthesize below (default True); frozen/order
   // are accepted only as explicit False.
@@ -3665,8 +3691,9 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
                        pendingBodyKinds)) {
     bool instanceBody = kind == "instance" && !bodySig.positionalNames.empty();
     if (instanceBody)
-      superContexts.push_back(SuperContext{std::string(contractName),
-                                           bodySig.positionalNames.front()});
+      superContexts.push_back(SuperContext{
+          std::string(contractName), bodySig.positionalNames.front(),
+          !decoratedMethodBodies.contains(statement)});
     // The frozen-field guard is off inside this class's own __init__, which is
     // where the fields are filled -- CPython goes around its own block there
     // with object.__setattr__. The body is emitted BOTH as a symbol (here) and
@@ -5517,6 +5544,16 @@ Value ModuleEmitter::emitInlineMethodBody(
   // class's contract name. Inside the cross-module isolation above, so an
   // imported generic keeps them too.
   bindClassTypeArguments(method.definingClass);
+  // And the method's own, solved above: the isolation hid the scope they
+  // were bound in, so a def nested in an imported generic method spelled
+  // `T` as a class of that name (`builtins.T`) -- a closure the call then
+  // found no target for, `@skip("...")` through an imported `skip` with a
+  // generic `__call__`.
+  if (methodSource)
+    for (const auto &binding : typeArguments) {
+      types.bindLocalSymbol(binding.first, binding.second);
+      types.bindLocalTypeParameter(binding.first, binding.second);
+    }
   // ⭐ AN INLINED BODY IS STILL A FUNCTION BODY, and a nested `def` inside it
   // needs the same promotion a free function's gets. `emitCallableFunction`
   // computes `nonlocalBoxedNames` so that a local a nested function declares

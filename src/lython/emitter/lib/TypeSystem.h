@@ -465,6 +465,20 @@ public:
   inferCallWithEvidence(mlir::Type calleeType,
                         mlir::ArrayRef<mlir::Type> positional,
                         mlir::ArrayRef<CallKeywordType> keywords) const;
+  // `factory(args)(applied)` where `factory` is generic in a parameter only
+  // its RESULT names -- `def skip[F](reason) -> Callable[[F], F]`, the shape
+  // of a decorator factory: the two calls solved as one. Nothing when the
+  // factory call alone answers, or the shape is not two positional calls.
+  struct CurriedCallSolution {
+    mlir::Type result;
+    // The factory's signature at the solution, and what it returns.
+    py::CallableType factory;
+    py::CallableType applied;
+  };
+  std::optional<CurriedCallSolution>
+  solveCurriedGenericCall(mlir::Type factoryType,
+                          mlir::ArrayRef<mlir::Type> factoryArguments,
+                          mlir::ArrayRef<mlir::Type> appliedArguments) const;
   CallInferenceResult inferMethodCallWithEvidence(
       mlir::Type receiverType, llvm::StringRef methodName,
       mlir::ArrayRef<mlir::Type> positional,

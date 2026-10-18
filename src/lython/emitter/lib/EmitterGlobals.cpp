@@ -55,6 +55,7 @@
 #include "AstAccess.h"
 #include "AstSynth.h"
 #include "ClosureAnalysis.h"
+#include "EmitterSupport.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/ADT/StringSet.h"
@@ -156,8 +157,11 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
   // And a decorated METHOD's cell (desugarMethodDecorators): typed by its
   // application, like a decorated function's -- here when its decorators'
   // types are known already, else when its class is emitted.
+  // An imported module's are typed in its own scope, where its decorators
+  // are named (emitClassContract).
   for (DecoratedMethod &method : decoratedMethods)
-    typeDecoratedMethod(method, /*reportFailure=*/false);
+    if (!method.source)
+      typeDecoratedMethod(method, /*reportFailure=*/false);
   for (const parser::NodePtr &statement : *body) {
     if (!statement || statement->kind != "AnnAssign")
       continue;
@@ -550,7 +554,7 @@ bool ModuleEmitter::typeDecoratedMethod(DecoratedMethod &method,
   mlir::Type decoratedType;
   mlir::Type undecoratedType;
   if (std::optional<mlir::Type> classType =
-          types.lookupClass(method.className);
+          types.lookupClass(method.contractName);
       classType && method.hiddenDef) {
     std::optional<llvm::StringRef> selfName;
     if (const parser::Node *arguments = ast::node(*method.hiddenDef, "args"))
@@ -567,6 +571,83 @@ bool ModuleEmitter::typeDecoratedMethod(DecoratedMethod &method,
         method, synth::name(subject, method.range));
     synthesizedIteratorDefs.push_back(applied);
     decoratedType = types.widenLiteral(types.inferExpr(applied.get()));
+  }
+  // ⛔ A default the def declares is the method's only while what the
+  // decorator returned still has it: the forwarder restates the def's
+  // signature, and over a wrapper `(x, n)` it answered `m()` with the def's
+  // default where CPython raises TypeError. A decorator that hands the
+  // function back (`F -> F`) keeps the def's own type, defaults and all.
+  std::string droppedDefaults;
+  if (auto decorated = mlir::dyn_cast_if_present<py::CallableType>(decoratedType))
+    if (const parser::Node *arguments =
+            method.hiddenDef ? ast::node(*method.hiddenDef, "args") : nullptr)
+      if (const auto *defaults = ast::nodeList(*arguments, "defaults");
+          defaults && !defaults->empty()) {
+        llvm::ArrayRef<mlir::BoolAttr> kept = decorated.getPositionalDefaults();
+        std::size_t count = decorated.getPositionalTypes().size();
+        bool keeps = kept.size() == count && count >= defaults->size();
+        for (std::size_t index = count - std::min(count, defaults->size());
+             keeps && index < count; ++index)
+          keeps = kept[index] && kept[index].getValue();
+        if (!keeps)
+          droppedDefaults = "' declares default values, and what the "
+                            "decorator returns does not take them: the method "
+                            "is what the decorator returns";
+      }
+  // ⛔ Nor one whose result takes other parameters or returns another type:
+  // the forwarder restates the def's signature, so `@as_text` turning
+  // `-> int` into `-> str` read as "annotated to return int but this return
+  // gives str", a sentence about a line the program did not write wrong.
+  // Supporting it is the forwarder taking the result's signature instead.
+  if (droppedDefaults.empty())
+    if (auto decorated =
+            mlir::dyn_cast_if_present<py::CallableType>(decoratedType))
+      if (auto undecorated =
+              mlir::dyn_cast_if_present<py::CallableType>(undecoratedType)) {
+        auto same = [&](mlir::ArrayRef<mlir::Type> lhs,
+                        mlir::ArrayRef<mlir::Type> rhs) {
+          if (lhs.size() != rhs.size())
+            return false;
+          for (auto [left, right] : llvm::zip(lhs, rhs))
+            if (types.widenLiteral(left) != types.widenLiteral(right))
+              return false;
+          return true;
+        };
+        auto spell = [&](py::CallableType callable) {
+          std::string text = "(";
+          for (auto [index, parameter] :
+               llvm::enumerate(callable.getPositionalTypes()))
+            text += (index ? ", " : "") + pythonTypeSpelling(parameter);
+          text += ") -> ";
+          text += callable.getResultTypes().empty()
+                      ? std::string("None")
+                      : pythonTypeSpelling(callable.getResultTypes().front());
+          return text;
+        };
+        if (!same(decorated.getPositionalTypes(),
+                  undecorated.getPositionalTypes()) ||
+            !same(decorated.getResultTypes(), undecorated.getResultTypes()))
+          droppedDefaults = "' is " + spell(undecorated) +
+                            " and its decorator makes it " + spell(decorated) +
+                            ": a decorated method keeps the signature its def "
+                            "declares here";
+      }
+  if (!droppedDefaults.empty()) {
+    if (!reportFailure)
+      return false;
+    const parser::Node *decorator =
+        method.decorators.empty() ? nullptr : method.decorators.front().get();
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error,
+        decorator ? decorator->range.start : method.range.start,
+        "method '" +
+            llvm::StringRef(method.hiddenName)
+                .drop_front(llvm::StringRef("__ly_undecorated$").size())
+                .str() +
+            droppedDefaults});
+    if (undecoratedType)
+      bindDecoratedMethodCell(method, undecoratedType);
+    return false;
   }
   if (!mlir::isa_and_nonnull<py::CallableType>(decoratedType)) {
     if (!reportFailure)
@@ -588,16 +669,22 @@ bool ModuleEmitter::typeDecoratedMethod(DecoratedMethod &method,
             "what its decorators return, and only a callable can be"});
     // The forwarder still names the cell; typed as the method itself, it
     // adds no second sentence to the one above.
-    if (undecoratedType) {
-      moduleGlobals[method.cellName] = undecoratedType;
-      types.bindSymbol(method.cellName, undecoratedType);
-    }
+    if (undecoratedType)
+      bindDecoratedMethodCell(method, undecoratedType);
     return false;
   }
   method.typed = true;
-  moduleGlobals[method.cellName] = decoratedType;
-  types.bindSymbol(method.cellName, decoratedType);
+  bindDecoratedMethodCell(method, decoratedType);
   return true;
+}
+
+void ModuleEmitter::bindDecoratedMethodCell(const DecoratedMethod &method,
+                                            mlir::Type type) {
+  moduleGlobals[method.globalName] = type;
+  if (method.source)
+    types.bindCanonicalSymbol(method.cellName, method.globalName, type);
+  else
+    types.bindSymbol(method.cellName, type);
 }
 
 } // namespace lython::emitter

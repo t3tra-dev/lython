@@ -155,6 +155,41 @@ TEST(EmitterTest, RefusesAStatementInAnImportedModuleBody) {
       << emitted.diagnostics;
 }
 
+// What: what an imported module's decorated method or function-local class
+// cannot be is refused in that module's file: a diagnostic with no file was
+// printed against the main module's name.
+TEST(EmitterTest, AnImportedModuleIsRefusedInItsOwnFile) {
+  ImportedModuleEmit decorated = emitWithImportedModule(
+      "decorated",
+      "from typing import Callable\n\n"
+      "def wrapped[T](f: Callable[[T, int], int]) -> Callable[[T, int], int]:\n"
+      "    def inner(x: T, n: int) -> int:\n        return f(x, n)\n"
+      "    return inner\n\n"
+      "class A:\n"
+      "    @wrapped\n"
+      "    def m(self, n: int = 2) -> int:\n        return n\n",
+      "from decorated import A\nprint(A().m(1))\n");
+  EXPECT_FALSE(decorated.succeeded);
+  EXPECT_NE(decorated.diagnostics.find(
+                "decorated.py:9:5: emit error: method 'm' declares default "
+                "values"),
+            std::string::npos)
+      << decorated.diagnostics;
+
+  ImportedModuleEmit local = emitWithImportedModule(
+      "local",
+      "def f() -> int:\n"
+      "    class A:\n"
+      "        items: list[int] = []\n"
+      "    return 1\n",
+      "import local\nprint(local.f())\n");
+  EXPECT_FALSE(local.succeeded);
+  EXPECT_NE(local.diagnostics.find("local.py:3:8: emit error: class 'A' is "
+                                   "written in a function"),
+            std::string::npos)
+      << local.diagnostics;
+}
+
 // What: a decorator on a function in an imported module. It was dropped and the
 // undecorated function answered under the decorated name, so the refusal is
 // what keeps the wrong answer from happening.
@@ -616,7 +651,9 @@ TEST(EmitterTest, ADecoratorThatReturnsNoFunctionIsRefusedByName) {
 
 // What: a decorated method compiles when its decorator returns a function,
 // and one whose decorator returns anything else is refused by name, with no
-// second sentence about the cell the rewrite reads.
+// second sentence about the cell the rewrite reads. A method with defaults
+// keeps them through a decorator that hands the function back, and is
+// refused under one whose result does not take them.
 TEST(EmitterTest, ADecoratedMethodIsWhatItsDecoratorReturns) {
   mlir::MLIRContext accepting(testRegistry());
   lython::emitter::EmitResult accepted = emitSource(
@@ -646,6 +683,80 @@ TEST(EmitterTest, ADecoratedMethodIsWhatItsDecoratorReturns) {
   EXPECT_TRUE(reportsDiagnostic(
       refused, "decorator 'to_int' on method 'm' does not return a function"));
   EXPECT_FALSE(reportsDiagnostic(refused, "unresolved name"));
+
+  mlir::MLIRContext wrapping(testRegistry());
+  lython::emitter::EmitResult dropped = emitSource(
+      "from typing import Callable\n"
+      "def wrapped[T](f: Callable[[T, int], int]) -> Callable[[T, int], int]:\n"
+      "    def inner(x: T, n: int) -> int:\n"
+      "        return f(x, n)\n"
+      "    return inner\n"
+      "class A:\n"
+      "    @wrapped\n"
+      "    def m(self, n: int = 2) -> int:\n"
+      "        return n\n"
+      "print(A().m())\n",
+      wrapping);
+  EXPECT_FALSE(dropped.ok());
+  EXPECT_TRUE(reportsDiagnostic(
+      dropped, "method 'm' declares default values, and what the decorator "
+               "returns does not take them"));
+}
+
+// What: a decorator factory generic in a parameter only its result names
+// compiles where its result is applied at once -- a decorator, or `f(r)(g)`
+// -- and a call that holds the factory's result is refused naming why. A
+// decorator whose result changes the method's signature is refused naming
+// both signatures.
+TEST(EmitterTest, AGenericDecoratorFactoryIsSolvedWhereItIsApplied) {
+  const char *factory =
+      "from typing import Callable\n"
+      "def skip[F](reason: str) -> Callable[[F], F]:\n"
+      "    def decorator(f: F) -> F:\n"
+      "        return f\n"
+      "    return decorator\n";
+  mlir::MLIRContext accepting(testRegistry());
+  lython::emitter::EmitResult accepted = emitSource(
+      std::string(factory) +
+          "class Case:\n"
+          "    @skip(\"why\")\n"
+          "    def test(self) -> None:\n"
+          "        print(1)\n"
+          "@skip(\"module\")\n"
+          "def g(x: int) -> int:\n"
+          "    return x\n"
+          "Case().test()\n"
+          "print(g(1), skip(\"now\")(g)(2))\n",
+      accepting);
+  EXPECT_TRUE(accepted.ok());
+  for (const lython::parser::Diagnostic &diagnostic : accepted.diagnostics)
+    ADD_FAILURE() << diagnostic.message;
+
+  mlir::MLIRContext holding(testRegistry());
+  lython::emitter::EmitResult held = emitSource(
+      std::string(factory) + "d = skip(\"later\")\n", holding);
+  EXPECT_FALSE(held.ok());
+  EXPECT_TRUE(reportsDiagnostic(
+      held, "this call's result is generic in a type parameter no argument "
+            "names"));
+
+  mlir::MLIRContext changing(testRegistry());
+  lython::emitter::EmitResult changed = emitSource(
+      "from typing import Callable\n"
+      "def as_text[T](f: Callable[[T], int]) -> Callable[[T], str]:\n"
+      "    def wrapper(x: T) -> str:\n"
+      "        return str(f(x))\n"
+      "    return wrapper\n"
+      "class Case:\n"
+      "    @as_text\n"
+      "    def count(self) -> int:\n"
+      "        return 5\n"
+      "print(Case().count())\n",
+      changing);
+  EXPECT_FALSE(changed.ok());
+  EXPECT_TRUE(reportsDiagnostic(
+      changed, "method 'count' is (Case) -> int and its decorator makes it "
+               "(Case) -> str"));
 }
 
 // What: `Container` is covariant, as typeshed declares it, so a method taking

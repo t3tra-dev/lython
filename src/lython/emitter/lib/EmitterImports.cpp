@@ -1483,6 +1483,12 @@ void ModuleEmitter::bindSourceModuleLocals(llvm::StringRef moduleName,
     if (moduleAliasTarget(*body, name))
       bindSourceModuleName(moduleName, name, name);
   }
+  // A decorated method's cell, which no statement of the module assigns.
+  for (const DecoratedMethod &method : decoratedMethods)
+    if (method.source && method.source->moduleName == moduleName &&
+        moduleGlobals.count(method.globalName))
+      types.bindCanonicalSymbol(method.cellName, method.globalName,
+                                moduleGlobals[method.globalName]);
 }
 
 void ModuleEmitter::bindModuleImportScope(const parser::Node &sourceModule,

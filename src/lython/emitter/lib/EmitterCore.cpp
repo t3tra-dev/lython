@@ -50,11 +50,24 @@ EmitResult ModuleEmitter::emit() {
 
   module = mlir::ModuleOp::create(builder.getUnknownLoc());
   module.setName(moduleName);
+  // A desugar of an imported module refuses in that module's file: a
+  // diagnostic with no file is read as the main module's.
+  auto inSourceModule = [&](const EmitOptions::SourceModule &source,
+                            llvm::function_ref<void()> desugar) {
+    std::size_t start = diagnostics.size();
+    desugar();
+    for (std::size_t index = start; index < diagnostics.size(); ++index)
+      if (diagnostics[index].filename.empty())
+        diagnostics[index].filename =
+            source.sourceName.empty() ? source.moduleName : source.sourceName;
+  };
   // First of all: a class written in a function becomes a class of its
   // module's top level, which every desugar below then treats as one.
   for (const EmitOptions::SourceModule &source : options.sourceModules)
     if (source.moduleNode && !source.isStub)
-      hoistFunctionLocalClasses(*source.moduleNode, source.moduleName);
+      inSourceModule(source, [&] {
+        hoistFunctionLocalClasses(*source.moduleNode, source.moduleName);
+      });
   hoistFunctionLocalClasses(moduleNode, moduleName);
   // Enum desugaring rewrites the parsed tree, so it must run before anything
   // reads the module's shape (static module attributes below already do).
@@ -67,22 +80,25 @@ EmitResult ModuleEmitter::emit() {
   // sees their members as well as its own.
   for (const EmitOptions::SourceModule &source : options.sourceModules)
     if (source.moduleNode && !source.isStub)
-      desugarEnumClasses(*source.moduleNode);
+      inSourceModule(source, [&] { desugarEnumClasses(*source.moduleNode); });
   desugarEnumClasses(moduleNode);
   // Before every binder: the parameters this moves into `type_params` are what
   // decides whether a class or a def is generic at all.
   for (const EmitOptions::SourceModule &source : options.sourceModules)
     if (source.moduleNode && !source.isStub)
-      desugarClassicGenerics(*source.moduleNode);
+      inSourceModule(source,
+                     [&] { desugarClassicGenerics(*source.moduleNode); });
   desugarClassicGenerics(moduleNode);
   // Before every binder, for the same reason: a comprehension target that
   // shares a name with its scope is renamed, so nothing counts it as a
   // binding of that scope.
   for (const EmitOptions::SourceModule &source : options.sourceModules)
-    if (source.moduleNode && !source.isStub) {
-      desugarContextManagers(*source.moduleNode);
-      scopeComprehensionTargets(*source.moduleNode);
-    }
+    if (source.moduleNode && !source.isStub)
+      inSourceModule(source, [&] {
+        desugarContextManagers(*source.moduleNode);
+        desugarMethodDecorators(*source.moduleNode, &source);
+        scopeComprehensionTargets(*source.moduleNode);
+      });
   desugarContextManagers(moduleNode);
   desugarMethodDecorators(moduleNode);
   scopeComprehensionTargets(moduleNode);
