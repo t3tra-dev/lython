@@ -5726,8 +5726,7 @@ mlir::Value ModuleEmitter::emitBoolValue(Value value,
   // not a runtime question — it is answered by the static class.
   if (std::optional<Value> truth = tryEmitClassDunder(anchor, value, "__bool__"))
     return emitBoolValue(*truth, anchor);
-  if (std::optional<Value> length =
-          tryEmitClassDunder(anchor, value, "__len__")) {
+  if (std::optional<Value> length = tryEmitClassLength(anchor, value)) {
     Value count = *length;
     mlir::Type zeroType = types.literal("0");
     Value zero{py::IntConstantOp::create(builder, loc(anchor), zeroType,

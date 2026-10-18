@@ -58,6 +58,7 @@ module attributes {
   func.func private @__ly_global_view_i64(%pointer: i64, %size: i64) -> memref<?xi64>
   func.func private @__ly_handle_retain_raw(%entity: i64)
   func.func private @__ly_raise_static_message(%class_word: i64, %message: memref<?xi8>, %length: i64)
+  func.func private @__ly_raise_index_overflow()
   func.func private @__ly_slot_word_from_view_address(%address: i64) -> i64
   func.func private @__ly_slot_word_is_immediate(%word: i64) -> i1
 
@@ -71,7 +72,11 @@ module attributes {
                     "__gt__", "__ge__", "__repr__", "__str__", "__eq__", "__ne__",
                     "__pow__", "__abs__", "__format__",
                     "__lt__", "__le__", "__gt__", "__ge__", "__eq__", "__ne__",
-                    "__round__", "bit_length", "conjugate", "is_integer", "as_integer_ratio", "bit_count", "to_bytes", "to_bytes", "to_bytes", "to_bytes", "from_bytes", "from_bytes", "from_bytes"],
+                    "__round__", "bit_length", "conjugate", "is_integer", "as_integer_ratio", "bit_count", "to_bytes", "to_bytes", "to_bytes", "to_bytes", "from_bytes", "from_bytes", "from_bytes",
+                    // ⛔ NOT A CPython METHOD: slot_sq_length's checks on what a
+                    // class's `__len__` returned, asked by name as
+                    // `object.__ly_is_none__` is.
+                    "__ly_length__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.int">>, !py.union<!py.contract<"typing.SupportsInt">, !py.contract<"typing.SupportsIndex">, !py.contract<"builtins.str">, !py.contract<"builtins.bytes">, !py.contract<"builtins.bytearray">>] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
@@ -123,7 +128,8 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.str">, !py.contract<"builtins.bool">] -> [!py.contract<"builtins.bytes">]>,
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.int">>, !py.contract<"builtins.bytes">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.int">>, !py.contract<"builtins.bytes">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.int">]>,
-      !py.protocol<"Callable", [!py.type<!py.contract<"builtins.int">>, !py.contract<"builtins.bytes">, !py.contract<"builtins.str">, !py.contract<"builtins.bool">] -> [!py.contract<"builtins.int">]>
+      !py.protocol<"Callable", [!py.type<!py.contract<"builtins.int">>, !py.contract<"builtins.bytes">, !py.contract<"builtins.str">, !py.contract<"builtins.bool">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
@@ -135,7 +141,8 @@ module attributes {
                     "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance",
-                    "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "classmethod", "classmethod", "classmethod"]
+                    "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "classmethod", "classmethod", "classmethod",
+                    "instance"]
   } {}
 
   func.func @LyLong_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.int", ly.runtime.deallocator} {
@@ -1477,6 +1484,43 @@ module attributes {
     %count = memref.load %meta[%count_slot] : memref<2xi64>
     %result = arith.cmpi ne, %count, %zero : i64
     func.return %result : i1
+  }
+
+  // "__len__() should return >= 0"
+  memref.global "private" constant @__ly_msg_len_negative : memref<28xi8> = dense<[95, 95, 108, 101, 110, 95, 95, 40, 41, 32, 115, 104, 111, 117, 108, 100, 32, 114, 101, 116, 117, 114, 110, 32, 62, 61, 32, 48]>
+
+  // What a class's `__len__` returned, as the length `len` and a truth test
+  // read -- slot_sq_length (Objects/typeobject.c): a negative int is a
+  // ValueError, asked before the size, and one past the word an
+  // OverflowError (PyNumber_AsSsize_t).
+  func.func @LyLong_AsLength(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__ly_length__"} {
+    %meta_raw, %digits_raw = func.call @__ly_long_parts(%header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
+    %meta, %digits = func.call @__ly_long_operand_view(%meta_raw, %digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
+    %sign_slot = arith.constant 0 : index
+    %zero = arith.constant 0 : i64
+    %sign = memref.load %meta[%sign_slot] : memref<2xi64>
+    %negative = arith.cmpi slt, %sign, %zero : i64
+    cf.cond_br %negative, ^negative, ^sized
+
+  ^negative:
+    %value_error = arith.constant {ly.class_of = "builtins.ValueError"} 53 : i64
+    %message_static = memref.get_global @__ly_msg_len_negative : memref<28xi8>
+    %message = memref.cast %message_static : memref<28xi8> to memref<?xi8>
+    %length = arith.constant 28 : i64
+    func.call @__ly_raise_static_message(%value_error, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.return %zero : i64
+
+  ^sized:
+    %fits = func.call @__ly_long_view_fits_i64(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i1
+    cf.cond_br %fits, ^fits, ^overflow
+
+  ^overflow:
+    func.call @__ly_raise_index_overflow() : () -> ()
+    func.return %zero : i64
+
+  ^fits:
+    %value = func.call @__ly_long_view_as_i64(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i64
+    func.return %value : i64
   }
 
   func.func @LyLong_Pos(%header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__pos__"} {

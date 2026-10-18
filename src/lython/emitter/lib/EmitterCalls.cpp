@@ -6621,6 +6621,33 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
   return std::nullopt;
 }
 
+// ⭐ A CLASS'S `__len__` IS A LENGTH ONLY AFTER slot_sq_length's CHECKS:
+// CPython raises ValueError for a negative answer and OverflowError for one
+// past the word, in `len` and in a truth test alike. Handed back as it was,
+// `len(b)` printed -1 and `bool(b)` answered True for a `__len__` returning
+// -1, and `len` printed 2**70.
+std::optional<Value>
+ModuleEmitter::tryEmitClassLength(const parser::Node &anchor, Value receiver) {
+  std::optional<Value> count = tryEmitClassDunder(anchor, receiver, "__len__");
+  if (!count)
+    return std::nullopt;
+  mlir::Type intType = types.intType();
+  Value counted = coerceValue(*count, intType, anchor);
+  CallInferenceResult inference =
+      types.inferMethodCallWithEvidence(intType, "__ly_length__", {});
+  if (!inference)
+    return counted;
+  Value posPack = emitPack({});
+  Value namePack = emitPack({});
+  Value valuePack = emitPack({});
+  auto call = py::CallOp::create(
+      builder, loc(anchor), mlir::TypeRange{inference.resultType},
+      callProtocolFor(inference), counted.value, posPack.value,
+      namePack.value, valuePack.value);
+  call->setAttr("ly.bound_method", builder.getStringAttr("__ly_length__"));
+  return Value{call.getResults().front(), inference.resultType};
+}
+
 std::optional<Value>
 ModuleEmitter::tryEmitLenCall(const parser::Node &expr,
                               const parser::Node *calleeNode) {
@@ -6650,7 +6677,7 @@ ModuleEmitter::tryEmitLenCall(const parser::Node &expr,
       }
     }
     Value input = emitExpr(argNode);
-  if (std::optional<Value> count = tryEmitClassDunder(expr, input, "__len__"))
+  if (std::optional<Value> count = tryEmitClassLength(expr, input))
     return *count;
   // ⭐ A UNION COUNTS BY TAG, like it adds by tag. `def f(x: "list[int] | str")`
   // is an ordinary Python signature and `len(x)` in its body was refused for a

@@ -1174,6 +1174,10 @@ private:
                                           llvm::StringRef dunder,
                                           llvm::ArrayRef<Value> positional = {},
                                           bool *refused = nullptr);
+  // A class's `__len__` as `len` and a truth test read it: through int's
+  // length check.
+  std::optional<Value> tryEmitClassLength(const parser::Node &anchor,
+                                          Value receiver);
   // The same gate for the one dunder whose arguments are still AST: __call__
   // takes the call node's own arguments, keywords and defaults included, so
   // it cannot pre-build the operand list the other entry point takes.
