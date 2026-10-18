@@ -810,6 +810,11 @@ private:
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
   objectPayloadClassEntity(mlir::Operation *op, const RuntimeBundle &value,
                            bool ownsPayload = true);
+  // The same words, emitted where the builder already is.
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
+  objectPayloadClassEntityAtCurrentInsertion(mlir::Operation *op,
+                                             const RuntimeBundle &value,
+                                             bool ownsPayload);
   // True when `op` is the ONLY user of `value` — i.e. the value is a
   // temporary this op consumes, not a binding that outlives it. Container
   // literals use it to decide whether storing an element may take over the
@@ -1642,6 +1647,14 @@ private:
                                           RuntimeBundle &bundle);
   mlir::LogicalResult lowerAliasView(mlir::Operation *op, mlir::Value input,
                                      mlir::Value resultValue);
+  // The view `lowerAliasView` gives a value of `inputType` as `resultType`,
+  // for a bundle that no SSA value of its own holds (a call through a
+  // callable value answering with its target's result). Emits at the
+  // builder's insertion point.
+  mlir::FailureOr<RuntimeBundle> aliasViewBundle(mlir::Operation *op,
+                                                 const RuntimeBundle &source,
+                                                 mlir::Type inputType,
+                                                 mlir::Type resultType);
   mlir::LogicalResult collectObjectSources(
       mlir::Operation *op, mlir::ValueRange values, llvm::StringRef message,
       llvm::SmallVectorImpl<const RuntimeBundle *> &sources) const;
@@ -1802,6 +1815,16 @@ private:
       py::CallOp op, mlir::func::FuncOp target, llvm::StringRef targetName,
       mlir::func::CallOp call, llvm::ArrayRef<const RuntimeBundle *> sources,
       RuntimeBundle &result);
+  // What `target` returns, when it returns one value: the type its results
+  // are laid out in, which the callable a call went through may only bound.
+  mlir::Type functionTargetResultType(mlir::func::FuncOp target) const;
+  // Whether a call typed `declared` by its callable gets `actual` back in
+  // another representation (an `object` box, a union's tag and lanes).
+  bool callResultNeedsView(mlir::Operation *op, mlir::Type actual,
+                           mlir::Type declared) const;
+  mlir::FailureOr<RuntimeBundle>
+  viewCallResultAsDeclared(mlir::Operation *op, const RuntimeBundle &result,
+                           mlir::Type actual, mlir::Type declared);
   mlir::LogicalResult
   bundlePrimitiveI64CloneCallResult(py::CallOp op, mlir::func::FuncOp target,
                                     mlir::func::CallOp call,

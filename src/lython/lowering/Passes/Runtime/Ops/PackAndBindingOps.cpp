@@ -751,6 +751,50 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
   if (!inputBundle)
     return op->emitError()
            << "aliasing contract view input has no lowered runtime bundle";
+  // Copy before inserting: operator[] can rehash valueBundles and invalidate
+  // inputBundle (which points into it).
+  RuntimeBundle source = *inputBundle;
+  builder.setInsertionPoint(op);
+  mlir::FailureOr<RuntimeBundle> viewed = RuntimeBundleLowerer::aliasViewBundle(
+      op, source, input.getType(), resultValue.getType());
+  if (mlir::failed(viewed))
+    return mlir::failure();
+  valueBundles[resultValue] = std::move(*viewed);
+  erase.push_back(op);
+  return mlir::success();
+}
+
+mlir::FailureOr<RuntimeBundle>
+RuntimeBundleLowerer::aliasViewBundle(mlir::Operation *op,
+                                      const RuntimeBundle &source,
+                                      mlir::Type inputType,
+                                      mlir::Type resultType) {
+  const RuntimeBundle *inputBundle = &source;
+
+  // ⭐ A UNION SEEN AS `object` IS BOXED, as an argument handed to an `object`
+  // parameter already is: the tag picks the class and entity words the box
+  // keeps (`objectPayloadClassEntity`). The common-base view below wants
+  // every member to be one header lane, and None is no lane at all --
+  // `x: object = maybe(5)` with `maybe` returning `int | None` was "a union
+  // seen as 'builtins.object' needs every member to be one header lane".
+  // ⛔ Not aliased, as an int is: the union's first lane is its TAG, and a
+  // narrowing of the `object` back to a member would read the tag as the
+  // member's header.
+  if (mlir::isa<py::UnionType>(inputType) &&
+      inputBundle->kind == RuntimeBundle::Kind::Object &&
+      isBuiltinsObjectContract(resultType) &&
+      !inputBundle->physicalValues().empty()) {
+    mlir::FailureOr<RuntimeBundle> boxed =
+        RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
+            op, *inputBundle, /*retainPayload=*/true);
+    if (mlir::failed(boxed))
+      return mlir::failure();
+    RuntimeBundle concrete = *inputBundle;
+    concrete.setObjectLogicalOwnership(/*ownsObject=*/false);
+    RuntimeBundle result = std::move(*boxed);
+    result.boxedObject = std::make_shared<RuntimeBundle>(std::move(concrete));
+    return result;
+  }
 
   // ⭐ A UNION OF CLASSES SEEN AS THEIR COMMON BASE is the active member's
   // header: each member is one header lane, and the base reads the same
@@ -758,12 +802,12 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
   // `isinstance(t, Base)` over `A | B | C`). The tag picks it, as
   // `union.unwrap` picks a member's lanes, and the view owns what an unwrap
   // owns.
-  if (auto inputUnion = mlir::dyn_cast<py::UnionType>(input.getType());
+  if (auto inputUnion = mlir::dyn_cast<py::UnionType>(inputType);
       inputUnion && inputBundle->kind == RuntimeBundle::Kind::Object &&
-      mlir::isa<py::ContractType>(resultValue.getType()) &&
+      mlir::isa<py::ContractType>(resultType) &&
       !inputBundle->physicalValues().empty()) {
     mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> expected =
-        RuntimeBundleLowerer::runtimeValueTypesFor(op, resultValue.getType(),
+        RuntimeBundleLowerer::runtimeValueTypesFor(op, resultType,
                                                    "union base view ABI");
     if (mlir::failed(expected))
       return mlir::failure();
@@ -771,9 +815,8 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
                           ? mlir::dyn_cast<mlir::MemRefType>(expected->front())
                           : mlir::MemRefType();
     if (!headerType)
-      return op->emitError() << "a union seen as " << resultValue.getType()
+      return op->emitError() << "a union seen as " << resultType
                              << " needs that class to be one header lane";
-    builder.setInsertionPoint(op);
     mlir::Location loc = op->getLoc();
     mlir::Value tag = inputBundle->physicalValues().front();
     mlir::MemRefType dynamicHeader = mlir::MemRefType::get(
@@ -796,7 +839,7 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
         return mlir::failure();
       if (memberTypes->size() != 1 ||
           !mlir::isa<mlir::MemRefType>(memberTypes->front()))
-        return op->emitError() << "a union seen as " << resultValue.getType()
+        return op->emitError() << "a union seen as " << resultType
                                << " needs every member to be one header "
                                   "lane, and "
                                << member << " is not";
@@ -819,29 +862,22 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
     }
     RuntimeBundle result;
     if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-            op, resultValue.getType(), mlir::ValueRange{selected}, result)))
+            op, resultType, mlir::ValueRange{selected}, result)))
       return mlir::failure();
     result.copyEvidenceFrom(*inputBundle);
-    valueBundles[resultValue] = std::move(result);
-    erase.push_back(op);
-    return mlir::success();
+    return result;
   }
 
   if (inputBundle->kind == RuntimeBundle::Kind::Object &&
-      mlir::isa<py::ContractType>(resultValue.getType())) {
+      mlir::isa<py::ContractType>(resultType)) {
     if (inputBundle->boxedObject &&
         py::isAssignableTo(inputBundle->boxedObject->objectValue.contract,
-                           resultValue.getType(), op)) {
-      // Copy before inserting: operator[] can rehash valueBundles and
-      // invalidate inputBundle (which points into it).
-      RuntimeBundle boxed = *inputBundle->boxedObject;
-      valueBundles[resultValue] = std::move(boxed);
-      erase.push_back(op);
-      return mlir::success();
+                           resultType, op)) {
+      return RuntimeBundle(*inputBundle->boxedObject);
     }
 
     mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> expectedTypes =
-        RuntimeBundleLowerer::runtimeValueTypesFor(op, resultValue.getType(),
+        RuntimeBundleLowerer::runtimeValueTypesFor(op, resultType,
                                                    "alias view ABI");
     if (mlir::failed(expectedTypes))
       return mlir::failure();
@@ -859,9 +895,8 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
     // where the class test is doing real work.
     if (runtimeContractName(inputBundle->objectValue.contract) ==
             "builtins.object" &&
-        runtimeContractName(resultValue.getType()) != "builtins.object" &&
+        runtimeContractName(resultType) != "builtins.object" &&
         inputBundle->physicalValues().size() == 1) {
-      builder.setInsertionPoint(op);
       mlir::Location loc = op->getLoc();
       mlir::Value header = inputBundle->physicalValues().front();
       mlir::Type dynamicHeader = mlir::MemRefType::get(
@@ -881,12 +916,12 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
       // element already take for the same pair.
       // ⛔ Only where the contract's own lanes are not the slot's: every other
       // class is the view it always was.
-      std::string resultContract = runtimeContractName(resultValue.getType());
+      std::string resultContract = runtimeContractName(resultType);
       mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
           mlir::failure();
       if (resultContract == "builtins.bool") {
         mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> slotShapes =
-            RuntimeBundleLowerer::slotStorageShapesFor(op, resultValue.getType(),
+            RuntimeBundleLowerer::slotStorageShapesFor(op, resultType,
                                                        "isinstance bool view");
         if (mlir::failed(slotShapes))
           return mlir::failure();
@@ -897,7 +932,7 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
         if (mlir::failed(stored))
           return mlir::failure();
         lanes = RuntimeBundleLowerer::unboxSlotElementValues(
-            op, resultValue.getType(), *stored);
+            op, resultType, *stored);
       } else {
         lanes = RuntimeBundleLowerer::lanesFromBoxEntity(
             builder, loc, entityWord, *expectedTypes, resultContract, op,
@@ -907,14 +942,12 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
         return mlir::failure();
       RuntimeBundle result;
       if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-              op, resultValue.getType(), *lanes, result)))
+              op, resultType, *lanes, result)))
         return mlir::failure();
       // The box still owns the entity; this is a view of it for as long as the
       // box is live, which the narrowed branch is by construction.
       result.setObjectLogicalOwnership(/*ownsObject=*/false);
-      valueBundles[resultValue] = std::move(result);
-      erase.push_back(op);
-      return mlir::success();
+      return result;
     }
 
     // ⛔ NOT TO `object` FROM ANOTHER CLASS, whatever the types say. An
@@ -923,7 +956,7 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
     // cell stored the list's handle, and the read took its length for an
     // entity. The consumer that needs a box makes one from the concrete value.
     bool upcastToObject =
-        runtimeContractName(resultValue.getType()) == "builtins.object" &&
+        runtimeContractName(resultType) == "builtins.object" &&
         runtimeContractName(inputBundle->objectValue.contract) !=
             "builtins.object";
     // ⭐ AN INSTANCE SEEN AS `object` IS BOXED HERE, because what the static
@@ -945,19 +978,16 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
         sourceClass->hasAttr("ly.class.source") &&
         !RuntimeBundleLowerer::exceptionAncestorContract(sourceClass) &&
         !inputBundle->physicalValues().empty()) {
-      builder.setInsertionPoint(op);
       mlir::FailureOr<RuntimeBundle> boxed =
-          RuntimeBundleLowerer::boxRuntimeObject(op, *inputBundle,
-                                                 /*retainPayload=*/true);
+          RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
+              op, *inputBundle, /*retainPayload=*/true);
       if (mlir::failed(boxed))
         return mlir::failure();
       RuntimeBundle concrete = *inputBundle;
       concrete.setObjectLogicalOwnership(/*ownsObject=*/false);
       RuntimeBundle result = std::move(*boxed);
       result.boxedObject = std::make_shared<RuntimeBundle>(std::move(concrete));
-      valueBundles[resultValue] = std::move(result);
-      erase.push_back(op);
-      return mlir::success();
+      return result;
     }
     if (!upcastToObject &&
         expectedTypes->size() <= inputBundle->physicalValues().size()) {
@@ -974,30 +1004,23 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
                       inputBundle->physicalValues().begin() +
                           expectedTypes->size());
         RuntimeBundle result = RuntimeBundle::objectWithOwnership(
-            resultValue.getType(), values, inputBundle->objectValue.ownership);
+            resultType, values, inputBundle->objectValue.ownership);
         result.copyEvidenceFrom(*inputBundle);
         if (!result.boxedObject &&
-            inputBundle->objectValue.contract != resultValue.getType() &&
+            inputBundle->objectValue.contract != resultType &&
             py::isAssignableTo(inputBundle->objectValue.contract,
-                               resultValue.getType(), op)) {
+                               resultType, op)) {
           RuntimeBundle concrete = *inputBundle;
           concrete.setObjectLogicalOwnership(/*ownsObject=*/false);
           result.boxedObject =
               std::make_shared<RuntimeBundle>(std::move(concrete));
         }
-        valueBundles[resultValue] = std::move(result);
-        erase.push_back(op);
-        return mlir::success();
+        return result;
       }
     }
   }
 
-  // Copy before inserting: operator[] can rehash valueBundles and invalidate
-  // inputBundle (which points into it).
-  RuntimeBundle aliased = *inputBundle;
-  valueBundles[resultValue] = std::move(aliased);
-  erase.push_back(op);
-  return mlir::success();
+  return RuntimeBundle(*inputBundle);
 }
 
 // ⭐ A STARRED ARGUMENT IS AN ARITY, AND THE TYPE CARRIES IT. Sequence

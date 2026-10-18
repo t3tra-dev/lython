@@ -474,6 +474,17 @@ RuntimeBundleLowerer::objectPayloadClassEntity(mlir::Operation *op,
                                                const RuntimeBundle &value,
                                                bool ownsPayload) {
   builder.setInsertionPoint(op);
+  return RuntimeBundleLowerer::objectPayloadClassEntityAtCurrentInsertion(
+      op, value, ownsPayload);
+}
+
+// ⛔ Never moves the insertion point: a box made in a dispatch arm reads a
+// payload the arm's call defined, and words read before `op` -- in the block
+// the arms merge into -- were a box whose allocation sat in the arm and whose
+// stores sat after the merge ("block with no terminator").
+mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
+RuntimeBundleLowerer::objectPayloadClassEntityAtCurrentInsertion(
+    mlir::Operation *op, const RuntimeBundle &value, bool ownsPayload) {
   mlir::Location loc = op->getLoc();
   mlir::Value zero = constantI64(builder, loc, 0);
   // ⛔ WORD 0 IS A REFCOUNT EVEN WHEN THERE IS NOTHING TO COUNT. None's handle
@@ -552,17 +563,15 @@ RuntimeBundleLowerer::objectPayloadClassEntity(mlir::Operation *op,
       // same union works, and so does a plain `[True, False]` -- the literal
       // path already normalizes through the contract's `box` primitive, and
       // this is the same step for a member the union splices inline.
-      builder.setInsertionPoint(op);
       mlir::FailureOr<RuntimeBundle> normalizedMember =
           RuntimeBundleLowerer::normalizeBoxSource(op, memberBundle);
       if (mlir::failed(normalizedMember))
         return mlir::failure();
       mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> memberWords =
-          RuntimeBundleLowerer::objectPayloadClassEntity(op, *normalizedMember,
-                                                          ownsPayload);
+          RuntimeBundleLowerer::objectPayloadClassEntityAtCurrentInsertion(
+              op, *normalizedMember, ownsPayload);
       if (mlir::failed(memberWords))
         return mlir::failure();
-      builder.setInsertionPoint(op);
       mlir::Value active = mlir::arith::CmpIOp::create(
           builder, loc, mlir::arith::CmpIPredicate::eq, tag,
           constantI64(builder, loc, static_cast<std::int64_t>(index)));

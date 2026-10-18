@@ -1001,8 +1001,8 @@ RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
   box.getDefiningOp()->setAttr(own::kObjectHeaderAttr, builder.getUnitAttr());
 
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> classEntity =
-      RuntimeBundleLowerer::objectPayloadClassEntity(op, concrete,
-                                                     retainPayload);
+      RuntimeBundleLowerer::objectPayloadClassEntityAtCurrentInsertion(
+          op, concrete, retainPayload);
   if (mlir::failed(classEntity))
     return mlir::failure();
   {
