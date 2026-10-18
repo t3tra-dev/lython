@@ -505,6 +505,7 @@ void ModuleEmitter::desugarMethodDecorators(const parser::Node &moduleNode) {
       if (parser::Field *field = parser::findField(*method, "name"))
         field->value = split.hiddenName;
       pythonNameOverrides[method.get()] = name;
+      decoratedMethodBodies.insert(method.get());
       members->insert(members->begin() + static_cast<std::ptrdiff_t>(index) + 1,
                       std::move(forwarder));
       ++index;
@@ -806,7 +807,11 @@ bool ModuleEmitter::dispatchIsUnresolvable(Value receiver,
   // receiver has a known dynamic class at this site; `methodsBeingInlined` is
   // where that is recorded, because an inlining is precisely the case where
   // `self` is somebody else's value.
-  if (!superContexts.empty() && methodsBeingInlined.empty())
+  // ⛔ Not a decorated method's body: what the decorator returned calls it
+  // with an instance of any subclass, and `self.helper()` in it ran the
+  // defining class's `helper` over a subclass's override.
+  if (!superContexts.empty() && methodsBeingInlined.empty() &&
+      superContexts.back().selfIsExact)
     if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(receiver.value))
       if (argument.getArgNumber() == 0 && argument.getOwner() &&
           argument.getOwner()->isEntryBlock())
@@ -1620,7 +1625,8 @@ void ModuleEmitter::emitDeferredMethodBodies() {
     auto emitBody = [&] {
       if (instanceBody)
         superContexts.push_back(SuperContext{
-            entry.contractName, entry.signature.positionalNames.front()});
+            entry.contractName, entry.signature.positionalNames.front(),
+            !decoratedMethodBodies.contains(entry.statement)});
       emitCallableFunction(*entry.statement, entry.symbolName,
                            entry.signature, {}, /*isLambda=*/false);
       if (instanceBody)
@@ -3665,8 +3671,9 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
                        pendingBodyKinds)) {
     bool instanceBody = kind == "instance" && !bodySig.positionalNames.empty();
     if (instanceBody)
-      superContexts.push_back(SuperContext{std::string(contractName),
-                                           bodySig.positionalNames.front()});
+      superContexts.push_back(SuperContext{
+          std::string(contractName), bodySig.positionalNames.front(),
+          !decoratedMethodBodies.contains(statement)});
     // The frozen-field guard is off inside this class's own __init__, which is
     // where the fields are filled -- CPython goes around its own block there
     // with object.__setattr__. The body is emitted BOTH as a symbol (here) and

@@ -616,7 +616,9 @@ TEST(EmitterTest, ADecoratorThatReturnsNoFunctionIsRefusedByName) {
 
 // What: a decorated method compiles when its decorator returns a function,
 // and one whose decorator returns anything else is refused by name, with no
-// second sentence about the cell the rewrite reads.
+// second sentence about the cell the rewrite reads. A method with defaults
+// keeps them through a decorator that hands the function back, and is
+// refused under one whose result does not take them.
 TEST(EmitterTest, ADecoratedMethodIsWhatItsDecoratorReturns) {
   mlir::MLIRContext accepting(testRegistry());
   lython::emitter::EmitResult accepted = emitSource(
@@ -646,6 +648,24 @@ TEST(EmitterTest, ADecoratedMethodIsWhatItsDecoratorReturns) {
   EXPECT_TRUE(reportsDiagnostic(
       refused, "decorator 'to_int' on method 'm' does not return a function"));
   EXPECT_FALSE(reportsDiagnostic(refused, "unresolved name"));
+
+  mlir::MLIRContext wrapping(testRegistry());
+  lython::emitter::EmitResult dropped = emitSource(
+      "from typing import Callable\n"
+      "def wrapped[T](f: Callable[[T, int], int]) -> Callable[[T, int], int]:\n"
+      "    def inner(x: T, n: int) -> int:\n"
+      "        return f(x, n)\n"
+      "    return inner\n"
+      "class A:\n"
+      "    @wrapped\n"
+      "    def m(self, n: int = 2) -> int:\n"
+      "        return n\n"
+      "print(A().m())\n",
+      wrapping);
+  EXPECT_FALSE(dropped.ok());
+  EXPECT_TRUE(reportsDiagnostic(
+      dropped, "method 'm' declares default values, and what the decorator "
+               "returns does not take them"));
 }
 
 // What: `Container` is covariant, as typeshed declares it, so a method taking

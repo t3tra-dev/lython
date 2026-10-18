@@ -2009,7 +2009,14 @@ private:
   struct SuperContext {
     std::string definingClass;
     std::string selfName;
+    // Whether `self` is the defining class itself: true of a standalone
+    // method body, which every call inlines instead, but not of a decorated
+    // method's body, which the decorator's result calls with an instance of
+    // any subclass that inherits it.
+    bool selfIsExact = true;
   };
+  // The bodies desugarMethodDecorators hid behind their decorators.
+  llvm::DenseSet<const parser::Node *> decoratedMethodBodies;
   llvm::SmallVector<SuperContext, 4> superContexts;
   // Method bodies currently being inlined, innermost last. Inlining emits
   // BOTH arms of every branch, so a cycle in the inline graph has no base

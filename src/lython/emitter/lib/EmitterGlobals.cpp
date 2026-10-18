@@ -568,6 +568,47 @@ bool ModuleEmitter::typeDecoratedMethod(DecoratedMethod &method,
     synthesizedIteratorDefs.push_back(applied);
     decoratedType = types.widenLiteral(types.inferExpr(applied.get()));
   }
+  // ⛔ A default the def declares is the method's only while what the
+  // decorator returned still has it: the forwarder restates the def's
+  // signature, and over a wrapper `(x, n)` it answered `m()` with the def's
+  // default where CPython raises TypeError. A decorator that hands the
+  // function back (`F -> F`) keeps the def's own type, defaults and all.
+  std::string droppedDefaults;
+  if (auto decorated = mlir::dyn_cast_if_present<py::CallableType>(decoratedType))
+    if (const parser::Node *arguments =
+            method.hiddenDef ? ast::node(*method.hiddenDef, "args") : nullptr)
+      if (const auto *defaults = ast::nodeList(*arguments, "defaults");
+          defaults && !defaults->empty()) {
+        llvm::ArrayRef<mlir::BoolAttr> kept = decorated.getPositionalDefaults();
+        std::size_t count = decorated.getPositionalTypes().size();
+        bool keeps = kept.size() == count && count >= defaults->size();
+        for (std::size_t index = count - std::min(count, defaults->size());
+             keeps && index < count; ++index)
+          keeps = kept[index] && kept[index].getValue();
+        if (!keeps)
+          droppedDefaults = "' declares default values, and what the "
+                            "decorator returns does not take them: the method "
+                            "is what the decorator returns";
+      }
+  if (!droppedDefaults.empty()) {
+    if (!reportFailure)
+      return false;
+    const parser::Node *decorator =
+        method.decorators.empty() ? nullptr : method.decorators.front().get();
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error,
+        decorator ? decorator->range.start : method.range.start,
+        "method '" +
+            llvm::StringRef(method.hiddenName)
+                .drop_front(llvm::StringRef("__ly_undecorated$").size())
+                .str() +
+            droppedDefaults});
+    if (undecoratedType) {
+      moduleGlobals[method.cellName] = undecoratedType;
+      types.bindSymbol(method.cellName, undecoratedType);
+    }
+    return false;
+  }
   if (!mlir::isa_and_nonnull<py::CallableType>(decoratedType)) {
     if (!reportFailure)
       return false;
