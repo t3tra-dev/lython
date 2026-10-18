@@ -2148,9 +2148,13 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
     py::protocols::Table::getMutable(context).registerClass(contractName,
                                                             partial);
   };
+  classFieldsDeclaredOutsideInit.erase(contractName);
+  // A NamedTuple's instances are immutable: a store in a method raises in
+  // CPython, and must not become a slot of the tuple.
   collectClassFields(classDef, fieldNames, fieldTypes,
                      /*includeAnnAssignDefaults=*/isDataclass, contractName,
-                     publishFieldsSoFar);
+                     publishFieldsSoFar,
+                     /*methodsDeclareFields=*/!isNamedTuple);
 
   // Dataclass field defaults (AnnAssign initializers). dataclasses.field()
   // models default= and default_factory= only: the factory desugars to a
@@ -2881,7 +2885,17 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
     // Synthesize __init__/__repr__/__eq__ from the MRO-merged field list
     // (CPython composes base dataclass fields the same way); an explicit
     // user definition wins, as in dataclasses._set_new_attribute.
-    llvm::ArrayRef<std::string> order = classFieldOrders[contractName];
+    // A field a method created (`self.total = ...` in __post_init__) is an
+    // instance attribute, not a dataclass field.
+    llvm::SmallVector<std::string, 8> dataclassFields;
+    for (const std::string &field : classFieldOrders[contractName])
+      if (llvm::none_of(classMros[contractName], [&](const std::string &cls) {
+            auto created = classFieldsDeclaredOutsideInit.find(cls);
+            return created != classFieldsDeclaredOutsideInit.end() &&
+                   created->second.contains(field);
+          }))
+        dataclassFields.push_back(field);
+    llvm::ArrayRef<std::string> order = dataclassFields;
     const llvm::StringMap<mlir::Type> &fieldTypeMap =
         classFieldBindings[contractName];
     auto defaultNodeFor = [&](llvm::StringRef field) -> parser::NodePtr {
@@ -3608,7 +3622,8 @@ void ModuleEmitter::collectClassFields(
     bool includeAnnAssignDefaults, llvm::StringRef contractName,
     llvm::function_ref<void(llvm::ArrayRef<std::string>,
                             llvm::ArrayRef<mlir::Type>)>
-        publishSoFar) {
+        publishSoFar,
+    bool methodsDeclareFields) {
   // The class as the TYPE SYSTEM knows it. An imported class is `lib.R` there
   // and `R` in its own ClassDef, and every question this walk asks -- what
   // `self` is, whether a target's owner is this class -- was asked by the
@@ -3620,6 +3635,44 @@ void ModuleEmitter::collectClassFields(
   // Field names whose only assignment so far was an EMPTY container literal,
   // which has no element type of its own: the next assignment replaces it.
   llvm::StringSet<> provisionalFields;
+  auto answeredOutsideTheFields = [&](llvm::StringRef name) {
+    if (const auto *classBody = ast::nodeList(classDef, "body"))
+      for (const parser::NodePtr &statement : *classBody) {
+        if (!statement)
+          continue;
+        if ((statement->kind == "FunctionDef" ||
+             statement->kind == "AsyncFunctionDef") &&
+            llvm::StringRef(ast::nameSpelling(*statement)) == name)
+          return true;
+        llvm::SmallVector<const parser::Node *, 2> targets;
+        if (statement->kind == "Assign") {
+          if (const auto *list = ast::nodeList(*statement, "targets"))
+            for (const parser::NodePtr &target : *list)
+              targets.push_back(target.get());
+        } else if (statement->kind == "AnnAssign") {
+          targets.push_back(ast::node(*statement, "target"));
+        }
+        for (const parser::Node *target : targets)
+          if (target && target->kind == "Name" &&
+              llvm::StringRef(ast::nameSpelling(*target)) == name)
+            return true;
+      }
+    auto mro = classMros.find(ownContractName);
+    if (mro == classMros.end())
+      return false;
+    const py::protocols::Table &table = py::protocols::Table::get(context);
+    for (const std::string &cls : mro->second) {
+      if (cls == ownContractName)
+        continue;
+      mlir::Type base = types.contract(cls);
+      if (lookupClassField(base, name) || resolveMroMethod(cls, name) ||
+          lookupClassStaticAttr(base, name) ||
+          table.resolveFieldContractWithEvidence(base, name) ||
+          !table.methodContractCandidatesWithEvidence(base, name).empty())
+        return true;
+    }
+    return false;
+  };
   auto setField = [&](llvm::StringRef name, mlir::Type type,
                       bool overwriteExisting, const parser::Node &anchor,
                       bool provisional = false) {
@@ -3727,8 +3780,29 @@ void ModuleEmitter::collectClassFields(
         fieldTypes[index] = optional;
       return;
     }
-    if (collectFieldsRefineOnly)
-      return;
+    // ⭐ A METHOD OTHER THAN `__init__` CREATES THE ATTRIBUTE TOO, as CPython's
+    // does when it runs:
+    //
+    //     class MyTest(TestCase):
+    //         def setUp(self) -> None:
+    //             self.data = [1, 2, 3]
+    //         def test_len(self) -> None:
+    //             print(len(self.data))   # 'MyTest' object has no attribute 'data'
+    //
+    // -- every fixture of a unittest is written this way. The field's reads ask
+    // whether construction stored it (`fieldAlwaysStoredBeforeRead`), and
+    // construction does not, so one before the store raises AttributeError as
+    // it does in CPython.
+    //
+    // ⛔ Not a name a base, a method or a class attribute already answers: an
+    // instance attribute that SHADOWS one of those is a second storage for one
+    // name, which this layout cannot hold, and redeclaring a base's field here
+    // would retype its slot under the base's own methods.
+    if (collectFieldsRefineOnly) {
+      if (!methodsDeclareFields || answeredOutsideTheFields(name))
+        return;
+      classFieldsDeclaredOutsideInit[ownContractName].insert(name);
+    }
     fieldNames.push_back(name.str());
     fieldTypes.push_back(storedType);
     if (provisional)

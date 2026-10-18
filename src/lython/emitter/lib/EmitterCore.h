@@ -484,7 +484,8 @@ private:
       bool includeAnnAssignDefaults = false, llvm::StringRef contractName = {},
       llvm::function_ref<void(llvm::ArrayRef<std::string>,
                               llvm::ArrayRef<mlir::Type>)>
-          publishSoFar = nullptr);
+          publishSoFar = nullptr,
+      bool methodsDeclareFields = true);
   void collectStaticClassAssignments(
       const parser::Node &classDef, llvm::SmallVectorImpl<std::string> &names,
       llvm::SmallVectorImpl<mlir::Attribute> &values,
@@ -1537,6 +1538,10 @@ private:
   // Fields declared by the class body itself (classFieldOrders holds the
   // MRO-merged instance layout).
   llvm::StringMap<llvm::SmallVector<std::string, 8>> classOwnFieldOrders;
+  // The fields a method other than `__init__` creates (`self.data = ...` in a
+  // test's setUp). They are instance attributes, not dataclass fields: CPython's
+  // dataclass reads the class annotations.
+  llvm::StringMap<llvm::StringSet<>> classFieldsDeclaredOutsideInit;
   // MRO-merged class attribute declaration order and initializer expression
   // per class (classStaticAttrBindings holds the merged types).
   llvm::StringMap<llvm::SmallVector<std::string, 8>> classStaticAttrOrders;
