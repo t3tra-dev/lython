@@ -4037,6 +4037,24 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
               return py::protocols::bindReceiverCallable(
                   methods.front().method.signature);
           }
+          // ⭐ AND READ OFF THE CLASS, THE PLAIN FUNCTION, receiver first --
+          // what a decorator is handed (`d(C.m)`), which a generic factory's
+          // `Callable[[T], int]` has to be solved against. It answered
+          // `object`, which solved `F -> F` at `object` and nothing else.
+          // ⛔ An instance method only, told by its first parameter being the
+          // class: a classmethod read off the class is bound to it.
+          if (mlir::isa<py::TypeType>(widenLiteral(objectType)) &&
+              lookupClass(contractType.getContractName())) {
+            std::vector<py::protocols::ContractResolution> methods =
+                table.methodContractCandidatesWithEvidence(receiverInstance,
+                                                           *attr);
+            if (methods.size() == 1) {
+              py::CallableType signature = methods.front().method.signature;
+              if (!signature.getPositionalTypes().empty() &&
+                  signature.getPositionalTypes().front() == receiverInstance)
+                return signature;
+            }
+          }
         }
         if (std::optional<CallSolution> method =
                 tryManifestMethod(*this, widenLiteral(objectType), *attr, {}))
@@ -5212,6 +5230,26 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         }
       }
     }
+    if (callee && callee->kind == "Call" && keywords.empty()) {
+      const auto *factoryArgs = ast::nodeList(*callee, "args");
+      const auto *factoryKeywords = ast::nodeList(*callee, "keywords");
+      if ((!factoryKeywords || factoryKeywords->empty()) &&
+          llvm::none_of(factoryArgs ? *factoryArgs
+                                    : std::vector<parser::NodePtr>{},
+                        [](const parser::NodePtr &arg) {
+                          return !arg || arg->kind == "Starred";
+                        })) {
+        llvm::SmallVector<mlir::Type, 4> factoryArgTypes;
+        if (factoryArgs)
+          for (const parser::NodePtr &arg : *factoryArgs)
+            factoryArgTypes.push_back(lenientRecurse(arg.get()));
+        if (std::optional<CurriedCallSolution> curried =
+                solveCurriedGenericCall(
+                    lenientRecurse(ast::node(*callee, "func")),
+                    factoryArgTypes, positional))
+          return curried->result;
+      }
+    }
     if (callee) {
       mlir::Type calleeType = recurse(callee);
       if (strict) {
@@ -5424,6 +5462,57 @@ TypeSystem::inferYieldFromWithEvidence(mlir::Type sourceType) const {
       std::string(
           "yield from requires a Generator, Iterator, or Iterable value, got ") +
           typeText(source)};
+}
+
+// ⭐ A GENERIC FACTORY IS SOLVED BY WHAT ITS RESULT IS APPLIED TO. `F` in
+// `def skip[F](reason: str) -> Callable[[F], F]` is named by no parameter,
+// so `skip("why")` alone determines nothing and was refused -- and `@skip(r)`
+// is exactly that call, applied at once to the def it decorates. The two
+// calls are one application of `(reason, f: F) -> F`, which the def's type
+// solves.
+// ⛔ Positional calls with no packs, and a factory with no default left
+// out: the joined signature restates the two parameter lists end to end,
+// which is all it can do without names to place the rest by.
+std::optional<TypeSystem::CurriedCallSolution>
+TypeSystem::solveCurriedGenericCall(
+    mlir::Type factoryType, mlir::ArrayRef<mlir::Type> factoryArguments,
+    mlir::ArrayRef<mlir::Type> appliedArguments) const {
+  auto factory = mlir::dyn_cast_if_present<py::CallableType>(factoryType);
+  if (!factory || unboundStaticParameterCount(factory) == 0 ||
+      factory.getResultTypes().size() != 1 || factory.hasVararg() ||
+      factory.hasKwarg() || !factory.getKwOnlyTypes().empty() ||
+      factoryArguments.size() != factory.getPositionalTypes().size())
+    return std::nullopt;
+  auto applied =
+      mlir::dyn_cast_if_present<py::CallableType>(factory.getResultTypes().front());
+  if (!applied || applied.hasVararg() || applied.hasKwarg() ||
+      !applied.getKwOnlyTypes().empty() ||
+      appliedArguments.size() != applied.getPositionalTypes().size())
+    return std::nullopt;
+  if (tryCallableApplication(*this, factory, factoryArguments, {}))
+    return std::nullopt;
+  llvm::SmallVector<mlir::Type, 8> parameters(
+      factory.getPositionalTypes().begin(), factory.getPositionalTypes().end());
+  parameters.append(applied.getPositionalTypes().begin(),
+                    applied.getPositionalTypes().end());
+  py::CallableType joined = py::CallableType::get(
+      &context, parameters, {}, {}, {}, applied.getResultTypes());
+  llvm::SmallVector<mlir::Type, 8> arguments(factoryArguments.begin(),
+                                             factoryArguments.end());
+  arguments.append(appliedArguments.begin(), appliedArguments.end());
+  std::optional<CallSolution> solved =
+      tryCallableApplication(*this, joined, arguments, {});
+  if (!solved)
+    return std::nullopt;
+  auto ground = mlir::dyn_cast_if_present<py::CallableType>(
+      substituteType(*this, factory, solved->bindings));
+  if (!ground || unboundStaticParameterCount(ground) != 0)
+    return std::nullopt;
+  auto groundApplied =
+      mlir::dyn_cast_if_present<py::CallableType>(ground.getResultTypes().front());
+  if (!groundApplied)
+    return std::nullopt;
+  return CurriedCallSolution{solved->result, ground, groundApplied};
 }
 
 CallInferenceResult TypeSystem::inferCallWithEvidence(

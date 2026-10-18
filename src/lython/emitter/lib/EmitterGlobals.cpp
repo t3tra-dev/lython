@@ -55,6 +55,7 @@
 #include "AstAccess.h"
 #include "AstSynth.h"
 #include "ClosureAnalysis.h"
+#include "EmitterSupport.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/ADT/StringSet.h"
@@ -592,6 +593,44 @@ bool ModuleEmitter::typeDecoratedMethod(DecoratedMethod &method,
           droppedDefaults = "' declares default values, and what the "
                             "decorator returns does not take them: the method "
                             "is what the decorator returns";
+      }
+  // ⛔ Nor one whose result takes other parameters or returns another type:
+  // the forwarder restates the def's signature, so `@as_text` turning
+  // `-> int` into `-> str` read as "annotated to return int but this return
+  // gives str", a sentence about a line the program did not write wrong.
+  // Supporting it is the forwarder taking the result's signature instead.
+  if (droppedDefaults.empty())
+    if (auto decorated =
+            mlir::dyn_cast_if_present<py::CallableType>(decoratedType))
+      if (auto undecorated =
+              mlir::dyn_cast_if_present<py::CallableType>(undecoratedType)) {
+        auto same = [&](mlir::ArrayRef<mlir::Type> lhs,
+                        mlir::ArrayRef<mlir::Type> rhs) {
+          if (lhs.size() != rhs.size())
+            return false;
+          for (auto [left, right] : llvm::zip(lhs, rhs))
+            if (types.widenLiteral(left) != types.widenLiteral(right))
+              return false;
+          return true;
+        };
+        auto spell = [&](py::CallableType callable) {
+          std::string text = "(";
+          for (auto [index, parameter] :
+               llvm::enumerate(callable.getPositionalTypes()))
+            text += (index ? ", " : "") + pythonTypeSpelling(parameter);
+          text += ") -> ";
+          text += callable.getResultTypes().empty()
+                      ? std::string("None")
+                      : pythonTypeSpelling(callable.getResultTypes().front());
+          return text;
+        };
+        if (!same(decorated.getPositionalTypes(),
+                  undecorated.getPositionalTypes()) ||
+            !same(decorated.getResultTypes(), undecorated.getResultTypes()))
+          droppedDefaults = "' is " + spell(undecorated) +
+                            " and its decorator makes it " + spell(decorated) +
+                            ": a decorated method keeps the signature its def "
+                            "declares here";
       }
   if (!droppedDefaults.empty()) {
     if (!reportFailure)

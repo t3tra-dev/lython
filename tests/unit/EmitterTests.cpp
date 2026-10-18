@@ -703,6 +703,62 @@ TEST(EmitterTest, ADecoratedMethodIsWhatItsDecoratorReturns) {
                "returns does not take them"));
 }
 
+// What: a decorator factory generic in a parameter only its result names
+// compiles where its result is applied at once -- a decorator, or `f(r)(g)`
+// -- and a call that holds the factory's result is refused naming why. A
+// decorator whose result changes the method's signature is refused naming
+// both signatures.
+TEST(EmitterTest, AGenericDecoratorFactoryIsSolvedWhereItIsApplied) {
+  const char *factory =
+      "from typing import Callable\n"
+      "def skip[F](reason: str) -> Callable[[F], F]:\n"
+      "    def decorator(f: F) -> F:\n"
+      "        return f\n"
+      "    return decorator\n";
+  mlir::MLIRContext accepting(testRegistry());
+  lython::emitter::EmitResult accepted = emitSource(
+      std::string(factory) +
+          "class Case:\n"
+          "    @skip(\"why\")\n"
+          "    def test(self) -> None:\n"
+          "        print(1)\n"
+          "@skip(\"module\")\n"
+          "def g(x: int) -> int:\n"
+          "    return x\n"
+          "Case().test()\n"
+          "print(g(1), skip(\"now\")(g)(2))\n",
+      accepting);
+  EXPECT_TRUE(accepted.ok());
+  for (const lython::parser::Diagnostic &diagnostic : accepted.diagnostics)
+    ADD_FAILURE() << diagnostic.message;
+
+  mlir::MLIRContext holding(testRegistry());
+  lython::emitter::EmitResult held = emitSource(
+      std::string(factory) + "d = skip(\"later\")\n", holding);
+  EXPECT_FALSE(held.ok());
+  EXPECT_TRUE(reportsDiagnostic(
+      held, "this call's result is generic in a type parameter no argument "
+            "names"));
+
+  mlir::MLIRContext changing(testRegistry());
+  lython::emitter::EmitResult changed = emitSource(
+      "from typing import Callable\n"
+      "def as_text[T](f: Callable[[T], int]) -> Callable[[T], str]:\n"
+      "    def wrapper(x: T) -> str:\n"
+      "        return str(f(x))\n"
+      "    return wrapper\n"
+      "class Case:\n"
+      "    @as_text\n"
+      "    def count(self) -> int:\n"
+      "        return 5\n"
+      "print(Case().count())\n",
+      changing);
+  EXPECT_FALSE(changed.ok());
+  EXPECT_TRUE(reportsDiagnostic(
+      changed, "method 'count' is (Case) -> int and its decorator makes it "
+               "(Case) -> str"));
+}
+
 // What: `Container` is covariant, as typeshed declares it, so a method taking
 // `Container[object]` accepts a list[int], a dict, a set and a tuple, while a
 // `Container[str]` parameter still refuses a list[int].

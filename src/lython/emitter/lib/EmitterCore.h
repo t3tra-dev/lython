@@ -907,6 +907,8 @@ private:
   // contract names), null for main-module and manifest classes.
   const EmitOptions::SourceModule *
   sourceModuleForClass(llvm::StringRef className) const;
+  std::optional<Value> tryEmitCurriedGenericCall(const parser::Node &expr,
+                                                 const parser::Node &factoryCall);
   Value emitGenericCall(const parser::Node &expr,
                         const parser::Node &calleeNode,
                         GenericFunctionInfo &generic);

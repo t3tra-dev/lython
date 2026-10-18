@@ -402,6 +402,10 @@ Value ModuleEmitter::emitCallableDispatch(const parser::Node &anchor,
 
 Value ModuleEmitter::emitCall(const parser::Node &expr) {
   const parser::Node *calleeNode = ast::node(expr, "func");
+  if (calleeNode && calleeNode->kind == "Call")
+    if (std::optional<Value> curried =
+            tryEmitCurriedGenericCall(expr, *calleeNode))
+      return *curried;
   if (std::optional<Value> dispatched = emitClassValueCall(expr, calleeNode))
     return *dispatched;
   std::string calleeQualified = ast::qualifiedName(calleeNode);
@@ -2493,6 +2497,64 @@ Value ModuleEmitter::emitArgumentSpecializedCall(const parser::Node &expr,
   return emitCallableDispatch(expr, callee, operands);
 }
 
+// `factory(args)(applied)` with a generic factory its own arguments do not
+// solve (TypeSystem::solveCurriedGenericCall): the factory is specialized at
+// the solution the applied arguments give, called, and its result applied.
+std::optional<Value>
+ModuleEmitter::tryEmitCurriedGenericCall(const parser::Node &expr,
+                                         const parser::Node &factoryCall) {
+  const parser::Node *factoryNode = ast::node(factoryCall, "func");
+  if (!factoryNode)
+    return std::nullopt;
+  GenericFunctionInfo *generic = nullptr;
+  if (factoryNode->kind == "Name") {
+    generic = lookupGenericFunction(ast::nameSpelling(*factoryNode));
+  } else if (factoryNode->kind == "Attribute") {
+    std::string qualified = ast::qualifiedName(factoryNode);
+    if (!qualified.empty())
+      generic = lookupGenericFunction(qualified);
+  }
+  if (!generic)
+    return std::nullopt;
+  auto positionalOnly = [](const parser::Node &call) {
+    const auto *keywords = ast::nodeList(call, "keywords");
+    const auto *args = ast::nodeList(call, "args");
+    return (!keywords || keywords->empty()) &&
+           (!args || llvm::none_of(*args, [](const parser::NodePtr &arg) {
+              return !arg || arg->kind == "Starred";
+            }));
+  };
+  if (!positionalOnly(factoryCall) || !positionalOnly(expr))
+    return std::nullopt;
+  auto argumentTypes = [&](const parser::Node &call) {
+    llvm::SmallVector<mlir::Type, 4> out;
+    if (const auto *args = ast::nodeList(call, "args"))
+      for (const parser::NodePtr &arg : *args)
+        out.push_back(types.inferExpr(arg.get()));
+    return out;
+  };
+  std::optional<TypeSystem::CurriedCallSolution> solved =
+      types.solveCurriedGenericCall(generic->signature.publicCallable,
+                                    argumentTypes(factoryCall),
+                                    argumentTypes(expr));
+  if (!solved)
+    return std::nullopt;
+  std::optional<std::pair<std::string, py::CallableType>> specialization =
+      ensureGenericSpecialization(factoryCall, *generic, solved->factory);
+  if (!specialization)
+    return emitNone(expr);
+  Value factory = emitBindingRef(*factoryNode, specialization->first,
+                                 specialization->second);
+  Value made = emitCallableDispatch(
+      factoryCall, factory,
+      emitCallOperands(factoryCall, {}, /*includeAstArguments=*/true,
+                       specialization->second));
+  return emitCallableDispatch(
+      expr, made,
+      emitCallOperands(expr, {}, /*includeAstArguments=*/true,
+                       solved->applied));
+}
+
 Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
                                      const parser::Node &calleeNode,
                                      GenericFunctionInfo &generic) {
@@ -2509,6 +2571,30 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
   CallInferenceResult inference = types.inferCallWithEvidence(
       generic.signature.publicCallable, operands.positionalTypes,
       operands.keywordTypes);
+  // A type parameter only the result names is solved by what the result is
+  // applied to, which a held factory (`d = skip(r)`) has not been yet.
+  if (!inference)
+    if (auto declared = mlir::dyn_cast_if_present<py::CallableType>(
+            generic.signature.publicCallable)) {
+      llvm::SmallVector<mlir::Type, 8> parameterTypes(
+          declared.getPositionalTypes().begin(),
+          declared.getPositionalTypes().end());
+      parameterTypes.append(declared.getKwOnlyTypes().begin(),
+                            declared.getKwOnlyTypes().end());
+      bool parametersGround = llvm::all_of(parameterTypes, [](mlir::Type t) {
+        return unboundStaticParameterCount(t) == 0;
+      });
+      if (parametersGround && !declared.getResultTypes().empty() &&
+          unboundStaticParameterCount(declared.getResultTypes().front()) != 0) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "this call's result is generic in a type parameter no argument "
+            "names: apply the result where it is made -- `" +
+                ast::qualifiedName(&calleeNode) +
+                "(...)(f)`, as a decorator does -- which is what solves it"});
+        return emitNone(expr);
+      }
+    }
   if (!requireStaticEvidence(expr, inference))
     return emitNone(expr);
   auto resolved = mlir::dyn_cast_if_present<py::CallableType>(
