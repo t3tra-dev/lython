@@ -1,0 +1,5 @@
+a=1
+[only]
+x:2 <y>
+['j=2', 'k=1']
+[5] [s] [7] TypeError: not all arguments converted during string formatting TypeError: not enough arguments for format string

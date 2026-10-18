@@ -946,6 +946,8 @@ private:
                                                      std::string &why) const;
   std::optional<Value> tryEmitDirCall(const parser::Node &expr,
                                       const parser::Node *calleeNode);
+  Value emitPercentFormatArguments(const parser::Node &expr, Value operand,
+                                   unsigned wanted);
   // `object.__repr__(x)` and its siblings: object's own slot, not x's.
   std::optional<Value> tryEmitObjectSlotCall(const parser::Node &expr,
                                              const parser::Node *calleeNode);

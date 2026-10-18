@@ -6,6 +6,7 @@
 // call. What the file is about is the string, not the call: the format
 // template readers, the conversion/spec pair, and the per-type stringify are
 // one subject, and they used none of that file's call-shaping helpers.
+#include "llvm/ADT/ScopeExit.h"
 #include "Contracts.h"
 #include "AstSynth.h"
 #include "EmitterCore.h"
@@ -996,6 +997,98 @@ ModuleEmitter::tryEmitStrFormatCall(const parser::Node &expr,
   return *result;
 }
 
+// The argument tuple `fmt % operand` formats when the operand's arity is the
+// run time's: `__ly_fmtargs$<n>(x) -> tuple of n`, raising CPython's
+// TypeError when the count differs, and taking a non-tuple object as the one
+// argument.
+Value ModuleEmitter::emitPercentFormatArguments(const parser::Node &expr,
+                                                Value operand,
+                                                unsigned wanted) {
+  parser::SourceRange range = expr.range;
+  mlir::Type operandType = types.widenLiteral(operand.type);
+  bool isObject = py::isPyObjectType(operandType);
+  mlir::Type element = types.object();
+  if (!isObject)
+    if (auto tuple = mlir::dyn_cast<py::ContractType>(operandType);
+        tuple && tuple.getArguments().size() == 1)
+      element = tuple.getArguments().front();
+  std::string key = "fmtargs|" + std::to_string(wanted) + "|" +
+                    typeText(operandType);
+  std::string symbol;
+  if (auto found = computedLookupDispatchers.find(key);
+      found != computedLookupDispatchers.end()) {
+    symbol = found->second;
+  } else {
+    symbol = "__ly_fmtargs$" + std::to_string(++syntheticFunctionCounter);
+    computedLookupDispatchers[key] = symbol;
+    auto x = [&] { return synth::name("__ly_x", range); };
+    auto lengthIs = [&](llvm::StringRef op) {
+      return synth::compare(synth::lenCall(x(), range), op,
+                            synth::intConstant(wanted, range), range);
+    };
+    std::vector<parser::NodePtr> items;
+    for (unsigned index = 0; index < wanted; ++index)
+      items.push_back(
+          synth::subscript(x(), synth::intConstant(index, range), range));
+    std::vector<parser::NodePtr> spread{
+        synth::ifStmt(lengthIs("Lt"),
+                      {synth::raiseCall("TypeError",
+                                        "not enough arguments for format "
+                                        "string",
+                                        range)},
+                      {}, range),
+        synth::ifStmt(lengthIs("Gt"),
+                      {synth::raiseCall("TypeError",
+                                        "not all arguments converted during "
+                                        "string formatting",
+                                        range)},
+                      {}, range),
+        synth::returnStmt(synth::tuple(std::move(items), range), range)};
+    std::vector<parser::NodePtr> body;
+    if (isObject) {
+      body.push_back(synth::ifStmt(
+          synth::call(synth::name("isinstance", range),
+                      {x(), synth::name("tuple", range)}, range),
+          std::move(spread), {}, range));
+      if (wanted == 1)
+        body.push_back(
+            synth::returnStmt(synth::tuple({x()}, range), range));
+      else
+        body.push_back(synth::raiseCall(
+            "TypeError", "not enough arguments for format string", range));
+    } else {
+      body = std::move(spread);
+    }
+    llvm::SmallVector<const parser::Node *, 1> paramNodes;
+    parser::NodePtr def = synth::functionDef(
+        symbol, {synth::Param{"__ly_x", nullptr}}, {}, std::move(body),
+        nullptr, {}, range, &paramNodes);
+    synthesizedIteratorDefs.push_back(def);
+    types.overrideParameterType(paramNodes[0], operandType);
+    types.pinResultType(def.get(),
+                        types.contract("builtins.tuple",
+                                       llvm::SmallVector<mlir::Type, 4>(
+                                           wanted, element)));
+    FunctionSignature sig = types.functionSignature(*def);
+    types.bindRootSymbol(symbol, sig.publicCallable);
+    auto emitBody = [this, def, symbol, sig] {
+      emitDispatcherBody(*def, symbol, sig, /*suppressGate=*/false);
+    };
+    if (classDeclarationsEmitted)
+      emitBody();
+    else
+      deferredDispatcherBodies.push_back(std::move(emitBody));
+  }
+  std::string temp = symbol + "$operand";
+  values[temp] = operand;
+  types.bindSymbol(temp, operand.type);
+  auto forget = llvm::scope_exit([&] { values.erase(temp); });
+  parser::NodePtr call = synth::call(synth::name(symbol, range),
+                                     {synth::name(temp, range)}, range);
+  synthesizedIteratorDefs.push_back(call);
+  return emitExpr(call.get());
+}
+
 Value ModuleEmitter::emitPercentFormat(const parser::Node &expr) {
   mlir::Type strType = types.contract("builtins.str");
   const parser::Node *leftNode = ast::node(expr, "left");
@@ -1025,7 +1118,79 @@ Value ModuleEmitter::emitPercentFormat(const parser::Node &expr) {
         arguments.push_back(emitExpr(element.get()));
       }
   } else if (rightNode) {
-    arguments.push_back(emitExpr(rightNode));
+    // ⭐ A TUPLE IS THE ARGUMENT LIST WHEREVER IT COMES FROM, not only when
+    // it is written there: CPython asks the operand's run-time type. A tuple
+    // held in a name was formatted as ONE argument -- `"[%s]" % one` printed
+    // `[('only',)]` for a one-element tuple where CPython prints `[only]`,
+    // and a two-element tuple against one `%s` printed the pair where CPython
+    // raises "not all arguments converted". Silent both ways.
+    Value operand = emitExpr(rightNode);
+    mlir::Type operandType = types.widenLiteral(operand.type);
+    auto tuple = mlir::dyn_cast_if_present<py::ContractType>(operandType);
+    bool isTuple = tuple && tuple.getContractName() == "builtins.tuple";
+    auto itemAt = [&](Value sequence, unsigned index) -> std::optional<Value> {
+      mlir::Type indexType = types.literal(std::to_string(index));
+      Value indexValue{py::IntConstantOp::create(
+                           builder, loc(expr), indexType,
+                           builder.getStringAttr(std::to_string(index)))
+                           .getResult(),
+                       indexType};
+      CallInferenceResult inference = types.inferMethodCallWithEvidence(
+          sequence.type, "__getitem__", {indexValue.type});
+      if (!requireStaticEvidence(expr, inference))
+        return std::nullopt;
+      auto item = py::GetItemOp::create(
+          builder, loc(expr), inference.resultType,
+          mlir::FlatSymbolRefAttr::get(&context, "__getitem__"),
+          callProtocolFor(inference), sequence.value, indexValue.value);
+      return Value{item.getResult(), inference.resultType};
+    };
+    if (isTuple && tuple.getArguments().size() >= 2) {
+      // Its type says how many: read by position.
+      for (unsigned index = 0; index < tuple.getArguments().size(); ++index) {
+        std::optional<Value> item = itemAt(operand, index);
+        if (!item)
+          return emitNone(expr);
+        arguments.push_back(*item);
+      }
+    } else if (isTuple || py::isPyObjectType(operandType)) {
+      // A one-element spelling is also the homogeneous one, and an object
+      // may hold a tuple or not: the run time says how many, so a helper
+      // checks the count against the template's and hands the items over --
+      // or, for an object that is no tuple, the object itself.
+      unsigned wanted = 0;
+      for (size_t at = 0; at < tpl->size(); ++at)
+        if ((*tpl)[at] == '%') {
+          if (at + 1 < tpl->size() && (*tpl)[at + 1] == '%')
+            ++at;
+          else
+            ++wanted;
+        }
+      if (wanted == 0)
+        wanted = 1;
+      Value items = emitPercentFormatArguments(expr, operand, wanted);
+      for (unsigned index = 0; index < wanted; ++index) {
+        std::optional<Value> item = itemAt(items, index);
+        if (!item)
+          return emitNone(expr);
+        arguments.push_back(*item);
+      }
+    } else if (auto unionType =
+                   mlir::dyn_cast_if_present<py::UnionType>(operandType);
+               unionType &&
+               llvm::any_of(unionType.getMemberTypes(), [](mlir::Type member) {
+                 auto memberContract =
+                     mlir::dyn_cast_if_present<py::ContractType>(member);
+                 return memberContract &&
+                        memberContract.getContractName() == "builtins.tuple";
+               })) {
+      return diag("%-formatting with a union that may hold a tuple is not "
+                  "supported: whether the tuple is the argument list is a "
+                  "run-time question this compiler does not ask of a union; "
+                  "write the arguments as a tuple");
+    } else {
+      arguments.push_back(operand);
+    }
   }
 
   std::optional<Value> result;
