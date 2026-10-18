@@ -67,6 +67,18 @@ private:
                             const std::vector<parser::NodePtr> &body,
                             const parser::Node &function);
   llvm::StringSet<> importedSignatureScopes;
+  // ⛔ Not recomputed at every binding: a signature binds its module's imports,
+  // and binding an import reads the signature of every def that module
+  // exports, so the work multiplied with each level of the import graph (a
+  // chain of 12 modules took 22 s, CPython's unittest package never finished).
+  // ⛔ And not kept for the whole compile: a signature read before the class
+  // declarations exist walks its body against no class schemas, so the
+  // memo is dropped at every step that declares more (forgetImportedSignatures).
+  // Keyed with whether defaults describe parameters, which is false only
+  // during the module fixpoint and changes what a body walk answers.
+  llvm::DenseMap<std::pair<const parser::Node *, unsigned>, FunctionSignature>
+      importedSignatures;
+  void forgetImportedSignatures() { importedSignatures.clear(); }
   // The host's global functions (Window's methods), and the spellings the
   // program imported them by.
   llvm::StringSet<> jsHostGlobalFunctions;

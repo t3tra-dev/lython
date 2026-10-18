@@ -1534,6 +1534,8 @@ void ModuleEmitter::predeclareSourceModules() {
             registerGenericClass(
                 *statement, sourceModuleClassSymbol(source.moduleName, *name),
                 &source);
+    // Read before this module's generic classes existed.
+    forgetImportedSignatures();
   }
 }
 
@@ -1707,6 +1709,8 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
     TypeSystem::ScopeIsolation isolation = types.isolateScopes();
     auto moduleScope = types.pushScope();
     std::size_t importDiagnosticStart = diagnostics.size();
+    // The module before this one declared its classes.
+    forgetImportedSignatures();
     bindModuleImportScope(*source.moduleNode, /*diagnoseUnsupported=*/true);
     for (std::size_t index = importDiagnosticStart; index < diagnostics.size();
          ++index)
@@ -2721,6 +2725,16 @@ void ModuleEmitter::wrapJsCallbackArguments(const parser::Node &anchor,
 FunctionSignature ModuleEmitter::importedFunctionSignature(
     const EmitOptions::SourceModule &source,
     const std::vector<parser::NodePtr> &body, const parser::Node &function) {
+  static const bool ablateMemo =
+      std::getenv("LYTHON_ABLATE_IMPORTED_SIGNATURE_MEMO") != nullptr;
+  std::pair<const parser::Node *, unsigned> key{
+      &function, types.describesParametersByDefaults() ? 1u : 0u};
+  if (!ablateMemo)
+    if (auto found = importedSignatures.find(key);
+        found != importedSignatures.end())
+      return found->second;
+  // ⛔ The cycle's reading is not memoized: it is the classes alone, and the
+  // same def read from outside the cycle binds its imports.
   if (!importedSignatureScopes.insert(source.moduleName).second)
     return sourceModuleFunctionSignature(types, source.moduleName, body,
                                          function, source.isStub);
@@ -2729,8 +2743,11 @@ FunctionSignature ModuleEmitter::importedFunctionSignature(
   TypeSystem::ScopeIsolation isolation = types.isolateScopes();
   auto moduleScope = types.pushScope();
   bindModuleImportScope(*source.moduleNode, /*diagnoseUnsupported=*/false);
-  return sourceModuleFunctionSignature(types, source.moduleName, body, function,
-                                       source.isStub);
+  FunctionSignature signature = sourceModuleFunctionSignature(
+      types, source.moduleName, body, function, source.isStub);
+  if (!ablateMemo)
+    importedSignatures.try_emplace(key, signature);
+  return signature;
 }
 
 // `setTimeout(f, 10)` imported from `js` is `globalThis.setTimeout(f, 10)`:

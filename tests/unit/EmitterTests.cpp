@@ -12,6 +12,8 @@
 
 #include <gtest/gtest.h>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -59,21 +61,22 @@ struct ImportedModuleEmit {
 };
 
 ImportedModuleEmit
-emitWithImportedModule(llvm::StringRef helperName, llvm::StringRef helperSource,
-                       llvm::StringRef mainSource,
-                       llvm::StringRef helperExtension = ".py",
-                       llvm::StringRef targetTriple = {},
-                       bool jsHost = false) {
+emitWithImportedModules(
+    llvm::ArrayRef<std::pair<std::string, std::string>> helpers,
+    llvm::StringRef mainSource, llvm::StringRef helperExtension = ".py",
+    llvm::StringRef targetTriple = {}, bool jsHost = false) {
   ImportedModuleEmit result;
   llvm::SmallString<128> dir;
   if (llvm::sys::fs::createUniqueDirectory("lython-emit-import", dir)) {
     result.diagnostics = "could not create a temporary import directory";
     return result;
   }
-  llvm::SmallString<128> helperPath(dir);
-  llvm::sys::path::append(helperPath,
-                          llvm::Twine(helperName) + helperExtension);
-  {
+  std::vector<llvm::SmallString<128>> helperPaths;
+  for (const auto &[helperName, helperSource] : helpers) {
+    llvm::SmallString<128> helperPath(dir);
+    llvm::sys::path::append(helperPath,
+                            llvm::Twine(helperName) + helperExtension);
+    helperPaths.push_back(helperPath);
     std::error_code error;
     llvm::raw_fd_ostream out(helperPath, error);
     if (error) {
@@ -95,9 +98,46 @@ emitWithImportedModule(llvm::StringRef helperName, llvm::StringRef helperSource,
   options.jsHost = jsHost;
   result.succeeded = mlir::succeeded(lython::driver::emitMLIRFromSource(
       mainSource, mainPath, dir, options, context, module, diag));
-  llvm::sys::fs::remove(helperPath);
+  for (const llvm::SmallString<128> &helperPath : helperPaths)
+    llvm::sys::fs::remove(helperPath);
   llvm::sys::fs::remove(dir);
   return result;
+}
+
+ImportedModuleEmit
+emitWithImportedModule(llvm::StringRef helperName, llvm::StringRef helperSource,
+                       llvm::StringRef mainSource,
+                       llvm::StringRef helperExtension = ".py",
+                       llvm::StringRef targetTriple = {},
+                       bool jsHost = false) {
+  return emitWithImportedModules({{helperName.str(), helperSource.str()}},
+                                 mainSource, helperExtension, targetTriple,
+                                 jsHost);
+}
+
+// What: sixteen modules, each importing every module before it, emit. Each
+// import used to read the signatures of everything the imported module imports
+// again, level by level -- twelve such modules took over four minutes, and
+// CPython's unittest package never finished.
+TEST(EmitterTest, AModuleGraphWhereEachImportsAllEarlierOnesEmits) {
+  std::vector<std::pair<std::string, std::string>> modules;
+  for (int index = 0; index < 16; ++index) {
+    std::string source;
+    for (int earlier = 0; earlier < index; ++earlier)
+      source += "import m" + std::to_string(earlier) + "\n";
+    std::string self = std::to_string(index);
+    source += "def f" + self + "(x: int) -> int:\n    return " +
+              (index == 0 ? std::string("x")
+                          : "m" + std::to_string(index - 1) + ".f" +
+                                std::to_string(index - 1) + "(x) + 1") +
+              "\n";
+    source += "def g" + self + "(x: int) -> int:\n    return f" + self +
+              "(x) * 2\n";
+    modules.emplace_back("m" + self, std::move(source));
+  }
+  ImportedModuleEmit emitted =
+      emitWithImportedModules(modules, "import m15\nprint(m15.g15(1))\n");
+  EXPECT_TRUE(emitted.succeeded) << emitted.diagnostics;
 }
 
 // What: an imported module's body does not run, so a statement in it that WOULD

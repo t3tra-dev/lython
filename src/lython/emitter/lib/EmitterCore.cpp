@@ -91,7 +91,9 @@ EmitResult ModuleEmitter::emit() {
   // under, and predeclareTopLevel already binds imports and classes.
   collectTopLevelBindings();
   predeclareSourceModules();
+  forgetImportedSignatures();
   predeclareTopLevel();
+  forgetImportedSignatures();
   // ⭐ AND THE BASES THAT ARE NOT BARE NAMES. `collectTopLevelBindings` runs
   // before the imports are bound -- it has to, because the spellings it reads
   // decide which symbols the declarations are emitted under -- so a base
@@ -107,14 +109,17 @@ EmitResult ModuleEmitter::emit() {
   // where the aliases resolve and still before anything is emitted, so the
   // answer stays a property of the module rather than of the position asked.
   resolveTopLevelBaseSpellings();
+  forgetImportedSignatures();
   // After class/import predeclaration (signatures may reference user classes
   // and imported names), before any body is typed or emitted.
   types.registerModule(moduleNode);
+  forgetImportedSignatures();
 
   // Register module globals after the top-level classes are predeclared (a
   // global's annotation may name a user class) but before any function body
   // is emitted so their reads resolve.
   collectModuleGlobals(moduleNode);
+  forgetImportedSignatures();
 
   // Generic class instantiations may now be emitted as they are demanded.
   // Everything registerModule's fixpoint allocated (a parameter annotated
@@ -122,7 +127,9 @@ EmitResult ModuleEmitter::emit() {
   // would duplicate, and no top-level environment existed yet.
   genericClassEmissionReady = true;
   emitSourceModuleDeclarations();
+  forgetImportedSignatures();
   emitTopLevelDeclarations();
+  forgetImportedSignatures();
   classDeclarationsEmitted = true;
   // A body may ask for another dispatcher, which then emits at once.
   for (std::size_t index = 0; index < deferredDispatcherBodies.size(); ++index)
