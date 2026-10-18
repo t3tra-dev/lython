@@ -52,12 +52,16 @@ void ModuleEmitter::recordPythonDefinitionNames(const parser::Node &moduleNode,
         name = override->second;
       else
         name = std::string(ast::string(node, "name").value_or(""));
+      // A class written in a function is named where it was written.
       std::string qualname = prefix + name;
+      if (auto hoisted = hoistedClassPrefixes.find(&node);
+          hoisted != hoistedClassPrefixes.end())
+        qualname = hoisted->second + name;
       pythonDefinitionNames[&node] =
           PythonDefinitionName{moduleName.str(), qualname, name};
-      visitChildren(node, prefix,
-                    function ? qualname + ".<locals>." : qualname + ".",
-                    "body");
+      visitChildren(
+          node, hoistedClassPrefixes.count(&node) ? std::string() : prefix,
+          function ? qualname + ".<locals>." : qualname + ".", "body");
       return;
     }
     if (kind == "GeneratorExp") {

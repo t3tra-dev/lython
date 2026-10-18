@@ -1584,6 +1584,13 @@ private:
   llvm::DenseMap<const parser::Node *, PythonDefinitionName>
       pythonDefinitionNames;
   llvm::DenseMap<const parser::Node *, std::string> pythonNameOverrides;
+  // A class written in a function, declared at its module's top level
+  // (EmitterLocalClasses.cpp): the qualified-name prefix of where it was
+  // written, and the ones refused there.
+  llvm::DenseMap<const parser::Node *, std::string> hoistedClassPrefixes;
+  llvm::DenseSet<const parser::Node *> refusedLocalClasses;
+  void hoistFunctionLocalClasses(const parser::Node &moduleNode,
+                                 llvm::StringRef moduleName);
   void recordPythonDefinitionNames(const parser::Node &moduleNode,
                                    llvm::StringRef moduleName);
   // Each function emitted for a definition, under the symbol the emitter

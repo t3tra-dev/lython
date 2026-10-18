@@ -1688,10 +1688,10 @@ TEST(EmitterTest, RefusesAStatementInAClassBody) {
   }
 }
 
-// What: a class declared inside another class. The refusal for a class inside
-// a FUNCTION lives where statements are emitted, which never sees a class
-// body, so this one was accepted, silently dropped, and reported only at a use
-// -- as a missing "manifest method".
+// What: a class declared inside another class. The refusals for a class
+// statement elsewhere live where statements are emitted, which never sees a
+// class body, so this one was accepted, silently dropped, and reported only at
+// a use -- as a missing "manifest method".
 TEST(EmitterTest, RefusesAClassDeclaredInsideAClass) {
   mlir::MLIRContext context(testRegistry());
   lython::emitter::EmitResult result = emitSource(
@@ -1706,7 +1706,7 @@ TEST(EmitterTest, RefusesAClassDeclaredInsideAClass) {
   bool named = false;
   for (const lython::parser::Diagnostic &diagnostic : result.diagnostics)
     named = named || diagnostic.message.find(
-                         "a class defined inside a function or another class") !=
+                         "a class defined inside another class") !=
                          std::string::npos;
   EXPECT_TRUE(named);
 }
@@ -1826,20 +1826,19 @@ TEST(EmitterTest, AFunctionValueSaysItHasNoRepr) {
 TEST(EmitterTest, ANestedClassNamesItsOwnLimit) {
   // The generic "unsupported statement kind 'ClassDef'" plus a misleading
   // "unresolved name" at every use read as a scoping bug rather than as the
-  // one limitation it is.
+  // one limitation it is. In a function the class compiles; in a block of the
+  // module's top level it is still refused, by name.
   mlir::MLIRContext nested(testRegistry());
   lython::emitter::EmitResult inFunction = emitSource(
       "def run() -> None:\n    class D:\n        def __init__(self) -> None:\n"
       "            self.v = 1\n    print(D().v)\nrun()\n",
       nested);
-  EXPECT_FALSE(inFunction.ok());
-  bool saidClass = false;
-  for (const lython::parser::Diagnostic &diagnostic : inFunction.diagnostics)
-    saidClass = saidClass ||
-                diagnostic.message.find(
-                    "a class defined inside a function or another class") !=
-                    std::string::npos;
-  EXPECT_TRUE(saidClass);
+  EXPECT_TRUE(inFunction.ok());
+  mlir::MLIRContext block(testRegistry());
+  lython::emitter::EmitResult inBlock = emitSource(
+      "import sys\nif sys.platform:\n    class D:\n        pass\n", block);
+  EXPECT_TRUE(reportsDiagnostic(
+      inBlock, "a class defined in a block of the module's top level"));
 
   // At module scope the same class compiles.
   mlir::MLIRContext top(testRegistry());
@@ -1849,6 +1848,113 @@ TEST(EmitterTest, ANestedClassNamesItsOwnLimit) {
       top);
   EXPECT_TRUE(atModule.ok());
 }
+}
+
+// What: a class written in a function is one class, declared at the module's
+// top level under its qualified name. Each program here has a class statement
+// whose meaning one class cannot carry -- a use the statement may not have run
+// before, a second binding of the name, a read of the function's locals, or
+// something the statement evaluates that a later call could see differ -- and
+// each is refused at the class, naming why.
+TEST(EmitterTest, AClassInAFunctionIsRefusedWhereOneClassCannotBeIt) {
+  struct Case {
+    const char *source;
+    const char *says;
+  };
+  const Case cases[] = {
+      {"def f() -> None:\n    a = A()\n    class A:\n        pass\n",
+       "is used where its class statement may not have run"},
+      {"def f(flag: bool) -> None:\n    if flag:\n        class A:\n"
+       "            pass\n    print(A())\n",
+       "is used where its class statement may not have run"},
+      {"def f() -> int:\n    def g() -> int:\n        return A().v()\n"
+       "    class A:\n        def v(self) -> int:\n            return 1\n"
+       "    return g()\n",
+       "is used where its class statement may not have run"},
+      {"def f() -> int:\n    class A:\n        pass\n    A = 3\n    return A\n",
+       "is bound again in the function that defines the class"},
+      {"def f() -> None:\n    class A:\n        pass\n    def g() -> None:\n"
+       "        nonlocal A\n        A = int\n",
+       "by a nested def's nonlocal"},
+      {"def f(flag: bool) -> None:\n    if flag:\n        class A:\n"
+       "            pass\n    else:\n        class A:\n            pass\n",
+       "two classes named 'A' in one function"},
+      {"def f() -> None:\n    global A\n    class A:\n        pass\n",
+       "is declared global or nonlocal"},
+      {"def f(n: int) -> int:\n    class A:\n        def get(self) -> int:\n"
+       "            return n\n    return A().get()\n",
+       "reads 'n', a local of the function that defines it"},
+      {"def f() -> None:\n    class A:\n        items: list[int] = []\n",
+       "the value of 'items' makes a new list for every call"},
+      {"def g() -> int:\n    return 1\ndef f() -> None:\n    class A:\n"
+       "        x = g()\n",
+       "the value of 'x' calls 'g', which runs again for every call"},
+      {"def f() -> None:\n    class A:\n        print(1)\n",
+       "its body runs a statement"},
+      {"from typing import Callable\n"
+       "def deco(fn: Callable[[object], int]) -> Callable[[object], int]:\n"
+       "    return fn\n"
+       "def f() -> None:\n    class A:\n        @deco\n"
+       "        def m(self) -> int:\n            return 1\n",
+       "'m' applies 'deco', which runs again for every call"},
+      {"def f() -> None:\n    class A:\n"
+       "        def m(self, acc: list[int] = []) -> int:\n"
+       "            return len(acc)\n",
+       "a default of 'm' makes a new list for every call"},
+      {"def f() -> int:\n    class A:\n        n = 0\n        @classmethod\n"
+       "        def bump(cls) -> None:\n            cls.n += 1\n"
+       "    A.bump()\n    return A.n\n",
+       "class attribute 'n' of 'f.<locals>.A' is assigned outside its class "
+       "body"},
+  };
+  for (const Case &each : cases) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult emitted = emitSource(each.source, context);
+    EXPECT_FALSE(emitted.ok()) << each.source;
+    EXPECT_TRUE(reportsDiagnostic(emitted, each.says))
+        << each.source << "\nexpected: " << each.says;
+  }
+}
+
+// What: what a class statement in a function evaluates may be what every
+// call would evaluate alike -- literals, a tuple of them, enum numbering, a
+// dataclass field's spec, the descriptors a def is wrapped in, a name the
+// module binds once -- and such a class compiles.
+TEST(EmitterTest, AClassInAFunctionEvaluatingOnlyConstantsCompiles) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult emitted = emitSource(
+      "from dataclasses import dataclass, field\n"
+      "from enum import Enum, auto\n"
+      "LIMIT = 10\n"
+      "def f() -> None:\n"
+      "    class Color(Enum):\n"
+      "        RED = auto()\n"
+      "    @dataclass\n"
+      "    class P:\n"
+      "        x: int = 0\n"
+      "        ys: list[int] = field(default_factory=list)\n"
+      "    class A:\n"
+      "        \"\"\"Doc.\"\"\"\n"
+      "        name = \"a\"\n"
+      "        pair = (1, -2)\n"
+      "        limit = LIMIT\n"
+      "        def __init__(self, v: int = 3) -> None:\n"
+      "            self._v = v\n"
+      "        @property\n"
+      "        def v(self) -> int:\n"
+      "            return self._v\n"
+      "        @v.setter\n"
+      "        def v(self, value: int) -> None:\n"
+      "            self._v = value\n"
+      "        @staticmethod\n"
+      "        def twice(x: int) -> int:\n"
+      "            return x * 2\n"
+      "    print(Color.RED, P(), A().v, A.twice(A.limit), A.name, A.pair)\n"
+      "f()\n",
+      context);
+  EXPECT_TRUE(emitted.ok());
+  for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+    ADD_FAILURE() << diagnostic.message;
 }
 
 TEST(EmitterTest, AModuleGlobalContainerNamesItsElementRepresentation) {

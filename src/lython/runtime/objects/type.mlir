@@ -10,14 +10,13 @@
 // write.
 //
 // What is implemented is what a class value answers by itself, from its image:
-// the name (word 3, "__main__.A" or "int"), identity, its hash and `repr`, and
-// the subclass walk over its MRO array (word 5). Construction and class
+// the name (word 3, "__main__.f.<locals>.A" or "int", and word 4, which says
+// how much of it is the module), identity, its hash and `repr`, and the
+// subclass walk over its MRO array (word 5). Construction and class
 // attributes are not here: which class a value is decides them, and the
 // emitter dispatches on that.
 //
 // Deviations from CPython:
-// - `__qualname__` is `__name__`: a class here is always a module-level
-//   statement, so the two are the same string.
 // - the hash is CPython's `_Py_HashPointer` of the image address, so it is
 //   stable for a run and differs between runs, as CPython's does.
 
@@ -28,6 +27,8 @@ module attributes {
   // ===== declared here, defined in another runtime file or built by the lowering =====
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyType_Name(%class_word: i64) -> !llvm.ptr
+  func.func private @LyType_NameLength(%class_word: i64) -> i64
+  func.func private @LyType_ModuleLength(%class_word: i64) -> i64
   func.func private @LyType_IsSubtype(%class: i64, %base: i64) -> i1
   func.func private @LyObject_ClassNameFromId(%class_word: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "class_name_from_id", ly.runtime.result_contract = "builtins.str"}
 
@@ -76,12 +77,11 @@ module attributes {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
-    %c4 = arith.constant 4 : index
     %c8 = arith.constant 8 : index
     %c10 = arith.constant 10 : index
     %word = func.call @__ly_type_word(%type) : (memref<16xi64>) -> i64
     %name_ptr = func.call @LyType_Name(%word) : (i64) -> !llvm.ptr
-    %length = memref.load %type[%c4] : memref<16xi64>
+    %length = func.call @LyType_NameLength(%word) : (i64) -> i64
     %length_index = arith.index_cast %length : i64 to index
     %total = arith.addi %length_index, %c10 : index
     %buffer = memref.alloc(%total) : memref<?xi8>
@@ -155,39 +155,37 @@ module attributes {
     func.return %h, %b : memref<2xi64>, memref<?xi8>
   }
 
-  // `cls.__module__`: the name before the last dot, or "builtins" for a class
-  // whose name has none.
-  func.func @LyType_GetModule(%type: memref<16xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.type", ly.runtime.primitive = "module", ly.runtime.result_contract = "builtins.str"} {
+  // The bytes [start, start + length) of the class's name, as a str.
+  func.func private @__ly_type_name_slice(%word: i64, %start: i64, %length: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c4 = arith.constant 4 : index
-    %dot = arith.constant 46 : i8
-    %word = func.call @__ly_type_word(%type) : (memref<16xi64>) -> i64
     %name_ptr = func.call @LyType_Name(%word) : (i64) -> !llvm.ptr
-    %length = memref.load %type[%c4] : memref<16xi64>
     %length_index = arith.index_cast %length : i64 to index
-    %last_dot = scf.for %i = %c0 to %length_index step %c1 iter_args(%found = %length_index) -> (index) {
+    %buffer = memref.alloc(%length_index) : memref<?xi8>
+    scf.for %i = %c0 to %length_index step %c1 {
       %i_i64 = arith.index_cast %i : index to i64
-      %slot = llvm.getelementptr %name_ptr[%i_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
-      %byte = llvm.load %slot : !llvm.ptr -> i8
-      %is_dot = arith.cmpi eq, %byte, %dot : i8
-      %next = arith.select %is_dot, %i, %found : index
-      scf.yield %next : index
-    }
-    %has_module = arith.cmpi ult, %last_dot, %length_index : index
-    cf.cond_br %has_module, ^qualified, ^builtin
-
-  ^qualified:
-    %buffer = memref.alloc(%last_dot) : memref<?xi8>
-    scf.for %i = %c0 to %last_dot step %c1 {
-      %i_i64 = arith.index_cast %i : index to i64
-      %slot = llvm.getelementptr %name_ptr[%i_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
+      %at = arith.addi %i_i64, %start : i64
+      %slot = llvm.getelementptr %name_ptr[%at] : (!llvm.ptr, i64) -> !llvm.ptr, i8
       %byte = llvm.load %slot : !llvm.ptr -> i8
       memref.store %byte, %buffer[%i] : memref<?xi8>
     }
-    %module_len = arith.index_cast %last_dot : index to i64
-    %qh, %qb = func.call @__ly_unicode_from_valid_utf8(%buffer, %c0, %module_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %h, %b = func.call @__ly_unicode_from_valid_utf8(%buffer, %c0, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     memref.dealloc %buffer : memref<?xi8>
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  // `cls.__module__`: the part of the name word 4 says is the module, or
+  // "builtins" for a class whose name has none.
+  func.func @LyType_GetModule(%type: memref<16xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.type", ly.runtime.primitive = "module", ly.runtime.result_contract = "builtins.str"} {
+    %c0 = arith.constant 0 : index
+    %zero = arith.constant 0 : i64
+    %word = func.call @__ly_type_word(%type) : (memref<16xi64>) -> i64
+    %module_len = func.call @LyType_ModuleLength(%word) : (i64) -> i64
+    %has_module = arith.cmpi ne, %module_len, %zero : i64
+    cf.cond_br %has_module, ^qualified, ^builtin
+
+  ^qualified:
+    %qh, %qb = func.call @__ly_type_name_slice(%word, %zero, %module_len) : (i64, i64, i64) -> (memref<2xi64>, memref<?xi8>)
     func.return %qh, %qb : memref<2xi64>, memref<?xi8>
 
   ^builtin:
@@ -196,6 +194,22 @@ module attributes {
     %eight = arith.constant 8 : i64
     %bh, %bb = func.call @__ly_unicode_from_valid_utf8(%builtins_dyn, %c0, %eight) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     func.return %bh, %bb : memref<2xi64>, memref<?xi8>
+  }
+
+  // `cls.__qualname__`: the name past its module and the dot after it --
+  // "f.<locals>.A" of "__main__.f.<locals>.A" -- or all of it for a builtin.
+  func.func @LyType_GetQualname(%type: memref<16xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.type", ly.runtime.primitive = "qualname", ly.runtime.result_contract = "builtins.str"} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %word = func.call @__ly_type_word(%type) : (memref<16xi64>) -> i64
+    %length = func.call @LyType_NameLength(%word) : (i64) -> i64
+    %module_len = func.call @LyType_ModuleLength(%word) : (i64) -> i64
+    %has_module = arith.cmpi ne, %module_len, %zero : i64
+    %past_dot = arith.addi %module_len, %one : i64
+    %start = arith.select %has_module, %past_dot, %zero : i64
+    %rest = arith.subi %length, %start : i64
+    %h, %b = func.call @__ly_type_name_slice(%word, %start, %rest) : (i64, i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
   }
 
   // `issubclass(sub, base)` for two class values, over the class words

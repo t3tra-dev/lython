@@ -1,0 +1,3 @@
+in fail
+    raise LocalError\("bad thing"\)
+fail\.<locals>\.LocalError: bad thing

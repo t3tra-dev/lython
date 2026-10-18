@@ -56,7 +56,7 @@ std::optional<Definition> recordedSource(mlir::ModuleOp module,
     return std::nullopt;
   for (mlir::Attribute entry : recorded) {
     auto fields = mlir::dyn_cast<mlir::ArrayAttr>(entry);
-    if (!fields || fields.size() < 3)
+    if (!fields || fields.size() < 4)
       continue;
     auto text = [&](unsigned index) {
       auto attr = mlir::dyn_cast<mlir::StringAttr>(fields[index]);
@@ -64,8 +64,9 @@ std::optional<Definition> recordedSource(mlir::ModuleOp module,
     };
     if (text(0) != qualifiedName)
       continue;
-    Definition definition{text(0), text(1), text(2), {}};
-    for (unsigned index = 3; index < fields.size(); ++index)
+    Definition definition{text(0), text(1), 0, text(2), {}};
+    llvm::StringRef(text(3)).getAsInteger(10, definition.moduleLength);
+    for (unsigned index = 4; index < fields.size(); ++index)
       definition.mro.push_back(text(index));
     return definition;
   }
@@ -116,7 +117,11 @@ mlir::LogicalResult defineOne(mlir::ModuleOp module, const Definition &definitio
     appendImageAddress(fields, symbolFor(definition.base));
   }
   appendImageAddress(fields, nameSymbol);
-  appendImageWord(fields, static_cast<std::int64_t>(definition.name.size()));
+  appendImageWord(
+      fields,
+      static_cast<std::int64_t>(definition.name.size()) |
+          static_cast<std::int64_t>(definition.moduleLength)
+              << kModuleLengthShift);
   std::string mroSymbol = ("__ly_type_mro." + definition.qualifiedName);
   appendImageAddress(fields, mroSymbol);
   mlir::DictionaryAttr slots;
@@ -350,6 +355,9 @@ std::optional<Definition> runtimeDefinition(llvm::StringRef contract) {
   // io.UnsupportedOperation is defined by io, not _io.
   if (contract == "_io.UnsupportedOperation")
     definition.name = "io.UnsupportedOperation";
+  // No runtime class is nested in another: its module ends at its last dot.
+  if (std::size_t dot = definition.name.rfind('.'); dot != std::string::npos)
+    definition.moduleLength = dot;
   if (contract == "builtins.object")
     return definition;
   definition.base = runtimeBases(contract).front();
@@ -363,8 +371,9 @@ void recordSource(mlir::ModuleOp module, const Definition &definition) {
   llvm::SmallVector<mlir::Attribute, 16> entries;
   if (auto recorded = module->getAttrOfType<mlir::ArrayAttr>(kSourceTypesAttr))
     entries.append(recorded.begin(), recorded.end());
+  std::string moduleLength = std::to_string(definition.moduleLength);
   llvm::SmallVector<llvm::StringRef, 8> fields{
-      definition.qualifiedName, definition.name, definition.base};
+      definition.qualifiedName, definition.name, definition.base, moduleLength};
   for (const std::string &ancestor : definition.mro)
     fields.push_back(ancestor);
   entries.push_back(builder.getStrArrayAttr(fields));

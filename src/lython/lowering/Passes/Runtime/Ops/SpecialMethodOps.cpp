@@ -309,9 +309,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerTypeName(py::TypeNameOp op) {
   if (!type)
     return op.emitError() << "type name operand has no lowered runtime bundle";
   llvm::StringRef attribute = op.getAttribute();
-  llvm::StringRef primitiveName =
-      attribute == "__module__" ? llvm::StringRef("module")
-                                : llvm::StringRef("name");
+  llvm::StringRef primitiveName = attribute == "__module__" ? "module"
+                                 : attribute == "__qualname__"
+                                     ? "qualname"
+                                     : "name";
   std::optional<RuntimeSymbol> primitive =
       manifest.primitive("builtins.type", primitiveName);
   if (!primitive)

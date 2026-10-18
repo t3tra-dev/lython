@@ -1,0 +1,9 @@
+Local make.<locals>.Local __main__
+Local make.<locals>.Local __main__
+Base Base __main__
+<__main__.make.<locals>.Local
+<class '__main__.make.<locals>.Local'>
+Suite.test_names.<locals>.Helper
+Color.RED <Color.RED: 1>
+Pt(x=1) Suite.test_names.<locals>.Rec(v=2)
+Problem Suite.test_names.<locals>.Problem bad

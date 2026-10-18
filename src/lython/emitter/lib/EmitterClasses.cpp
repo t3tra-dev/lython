@@ -2784,20 +2784,19 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   llvm::StringSet<> propertyNames = classPropertyNames(classDef);
   if (const auto *body = ast::nodeList(classDef, "body")) {
     for (const parser::NodePtr &statement : *body) {
-      // ⭐ A NESTED CLASS IS DROPPED, and only its USE said so. The refusal for
-      // a class declared inside a function lives in `emitStatement`, which
-      // never sees a class BODY -- so `class Outer: class Inner: ...` was
-      // accepted, the inner class was never emitted, and `Outer.Inner()`
-      // reported "static type !py.type<Outer> does not provide manifest method
+      // ⭐ A NESTED CLASS IS DROPPED, and only its USE said so. The refusals
+      // for a class statement elsewhere live in `emitStatement`, which never
+      // sees a class BODY -- so `class Outer: class Inner: ...` was accepted,
+      // the inner class was never emitted, and `Outer.Inner()` reported
+      // "static type !py.type<Outer> does not provide manifest method
       // 'Inner'": a sentence about a method, for a class the source declares.
-      // The same limitation, said at the same boundary, in the same words.
       if (statement && statement->kind == "ClassDef") {
         diagnostics.push_back(parser::Diagnostic{
             parser::Severity::Error, statement->range.start,
-            "a class defined inside a function or another class is not "
-            "supported: a class is a module-level contract here, so declare '" +
+            "a class defined inside another class is not supported: a class "
+            "is a module-level contract here, so declare '" +
                 std::string(ast::nameSpelling(*statement)) +
-                "' at module scope"});
+                "' at module scope or in a function"});
         continue;
       }
       // ⭐ AND A STATEMENT THAT WOULD HAVE RUN. A class body executes in
@@ -3243,20 +3242,22 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
           std::move(sig));
     }
     if (dataclassRepr && !userDefines("__repr__")) {
-      // ⭐ `__qualname__`, WHICH HAS NO MODULE IN IT. CPython's dataclass and
-      // NamedTuple reprs print the class's qualified NAME, not its module
-      // path, so an imported `Point(3, 4)` renders as `Point(x=3, y=4)` there
-      // and rendered as `data.Point(x=3, y=4)` here -- a silent wrong answer
-      // for every imported dataclass printed.
+      // ⭐ `__qualname__`, WHICH HAS NO MODULE IN IT. CPython's dataclass
+      // repr prints the class's qualified NAME, not its module path, so an
+      // imported `Point(3, 4)` renders as `Point(x=3, y=4)` there and
+      // rendered as `data.Point(x=3, y=4)` here -- a silent wrong answer for
+      // every imported dataclass printed.
       //
       // ⛔ NOT the same as the default object repr beside it, which CPython
       // spells `<data.Point object at 0x...>` WITH the module and which this
       // compiler was taught to qualify for exactly that reason. The two reprs
       // read different attributes and disagree on purpose.
+      // ⛔ And not a NamedTuple's, which prints `__name__`: the two differ for
+      // a class written in a function (`f.<locals>.P(x=1)`, `P(x=1)`).
       std::string className =
-          py::contracts::displayClassNameForContract(contractName);
-      if (std::size_t dot = className.rfind('.'); dot != std::string::npos)
-        className = className.substr(dot + 1);
+          isNamedTuple
+              ? py::contracts::pythonClassNameForContract(contractName)
+              : py::contracts::pythonQualnameForContract(contractName);
       parser::NodePtr expr;
       if (order.empty()) {
         expr = synth::strConstant(className + "()", range);

@@ -50,6 +50,12 @@ EmitResult ModuleEmitter::emit() {
 
   module = mlir::ModuleOp::create(builder.getUnknownLoc());
   module.setName(moduleName);
+  // First of all: a class written in a function becomes a class of its
+  // module's top level, which every desugar below then treats as one.
+  for (const EmitOptions::SourceModule &source : options.sourceModules)
+    if (source.moduleNode && !source.isStub)
+      hoistFunctionLocalClasses(*source.moduleNode, source.moduleName);
+  hoistFunctionLocalClasses(moduleNode, moduleName);
   // Enum desugaring rewrites the parsed tree, so it must run before anything
   // reads the module's shape (static module attributes below already do).
   //

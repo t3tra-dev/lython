@@ -12,8 +12,14 @@
 //   0  refcount, INT64_MAX: immortal, as every static object here
 //   1  ob_type: `type`'s type object -- a class is a value of class `type`
 //   2  tp_base: the base's type object, 0 at the root (object)
-//   3  tp_name: a NUL-terminated name, the one a default repr prints
-//   4  the name's length, without the NUL
+//   3  tp_name: a NUL-terminated name, the one a default repr prints --
+//      `__module__`, a dot and `__qualname__` ("__main__.f.<locals>.A"), or
+//      the qualified name alone for a builtin ("int")
+//   4  the name's length, without the NUL, in the low 32 bits, and in the
+//      high 32 how much of it is `__module__`: 0 for a builtin. The two
+//      share a word because the image is the size of every box, and no name
+//      is 4 GiB long; neither can be found from the text alone, as
+//      `pkg.mod.C.D` is `pkg.mod` + `C.D` or `pkg` + `mod.C.D`.
 //   5  tp_mro: the class and its ancestors in method resolution order, an
 //      array of type-object addresses ending in 0
 //   6.. the slots, CPython's tp_repr, tp_hash, ...: each the function a boxed
@@ -47,6 +53,8 @@ inline constexpr std::int64_t kBaseWord = 2;
 inline constexpr std::int64_t kNameWord = 3;
 inline constexpr std::int64_t kNameLengthWord = 4;
 inline constexpr std::int64_t kMroWord = 5;
+inline constexpr std::int64_t kNameLengthMask = 0xFFFFFFFF;
+inline constexpr std::int64_t kModuleLengthShift = 32;
 
 // The boxed hooks, each with its slot word. A unary hook is `(ptr slot, i64
 // class) -> (results..., i1 hit)` and its slot `(ptr slot) -> (results..., i1)`;
@@ -81,7 +89,7 @@ inline constexpr llvm::StringLiteral kHookSlotsAttr{"ly.slots"};
 
 // A program's source classes, recorded while their `py.class` ops still exist
 // (the runtime lowering erases them): [qualified name, display name, base,
-// MRO after the class...].
+// module length, MRO after the class...].
 inline constexpr llvm::StringLiteral kSourceTypesAttr{"ly.type_objects"};
 
 std::string symbolFor(llvm::StringRef qualifiedName);
@@ -99,6 +107,8 @@ struct Definition {
   std::string qualifiedName;
   // What tp_name holds: the name a default repr prints.
   std::string name;
+  // How much of `name` is `__module__`; 0 for a builtin.
+  std::size_t moduleLength = 0;
   // The base's qualified name; empty only for object.
   std::string base;
   // The ancestors in method resolution order, the class itself left out.

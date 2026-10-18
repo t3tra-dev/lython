@@ -1671,9 +1671,12 @@ void buildExceptionClassName(SupportBuilder &b) {
   mlir::Value name =
       b.intToPtr(b.typeObjectWord(word, py::type_objects::kNameWord));
   constexpr llvm::StringLiteral kMain = "__main__.";
-  // Word 4 is the name's length: the prefix is read only where it fits.
-  mlir::Value length =
-      b.typeObjectWord(word, py::type_objects::kNameLengthWord);
+  // Word 4's low half is the name's length: the prefix is read only where
+  // it fits.
+  mlir::Value length = mlir::arith::AndIOp::create(
+      b.builder, b.loc,
+      b.typeObjectWord(word, py::type_objects::kNameLengthWord),
+      b.iconst(py::type_objects::kNameLengthMask));
   mlir::cf::CondBranchOp::create(
       b.builder, b.loc,
       b.cmpi(mlir::arith::CmpIPredicate::sgt, length,
