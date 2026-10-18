@@ -43,6 +43,18 @@ ModuleEmitter::emitInheritedObjectStr(const parser::Node &anchor,
   mlir::Type widened = types.widenLiteral(receiver.type);
   if (!inheritsObjectDefaultDunder(widened, "__str__"))
     return std::nullopt;
+  // ⛔ The STATIC class's default is not the answer when a subclass declares
+  // `__str__`: the receiver may be that subclass, and going straight to
+  // `__repr__` printed its repr where CPython calls its `__str__`. The
+  // dispatcher asks the runtime class, and falls back to object's.
+  if (dispatchIsUnresolvable(receiver, "__str__", /*receiverNode=*/nullptr,
+                             /*throughSuper=*/false)) {
+    if (std::optional<Value> dispatched =
+            tryEmitVirtualDispatchWithValues(anchor, receiver, "__str__", {}))
+      return *dispatched;
+    if (refuseUnresolvableDispatch(anchor, receiver, "__str__"))
+      return emitNone(anchor);
+  }
   if (std::optional<Value> dispatched =
           tryEmitClassDunder(anchor, receiver, "__repr__"))
     return *dispatched;

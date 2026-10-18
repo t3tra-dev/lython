@@ -1,0 +1,7 @@
+a ran
+test_a None
+__init__ None
+T.__init__() takes exactly one argument (the instance to initialize)
+Sub! Sub() int True
+<__main__.Base  <__main__.Base  int False
+Sub() Sub! True | <__main__.Base  <__main__.Base  False

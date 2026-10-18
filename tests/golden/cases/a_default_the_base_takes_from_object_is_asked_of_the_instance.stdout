@@ -1,0 +1,6 @@
+<__main__.Base object> <__main__.Base object> <__main__.Base object> <__main__.Base object> <__main__.Base object> <__main__.Base object> False
+R:Reprs R:Reprs R:Reprs R:Reprs R:Reprs R:Reprs False
+<__main__.Strs object> S:Strs S:Strs <__main__.Strs object> S:Strs <__main__.Strs object> False
+R:Both S:Both S:Both R:Both S:Both R:Both False
+<__main__.Hashes object> <__main__.Hashes object> <__main__.Hashes object> <__main__.Hashes object> <__main__.Hashes object> <__main__.Hashes object> True
+R:Leaf S:Leaf S:Leaf R:Leaf S:Leaf R:Leaf False
