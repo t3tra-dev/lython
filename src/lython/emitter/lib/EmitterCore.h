@@ -1571,6 +1571,30 @@ private:
   // the emitted symbol keeps the two entities distinguishable at the only
   // layer that can tell them apart -- the one that knows which is which.
   llvm::StringMap<std::string> shadowedBuiltinSymbols;
+  // What CPython calls each `def`, `lambda` and `class` of the program's
+  // modules: its module, `__qualname__` and `__name__`, read off the tree once
+  // the desugars are done (recordPythonDefinitionNames). A desugar that
+  // renames a def it split out says what the def is called in
+  // `pythonNameOverrides`.
+  struct PythonDefinitionName {
+    std::string module;
+    std::string qualname;
+    std::string name;
+  };
+  llvm::DenseMap<const parser::Node *, PythonDefinitionName>
+      pythonDefinitionNames;
+  llvm::DenseMap<const parser::Node *, std::string> pythonNameOverrides;
+  void recordPythonDefinitionNames(const parser::Node &moduleNode,
+                                   llvm::StringRef moduleName);
+  // Each function emitted for a definition, under the symbol the emitter
+  // names it by, in emission order -- the order its `.N` is given in.
+  struct EmittedPythonDefinition {
+    std::string symbol;
+    std::string module;
+    std::string qualname;
+  };
+  std::vector<EmittedPythonDefinition> emittedPythonDefinitions;
+  void manglePythonDefinitionSymbols();
   // The call whose traceback frame must draw no `~~~^^^` underline, recognized
   // while its statement is emitted and read back by `loc`.
   //

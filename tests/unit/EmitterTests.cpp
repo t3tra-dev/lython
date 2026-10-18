@@ -1,4 +1,5 @@
 #include "Driver.h"
+#include "Mangling.h"
 #include "Emitter.h"
 #include "Parser.h"
 
@@ -261,11 +262,14 @@ TEST(EmitterTest, TopLevelDefOutranksBuiltinFastPath) {
                              "print(len([1, 2, 3]))\n",
                              context);
   EXPECT_EQ(ir.find("py.len"), std::string::npos);
-  // The emitted symbol is renamed away from the manifest's `len` binding, and
-  // the reference names the symbol: py.binding.ref carries a name, and the
-  // runtime lowering resolves names against the manifest first.
-  EXPECT_NE(ir.find("@len$user"), std::string::npos);
-  EXPECT_NE(ir.find("py.binding.ref \"len$user\""), std::string::npos);
+  // The emitted symbol is the definition's mangled one, away from the
+  // manifest's `len` binding, and the reference names the symbol:
+  // py.binding.ref carries a name, and the runtime lowering resolves names
+  // against the manifest first.
+  std::string symbol = py::mangling::pythonDefinitionSymbol("__main__", "len");
+  EXPECT_NE(ir.find("@" + symbol), std::string::npos);
+  EXPECT_NE(ir.find("py.binding.ref \"" + symbol + "\""), std::string::npos);
+  EXPECT_EQ(ir.find("py.binding.ref \"len\""), std::string::npos);
 }
 
 TEST(EmitterTest, UnshadowedBuiltinKeepsItsFastPath) {
@@ -291,9 +295,8 @@ TEST(EmitterTest, LocalBindingOutranksBuiltinFastPath) {
 }
 
 // `int` names a class contract as well as a conversion fast path, and neither
-// may claim the call once a top-level `def int` exists. It needs no rename:
-// nothing in the manifest binds the name `int`, so the reference resolves to
-// the user's func.func on its own spelling.
+// may claim the call once a top-level `def int` exists: the reference names
+// the user's func.func by its mangled symbol.
 //
 // The discriminator is the conversion's target attribute rather than the
 // absence of py.type.object: the constructor route only appears in an
@@ -307,7 +310,10 @@ TEST(EmitterTest, TopLevelDefOutranksBuiltinConversion) {
                              context);
   EXPECT_EQ(ir.find("@__int__"), std::string::npos);
   EXPECT_EQ(ir.find("py.type.object"), std::string::npos);
-  EXPECT_NE(ir.find("py.binding.ref \"int\""), std::string::npos);
+  EXPECT_NE(ir.find("py.binding.ref \"" +
+                    py::mangling::pythonDefinitionSymbol("__main__", "int") +
+                    "\""),
+            std::string::npos);
 }
 
 bool reportsDiagnostic(const lython::emitter::EmitResult &emitted,

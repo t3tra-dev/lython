@@ -1,3 +1,4 @@
+#include "Mangling.h"
 #include "AstSynth.h"
 #include "EmitterCore.h"
 #include "EmitterPyOps.h"
@@ -573,6 +574,16 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
       mlir::func::FuncOp::create(builder, loc(callable), symbolName, funcType);
   func.setPrivate();
   func->setAttr("callable_type", mlir::TypeAttr::get(sig.callable));
+  if (auto definition = pythonDefinitionNames.find(&callable);
+      definition != pythonDefinitionNames.end()) {
+    func->setAttr(py::mangling::kFunctionNameAttr,
+                  builder.getStringAttr(definition->second.name));
+    func->setAttr(py::mangling::kFunctionQualnameAttr,
+                  builder.getStringAttr(definition->second.qualname));
+    emittedPythonDefinitions.push_back(EmittedPythonDefinition{
+        symbolName.str(), definition->second.module,
+        definition->second.qualname});
+  }
   if (sig.varargType)
     func->setAttr(kCallableVarargValueTypeAttr,
                   mlir::TypeAttr::get(sig.varargType));

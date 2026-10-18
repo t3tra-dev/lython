@@ -499,10 +499,12 @@ void ModuleEmitter::desugarMethodDecorators(const parser::Node &moduleNode) {
           range));
       if (parser::Field *field = parser::findField(*forwarder, "body"))
         field->value = std::move(forwardingBody);
-      // The body, under the hidden name and undecorated.
+      // The body, under the hidden name and undecorated -- the def CPython
+      // runs, called what it was written as.
       decorators->clear();
       if (parser::Field *field = parser::findField(*method, "name"))
         field->value = split.hiddenName;
+      pythonNameOverrides[method.get()] = name;
       members->insert(members->begin() + static_cast<std::ptrdiff_t>(index) + 1,
                       std::move(forwarder));
       ++index;

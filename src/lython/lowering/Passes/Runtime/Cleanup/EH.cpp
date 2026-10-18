@@ -1,4 +1,5 @@
 #include "Common/PythonSourceRange.h"
+#include "Mangling.h"
 #include "Common/RuntimeSupport.h"
 #include "Common/LibcPrototypes.h"
 #include "Common/UnwindABI.h"
@@ -774,20 +775,13 @@ bool convertCallToPythonTryInvoke(
 
 } // namespace
 
-// ⛔ A PYTHON FUNCTION IS NOT A C SYMBOL. A program's `def rename(...)` was an
-// external `rename`, and the runtime's declaration of libc's `rename` merged
-// into it when the runtime was linked: `os.rename` called the program's
-// function. Any C name does it -- `write`, `malloc` -- and a static libc
-// (wasi-libc) also finds two definitions. Local linkage keeps the program's
-// name out of the symbol space; on a clash the linker gives the C name to the
-// runtime's declaration and renames the local. `__main__` stays external: the
-// JIT finds the program's body by that name.
 void installJsHostEntryPoints(llvm::Module &module,
                               const llvm::Triple &triple) {
   for (auto [entry, target] : {std::pair<llvm::StringRef, llvm::StringRef>{
-                                   "LyJs_Dispatch", "_js_bridge.dispatch"},
-                               {"LyJs_Release", "_js_bridge.release"}}) {
-    llvm::Function *python = module.getFunction(target);
+                                   "LyJs_Dispatch", "dispatch"},
+                               {"LyJs_Release", "release"}}) {
+    llvm::Function *python = module.getFunction(
+        py::mangling::pythonDefinitionSymbol("_js_bridge", target));
     if (!python || python->isDeclaration() || module.getFunction(entry))
       continue;
     auto *function = llvm::Function::Create(
@@ -816,6 +810,12 @@ void installJsHostEntryPoints(llvm::Module &module,
   }
 }
 
+// A program's function is reached only through the module's own calls, so it
+// is local: nothing outside may bind to it, and the optimizer may inline or
+// drop it. Its NAME cannot meet a C one any more -- every definition is
+// mangled (common/Mangling.h), where `def rename` once merged with libc's
+// `rename` and `os.rename` called the program. `__main__` stays external:
+// the JIT finds the program's body by that name.
 void internalizePythonFunctions(llvm::Module &module) {
   for (llvm::Function &function : module)
     if (isPythonDebugFunction(&function) && function.getName() != "__main__")
@@ -1075,7 +1075,13 @@ void collectPythonCallSiteRanges(
     site.caller = caller.getSymName().str();
     site.callee = calleeName->str();
     site.filename = source->filename;
-    site.functionName = tracebackFunctionName(caller.getSymName());
+    // What CPython names the frame, carried beside a definition's mangled
+    // symbol (common/Mangling.h); the symbol for what has no such name.
+    if (auto python = caller->getAttrOfType<mlir::StringAttr>(
+            py::mangling::kFunctionNameAttr))
+      site.functionName = python.getValue().str();
+    else
+      site.functionName = tracebackFunctionName(caller.getSymName());
     site.line = source->line;
     site.column = source->column;
     site.endLine = source->endLine;

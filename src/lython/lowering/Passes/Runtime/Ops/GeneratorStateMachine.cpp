@@ -1,4 +1,5 @@
 #include "Runtime/Core/Lowerer.h"
+#include "Mangling.h"
 
 #include "ExceptionTaxonomy.h"
 
@@ -4957,10 +4958,16 @@ RuntimeBundleLowerer::getOrCreateGeneratorDispatch(mlir::Operation *op,
     if (auto declined = generatorDeclineReasons.find(target);
         declined != generatorDeclineReasons.end())
       reason = ": " + declined->getValue();
+    // The function as the program wrote it, not its mangled symbol.
+    llvm::StringRef shown = target;
+    if (auto qualname = body ? body->getAttrOfType<mlir::StringAttr>(
+                                   py::mangling::kFunctionQualnameAttr)
+                             : mlir::StringAttr())
+      shown = qualname.getValue();
     return op->emitError()
            << "a generator whose function is not known here is resumed by its "
               "frame, and '"
-           << target << "' has none (it is not a state machine" << reason
+           << shown << "' has none (it is not a state machine" << reason
            << ")";
   }
   if (targets.empty())

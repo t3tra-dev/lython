@@ -1,0 +1,2 @@
+['<module>', '<lambda>', 'outer', 'inner', 'innermost']
+['<module>', '<lambda>', 'via_lambda', 'run', '<lambda>']

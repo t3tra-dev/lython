@@ -500,6 +500,8 @@ void ModuleEmitter::desugarContextManagers(const parser::Node &moduleNode) {
           decorators->clear();
           if (parser::Field *field = parser::findField(*statement, "name"))
             field->value = generatorName;
+          // The generator is the def CPython runs, under its own name.
+          pythonNameOverrides[statement.get()] = name;
 
           const parser::Node *arguments = ast::node(*statement, "args");
           // The wrapper keeps the signature as written.

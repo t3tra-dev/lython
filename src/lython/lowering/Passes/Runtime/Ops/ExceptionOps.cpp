@@ -1,4 +1,5 @@
 #include "Common/ExceptionABI.h"
+#include "Mangling.h"
 #include "Common/PythonSourceRange.h"
 #include "Runtime/Core/Lowerer.h"
 
@@ -42,6 +43,11 @@ llvm::StringRef currentCallableName(mlir::Operation *op) {
     llvm::StringRef name = function.getName();
     if (name == "__main__")
       return "<module>";
+    // A definition's symbol is mangled (common/Mangling.h); what CPython
+    // names its frame is carried beside it, and a clone keeps it.
+    if (auto python = function->getAttrOfType<mlir::StringAttr>(
+            py::mangling::kFunctionNameAttr))
+      return python.getValue();
     // Specialization and generator state-machine clones carry ABI suffixes;
     // the traceback shows the Python-level name.
     for (llvm::StringRef marker : {"__lyrt_prim", "__lyrt_gen"}) {

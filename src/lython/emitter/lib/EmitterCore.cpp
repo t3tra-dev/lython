@@ -83,6 +83,11 @@ EmitResult ModuleEmitter::emit() {
   // After the generic desugar (a `Protocol[T]` base is what it leaves for a
   // generic protocol) and before any binder reads a base list.
   desugarProtocols();
+  // Once the tree is what will be emitted: what each definition is called.
+  for (const EmitOptions::SourceModule &source : options.sourceModules)
+    if (source.moduleNode && !source.isStub)
+      recordPythonDefinitionNames(*source.moduleNode, source.moduleName);
+  recordPythonDefinitionNames(moduleNode, moduleName);
   // Before any binder reads an imported module's top level: a container
   // constant there is a module GLOBAL, and the binders below hand out its
   // canonical name.
@@ -197,6 +202,7 @@ EmitResult ModuleEmitter::emit() {
     mlir::func::ReturnOp::create(builder, loc(moduleNode));
   }
 
+  manglePythonDefinitionSymbols();
   EmitResult result;
   // Annotation resolution runs from const contexts (TypeSystem), so its
   // diagnostics (rejected string forward references) surface here.
