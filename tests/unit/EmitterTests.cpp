@@ -564,6 +564,152 @@ TEST(EmitterTest, ObjectsOwnEqualityIsRefusedForItsNotImplemented) {
   }
 }
 
+// R1 refuses the truth test of an int the program typed as an int; a number
+// held by a parameter declared `object` is tested as the object it is there.
+TEST(EmitterTest, ImplicitTruthOfAnIntIsRefusedOnlyWhereTheIntIsDeclared) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult held = emitSource(
+      "class T:\n"
+      "    def check(self, expr: object) -> bool:\n"
+      "        return not expr\n"
+      "print(T().check(3), T().check(0.0))\n",
+      context);
+  EXPECT_TRUE(held.ok());
+  for (const char *declared : {"int", "float"}) {
+    std::string source = std::string("class T:\n"
+                                     "    def check(self, n: ") +
+                         declared +
+                         ") -> bool:\n"
+                         "        return not n\n"
+                         "print(T().check(3))\n";
+    lython::emitter::EmitResult result = emitSource(source, context);
+    EXPECT_FALSE(result.ok()) << declared;
+    EXPECT_TRUE(reportsDiagnostic(result, "implicit truthiness of"))
+        << declared;
+  }
+}
+
+// What: a decorator whose application is not a function is refused by name at
+// a module-level def -- the name is rebound to what the decorator returns,
+// and leaving the undecorated body under it would answer the wrong thing.
+TEST(EmitterTest, ADecoratorThatReturnsNoFunctionIsRefusedByName) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult refused = emitSource(
+      "from typing import Callable\n"
+      "def to_int(f: Callable[[int], int]) -> int:\n"
+      "    return f(10)\n"
+      "@to_int\n"
+      "def ten(n: int) -> int:\n"
+      "    return n + 1\n"
+      "print(ten)\n",
+      context);
+  EXPECT_FALSE(refused.ok());
+  EXPECT_TRUE(reportsDiagnostic(
+      refused, "decorator 'to_int' does not return a function here"));
+}
+
+// What: a decorated method compiles when its decorator returns a function,
+// and one whose decorator returns anything else is refused by name, with no
+// second sentence about the cell the rewrite reads.
+TEST(EmitterTest, ADecoratedMethodIsWhatItsDecoratorReturns) {
+  mlir::MLIRContext accepting(testRegistry());
+  lython::emitter::EmitResult accepted = emitSource(
+      "from typing import TypeVar\n"
+      "F = TypeVar(\"F\")\n"
+      "def mark(f: F) -> F:\n"
+      "    return f\n"
+      "class A:\n"
+      "    @mark\n"
+      "    def m(self, x: int = 1) -> int:\n"
+      "        return x\n"
+      "print(A().m(), A().m(2))\n",
+      accepting);
+  EXPECT_TRUE(accepted.ok());
+
+  mlir::MLIRContext refusing(testRegistry());
+  lython::emitter::EmitResult refused = emitSource(
+      "def to_int(f: object) -> int:\n"
+      "    return 1\n"
+      "class A:\n"
+      "    @to_int\n"
+      "    def m(self) -> int:\n"
+      "        return 1\n"
+      "print(A().m())\n",
+      refusing);
+  EXPECT_FALSE(refused.ok());
+  EXPECT_TRUE(reportsDiagnostic(
+      refused, "decorator 'to_int' on method 'm' does not return a function"));
+  EXPECT_FALSE(reportsDiagnostic(refused, "unresolved name"));
+}
+
+// What: `Container` is covariant, as typeshed declares it, so a method taking
+// `Container[object]` accepts a list[int], a dict, a set and a tuple, while a
+// `Container[str]` parameter still refuses a list[int].
+TEST(EmitterTest, AContainerOfObjectsTakesAContainerOfAnything) {
+  mlir::MLIRContext accepting(testRegistry());
+  lython::emitter::EmitResult accepted = emitSource(
+      "from typing import Container\n"
+      "class T:\n"
+      "    def has(self, member: object, c: Container[object]) -> bool:\n"
+      "        return member in c\n"
+      "t = T()\n"
+      "print(t.has(1, [1, 2]), t.has(\"k\", {\"k\": 1}), t.has(2, {2}),\n"
+      "      t.has(3, (1, 2)))\n",
+      accepting);
+  EXPECT_TRUE(accepted.ok());
+
+  mlir::MLIRContext refusing(testRegistry());
+  lython::emitter::EmitResult refused = emitSource(
+      "from typing import Container\n"
+      "class T:\n"
+      "    def has(self, member: str, c: Container[str]) -> bool:\n"
+      "        return member in c\n"
+      "print(T().has(\"a\", [1, 2]))\n",
+      refusing);
+  EXPECT_FALSE(refused.ok());
+  EXPECT_TRUE(reportsDiagnostic(refused, "argument 'c' of 'has' is declared"));
+}
+
+// A method forwarding its packs is specialized at each call; what cannot be
+// forwarded exactly -- a dict the body rewrites, a list starred into a method,
+// the method taken as a value -- is refused with the reason.
+TEST(EmitterTest, AMethodForwardingItsPacksIsRefusedWhereItCannotBeExact) {
+  mlir::MLIRContext context(testRegistry());
+  const char *prefix =
+      "from typing import Callable\n"
+      "def show(a: int, c: float = 1.5) -> str:\n"
+      "    return str(a)\n"
+      "class T:\n"
+      "    def call(self, f: Callable[..., str], *args: object,\n"
+      "             **kwargs: object) -> str:\n";
+  lython::emitter::EmitResult forwarded = emitSource(
+      std::string(prefix) + "        return f(*args, **kwargs)\n"
+                            "print(T().call(show, 1), T().call(show, 2, c=0.5))\n",
+      context);
+  EXPECT_TRUE(forwarded.ok());
+  struct Refused {
+    const char *body;
+    const char *reason;
+  };
+  for (const Refused &refused : std::initializer_list<Refused>{
+           {"        kwargs[\"c\"] = 9.5\n"
+            "        return f(*args, **kwargs)\n"
+            "print(T().call(show, 1))\n",
+            "`**` call arguments require statically known keyword names"},
+           {"        return f(*args, **kwargs)\n"
+            "xs = [1]\n"
+            "print(T().call(show, *xs))\n",
+            "unless their length is known here"},
+           {"        return f(*args, **kwargs)\n"
+            "m = T().call\n",
+            "it forwards its *args or **kwargs"}}) {
+    std::string source = std::string(prefix) + refused.body;
+    lython::emitter::EmitResult result = emitSource(source, context);
+    EXPECT_FALSE(result.ok()) << source;
+    EXPECT_TRUE(reportsDiagnostic(result, refused.reason)) << source;
+  }
+}
+
 TEST(EmitterTest, RejectsMethodArgumentThatViolatesTheDeclaredParameter) {
   mlir::MLIRContext context(testRegistry());
   lython::emitter::EmitResult method = emitSource(
@@ -1348,8 +1494,8 @@ TEST(EmitterTest, AGenericMethodHasABodyOnlyWhereItIsCalled) {
 }
 
 // What: `@contextmanager` on a function with spelled-out parameters compiles,
-// and on one with *args or **kwargs it is refused by name -- the function that
-// wraps the generator would have to hand them on unpacked.
+// and so does one with *args or **kwargs, whose packs the generator takes as
+// values; one that also has positional-only parameters is refused by name.
 TEST(EmitterTest, AContextManagerFunctionHandsItsParametersOnByName) {
   mlir::MLIRContext spelled(testRegistry());
   lython::emitter::EmitResult accepted = emitSource(
@@ -1364,16 +1510,29 @@ TEST(EmitterTest, AContextManagerFunctionHandsItsParametersOnByName) {
   EXPECT_TRUE(accepted.ok());
 
   mlir::MLIRContext starred(testRegistry());
+  lython::emitter::EmitResult packed = emitSource(
+      "import contextlib\n"
+      "from typing import Iterator\n"
+      "@contextlib.contextmanager\n"
+      "def sub(*labels: str, **params: int) -> Iterator[int]:\n"
+      "    yield len(labels) + len(params)\n"
+      "with sub(\"a\", i=1) as n:\n"
+      "    print(n)\n",
+      starred);
+  EXPECT_TRUE(packed.ok());
+
+  mlir::MLIRContext positionalOnly(testRegistry());
   lython::emitter::EmitResult refused = emitSource(
       "import contextlib\n"
+      "from typing import Iterator\n"
       "@contextlib.contextmanager\n"
-      "def sub(**params: int):\n"
-      "    yield\n",
-      starred);
+      "def sub(a: int, /, **params: int) -> Iterator[int]:\n"
+      "    yield a\n",
+      positionalOnly);
   EXPECT_FALSE(refused.ok());
   EXPECT_TRUE(reportsDiagnostic(
-      refused, "@contextmanager on 'sub' is not supported with *args or "
-               "**kwargs"));
+      refused, "@contextmanager on 'sub' is not supported with both "
+               "positional-only parameters and *args or **kwargs"));
 }
 
 TEST(EmitterTest, AnAttributeASourceClassDoesNotHaveIsRefusedAtEmit) {

@@ -2016,6 +2016,65 @@ TEST(DriverTest, AnOptionalFieldIsBoxedLikeThePayloadAlone) {
 // holds -- and a class that names itself through one has no finite layout and
 // is refused. The refusal is what keeps the expansion from recursing until the
 // compiler dies with SIGILL and no diagnostic, which is what it did.
+// A slot records only the class of what it holds, so a union whose members
+// are the same class at run time cannot be read back out of one; a member that
+// is a subclass of another can, and so can a union of distinct classes.
+TEST(DriverTest, AUnionOfTwoTuplesCannotBeReadBackFromASlot) {
+  CompileResult same = compileSource(
+      "def f(xs: list[tuple[int, int] | tuple[str, str]]) -> None:\n"
+      "    for x in xs:\n"
+      "        print(x)\n"
+      "f([(1, 1), (\"s\", \"t\")])\n");
+  EXPECT_FALSE(same.succeeded);
+  EXPECT_NE(same.diagnostics.find("are the same class at run time"),
+            std::string::npos)
+      << same.diagnostics;
+  CompileResult distinct = compileSource(
+      "def f(xs: list[tuple[int, int] | str]) -> None:\n"
+      "    for x in xs:\n"
+      "        print(x)\n"
+      "f([(1, 1), \"s\"])\n");
+  EXPECT_TRUE(distinct.succeeded) << distinct.diagnostics;
+  CompileResult subclass = compileSource(
+      "class A:\n    pass\nclass B(A):\n    pass\n"
+      "def f(xs: list[A | B]) -> None:\n"
+      "    for x in xs:\n"
+      "        print(type(x).__name__)\n"
+      "f([A(), B()])\n");
+  EXPECT_TRUE(subclass.succeeded) << subclass.diagnostics;
+}
+
+// What: a function whose parameter is a protocol lowers with no call to
+// specialize it -- a helper nobody calls, and the standalone body of a method
+// and of a constructor, whose calls are all inlined -- while a protocol-typed
+// function made into a value is still refused by name.
+TEST(DriverTest, AProtocolParameterWithNoCallerLowers) {
+  CompileResult uncalled = compileSource(
+      "from typing import Iterable, Sized\n"
+      "def size(c: Sized) -> int:\n"
+      "    return len(c)\n"
+      "class Bag:\n"
+      "    def __init__(self, items: Iterable[int]) -> None:\n"
+      "        self.items: list[int] = []\n"
+      "        for x in items:\n"
+      "            self.items.append(x)\n"
+      "    def count(self, c: Sized) -> int:\n"
+      "        return len(c)\n"
+      "print(Bag([1, 2]).count((3,)))\n");
+  EXPECT_TRUE(uncalled.succeeded) << uncalled.diagnostics;
+  CompileResult value = compileSource(
+      "from typing import Callable, Sized\n"
+      "def size(c: Sized) -> int:\n"
+      "    return len(c)\n"
+      "f: Callable[[list[int]], int] = size\n"
+      "print(size([1]), f([1, 2]))\n");
+  EXPECT_FALSE(value.succeeded);
+  EXPECT_NE(value.diagnostics.find("must be called from statically known "
+                                   "concrete arguments"),
+            std::string::npos)
+      << value.diagnostics;
+}
+
 TEST(DriverTest, AUnionOfTwoObjectsCannotReachItsOwnClass) {
   CompileResult result =
       compileSource("class Leaf:\n"

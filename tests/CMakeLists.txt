@@ -225,6 +225,8 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.TheExceptionChainIsWalkedWithPointers"
     "DriverTest.AnOptionalResultCarriesItsPayloadOnce"
     "DriverTest.AnOptionalFieldIsBoxedLikeThePayloadAlone"
+    "DriverTest.AUnionOfTwoTuplesCannotBeReadBackFromASlot"
+    "DriverTest.AProtocolParameterWithNoCallerLowers"
     "DriverTest.AUnionOfTwoObjectsCannotReachItsOwnClass"
     "DriverTest.AUnionOfTwoObjectsReachesItsOwnClass"
     "DriverTest.EveryLandingPadClauseIsAPythonClassOrCatchAll"

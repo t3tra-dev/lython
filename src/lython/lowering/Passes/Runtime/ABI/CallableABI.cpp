@@ -410,6 +410,34 @@ RuntimeBundleLowerer::callableLogicalInputTypes(
   return logicalInputTypes;
 }
 
+// The types a call converts its arguments to: the logical ones, except that a
+// protocol specialization takes the contract it was cloned for where the
+// template declares the protocol.
+// ⛔ Not the logical types alone: a protocol's runtime shape is `object`, and
+// a list or tuple handle has the object box's physical type, so a caller
+// converting to the logical type boxed the list and the clone -- which reads
+// its parameter as the list it was cloned for -- read the box as a list
+// header. `def f(c: Collection[int]): return 2 in c` crashed on `f([1, 2])`;
+// a dict or set argument only escaped because its handle is wider.
+llvm::SmallVector<mlir::Type, 8> RuntimeBundleLowerer::callableABIInputTypes(
+    mlir::func::FuncOp function, py::CallableType callable) const {
+  llvm::SmallVector<mlir::Type, 8> types =
+      callableLogicalInputTypes(function, callable);
+  RuntimeBundleLowerer::applyProtocolArgumentABIs(function, types);
+  return types;
+}
+
+void RuntimeBundleLowerer::applyProtocolArgumentABIs(
+    mlir::func::FuncOp function,
+    llvm::SmallVectorImpl<mlir::Type> &types) const {
+  auto overrides = callableProtocolArgumentABIs.find(function.getSymName());
+  if (overrides == callableProtocolArgumentABIs.end())
+    return;
+  for (auto [index, type] : llvm::enumerate(overrides->second))
+    if (index < types.size() && type)
+      types[index] = type;
+}
+
 bool RuntimeBundleLowerer::isPrimitiveI64CallableClone(
     mlir::func::FuncOp function) const {
   return function && function->hasAttr(kPrimitiveI64CloneAttr);
@@ -943,6 +971,65 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableProtocolArgumentABIs() {
     if (!specializations.empty())
       original->setAttr(kProtocolTemplateAttr, builder.getUnitAttr());
   }
+
+  // ⭐ A FUNCTION NOTHING NAMES IS A TEMPLATE WITH NO INSTANCES. A body that
+  // reads a protocol parameter runs only in a clone made for a concrete
+  // argument, and with no call there is no clone -- so the original was
+  // lowered as it stands and refused at the first read ("protocol-typed
+  // receiver ... has no concrete runtime method evidence"). That is every
+  // method taking one, since each call is inlined and the standalone body is
+  // there only for recursion and method values:
+  //
+  //     class Bag:
+  //         def __init__(self, items: Iterable[int]) -> None: ...
+  //     Bag([3, 1, 2])
+  //
+  // and every helper defined and not called.
+  // ⛔ Not a dunder other than `__init__`: the boxed hooks find a class's
+  // `__eq__`, `__repr__` and the rest by NAME and skip a symbol that is not
+  // there, so erasing one would answer with object's slot instead -- an
+  // `__eq__` turned into identity. Nor a public function, which the program's
+  // host may call.
+  llvm::DenseSet<llvm::StringRef> named;
+  if (std::optional<mlir::SymbolTable::UseRange> uses =
+          mlir::SymbolTable::getSymbolUses(module.getOperation()))
+    for (const mlir::SymbolTable::SymbolUse &use : *uses)
+      named.insert(use.getSymbolRef().getRootReference().getValue());
+  module.walk([&](py::BindingRefOp binding) {
+    named.insert(binding.getBinding());
+  });
+  module.walk([&](py::ClassOp classOp) {
+    auto names = classOp->getAttrOfType<mlir::ArrayAttr>("method_names");
+    auto symbols = classOp->getAttrOfType<mlir::ArrayAttr>("method_symbols");
+    if (!names || !symbols || names.size() != symbols.size())
+      return;
+    for (auto [nameAttr, symbolAttr] : llvm::zip(names, symbols)) {
+      auto name = mlir::dyn_cast<mlir::StringAttr>(nameAttr);
+      auto symbol = mlir::dyn_cast<mlir::StringAttr>(symbolAttr);
+      if (name && symbol && name.getValue() != "__init__" &&
+          name.getValue().starts_with("__") && name.getValue().ends_with("__"))
+        named.insert(symbol.getValue());
+    }
+  });
+  // A clone above is chosen by the call site at lowering time, so nothing
+  // names it either.
+  module.walk([&](mlir::func::FuncOp function) {
+    if (function.isDeclaration() || !function.isPrivate() ||
+        RuntimeBundleLowerer::isCallableProtocolTemplate(function) ||
+        function->hasAttr(kProtocolSpecializationAttr) ||
+        RuntimeBundleLowerer::isPrimitiveI64CallableClone(function) ||
+        named.contains(function.getSymName()))
+      return;
+    py::CallableType callable = callableTypeOf(function);
+    if (!callable)
+      return;
+    if (llvm::any_of(callableLogicalInputTypes(function, callable),
+                     [](mlir::Type type) {
+                       return mlir::isa<py::ProtocolType>(type) &&
+                              runtimeContractName(type).empty();
+                     }))
+      function->setAttr(kProtocolTemplateAttr, builder.getUnitAttr());
+  });
   return mlir::success();
 }
 
@@ -1223,14 +1310,7 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABI(
     llvm::function_ref<bool(mlir::Type)> memberOwnsALane) {
   llvm::SmallVector<mlir::Type, 8> abiInputTypes(logicalInputTypes.begin(),
                                                  logicalInputTypes.end());
-  auto protocolEvidence =
-      callableProtocolArgumentABIs.find(function.getSymName());
-  if (protocolEvidence != callableProtocolArgumentABIs.end()) {
-    llvm::SmallVector<mlir::Type, 8> &evidence = protocolEvidence->second;
-    for (auto [index, type] : llvm::enumerate(evidence))
-      if (index < abiInputTypes.size() && type)
-        abiInputTypes[index] = type;
-  }
+  RuntimeBundleLowerer::applyProtocolArgumentABIs(function, abiInputTypes);
 
   llvm::SmallVector<mlir::Type, 8> inputTypes;
   for (mlir::Type inputType : abiInputTypes) {

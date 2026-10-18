@@ -56,6 +56,7 @@ void ModuleEmitter::emitStatements(
       if (statement->kind == "ClassDef") {
         emitClassAttrInitializers(*statement);
         emitInitSubclassHook(*statement);
+        applyMethodDecorators(*statement);
       }
       // A skipped module-level def still EXECUTES here in CPython terms:
       // its non-constant defaults evaluate at this spot, once, into their
@@ -2487,6 +2488,57 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
             return;
           }
         }
+      // ⭐ A UNION OF TUPLES UNPACKS POSITION BY POSITION, chosen by the tag:
+      // `for a, b in [(1, 1), ("s", "t")]` reads a list of `tuple[int, int] |
+      // tuple[str, str]`, and the union itself has no `__getitem__`. Each
+      // target takes the join of what its position holds in every member.
+      // ⛔ The reads are values out of the dispatch and the targets are bound
+      // after it: a binding made inside an arm would not leave it.
+      // ⛔ Only tuples whose arity is the target's: a member that does not
+      // say how many it holds keeps the refusal below.
+      if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(
+              types.widenLiteral(value.type));
+          unionType && elts->size() >= 2 &&
+          llvm::all_of(unionType.getMemberTypes(), [&](mlir::Type member) {
+            auto tuple = mlir::dyn_cast_if_present<py::ContractType>(
+                types.widenLiteral(member));
+            return tuple && tuple.getContractName() == "builtins.tuple" &&
+                   tuple.getArguments().size() == elts->size();
+          })) {
+        auto itemAt = [&](Value sequence, unsigned index) -> Value {
+          mlir::Type indexType = types.literal(std::to_string(index));
+          Value indexValue{
+              py::IntConstantOp::create(builder, loc(target), indexType,
+                                        builder.getStringAttr(
+                                            std::to_string(index)))
+                  .getResult(),
+              indexType};
+          CallInferenceResult inference = types.inferMethodCallWithEvidence(
+              sequence.type, "__getitem__", {indexValue.type});
+          if (!requireStaticEvidence(target, inference))
+            return emitNone(target);
+          auto getItem = py::GetItemOp::create(
+              builder, loc(target), inference.resultType,
+              mlir::FlatSymbolRefAttr::get(&context, "__getitem__"),
+              callProtocolFor(inference), sequence.value, indexValue.value);
+          return Value{getItem.getResult(), inference.resultType};
+        };
+        std::vector<Value> items;
+        for (unsigned index = 0; index < elts->size(); ++index) {
+          llvm::SmallVector<mlir::Type, 4> held;
+          for (mlir::Type member : unionType.getMemberTypes())
+            held.push_back(mlir::cast<py::ContractType>(
+                               types.widenLiteral(member))
+                               .getArguments()[index]);
+          items.push_back(emitUnionMemberDispatch(
+              target, value, unionType, types.join(held),
+              [&](Value member) { return itemAt(member, index); }));
+        }
+        for (auto [index, elt] : llvm::enumerate(*elts))
+          if (elt)
+            emitAssignTarget(*elt, items[index]);
+        return;
+      }
       // The count IS checked, against the object: a check on the type alone
       // catches only heterogeneous tuples (a tuple whose members share a type
       // collapses to `tuple[T]`, and a list carries its length in the object),

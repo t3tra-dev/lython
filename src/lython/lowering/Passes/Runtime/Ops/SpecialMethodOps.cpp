@@ -2649,6 +2649,20 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNext(py::NextOp op) {
   if (elementContract.empty())
     return op.emitError() << "runtime __next__ element needs a concrete "
                              "manifest element contract";
+  // ⭐ THE ELEMENT IS WHAT THE ITERATOR PRODUCES, seen as the type the loop
+  // declared: a str iterated where `Iterable[object]` is declared yields a
+  // str's lanes, which read as an `object`'s were "runtime bundle for
+  // 'builtins.object' has 2 values, but ABI expects 1". The same view a call
+  // through a callable value takes for its target's result.
+  mlir::Type producedElement;
+  if (!emitted->symbol.elementContract.empty())
+    producedElement =
+        runtimeContractType(context, emitted->symbol.elementContract);
+  bool viewElement = producedElement &&
+                     RuntimeBundleLowerer::callResultNeedsView(
+                         op, producedElement, op.getElement().getType());
+  if (viewElement)
+    elementContract = emitted->symbol.elementContract;
 
   std::string nextContract = runtimeContractName(op.getNext().getType());
   if (nextContract.empty())
@@ -2672,6 +2686,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNext(py::NextOp op) {
           op, op.getElement(), runtimeContractType(context, elementContract),
           elementValues)))
     return mlir::failure();
+  if (viewElement) {
+    RuntimeBundle produced = valueBundles[op.getElement()];
+    mlir::FailureOr<RuntimeBundle> view =
+        RuntimeBundleLowerer::viewCallResultAsDeclared(
+            op, produced, producedElement, op.getElement().getType());
+    if (mlir::failed(view))
+      return mlir::failure();
+    valueBundles[op.getElement()] = std::move(*view);
+  }
   if (mlir::failed(assignObjectBundle(
           op, op.getNext(), runtimeContractType(context, nextContract),
           nextValues)))

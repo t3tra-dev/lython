@@ -208,6 +208,20 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
                               valueNode,
                               expectedFor(operands.positionalTypes.size()))
                         : emitExpr(valueNode);
+      // ⭐ AN INLINED METHOD'S OWN `*args` IS THE VALUES ITS CALL GAVE. A pack
+      // of one has no arity in its type (`tuple[str]` is also the
+      // homogeneous spelling), so it is forwarded as those values, not
+      // unpacked as a tuple.
+      if (unpacked)
+        if (auto pack = staticPositionalPacks.find(value.value);
+            pack != staticPositionalPacks.end()) {
+          for (const Value &element : pack->second) {
+            operands.positional.push_back(element);
+            operands.positionalUnpacked.push_back(0);
+            operands.positionalTypes.push_back(element.type);
+          }
+          continue;
+        }
       operands.positional.push_back(value);
       operands.positionalUnpacked.push_back(unpacked ? 1 : 0);
       if (unpacked) {
@@ -247,7 +261,24 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
       // whose keys are literals, and `g(**kwargs)` forwarding a parameter that
       // is itself a dict -- because each needs the callee's keyword ABI, and
       // this is the boundary that has to refuse first either way.
-      emitExpr(ast::node(*keyword, "value"));
+      // ⭐ EXCEPT AN INLINED METHOD'S OWN `**kwargs`, whose names are the
+      // call site's and whose body only reads it: forwarded as those
+      // keywords, one by one.
+      Value mapping = emitExpr(ast::node(*keyword, "value"));
+      if (auto pack = staticKeywordPacks.find(mapping.value);
+          pack != staticKeywordPacks.end()) {
+        for (const auto &[packedName, packedValue] : pack->second) {
+          mlir::Type literal = types.literal("\"" + packedName + "\"");
+          auto stringOp = py::StrConstantOp::create(
+              builder, loc(*keyword), literal,
+              builder.getStringAttr(packedName));
+          operands.keywordNames.push_back({stringOp.getResult(), literal});
+          operands.keywordValues.push_back(packedValue);
+          operands.keywordTypes.push_back(
+              CallKeywordType{packedName, packedValue.type});
+        }
+        continue;
+      }
       operands.valid = false;
       operands.failureReason =
           "`**` call arguments require statically known keyword names; spell "
@@ -2564,6 +2595,10 @@ ModuleEmitter::attributePresence(mlir::Type subject, llvm::StringRef attribute,
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(subject);
   if (!contract)
     return AttributePresence::Undecided;
+  // ⛔ A name with `$` is a body this compiler split out, which no source
+  // identifier spells and CPython's class does not have.
+  if (attribute.contains('$') && isSourceClassContract(subject))
+    return AttributePresence::Absent;
   bool field = !throughClass && lookupClassField(subject, attribute).has_value();
   bool present = field || lookupClassMethod(subject, attribute).has_value() ||
                  lookupClassStaticAttr(subject, attribute).has_value();
@@ -3075,7 +3110,11 @@ ModuleEmitter::programAttributeNames(llvm::StringRef cls) const {
       if (auto found = declarations->find(current);
           found != declarations->end())
         for (const auto &name : found->second)
-          names.insert(name.getKey());
+          // ⛔ Not a name with `$`, which no source identifier has: it is a
+          // body this compiler split out (`m$cmgen`, `__ly_undecorated$m`),
+          // and CPython's class has no such attribute.
+          if (!name.getKey().contains('$'))
+            names.insert(name.getKey());
     if (auto bases = declaredClassBases.find(current);
         bases != declaredClassBases.end())
       for (const std::string &base : bases->second)
@@ -3342,6 +3381,141 @@ std::vector<parser::NodePtr> ModuleEmitter::computedGetattrBody(
         synth::call(synth::name("type", range), {receiver()}, range), "Is",
         synth::name(member, range), range);
   };
+  mlir::Type receiverClassType =
+      types.lookupClass(cls).value_or(mlir::Type());
+  // What every instance answers. The data among it is never callable, and
+  // CPython's sentence names its class: a docstring is a str and its absence
+  // None, per class, since `__doc__` is not inherited.
+  static const llvm::StringMap<llvm::StringRef> kDataAttributeClasses = {
+      {"__dict__", "dict"},
+      {"__module__", "str"},
+      {"__weakref__", "NoneType"},
+      {"__firstlineno__", "int"},
+      {"__static_attributes__", "tuple"}};
+  auto everyInstanceHas = [&](llvm::StringRef name) {
+    return llvm::is_contained(kObjectAttributeNames, name) ||
+           llvm::is_contained(kClassStatementAttributeNames, name);
+  };
+  auto unsupported = [&](llvm::StringRef name, llvm::StringRef why) {
+    return synth::raiseCall("TypeError",
+                            "getattr(x, '" + name.str() +
+                                "')(...) is not supported here: " + why.str(),
+                            range);
+  };
+  // The arms of `name` for a receiver whose class declares nothing by it.
+  // `belowDefiners`: some subclass of the receiver's static class declares
+  // it, so `recv.name(...)` would ask for a dispatch over those overrides --
+  // the receiver reaching this arm is none of them, and what answers is the
+  // default its class inherits.
+  auto objectDefault = [&](llvm::StringRef name, bool belowDefiners) {
+    std::vector<parser::NodePtr> block;
+    bool objectsOwn = inheritsObjectDefaultDunder(receiverClassType, name);
+    if (belowDefiners && isImplementedObjectDefault(name)) {
+      // object's own slot, called with the receiver, as CPython's
+      // `object.__str__(x)` names it; a default from a runtime base, or one
+      // with no value here, is not.
+      if (!objectsOwn || !argumentTypes.empty() ||
+          (name != "__repr__" && name != "__str__" && name != "__hash__")) {
+        block.push_back(unsupported(
+            name, "the receiver's class inherits it, and only object's own "
+                  "__repr__, __str__ and __hash__ are called by a computed "
+                  "name past a subclass's override"));
+      } else if (name == "__hash__" &&
+                 !inheritsObjectDefaultDunder(receiverClassType, "__eq__")) {
+        // A class that declares `__eq__` and not `__hash__` has `__hash__ =
+        // None`.
+        block.push_back(notCallable("NoneType"));
+      } else {
+        block.push_back(synth::returnStmt(
+            synth::call(
+                synth::attribute(synth::name("object", range), name, range),
+                {receiver()}, range),
+            range));
+      }
+      return block;
+    }
+    if (auto data = kDataAttributeClasses.find(name);
+        data != kDataAttributeClasses.end()) {
+      block.push_back(notCallable(data->second));
+    } else if (name == "__doc__") {
+      for (const std::string &member : hierarchy) {
+        const parser::Node *classDef = declaredClassNodes.lookup(member);
+        const auto *classBody =
+            classDef ? ast::nodeList(*classDef, "body") : nullptr;
+        const parser::Node *first = classBody && !classBody->empty()
+                                        ? classBody->front().get()
+                                        : nullptr;
+        const parser::Node *docstring = first && first->kind == "Expr"
+                                            ? ast::node(*first, "value")
+                                            : nullptr;
+        if (!docstring || !literalStringArgument(docstring))
+          continue;
+        block.push_back(
+            synth::ifStmt(exactly(member), {notCallable("str")}, {}, range));
+      }
+      block.push_back(notCallable("NoneType"));
+    } else if (name == "__class__") {
+      // The class called: a new instance of the class the receiver has at
+      // run time, refused as CPython refuses it when its `__init__` does
+      // not take the arguments.
+      for (const std::string &member : hierarchy) {
+        mlir::Type memberType =
+            types.lookupClass(member).value_or(mlir::Type());
+        std::string message;
+        std::optional<MethodBinding> init =
+            lookupClassMethod(memberType, "__init__");
+        if (init && init->method)
+          message = arityMismatch(
+              qualname(init->definingClass, "__init__"), *init->method,
+              /*bound=*/true, static_cast<unsigned>(argumentTypes.size()));
+        else if (!argumentTypes.empty())
+          message = py::contracts::displayClassNameForContract(member) +
+                    "() takes no arguments";
+        parser::NodePtr arm =
+            message.empty()
+                ? synth::returnStmt(synth::call(synth::name(member, range),
+                                                forwarded(), range),
+                                    range)
+                : synth::raiseCall("TypeError", message, range);
+        block.push_back(
+            synth::ifStmt(exactly(member), {std::move(arm)}, {}, range));
+      }
+    } else if (name == "__init__") {
+      // object's: nothing to do, and CPython's sentence, naming the class
+      // the receiver has at run time, when the call passes anything.
+      if (argumentTypes.empty()) {
+        block.push_back(synth::returnStmt(synth::noneConstant(range), range));
+      } else {
+        parser::NodePtr className = synth::attribute(
+            synth::call(synth::name("type", range), {receiver()}, range),
+            "__name__", range);
+        block.push_back(synth::raiseStmt(
+            synth::call(
+                synth::name("TypeError", range),
+                {synth::binOp(
+                    std::move(className), "Add",
+                    synth::strConstant(".__init__() takes exactly one argument "
+                                       "(the instance to initialize)",
+                                       range),
+                    range)},
+                range),
+            range));
+      }
+    } else if (objectsOwn && !isImplementedObjectDefault(name)) {
+      // ⛔ Raised here, not refused: the program reaches this arm only if
+      // its run time computes the name, and refusing every computed call
+      // on a class that inherits an unimplemented default refused them all.
+      block.push_back(unsupported(
+          name, "Lython does not implement builtins.object." + name.str()));
+    } else if (types.inferMethodCallWithEvidence(receiverClassType, name,
+                                                 argumentTypes)) {
+      block.push_back(callArm(name));
+    } else {
+      block.push_back(unsupported(name, "a computed name calls the attributes "
+                                        "the program's classes declare"));
+    }
+    return block;
+  };
   std::vector<parser::NodePtr> body;
   for (const std::string &name : universe) {
     std::vector<parser::NodePtr> block;
@@ -3363,103 +3537,44 @@ std::vector<parser::NodePtr> ModuleEmitter::computedGetattrBody(
                         {receiver(), synth::name(member, range)}, range),
             {armFor(member, name)}, {}, range));
       }
+      // ⭐ A RECEIVER OF NONE OF THE DEFINERS STILL HAS WHAT EVERY INSTANCE
+      // HAS. `__str__` declared only by a subclass is object's for the base:
+      // `getattr(Base(), "__str__")()` fell past the arms to "'Base' object
+      // has no attribute '__str__'" where CPython answers the default str.
+      if (everyInstanceHas(name))
+        for (parser::NodePtr &arm : objectDefault(name, /*belowDefiners=*/true))
+          block.push_back(std::move(arm));
     }
     body.push_back(synth::ifStmt(nameIs(name), std::move(block), {}, range));
   }
-  mlir::Type receiverClassType =
-      types.lookupClass(cls).value_or(mlir::Type());
-  // What every instance answers. The data among it is never callable, and
-  // CPython's sentence names its class: a docstring is a str and its absence
-  // None, per class, since `__doc__` is not inherited.
-  static const llvm::StringMap<llvm::StringRef> kDataAttributeClasses = {
-      {"__dict__", "dict"},        {"__module__", "str"},
-      {"__weakref__", "NoneType"}, {"__firstlineno__", "int"},
-      {"__static_attributes__", "tuple"}};
   for (llvm::ArrayRef<llvm::StringLiteral> list :
        {llvm::ArrayRef<llvm::StringLiteral>(kObjectAttributeNames),
         llvm::ArrayRef<llvm::StringLiteral>(kClassStatementAttributeNames)})
     for (llvm::StringLiteral name : list) {
       if (universe.count(name.str()))
         continue;
-      std::vector<parser::NodePtr> block;
-      if (auto data = kDataAttributeClasses.find(name);
-          data != kDataAttributeClasses.end()) {
-        block.push_back(notCallable(data->second));
-      } else if (name == "__doc__") {
-        for (const std::string &member : hierarchy) {
-          const parser::Node *classDef = declaredClassNodes.lookup(member);
-          const auto *classBody =
-              classDef ? ast::nodeList(*classDef, "body") : nullptr;
-          const parser::Node *first = classBody && !classBody->empty()
-                                          ? classBody->front().get()
-                                          : nullptr;
-          const parser::Node *docstring =
-              first && first->kind == "Expr" ? ast::node(*first, "value")
-                                             : nullptr;
-          if (!docstring || !literalStringArgument(docstring))
-            continue;
-          block.push_back(
-              synth::ifStmt(exactly(member), {notCallable("str")}, {}, range));
-        }
-        block.push_back(notCallable("NoneType"));
-      } else if (name == "__class__") {
-        // The class called: a new instance of the class the receiver has at
-        // run time, refused as CPython refuses it when its `__init__` does
-        // not take the arguments.
-        for (const std::string &member : hierarchy) {
-          mlir::Type memberType =
-              types.lookupClass(member).value_or(mlir::Type());
-          std::string message;
-          std::optional<MethodBinding> init =
-              lookupClassMethod(memberType, "__init__");
-          if (init && init->method)
-            message = arityMismatch(
-                qualname(init->definingClass, "__init__"), *init->method,
-                /*bound=*/true, static_cast<unsigned>(argumentTypes.size()));
-          else if (!argumentTypes.empty())
-            message = py::contracts::displayClassNameForContract(member) +
-                      "() takes no arguments";
-          parser::NodePtr arm =
-              message.empty()
-                  ? synth::returnStmt(synth::call(synth::name(member, range),
-                                                  forwarded(), range),
-                                      range)
-                  : synth::raiseCall("TypeError", message, range);
-          block.push_back(
-              synth::ifStmt(exactly(member), {std::move(arm)}, {}, range));
-        }
-      } else if (types.inferMethodCallWithEvidence(receiverClassType, name,
-                                                   argumentTypes)) {
-        block.push_back(callArm(name));
-      } else {
-        block.push_back(synth::raiseCall(
-            "TypeError",
-            "getattr(x, '" + name.str() +
-                "')(...) is not supported here: a computed name calls the "
-                "attributes the program's classes declare",
-            range));
-      }
-      body.push_back(synth::ifStmt(nameIs(name), std::move(block), {}, range));
+      body.push_back(synth::ifStmt(nameIs(name),
+                                   objectDefault(name, /*belowDefiners=*/false),
+                                   {}, range));
     }
   // CPython's sentence, naming the class the receiver has at run time.
   parser::NodePtr message = synth::binOp(
       synth::binOp(
-          synth::binOp(
-              synth::strConstant("'", range), "Add",
-              synth::attribute(
-                  synth::call(synth::name("type", range), {receiver()}, range),
-                  "__name__", range),
-              range),
+          synth::binOp(synth::strConstant("'", range), "Add",
+                       synth::attribute(synth::call(synth::name("type", range),
+                                                    {receiver()}, range),
+                                        "__name__", range),
+                       range),
           "Add", synth::strConstant("' object has no attribute '", range),
           range),
       "Add",
       synth::binOp(synth::name("__ly_name", range), "Add",
                    synth::strConstant("'", range), range),
       range);
-  body.push_back(synth::raiseStmt(
-      synth::call(synth::name("AttributeError", range), {std::move(message)},
-                  range),
-      range));
+  body.push_back(
+      synth::raiseStmt(synth::call(synth::name("AttributeError", range),
+                                   {std::move(message)}, range),
+                       range));
   return body;
 }
 
@@ -3633,7 +3748,8 @@ ModuleEmitter::classDirNames(llvm::StringRef cls, std::string &why) const {
           continue;
         if (member->kind == "FunctionDef" ||
             member->kind == "AsyncFunctionDef" || member->kind == "ClassDef") {
-          if (auto name = ast::string(*member, "name"))
+          if (auto name = ast::string(*member, "name");
+              name && !llvm::StringRef(*name).contains('$'))
             names.insert(std::string(*name));
         } else if (member->kind == "AnnAssign") {
           annotated = true;
@@ -4840,9 +4956,29 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
     returns = synth::name(spelling, range);
   }
 
+  // ⭐ A DEFAULT THE BASE TAKES FROM OBJECT DISPATCHES TOO. `class Sub(Base)`
+  // declaring `__repr__` over a Base that declares none left the base with no
+  // body to fall back on, so `repr(b)` and `str(b)` on a Base-typed value
+  // were refused ("'__repr__' is overridden by a subclass of 'Base'") while
+  // `print(b)` answered right. The fallback is object's own slot, called with
+  // the receiver -- `object.__repr__(b)`, as CPython names it.
+  // ⛔ Not `__hash__` under a class that declares `__eq__`: its `__hash__` is
+  // None, not object's.
+  bool objectDefaultFallback =
+      !asAttribute && !asField && !asProperty && !asSetter &&
+      argumentCount == 0 && keywordNames.empty() &&
+      (methodName == "__repr__" || methodName == "__str__" ||
+       (methodName == "__hash__" &&
+        inheritsObjectDefaultDunder(receiver.type, "__eq__"))) &&
+      !lookupClassMethod(receiver.type, methodName) &&
+      inheritsObjectDefaultDunder(receiver.type, methodName);
+  if (objectDefaultFallback) {
+    fallbackClass = "object";
+    returns = synth::name(methodName == "__hash__" ? "int" : "str", range);
+  }
   // The body the STATIC type resolves to: its signature is the one the
   // dispatcher restates, and its declaring class is how the fallback names it.
-  if (!asAttribute && !asField) {
+  if (!asAttribute && !asField && !objectDefaultFallback) {
   // ⭐ A `@property` WRITE IS A DISPATCH TOO, and the assignment path had no
   // gate at all: `x.v = 5` inlined the setter the STATIC class resolves to, so
   // a base-typed receiver ran the BASE's setter while `x.v` one line over
@@ -4949,7 +5085,7 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
   llvm::SmallVector<synth::Param, 4> params;
   llvm::SmallVector<std::string, 2> keywordParameters;
   params.push_back(synth::Param{"__ly_recv", synth::name(receiverClass, range)});
-  if (!asAttribute && !asField) {
+  if (!asAttribute && !asField && !objectDefaultFallback) {
   // A staticmethod declares no receiver, so there is no first parameter to
   // skip -- `__ly_recv` above is the dispatcher's own, not the method's.
   // A classmethod's first parameter is `cls`, which the arm supplies by
@@ -6483,6 +6619,15 @@ ModuleEmitter::tryEmitStrCall(const parser::Node &expr,
               tryEmitClassDunder(expr, argument, "__str__"))
         return *dispatched;
     }
+    // ⛔ Nor is it repr when a SUBCLASS declares `__str__`: the argument may
+    // be that subclass. `emitInheritedObjectStr` asks the runtime class.
+    if (inheritsObjectDefaultDunder(argumentType, "__str__") &&
+        subclassOverridesMethod(
+            mlir::cast<py::ContractType>(argumentType).getContractName(),
+            "__str__"))
+      if (std::optional<Value> rendered = emitInheritedObjectStr(
+              expr, emitExpr(strArgs->front().get())))
+        return *rendered;
     // Manifest __str__ evidence over-accepts through the object contract
     // (container manifests only implement __repr__), so gate the __str__
     // dispatch on the exception taxonomy — the one family whose __str__

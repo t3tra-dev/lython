@@ -563,6 +563,25 @@ private:
   // `@contextlib.contextmanager` defs become a generator and a def that
   // wraps it (EmitterWith.cpp).
   void desugarContextManagers(const parser::Node &moduleNode);
+  void desugarMethodDecorators(const parser::Node &moduleNode);
+  // A method the desugar split: its body under `hiddenName`, and the cell
+  // `cellName` holding what its decorators returned, which the method of the
+  // written name forwards to.
+  struct DecoratedMethod {
+    const parser::Node *classDef = nullptr;
+    const parser::Node *hiddenDef = nullptr;
+    std::string className;
+    std::string hiddenName;
+    std::string cellName;
+    std::vector<parser::NodePtr> decorators;
+    parser::SourceRange range;
+    bool typed = false;
+  };
+  std::vector<DecoratedMethod> decoratedMethods;
+  parser::NodePtr decoratedMethodApplication(const DecoratedMethod &method,
+                                             parser::NodePtr subject);
+  void applyMethodDecorators(const parser::Node &classDef);
+  bool typeDecoratedMethod(DecoratedMethod &method, bool reportFailure);
   // Parsed trees a desugar spliced into a module, alive as long as it is.
   std::vector<parser::NodePtr> synthesizedHelperTrees;
   // The classes that were declared as protocols, by their own name.
@@ -946,6 +965,8 @@ private:
                                                      std::string &why) const;
   std::optional<Value> tryEmitDirCall(const parser::Node &expr,
                                       const parser::Node *calleeNode);
+  Value emitPercentFormatArguments(const parser::Node &expr, Value operand,
+                                   unsigned wanted);
   // `object.__repr__(x)` and its siblings: object's own slot, not x's.
   std::optional<Value> tryEmitObjectSlotCall(const parser::Node &expr,
                                              const parser::Node *calleeNode);
@@ -1001,6 +1022,14 @@ private:
                          mlir::Type resultType);
   // A `def` with PEP 695 type parameters of its own.
   static bool hasTypeParameters(const parser::Node &def);
+  // A def whose body spells its own `*args` or `**kwargs` into a call
+  // (`f(*args, **kwargs)`): their arity and names are the call site's.
+  static bool forwardsItsPacks(const parser::Node &def);
+  // The defs whose body is typed only where a call is: a generic one, and
+  // one that forwards its packs. Neither has a standalone body.
+  static bool specializedAtEachCall(const parser::Node &def) {
+    return hasTypeParameters(def) || forwardsItsPacks(def);
+  }
   // An isinstance/issubclass operand, or an element of a tuple of them, that
   // is a class value the static type does not decide.
   bool targetHasDynamicClassValue(const parser::Node *node);
@@ -1475,6 +1504,27 @@ private:
       const CallInferenceResult &inference,
       llvm::ArrayRef<mlir::Type> argumentTypes) const;
   mlir::Value emitBoolValue(Value value, const parser::Node &anchor);
+  mlir::Value emitNumberTruth(Value value, const parser::Node &anchor);
+  // Ints and floats an inlined method bound to a parameter declared
+  // `object`: their truth test is an object's, which R1 does not refuse.
+  llvm::DenseSet<mlir::Value> numbersHeldAsObject;
+  // The values an inlined method packed into its `*args` and `**kwargs`,
+  // keyed by the pack's own value: a call in the body that spells the pack
+  // forwards these one by one, with the arity and the names the call site
+  // gave.
+  llvm::DenseMap<mlir::Value, llvm::SmallVector<Value, 4>>
+      staticPositionalPacks;
+  llvm::DenseMap<mlir::Value,
+                 llvm::SmallVector<std::pair<std::string, Value>, 4>>
+      staticKeywordPacks;
+  // Whether `def` reads its `**name` dict and nothing else: forwards it,
+  // looks keys up, iterates it -- so the names the call gave are still its
+  // names wherever the body forwards it.
+  static bool keywordPackIsOnlyRead(const parser::Node &def,
+                                    llvm::StringRef name);
+  // A copy of `lambda` whose calls spell out the static packs they forward,
+  // through names bound to the packed values; null when it forwards none.
+  parser::NodePtr lambdaWithPacksSpelledOut(const parser::Node &lambda);
 
   template <typename Op>
   Value emitBinarySpecial(const parser::Node &anchor, llvm::StringRef method,
@@ -1507,6 +1557,11 @@ private:
   // the emitted SYMBOL rather than to the cell it is about to fill.
   std::string decoratorSubjectName;
   static bool isRecognizedNonBindingDecorator(llvm::StringRef leaf);
+  parser::NodePtr bindingDecoratorCallee(const parser::NodePtr &decorator);
+  // Module-level defs whose decorators rebind them (`f = d(f)`), and those
+  // where the rebinding was asked for and the application is no function.
+  llvm::DenseSet<const parser::Node *> rebindingDecoratedDefs;
+  llvm::DenseSet<const parser::Node *> attemptedDecoratedDefs;
   llvm::StringSet<> moduleClassNames;
   // Main-module top-level `def`s whose spelling is also a manifest builtin's
   // binding name (`def len`), mapped to the symbol they are emitted under.

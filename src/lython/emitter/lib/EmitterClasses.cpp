@@ -342,6 +342,205 @@ bool ModuleEmitter::isRecognizedNonBindingDecorator(llvm::StringRef leaf) {
          leaf == "property" || leaf == "abstractmethod" || leaf == "dataclass";
 }
 
+// The expression a decorator CALLS when it rebinds the name it decorates:
+// `@d` is `f = d(f)` and `@d(arg)` is `f = d(arg)(f)`. Whatever function the
+// program can name answers -- a def of this module, an imported one, `mod.d`
+// -- and a factory call over one; null for a marker that rebinds nothing and
+// for anything else.
+parser::NodePtr
+ModuleEmitter::bindingDecoratorCallee(const parser::NodePtr &decorator) {
+  if (!decorator)
+    return nullptr;
+  auto [function, spelling] = decoratorCallee(*decorator);
+  if (!function || isRecognizedNonBindingDecorator(decoratorLeafName(spelling)))
+    return nullptr;
+  if (function->kind == "Name" &&
+      moduleFunctionNames.count(ast::nameSpelling(*function)))
+    return decorator;
+  if (function->kind != "Name" && function->kind != "Attribute")
+    return nullptr;
+  if (!mlir::isa_and_nonnull<py::CallableType>(
+          types.widenLiteral(types.inferExpr(function))))
+    return nullptr;
+  return decorator;
+}
+
+// ⭐ A DECORATED METHOD IS `m = d(m)` IN THE CLASS BODY: the class attribute
+// holds what the decorator returned, and a call through an instance binds
+// the receiver to it like any function. Here every call of a method is
+// inlined, so the rewrite keeps that shape in two methods and a cell --
+//
+//     class C:
+//         def __ly_undecorated$m(self, x): <the body>
+//         def m(self, x): return __ly_decorated$C$m(self, x)
+//     __ly_decorated$C$m = d(C.__ly_undecorated$m)    # after the class
+//
+// -- so the body keeps its class (`super()`, the fields it reads), the name
+// keeps the signature it was written with, and the decorator runs once.
+// ⛔ Only what the forwarder can restate: positional parameters, defaults
+// included. A pack, a keyword-only parameter, a generator or a coroutine
+// keeps its decorators and their refusal, as does a decorator beside
+// staticmethod, classmethod or property, which bind differently.
+// ⛔ The application runs after the class statement and not in its body:
+// CPython runs it before the class name is bound, which only a decorator
+// with a side effect interleaved with the rest of the body could tell.
+void ModuleEmitter::desugarMethodDecorators(const parser::Node &moduleNode) {
+  auto *body = const_cast<std::vector<parser::NodePtr> *>(
+      ast::nodeList(moduleNode, "body"));
+  if (!body)
+    return;
+  auto isTypingMarker = [](llvm::StringRef leaf) {
+    return leaf == "overload" || leaf == "override" || leaf == "final";
+  };
+  auto definesItsOwnGenerator = [](const parser::Node &def) {
+    bool found = false;
+    std::function<void(const parser::Node &)> walk =
+        [&](const parser::Node &node) {
+          if (found)
+            return;
+          if (&node != &def &&
+              (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
+               node.kind == "Lambda" || node.kind == "ClassDef"))
+            return;
+          if (node.kind == "Yield" || node.kind == "YieldFrom") {
+            found = true;
+            return;
+          }
+          for (const parser::Field &field : node.fields) {
+            if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+              if (*child)
+                walk(**child);
+            } else if (const auto *children =
+                           std::get_if<std::vector<parser::NodePtr>>(
+                               &field.value)) {
+              for (const parser::NodePtr &child : *children)
+                if (child)
+                  walk(*child);
+            }
+          }
+        };
+    walk(def);
+    return found;
+  };
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement || statement->kind != "ClassDef")
+      continue;
+    if (const auto *typeParams = ast::nodeList(*statement, "type_params");
+        typeParams && !typeParams->empty())
+      continue;
+    std::string className(ast::string(*statement, "name").value_or(""));
+    auto *members = const_cast<std::vector<parser::NodePtr> *>(
+        ast::nodeList(*statement, "body"));
+    if (className.empty() || !members)
+      continue;
+    for (std::size_t index = 0; index < members->size(); ++index) {
+      parser::NodePtr method = (*members)[index];
+      if (!method || method->kind != "FunctionDef")
+        continue;
+      auto *decorators = const_cast<std::vector<parser::NodePtr> *>(
+          ast::nodeList(*method, "decorator_list"));
+      if (!decorators || decorators->empty())
+        continue;
+      std::vector<parser::NodePtr> markers;
+      std::vector<parser::NodePtr> binding;
+      bool bindsOtherwise = false;
+      for (const parser::NodePtr &decorator : *decorators) {
+        if (!decorator)
+          continue;
+        auto [function, spelling] = decoratorCallee(*decorator);
+        llvm::StringRef leaf = decoratorLeafName(spelling);
+        if (isTypingMarker(leaf))
+          markers.push_back(decorator);
+        else if (isRecognizedNonBindingDecorator(leaf) ||
+                 !propertySetterTarget(*decorator).empty() || !function ||
+                 (function->kind != "Name" && function->kind != "Attribute"))
+          bindsOtherwise = true;
+        else
+          binding.push_back(decorator);
+      }
+      const parser::Node *arguments = ast::node(*method, "args");
+      const auto *kwonly =
+          arguments ? ast::nodeList(*arguments, "kwonlyargs") : nullptr;
+      if (bindsOtherwise || binding.empty() || !arguments ||
+          ast::node(*arguments, "vararg") || ast::node(*arguments, "kwarg") ||
+          (kwonly && !kwonly->empty()) || definesItsOwnGenerator(*method))
+        continue;
+      std::vector<std::string> positional;
+      for (llvm::StringRef group : {"posonlyargs", "args"})
+        if (const auto *list = ast::nodeList(*arguments, group))
+          for (const parser::NodePtr &arg : *list)
+            if (arg)
+              positional.push_back(
+                  std::string(ast::string(*arg, "arg").value_or("")));
+      if (positional.empty())
+        continue;
+      std::string name(ast::string(*method, "name").value_or(""));
+      parser::SourceRange range = method->range;
+      DecoratedMethod split;
+      split.classDef = statement.get();
+      split.hiddenDef = method.get();
+      split.className = className;
+      split.hiddenName = "__ly_undecorated$" + name;
+      split.cellName = "__ly_decorated$" + className + "$" + name;
+      split.decorators = binding;
+      split.range = range;
+      // The method of the written name: its parameters, defaults and
+      // markers, forwarding every argument to what the decorators returned.
+      parser::NodePtr forwarder = synth::cloneTree(*method);
+      if (parser::Field *field = parser::findField(*forwarder, "decorator_list"))
+        field->value = std::move(markers);
+      std::vector<parser::NodePtr> forwarded;
+      for (const std::string &parameter : positional)
+        forwarded.push_back(synth::name(parameter, range));
+      std::vector<parser::NodePtr> forwardingBody;
+      forwardingBody.push_back(synth::returnStmt(
+          synth::call(synth::name(split.cellName, range), std::move(forwarded),
+                      range),
+          range));
+      if (parser::Field *field = parser::findField(*forwarder, "body"))
+        field->value = std::move(forwardingBody);
+      // The body, under the hidden name and undecorated.
+      decorators->clear();
+      if (parser::Field *field = parser::findField(*method, "name"))
+        field->value = split.hiddenName;
+      members->insert(members->begin() + static_cast<std::ptrdiff_t>(index) + 1,
+                      std::move(forwarder));
+      ++index;
+      decoratedMethods.push_back(std::move(split));
+    }
+  }
+}
+
+// `d1(d2(subject))` -- `subject` the method's function, `C.__ly_undecorated$m`
+// -- with the decorator closest to the def applied first, as it is to a
+// function.
+parser::NodePtr
+ModuleEmitter::decoratedMethodApplication(const DecoratedMethod &method,
+                                          parser::NodePtr subject) {
+  parser::NodePtr applied = std::move(subject);
+  for (const parser::NodePtr &decorator : llvm::reverse(method.decorators)) {
+    std::vector<parser::NodePtr> arguments;
+    arguments.push_back(std::move(applied));
+    applied = synth::call(decorator, std::move(arguments), method.range);
+  }
+  return applied;
+}
+
+void ModuleEmitter::applyMethodDecorators(const parser::Node &classDef) {
+  for (const DecoratedMethod &method : decoratedMethods) {
+    if (method.classDef != &classDef || !method.typed)
+      continue;
+    parser::NodePtr applied = synth::assign(
+        synth::name(method.cellName, method.range),
+        decoratedMethodApplication(
+            method, synth::attribute(synth::name(method.className, method.range),
+                                     method.hiddenName, method.range)),
+        method.range);
+    synthesizedIteratorDefs.push_back(applied);
+    emitStatement(*applied);
+  }
+}
+
 void ModuleEmitter::checkDecorators(const parser::Node &node,
                                     DecoratorRole role,
                                     const llvm::StringSet<> *propertyNames) {
@@ -385,10 +584,17 @@ void ModuleEmitter::checkDecorators(const parser::Node &node,
       // compiler would have to see through" -- and the hand-written spelling,
       // `shown = tagged("v")(show)`, has compiled all along. What was missing
       // was the desugaring in `declareModuleGlobals`, not the seeing.
+      // ⭐ AND ANY FUNCTION THE PROGRAM CAN NAME, not only a def of this
+      // module: `from decos import twice` then `@twice`, `@decos.twice`, a
+      // factory imported the same way. Each is the `f = d(f)` an imported
+      // function has always been callable in.
+      // ⛔ A module-level def whose application is not a function stays
+      // refused: its name is a cell typed by that application, and with no
+      // callable to hold, the undecorated body would answer under the name.
       recognized = leaf == "native" || isTypingMarker(leaf) ||
-                   ((decorator->kind == "Name" ||
-                     decorator->kind == "Call") &&
-                    moduleFunctionNames.count(leaf));
+                   (bindingDecoratorCallee(decorator) &&
+                    (!attemptedDecoratedDefs.contains(&node) ||
+                     rebindingDecoratedDefs.contains(&node)));
       break;
     case DecoratorRole::Class:
       recognized = leaf == "dataclass" || isTypingMarker(leaf);
@@ -398,6 +604,17 @@ void ModuleEmitter::checkDecorators(const parser::Node &node,
       continue;
     if (spelling.empty())
       spelling = "<expression>";
+    if (role == DecoratorRole::Function &&
+        attemptedDecoratedDefs.contains(&node) &&
+        bindingDecoratorCallee(decorator)) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, decorator->range.start,
+          "decorator '" + spelling +
+              "' does not return a function here: a decorated module-level "
+              "function is rebound to what its decorators return, and only a "
+              "callable can be held under its name"});
+      continue;
+    }
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, decorator->range.start,
         "decorator '" + spelling + "' is not supported (unrecognized "
@@ -1936,6 +2153,9 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       symbolName.empty() ? std::string(*name) : symbolName.str();
   llvm::StringRef contractName(classSymbol);
   checkDecorators(classDef, DecoratorRole::Class);
+  for (DecoratedMethod &method : decoratedMethods)
+    if (method.classDef == &classDef)
+      typeDecoratedMethod(method, /*reportFailure=*/true);
 
   // @dataclass: init/repr/eq synthesize below (default True); frozen/order
   // are accepted only as explicit False.
@@ -2775,7 +2995,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       // a call site solves T, which the inlining does.
       if (kind != "class" && kind != "classmethod" &&
           !isExceptionBackedClass(contractName) &&
-          !hasTypeParameters(*statement)) {
+          !specializedAtEachCall(*statement)) {
         pendingBodies.push_back(statement.get());
         pendingBodySigs.push_back(bodySig);
         pendingBodySymbols.push_back(symbolName);
@@ -2877,7 +3097,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
                                       ? specialized.publicCallable
                                       : specialized.callable);
         methodSymbols.push_back(symbolName);
-        if (hasTypeParameters(*inherited.method))
+        if (specializedAtEachCall(*inherited.method))
           continue;
         pendingBodies.push_back(inherited.method);
         pendingBodySigs.push_back(specialized);
@@ -4679,9 +4899,47 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
   if (const auto *args = ast::nodeList(expr, "args")) {
     for (const parser::NodePtr &arg : *args) {
       if (arg && arg->kind == "Starred") {
+        // ⭐ A STARRED ARGUMENT WHOSE VALUES ARE KNOWN IS THOSE VALUES: an
+        // inlined method's own `*args` (the values its call gave), or a tuple
+        // whose type says how many it holds, read by position. Anything else
+        // has an arity only the run time knows, and an inlined body binds
+        // its parameters here.
+        Value starred = emitExpr(ast::node(*arg, "value"));
+        if (auto pack = staticPositionalPacks.find(starred.value);
+            pack != staticPositionalPacks.end()) {
+          positional.append(pack->second.begin(), pack->second.end());
+          continue;
+        }
+        auto tuple = mlir::dyn_cast_if_present<py::ContractType>(
+            types.widenLiteral(starred.type));
+        if (tuple && tuple.getContractName() == "builtins.tuple" &&
+            tuple.getArguments().size() >= 2) {
+          for (unsigned index = 0; index < tuple.getArguments().size();
+               ++index) {
+            mlir::Type indexType = types.literal(std::to_string(index));
+            Value indexValue{
+                py::IntConstantOp::create(builder, loc(*arg), indexType,
+                                          builder.getStringAttr(
+                                              std::to_string(index)))
+                    .getResult(),
+                indexType};
+            CallInferenceResult inference = types.inferMethodCallWithEvidence(
+                starred.type, "__getitem__", {indexValue.type});
+            if (!requireStaticEvidence(*arg, inference))
+              break;
+            auto item = py::GetItemOp::create(
+                builder, loc(*arg), inference.resultType,
+                mlir::FlatSymbolRefAttr::get(&context, "__getitem__"),
+                callProtocolFor(inference), starred.value, indexValue.value);
+            positional.push_back(Value{item.getResult(), inference.resultType});
+          }
+          continue;
+        }
         diagnostics.push_back(parser::Diagnostic{
             parser::Severity::Error, arg->range.start,
-            "starred arguments are not supported for inlined class methods"});
+            "starred arguments are not supported for inlined class methods "
+            "unless their length is known here (a tuple of two or more, or "
+            "the method's own *args)"});
         continue;
       }
       mlir::Type expected = declaredPositional(positional.size());
@@ -4706,10 +4964,18 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
                      : emitExpr(ast::node(*keyword, "value"));
         continue;
       }
+      // The inlined caller's own `**kwargs`, forwarded by name.
+      Value mapping = emitExpr(ast::node(*keyword, "value"));
+      if (auto pack = staticKeywordPacks.find(mapping.value);
+          pack != staticKeywordPacks.end()) {
+        for (const auto &[packedName, packedValue] : pack->second)
+          keywords[packedName] = packedValue;
+        continue;
+      }
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, keyword->range.start,
           "variadic keyword arguments are not supported for inlined class "
-          "methods"});
+          "methods unless they are the calling method's own **kwargs"});
     }
   }
 
@@ -4748,21 +5014,9 @@ void ModuleEmitter::applyFunctionDecorators(const parser::Node &statement) {
     // callee of the application, evaluated here rather than named: it is the
     // hand-written `f = deco(arg)(f)` this compiler already runs, one AST
     // shape away.
-    parser::NodePtr callee;
-    if (decorator->kind == "Name") {
-      llvm::StringRef spelling = ast::nameSpelling(*decorator);
-      if (!moduleFunctionNames.count(spelling))
-        continue;
-      callee = synth::name(spelling, statement.range);
-    } else if (decorator->kind == "Call") {
-      const parser::Node *factory = ast::node(*decorator, "func");
-      if (!factory || factory->kind != "Name" ||
-          !moduleFunctionNames.count(ast::nameSpelling(*factory)))
-        continue;
-      callee = decorator;
-    } else {
+    parser::NodePtr callee = bindingDecoratorCallee(decorator);
+    if (!callee)
       continue;
-    }
     std::vector<parser::NodePtr> arguments;
     arguments.push_back(synth::name(*name, statement.range));
     parser::NodePtr applied = synth::assign(
@@ -4844,6 +5098,138 @@ bool ModuleEmitter::hasTypeParameters(const parser::Node &def) {
   return params && !params->empty();
 }
 
+bool ModuleEmitter::keywordPackIsOnlyRead(const parser::Node &def,
+                                          llvm::StringRef name) {
+  auto isPack = [&](const parser::Node *node) {
+    return node && node->kind == "Name" &&
+           llvm::StringRef(ast::nameSpelling(*node)) == name;
+  };
+  static const llvm::StringSet<> kReaders = {"get", "items", "keys", "values",
+                                             "copy"};
+  static const llvm::StringSet<> kReadingBuiltins = {
+      "len", "sorted", "list", "tuple", "set", "dict", "repr", "str", "bool"};
+  unsigned seen = 0;
+  unsigned read = 0;
+  std::function<void(const parser::Node &)> visit =
+      [&](const parser::Node &node) {
+        if (isPack(&node))
+          ++seen;
+        if (node.kind == "Call") {
+          const parser::Node *func = ast::node(node, "func");
+          if (const auto *keywords = ast::nodeList(node, "keywords"))
+            for (const parser::NodePtr &keyword : *keywords)
+              if (keyword && !ast::string(*keyword, "arg") &&
+                  isPack(ast::node(*keyword, "value")))
+                ++read;
+          if (func && func->kind == "Attribute" &&
+              isPack(ast::node(*func, "value")))
+            if (auto attr = ast::string(*func, "attr");
+                attr && kReaders.contains(*attr))
+              ++read;
+          const auto *args = ast::nodeList(node, "args");
+          if (func && func->kind == "Name" &&
+              kReadingBuiltins.contains(ast::nameSpelling(*func)) && args &&
+              args->size() == 1 && isPack(args->front().get()))
+            ++read;
+        } else if (node.kind == "Subscript") {
+          if (isPack(ast::node(node, "value")))
+            ++read;
+        } else if (node.kind == "Compare") {
+          if (const auto *comparators = ast::nodeList(node, "comparators"))
+            for (const parser::NodePtr &comparator : *comparators)
+              if (isPack(comparator.get()))
+                ++read;
+        } else if (node.kind == "For" || node.kind == "comprehension") {
+          if (isPack(ast::node(node, "iter")))
+            ++read;
+        } else if (node.kind == "Assign" || node.kind == "AugAssign" ||
+                   node.kind == "AnnAssign" || node.kind == "Delete") {
+          // A subscript STORE through the pack reads as a Subscript below,
+          // so it is taken back here: the pack is then not only read.
+          auto storesThrough = [&](const parser::Node *target) {
+            return target && target->kind == "Subscript" &&
+                   isPack(ast::node(*target, "value"));
+          };
+          if (const auto *targets = ast::nodeList(node, "targets"))
+            for (const parser::NodePtr &target : *targets)
+              if (storesThrough(target.get()))
+                seen += 2;
+          if (storesThrough(ast::node(node, "target")))
+            seen += 2;
+        }
+        for (const parser::Field &field : node.fields) {
+          if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+            if (*child)
+              visit(**child);
+          } else if (const auto *list =
+                         std::get_if<std::vector<parser::NodePtr>>(
+                             &field.value)) {
+            for (const parser::NodePtr &item : *list)
+              if (item)
+                visit(*item);
+          }
+        }
+      };
+  if (const auto *body = ast::nodeList(def, "body"))
+    for (const parser::NodePtr &statement : *body)
+      if (statement)
+        visit(*statement);
+  return seen == read;
+}
+
+bool ModuleEmitter::forwardsItsPacks(const parser::Node &def) {
+  const parser::Node *arguments = ast::node(def, "args");
+  if (!arguments)
+    return false;
+  auto packName = [&](llvm::StringRef field) -> std::string {
+    const parser::Node *pack = ast::node(*arguments, field);
+    return pack ? std::string(ast::nameSpelling(*pack)) : std::string();
+  };
+  std::string varargName = packName("vararg");
+  std::string kwargName = packName("kwarg");
+  if (varargName.empty() && kwargName.empty())
+    return false;
+  bool forwards = false;
+  std::function<void(const parser::Node &)> visit =
+      [&](const parser::Node &node) {
+        if (forwards)
+          return;
+        if (node.kind == "Call") {
+          if (const auto *args = ast::nodeList(node, "args"))
+            for (const parser::NodePtr &arg : *args)
+              if (arg && arg->kind == "Starred")
+                if (const parser::Node *value = ast::node(*arg, "value");
+                    value && value->kind == "Name" && !varargName.empty() &&
+                    ast::nameSpelling(*value) == varargName)
+                  forwards = true;
+          if (const auto *keywords = ast::nodeList(node, "keywords"))
+            for (const parser::NodePtr &keyword : *keywords)
+              if (keyword && !ast::string(*keyword, "arg"))
+                if (const parser::Node *value = ast::node(*keyword, "value");
+                    value && value->kind == "Name" && !kwargName.empty() &&
+                    ast::nameSpelling(*value) == kwargName)
+                  forwards = true;
+        }
+        for (const parser::Field &field : node.fields) {
+          if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+            if (*child)
+              visit(**child);
+          } else if (const auto *list =
+                         std::get_if<std::vector<parser::NodePtr>>(
+                             &field.value)) {
+            for (const parser::NodePtr &item : *list)
+              if (item)
+                visit(*item);
+          }
+        }
+      };
+  if (const auto *body = ast::nodeList(def, "body"))
+    for (const parser::NodePtr &statement : *body)
+      if (statement)
+        visit(*statement);
+  return forwards;
+}
+
 Value ModuleEmitter::emitInlineMethodBody(
     const parser::Node &anchor, Value receiver, bool bindDescriptorReceiver,
     const MethodBinding &method, llvm::ArrayRef<Value> positional,
@@ -4891,10 +5277,12 @@ Value ModuleEmitter::emitInlineMethodBody(
   // overridden method into a base-class call. Here the callee is the method
   // already being inlined, so its class is the one the recursion is in.
   if (llvm::is_contained(methodsBeingInlined, method.method) &&
-      hasTypeParameters(*method.method)) {
+      specializedAtEachCall(*method.method)) {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, anchor.range.start,
-        "the generic method '" +
+        std::string(hasTypeParameters(*method.method)
+                        ? "the generic method '"
+                        : "the method '") +
             std::string(ast::string(*method.method, "name").value_or("")) +
             "' calls itself: its body is specialized at each call site, and a "
             "call cycle has no base case to stop the expansion"});
@@ -5195,8 +5583,26 @@ Value ModuleEmitter::emitInlineMethodBody(
       synthesizedClassMethods, [&](const parser::NodePtr &synthesized) {
         return synthesized.get() == method.method;
       });
+  // Forgotten when the body is done: a value of this emission means nothing
+  // to the next one, and an erased op's address can be reused.
+  llvm::SmallVector<mlir::Value, 2> heldAsObject;
+  llvm::SmallVector<mlir::Value, 2> heldPacks;
+  llvm::scope_exit forgetHeldAsObject([&] {
+    for (mlir::Value held : heldAsObject)
+      numbersHeldAsObject.erase(held);
+    for (mlir::Value held : heldPacks) {
+      staticPositionalPacks.erase(held);
+      staticKeywordPacks.erase(held);
+    }
+  });
   auto checkArgument = [&](llvm::StringRef name, mlir::Type declared,
                            Value argument) {
+    if (declared && argument.value &&
+        types.widenLiteral(declared) == types.object() &&
+        (types.widenLiteral(argument.type) == types.intType() ||
+         types.widenLiteral(argument.type) == types.floatType()) &&
+        numbersHeldAsObject.insert(argument.value).second)
+      heldAsObject.push_back(argument.value);
     if (methodIsSynthesized || !declared || !argument.type)
       return;
     mlir::Type expected = types.widenLiteral(declared);
@@ -5385,8 +5791,28 @@ Value ModuleEmitter::emitInlineMethodBody(
           sig.varargType);
     else
       packed = emitPack(variadic);
-    if (sig.varargType && packed.type != sig.varargType)
+    // ⭐ A PACK EVERY VALUE FITS KEEPS WHAT IT HOLDS. `*args: object` (and a
+    // ParamSpec's `P.args`, which arrives as Any) takes anything, and coercing
+    // the pack to the declared `tuple[object]` erased its arity, so the one
+    // thing such a parameter is for -- `f(*args)` -- was "starred call
+    // arguments require a statically sized tuple". The arguments are bound as
+    // they came, as an inlined method binds every other argument.
+    auto acceptsEverything = [&](mlir::Type vararg) {
+      auto tuple = mlir::dyn_cast_if_present<py::ContractType>(vararg);
+      if (!tuple || tuple.getContractName() != "builtins.tuple" ||
+          tuple.getArguments().size() != 1)
+        return false;
+      auto element = mlir::dyn_cast_if_present<py::ContractType>(
+          tuple.getArguments().front());
+      return element && (element.getContractName() == "builtins.object" ||
+                         element.getContractName() == "typing.Any");
+    };
+    if (sig.varargType && packed.type != sig.varargType &&
+        !(!variadic.empty() && acceptsEverything(sig.varargType)))
       packed = coerceValue(packed, sig.varargType, anchor);
+    else if (packed.value &&
+             staticPositionalPacks.try_emplace(packed.value, variadic).second)
+      heldPacks.push_back(packed.value);
     bind(*sig.varargName, packed);
   }
 
@@ -5471,6 +5897,15 @@ Value ModuleEmitter::emitInlineMethodBody(
                                : emitExpr(dictNode.get());
     if (sig.kwargType && packedKeywords.type != sig.kwargType)
       packedKeywords = coerceValue(packedKeywords, sig.kwargType, anchor);
+    if (packedKeywords.value &&
+        keywordPackIsOnlyRead(*method.method, *sig.kwargName)) {
+      llvm::SmallVector<std::pair<std::string, Value>, 4> named;
+      for (auto [index, name] : llvm::enumerate(variadicKeywordNames))
+        named.push_back({name, variadicKeywordValues[index]});
+      if (staticKeywordPacks.try_emplace(packedKeywords.value, std::move(named))
+              .second)
+        heldPacks.push_back(packedKeywords.value);
+    }
     bind(*sig.kwargName, packedKeywords);
   }
 

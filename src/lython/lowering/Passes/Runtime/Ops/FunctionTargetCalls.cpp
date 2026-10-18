@@ -731,7 +731,7 @@ RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
   llvm::SmallVector<mlir::Type, 8> logicalInputTypes;
   if (py::CallableType callable = callableTypeOf(target))
     logicalInputTypes =
-        RuntimeBundleLowerer::callableLogicalInputTypes(target, callable);
+        RuntimeBundleLowerer::callableABIInputTypes(target, callable);
 
   if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(target)) {
     if (sources.size() != logicalInputTypes.size())

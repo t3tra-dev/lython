@@ -1,0 +1,8 @@
+True False True False True False True True False
+2:3:False 3:18:True 2:9:True 4:6:False
+["'a'", "'b'"] ['1', "'s'", 'None'] ["'k'"] ['0', '1']
+'b' 'c' 1 3.5 120 3
+1 3 0 10
+[0, 1, 2, 3, 4] [7, 8] [9]
+[1, 3] [4] [0]
+in missing in

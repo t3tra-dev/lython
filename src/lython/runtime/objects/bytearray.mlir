@@ -726,7 +726,7 @@ module attributes {
     func.return
   }
 
-  func.func @LyByteArray_GetSlice(%self: memref<4xi64> {ly.ownership.object_header}, %start_raw: i64 {ly.runtime.clip_i64}, %stop_raw: i64 {ly.runtime.clip_i64}, %step_raw: i64 {ly.runtime.clip_i64}, %mask: i64) -> memref<4xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytearray"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytearray", ly.runtime.method = "__getslice__"} {
+  func.func @LyByteArray_GetSlice(%self: memref<4xi64> {ly.ownership.object_header}, %start_raw: i64 {ly.runtime.clip_i64}, %stop_raw: i64 {ly.runtime.clip_i64}, %step_raw: i64 {ly.runtime.clip_i64}, %mask: i64) -> memref<4xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytearray"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytearray", ly.runtime.method = "__getslice__", ly.runtime.result_contract = "builtins.bytearray"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
@@ -755,7 +755,7 @@ module attributes {
     func.return %result : memref<4xi64>
   }
 
-  func.func @LyByteArray_SliceSubscript(%self: memref<4xi64> {ly.ownership.object_header}, %slice: memref<5xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytearray"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytearray", ly.runtime.method = "__getslice__"} {
+  func.func @LyByteArray_SliceSubscript(%self: memref<4xi64> {ly.ownership.object_header}, %slice: memref<5xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytearray"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytearray", ly.runtime.method = "__getslice__", ly.runtime.result_contract = "builtins.bytearray"} {
     %start, %stop, %step, %mask = func.call @__ly_slice_unpack(%slice) : (memref<5xi64>) -> (i64, i64, i64, i64)
     %result = func.call @LyByteArray_GetSlice(%self, %start, %stop, %step, %mask) : (memref<4xi64>, i64, i64, i64, i64) -> memref<4xi64>
     func.return %result : memref<4xi64>

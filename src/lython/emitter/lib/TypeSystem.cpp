@@ -1161,9 +1161,9 @@ std::optional<std::string> protocolAnnotationName(llvm::StringRef name) {
   name = annotationNamespaceTail(name);
   for (llvm::StringRef protocol :
        {"Awaitable", "Coroutine", "AsyncIterable", "AsyncIterator",
-        "AsyncGenerator", "Sized", "Iterable", "Iterator", "Generator",
-        "Collection", "Sequence", "Mapping", "MutableMapping", "ContextManager",
-        "AsyncContextManager"})
+        "AsyncGenerator", "Sized", "Container", "Iterable", "Iterator",
+        "Generator", "Collection", "Sequence", "Mapping", "MutableMapping",
+        "ContextManager", "AsyncContextManager"})
     if (name == protocol)
       return protocol.str();
   return std::nullopt;
@@ -1191,6 +1191,7 @@ std::optional<std::string> bareGenericAnnotationName(llvm::StringRef name) {
   llvm::StringRef tail = annotationNamespaceTail(name);
   for (llvm::StringRef generic :
        {"Callable",       "Collection",   "Sequence",      "Mapping",
+        "Container",
         "MutableMapping", "Iterable",     "Iterator",      "Generator",
         "AsyncIterable",  "AsyncIterator", "AsyncGenerator", "list",
         "List",           "dict",         "Dict",          "tuple",
@@ -1226,6 +1227,7 @@ void bindAnnotationModuleAliases(
                                "AsyncIterator",
                                "AsyncGenerator",
                                "Sized",
+                               "Container",
                                "Iterable",
                                "Iterator",
                                "Generator",
@@ -3425,6 +3427,20 @@ mlir::Type TypeSystem::annotationType(const parser::Node *node) const {
     return literal(literalSpelling(*node));
   }
   if (node->kind == "Attribute") {
+    // ⭐ `P.args` AND `P.kwargs` ARE WHAT `Callable[P, R]` ERASES P TO: any
+    // arguments. They were fabricated into contracts named "P.args", which no
+    // argument is, so `addCleanup(f, "x")` against `*args: P.args` was "this
+    // call does not determine the type arguments". The arguments are checked
+    // where the body forwards them to the callable, against its real
+    // signature.
+    if (const parser::Node *owner = ast::node(*node, "value");
+        owner && owner->kind == "Name")
+      if (auto attr = ast::string(*node, "attr");
+          attr && (*attr == "args" || *attr == "kwargs"))
+        if (std::optional<mlir::Type> bound =
+                lookupSymbol(ast::nameSpelling(*owner));
+            bound && mlir::isa<py::ParamSpecType>(*bound))
+          return any();
     std::string qualified = ast::qualifiedName(node);
     std::string_view spelling = ast::nameSpelling(*node);
     std::string resolved = resolveAnnotationName(
@@ -5678,6 +5694,36 @@ mlir::Type TypeSystem::join(mlir::ArrayRef<mlir::Type> types) const {
     return base;
   if (mlir::Type callable = commonCallableJoin(present))
     return callable;
+  // ⭐ TUPLES OF ONE ARITY JOIN POSITION BY POSITION. `[(1, 1), ("s", "t")]`
+  // inferred `list[tuple[int, int] | tuple[str, str]]`, and a slot holding one
+  // of those says only that it holds a tuple -- both members are `tuple` at
+  // run time -- so an element read back was decoded as whichever member came
+  // last, and `for a, b in xs` read a str's lanes as an int's. Position by
+  // position, each element is a box whose own class tells int from str.
+  // ⛔ Not an arity-erased `tuple[T]`, which is the homogeneous spelling and
+  // says nothing about positions.
+  if (present.size() >= 2 &&
+      llvm::all_of(present, [&](mlir::Type member) {
+        auto tuple = mlir::dyn_cast<py::ContractType>(member);
+        return tuple && tuple.getContractName() == "builtins.tuple" &&
+               tuple.getArguments().size() >= 2 &&
+               tuple.getArguments().size() ==
+                   mlir::cast<py::ContractType>(present.front())
+                       .getArguments()
+                       .size();
+      })) {
+    unsigned arity = static_cast<unsigned>(
+        mlir::cast<py::ContractType>(present.front()).getArguments().size());
+    llvm::SmallVector<mlir::Type, 4> positions;
+    for (unsigned index = 0; index < arity; ++index) {
+      llvm::SmallVector<mlir::Type, 4> held;
+      for (mlir::Type member : present)
+        held.push_back(
+            mlir::cast<py::ContractType>(member).getArguments()[index]);
+      positions.push_back(join(held));
+    }
+    return py::ContractType::get(&context, "builtins.tuple", positions);
+  }
   // ⭐ CLASS VALUES JOIN AT THE CLASS VALUE OF THEIR INSTANCES' JOIN.
   // `[A, B]` with `class B(A)` is a `list[type[A]]`, the list a loop that
   // constructs through each element needs; a union of two class values has

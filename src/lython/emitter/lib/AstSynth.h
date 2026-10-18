@@ -34,6 +34,8 @@ using parser::SourceRange;
 // ---- expressions ----------------------------------------------------------
 
 NodePtr name(llvm::StringRef id, SourceRange range);
+// A deep copy of `node`, for a rewrite that must not touch the tree it read.
+NodePtr cloneTree(const parser::Node &node);
 NodePtr intConstant(std::int64_t value, SourceRange range);
 NodePtr strConstant(llvm::StringRef text, SourceRange range);
 NodePtr constantBool(bool value, SourceRange range);

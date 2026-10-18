@@ -2934,14 +2934,18 @@ Value ModuleEmitter::emitMethodObject(const parser::Node &anchor, Value object,
     return emitNone(anchor);
   // A generic method has no body of its own until a call solves its type
   // parameters, so there is no function for the value to be.
-  if (methodBinding.method && hasTypeParameters(*methodBinding.method)) {
+  if (methodBinding.method && specializedAtEachCall(*methodBinding.method)) {
+    bool generic = hasTypeParameters(*methodBinding.method);
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, anchor.range.start,
-        "the generic method '" +
+        std::string(generic ? "the generic method '" : "the method '") +
             std::string(ast::string(*methodBinding.method, "name")
                             .value_or("")) +
-            "' cannot be used as a value: its type parameters are solved by "
-            "each call, so only a call has a body to run"});
+            "' cannot be used as a value: " +
+            (generic ? "its type parameters are solved by each call"
+                     : "it forwards its *args or **kwargs, whose arity is "
+                       "each call's") +
+            ", so only a call has a body to run"});
     return emitNone(anchor);
   }
 
@@ -5612,6 +5616,28 @@ Value ModuleEmitter::coerceValue(Value value, mlir::Type targetType,
   return value;
 }
 
+// `x != 0` for an int or a float: CPython's bool(x), nan included.
+mlir::Value ModuleEmitter::emitNumberTruth(Value value,
+                                           const parser::Node &anchor) {
+  Value zero;
+  if (types.widenLiteral(value.type) == types.intType()) {
+    mlir::Type zeroType = types.literal("0");
+    zero = Value{py::IntConstantOp::create(builder, loc(anchor), zeroType,
+                                           builder.getStringAttr("0"))
+                     .getResult(),
+                 zeroType};
+  } else {
+    zero = Value{py::FloatConstantOp::create(builder, loc(anchor),
+                                             types.floatType(),
+                                             builder.getF64FloatAttr(0.0))
+                     .getResult(),
+                 types.floatType()};
+  }
+  Value nonzero = emitBinarySpecial<py::NeOp>(anchor, "__ne__", value, zero,
+                                              types.boolType());
+  return emitBoolValue(nonzero, anchor);
+}
+
 mlir::Value ModuleEmitter::emitBoolValue(Value value,
                                          const parser::Node &anchor) {
   if (value.value && value.value.getType().isInteger(1))
@@ -5624,6 +5650,14 @@ mlir::Value ModuleEmitter::emitBoolValue(Value value,
   // R1: implicit numeric truthiness is rejected (deliberate deviation from
   // CPython — `if n:` over int/float hides the comparison); bool stays exempt
   // because its truth bit IS the value.
+  // ⛔ Not for a number an `object` parameter holds: the program wrote the
+  // truth test of an object, which every value answers. An inlined body binds
+  // the argument as it came, so `assertTrue(self, expr: object)` reached by
+  // `self.assertTrue(3)` saw an int and was refused, where the same method
+  // not inlined answers through `object.__bool__`.
+  if ((widened == types.intType() || widened == types.floatType()) &&
+      numbersHeldAsObject.contains(value.value))
+    return emitNumberTruth(value, anchor);
   if (widened == types.intType() || widened == types.floatType()) {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, anchor.range.start,
@@ -5681,26 +5715,8 @@ mlir::Value ModuleEmitter::emitBoolValue(Value value,
         Value unwrapped{unwrap.getResult(), member};
         mlir::Type widenedMember = types.widenLiteral(member);
         if (widenedMember == types.intType() ||
-            widenedMember == types.floatType()) {
-          Value zero;
-          if (widenedMember == types.intType()) {
-            mlir::Type zeroType = types.literal("0");
-            zero = Value{py::IntConstantOp::create(builder, loc(anchor),
-                                                   zeroType,
-                                                   builder.getStringAttr("0"))
-                             .getResult(),
-                         zeroType};
-          } else {
-            zero = Value{py::FloatConstantOp::create(builder, loc(anchor),
-                                                     types.floatType(),
-                                                     builder.getF64FloatAttr(0.0))
-                             .getResult(),
-                         types.floatType()};
-          }
-          Value nonzero = emitBinarySpecial<py::NeOp>(
-              anchor, "__ne__", unwrapped, zero, types.boolType());
-          return emitBoolValue(nonzero, anchor);
-        }
+            widenedMember == types.floatType())
+          return emitNumberTruth(unwrapped, anchor);
         return emitBoolValue(unwrapped, anchor);
       };
       auto dispatch = [&](unsigned index, auto &&recurse) -> mlir::Value {

@@ -61,6 +61,26 @@ NodePtr subscript(NodePtr value, NodePtr slice, SourceRange range) {
   return node;
 }
 
+NodePtr cloneTree(const parser::Node &node) {
+  NodePtr clone = parser::makeNode(node.kind, node.range);
+  for (const parser::Field &field : node.fields) {
+    if (const auto *child = std::get_if<NodePtr>(&field.value)) {
+      parser::addField(*clone, field.name,
+                       *child ? cloneTree(**child) : NodePtr());
+    } else if (const auto *children =
+                   std::get_if<std::vector<NodePtr>>(&field.value)) {
+      std::vector<NodePtr> copies;
+      copies.reserve(children->size());
+      for (const NodePtr &element : *children)
+        copies.push_back(element ? cloneTree(*element) : element);
+      parser::addField(*clone, field.name, std::move(copies));
+    } else {
+      parser::addField(*clone, field.name, field.value);
+    }
+  }
+  return clone;
+}
+
 NodePtr tuple(std::vector<NodePtr> elts, SourceRange range) {
   NodePtr node = parser::makeNode("Tuple", range);
   parser::addField(*node, "elts", std::move(elts));

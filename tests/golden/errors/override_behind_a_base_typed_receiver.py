@@ -8,8 +8,10 @@
 # runtime class and runs the body an instance of that class would have run, and
 # `a.kind` -- the class ATTRIBUTE spelling of the same question -- joined them.
 # So this file's remaining assertion is the one shape no dispatcher can be
-# built for: a name only the SUBCLASS declares, where there is no base body to
-# restate and no base binding to fall back to.
+# built for: a name only the SUBCLASS declares, where the base's binding is
+# object's and object's has no value to fall back to. A `__repr__`, `__str__`
+# or `__hash__` there falls back to object's own slot and dispatches; an
+# `__eq__` does not, because object's answers NotImplemented.
 class A:
     kind: int = 1
 
@@ -74,15 +76,15 @@ print(a.kind)
 
 
 # The subclass may be the ONLY class that declares it: nothing resolves on the
-# base, and the manifest's object repr answered instead of B's.
+# base but object's, whose `__eq__` answers NotImplemented for two objects.
 class Bare:
     pass
 
 
 class BareSub(Bare):
-    def __repr__(self) -> str:
-        return "BareSub!"
+    def __eq__(self, other: object) -> bool:
+        return True
 
 
 b: Bare = BareSub()
-print(repr(b))
+print(b == b)

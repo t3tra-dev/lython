@@ -1,0 +1,5 @@
+(i=1): odd 1
+(i=3): odd 3
+[lengths] (n=2, name='bb'): too long
+no params 0
+['loop i i=1, sq=1: i is one (n=4)']

@@ -1,0 +1,9 @@
+12 10 0 7 14
+24
+30 36
+1004 6
+6 1004
+['both', 'fact', 'held', 'marked', 'scale', 'uses']
+True True False
+['doubled applied', 'doubled applied', 'counted applied', 'counted applied', 'doubled 2', 'call #1', 'doubled 2', 'doubled 1', 'call #2', 'doubled 1', 'call #1', 'call #2', 'call #3', 'call #4', 'doubled 5', 'doubled 6', 'doubled 1', 'call #3', 'doubled 1', 'doubled 1', 'doubled 1']
+['mark']
