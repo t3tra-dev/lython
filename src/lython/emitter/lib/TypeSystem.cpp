@@ -1161,9 +1161,9 @@ std::optional<std::string> protocolAnnotationName(llvm::StringRef name) {
   name = annotationNamespaceTail(name);
   for (llvm::StringRef protocol :
        {"Awaitable", "Coroutine", "AsyncIterable", "AsyncIterator",
-        "AsyncGenerator", "Sized", "Iterable", "Iterator", "Generator",
-        "Collection", "Sequence", "Mapping", "MutableMapping", "ContextManager",
-        "AsyncContextManager"})
+        "AsyncGenerator", "Sized", "Container", "Iterable", "Iterator",
+        "Generator", "Collection", "Sequence", "Mapping", "MutableMapping",
+        "ContextManager", "AsyncContextManager"})
     if (name == protocol)
       return protocol.str();
   return std::nullopt;
@@ -1191,6 +1191,7 @@ std::optional<std::string> bareGenericAnnotationName(llvm::StringRef name) {
   llvm::StringRef tail = annotationNamespaceTail(name);
   for (llvm::StringRef generic :
        {"Callable",       "Collection",   "Sequence",      "Mapping",
+        "Container",
         "MutableMapping", "Iterable",     "Iterator",      "Generator",
         "AsyncIterable",  "AsyncIterator", "AsyncGenerator", "list",
         "List",           "dict",         "Dict",          "tuple",
@@ -1226,6 +1227,7 @@ void bindAnnotationModuleAliases(
                                "AsyncIterator",
                                "AsyncGenerator",
                                "Sized",
+                               "Container",
                                "Iterable",
                                "Iterator",
                                "Generator",

@@ -1102,7 +1102,7 @@ module attributes {
   // O(1) code-point indexing: fixed-width code units make the scan-free load
   // possible; the result re-canonicalizes to the smallest width for that one
   // code point.
-  func.func @LyUnicode_GetItem(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %raw_index: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__getitem__"} {
+  func.func @LyUnicode_GetItem(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %raw_index: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__getitem__", ly.runtime.result_contract = "builtins.str"} {
     %codepoints = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
@@ -1132,7 +1132,7 @@ module attributes {
   // gives O(1) indexing; the copy re-canonicalizes the width (pass 1 finds
   // the widest selected code point) so equal strings keep identical
   // representations, and a negative step reverses in iteration order.
-  func.func @LyUnicode_GetSlice(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.clip_i64}, %stop_raw: i64 {ly.runtime.clip_i64}, %step_raw: i64 {ly.runtime.clip_i64}, %mask: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__getslice__"} {
+  func.func @LyUnicode_GetSlice(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.clip_i64}, %stop_raw: i64 {ly.runtime.clip_i64}, %step_raw: i64 {ly.runtime.clip_i64}, %mask: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__getslice__", ly.runtime.result_contract = "builtins.str"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
@@ -1191,7 +1191,7 @@ module attributes {
   }
 
   // s[sl] for a slice object (unicode_subscript).
-  func.func @LyUnicode_SliceSubscript(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %slice: memref<5xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__getslice__"} {
+  func.func @LyUnicode_SliceSubscript(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %slice: memref<5xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__getslice__", ly.runtime.result_contract = "builtins.str"} {
     %start, %stop, %step, %mask = func.call @__ly_slice_unpack(%slice) : (memref<5xi64>) -> (i64, i64, i64, i64)
     %result_header, %result_bytes = func.call @LyUnicode_GetSlice(%header, %bytes, %start, %stop, %step, %mask) : (memref<2xi64>, memref<?xi8>, i64, i64, i64, i64) -> (memref<2xi64>, memref<?xi8>)
     func.return %result_header, %result_bytes : memref<2xi64>, memref<?xi8>

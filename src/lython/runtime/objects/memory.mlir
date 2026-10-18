@@ -405,7 +405,7 @@ module attributes {
 
   // A slice is a view of the same memory: its first item, `step` items
   // apart.
-  func.func @LyMemoryView_GetSlice(%self: memref<8xi64> {ly.ownership.object_header}, %start_raw: i64 {ly.runtime.clip_i64}, %stop_raw: i64 {ly.runtime.clip_i64}, %step_raw: i64 {ly.runtime.clip_i64}, %mask: i64) -> memref<8xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.memoryview"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.memoryview", ly.runtime.method = "__getslice__"} {
+  func.func @LyMemoryView_GetSlice(%self: memref<8xi64> {ly.ownership.object_header}, %start_raw: i64 {ly.runtime.clip_i64}, %stop_raw: i64 {ly.runtime.clip_i64}, %step_raw: i64 {ly.runtime.clip_i64}, %mask: i64) -> memref<8xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.memoryview"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.memoryview", ly.runtime.method = "__getslice__", ly.runtime.result_contract = "builtins.memoryview"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %s2 = arith.constant 2 : index
@@ -434,7 +434,7 @@ module attributes {
     func.return %view : memref<8xi64>
   }
 
-  func.func @LyMemoryView_SliceSubscript(%self: memref<8xi64> {ly.ownership.object_header}, %slice: memref<5xi64> {ly.ownership.object_header}) -> memref<8xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.memoryview"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.memoryview", ly.runtime.method = "__getslice__"} {
+  func.func @LyMemoryView_SliceSubscript(%self: memref<8xi64> {ly.ownership.object_header}, %slice: memref<5xi64> {ly.ownership.object_header}) -> memref<8xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.memoryview"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.memoryview", ly.runtime.method = "__getslice__", ly.runtime.result_contract = "builtins.memoryview"} {
     func.call @__ly_memoryview_check(%self) : (memref<8xi64>) -> ()
     %start, %stop, %step, %mask = func.call @__ly_slice_unpack(%slice) : (memref<5xi64>) -> (i64, i64, i64, i64)
     %view = func.call @LyMemoryView_GetSlice(%self, %start, %stop, %step, %mask) : (memref<8xi64>, i64, i64, i64, i64) -> memref<8xi64>

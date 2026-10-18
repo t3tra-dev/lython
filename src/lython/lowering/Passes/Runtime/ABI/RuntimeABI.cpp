@@ -890,9 +890,17 @@ bool RuntimeBundleLowerer::usesInheritedObjectDunder(
   // same box.
   bool readsIdentity =
       symbol.contract == "builtins.object" && symbol.name == "builtin_id";
+  // ⭐ EVERY METHOD OBJECT DECLARES TAKES ITS RECEIVER AS A BOX, not only the
+  // three a source class inherits by name. A range declares no `__bool__`, so
+  // its truth resolves through the manifest's bases to object's, which reads a
+  // box's class and entity words -- and a range's handle has the box's
+  // physical type, so it was handed over as one: `bool(range(3))` read the
+  // range's own words as a class and crashed, where the build before object
+  // had a `__bool__` refused it.
+  // ⛔ Not `__init__`: object's takes the header of the object being built.
   if (!readsIdentity &&
       (symbol.contract != "builtins.object" || symbol.role != "method" ||
-       !RuntimeBundleLowerer::isInheritedObjectDunder(symbol.name)))
+       symbol.name == "__init__"))
     return false;
   // ⭐ None too: it has no lanes, and its box holds the None object
   // (`objectPayloadClassEntity`), so `xs[0] == None` over a list[object]

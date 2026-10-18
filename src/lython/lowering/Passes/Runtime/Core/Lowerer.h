@@ -340,6 +340,11 @@ private:
   llvm::SmallVector<mlir::Type, 8>
   callableLogicalInputTypes(mlir::func::FuncOp function,
                             py::CallableType callable) const;
+  llvm::SmallVector<mlir::Type, 8>
+  callableABIInputTypes(mlir::func::FuncOp function,
+                        py::CallableType callable) const;
+  void applyProtocolArgumentABIs(mlir::func::FuncOp function,
+                                 llvm::SmallVectorImpl<mlir::Type> &types) const;
   mlir::LogicalResult buildReturnedValueSummaries();
   mlir::LogicalResult buildReturnedCallableSummaries();
   mlir::LogicalResult buildReturnedStaticObjectSummaries();
