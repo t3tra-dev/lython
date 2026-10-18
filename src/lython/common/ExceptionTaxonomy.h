@@ -236,6 +236,18 @@ inline constexpr OSErrorErrnoMapping kOSErrorErrnoMap[] = {
     {llvm::StringLiteral("ECONNREFUSED"), 61, 111, 14, llvm::StringLiteral("builtins.ConnectionRefusedError")},
 };
 
+// The builtin exceptions whose `__init__` is not BaseException's. Every other
+// one is built by its base's initializer with its own class word, which is
+// how a class value constructs any of them (`exc(msg)` for a
+// `type[Exception]`); these need their own arm. KeyError stores the repr of
+// its argument as the message (objects/exceptions.mlir, LyKeyError_Init).
+// golden.cases.a_class_value_constructs_every_builtin_exception holds this
+// list to the runtime: an initializer of its own missing here prints the
+// base's message there.
+inline constexpr llvm::StringLiteral kBuiltinExceptionsWithOwnInit[] = {
+    llvm::StringLiteral("builtins.KeyError"),
+};
+
 inline const BuiltinExceptionInfo *findByName(llvm::StringRef name) {
   for (const BuiltinExceptionInfo &entry : kBuiltinExceptions)
     if (entry.name == name)

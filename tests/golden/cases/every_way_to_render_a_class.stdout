@@ -1,0 +1,5 @@
+<class 'int'> <class 'list'> <class 'int'> <class 'int'> <class 'list'>
+<class 'int'> <class 'list'> <class '__main__.A'> <class '__main__.A'> <class '__main__.A'> <class 'int'> <class '__main__.A'>
+[<class 'int'>, <class '__main__.A'>] (<class '__main__.A'>,) {<class '__main__.A'>: <class 'int'>}
+<class '__main__.A'> <class 'int'>
+<class '__main__.A'> <class 'int'> <class '__main__.A'>

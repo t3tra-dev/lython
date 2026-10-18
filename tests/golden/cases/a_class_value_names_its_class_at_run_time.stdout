@@ -1,0 +1,15 @@
+A A __main__ <class '__main__.A'> B B __main__ <class '__main__.B'>
+True False False
+True False True False
+True True True True False
+['A', 'B'] True True
+2 True True
+an int a str a list something else
+B True True
+a A
+b B
+c none
+True False True False
+True False True True
+<class 'NoneType'> NoneType
+['int', 'str', 'float']

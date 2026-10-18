@@ -1,0 +1,11 @@
+A2 A0 0 a
+A2
+B20 B0 3 b
+B110
+['A4', 'B40']
+B50 A5
+A7 B70
+ValueError x ValueError('x')
+KeyError 'x' KeyError('x')
+Failure x Failure('x')
+LookupError x LookupError('x')

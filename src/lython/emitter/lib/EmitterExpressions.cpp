@@ -8,6 +8,7 @@
 #include "PlatformConstants.h"
 #include "TypeSystemSolver.h"
 
+#include "ArithBuilders.h"
 #include "AstAccess.h"
 #include "ConstantSetFold.h"
 #include "Contracts.h"
@@ -223,6 +224,15 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
             types.lookupCanonicalBinding(name))
       binding = *canonical;
     if (!symbolType) {
+      // `list` read as a value is the list class (a call of it never reaches
+      // here: each builtin constructor is its own call path).
+      if (std::optional<mlir::Type> classValue = types.builtinClassValue(name)) {
+        mlir::Type instance =
+            mlir::cast<py::TypeType>(*classValue).getInstanceType();
+        auto op =
+            py::TypeObjectOp::create(builder, loc(*expr), *classValue, instance);
+        return {op.getResult(), *classValue};
+      }
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, expr->range.start,
           unresolvedNameMessage(name)});
@@ -1689,6 +1699,34 @@ Value ModuleEmitter::emitCompare(const parser::Node &expr) {
   return result;
 }
 
+// ⭐ TWO CLASS VALUES ARE COMPARED AT RUN TIME unless both classes are closed:
+// a `type[Base]` may name any subclass, so `type(a) is type(b)` over two
+// erased values folded to True for an int and a str. A class has one type
+// object, so `==` is identity too.
+std::optional<Value> ModuleEmitter::emitClassValueIdentity(
+    const parser::Node &expr, Value lhs, Value rhs, bool negated) {
+  auto closed = [&](mlir::Type type) {
+    auto typeType = mlir::dyn_cast_if_present<py::TypeType>(type);
+    auto contract = typeType ? mlir::dyn_cast_if_present<py::ContractType>(
+                                   typeType.getInstanceType())
+                             : py::ContractType();
+    return !contract || classIsClosed(contract.getContractName());
+  };
+  if (closed(lhs.type) && closed(rhs.type))
+    return std::nullopt;
+  mlir::Value same =
+      py::IsOp::create(builder, loc(expr), builder.getI1Type(), lhs.value,
+                       rhs.value)
+          .getResult();
+  if (negated) {
+    auto one = mlir::arith::ConstantIntOp::create(builder, loc(expr), 1, 1);
+    same = mlir::arith::XOrIOp::create(builder, loc(expr), same, one);
+  }
+  auto pyBool =
+      py::CastFromPrimOp::create(builder, loc(expr), types.boolType(), same);
+  return Value{pyBool.getResult(), types.boolType()};
+}
+
 Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
                                        Value rhs, const parser::Node *op) {
   if (op)
@@ -1767,6 +1805,10 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
   if (ast::isOperator(op, "Eq") || ast::isOperator(op, "NotEq")) {
     if (auto lhsType = mlir::dyn_cast_if_present<py::TypeType>(lhs.type))
       if (auto rhsType = mlir::dyn_cast_if_present<py::TypeType>(rhs.type)) {
+        if (std::optional<Value> dynamic =
+                emitClassValueIdentity(expr, lhs, rhs,
+                                       ast::isOperator(op, "NotEq")))
+          return *dynamic;
         bool same = typeObjectsNameOneClass(lhsType.getInstanceType(),
                                            rhsType.getInstanceType());
         bool truth = ast::isOperator(op, "NotEq") ? !same : same;
@@ -1863,8 +1905,83 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
     // identity", which took the standard exact-class test with them. This is
     // the same fold `C.__name__` gets, and for the same reason: the answer
     // cannot depend on anything the program does at run time.
+    // ⭐ A UNION HOLDING A CLASS VALUE IS THAT CLASS ONLY WHILE THE MEMBER IS
+    // ACTIVE, and which class it names is a run-time question. The
+    // disjointness fold below cannot see that `type[A]` may name B, so
+    //
+    //     registry: dict[str, type[A]] = {"b": B}
+    //     print(registry.get("b") is B)     # printed False
+    //
+    // folded to a constant. Each class-value member is tested, then unwrapped
+    // under its own test and compared as two class values.
+    auto unionClassIdentity = [&](Value unionSide,
+                                  Value classSide) -> std::optional<Value> {
+      auto unionType =
+          mlir::dyn_cast_if_present<py::UnionType>(unionSide.value.getType());
+      if (!unionType || !mlir::isa_and_nonnull<py::TypeType>(
+                            types.widenLiteral(classSide.type)))
+        return std::nullopt;
+      llvm::SmallVector<mlir::Type, 4> classMembers;
+      for (mlir::Type member : unionType.getMemberTypes())
+        if (mlir::isa<py::TypeType>(member))
+          classMembers.push_back(member);
+      if (classMembers.empty())
+        return std::nullopt;
+      mlir::Type boolType = types.boolType();
+      std::function<mlir::Value(std::size_t)> chain =
+          [&](std::size_t index) -> mlir::Value {
+        if (index == classMembers.size())
+          return py::CastFromPrimOp::create(
+                     builder, loc(expr), boolType,
+                     common::constantBool(builder, loc(expr), false))
+              .getResult();
+        mlir::Type member = classMembers[index];
+        mlir::Value active =
+            py::UnionTestOp::create(builder, loc(expr), builder.getI1Type(),
+                                    unionSide.value,
+                                    mlir::TypeAttr::get(member))
+                .getResult();
+        return emitValueDiamond(
+            loc(expr), active, boolType,
+            [&]() -> mlir::Value {
+              Value unwrapped{py::UnionUnwrapOp::create(builder, loc(expr),
+                                                        member, unionSide.value)
+                                  .getResult(),
+                              member};
+              if (std::optional<Value> same = emitClassValueIdentity(
+                      expr, unwrapped, classSide, /*negated=*/false))
+                return same->value;
+              bool same = typeObjectsNameOneClass(
+                  mlir::cast<py::TypeType>(member).getInstanceType(),
+                  mlir::cast<py::TypeType>(types.widenLiteral(classSide.type))
+                      .getInstanceType());
+              return py::CastFromPrimOp::create(
+                         builder, loc(expr), boolType,
+                         common::constantBool(builder, loc(expr), same))
+                  .getResult();
+            },
+            [&] { return chain(index + 1); });
+      };
+      mlir::Value result = chain(0);
+      if (negatedIdentity) {
+        mlir::Value bit = emitBoolValue(Value{result, boolType}, expr);
+        auto one = mlir::arith::ConstantIntOp::create(builder, loc(expr), 1, 1);
+        bit = mlir::arith::XOrIOp::create(builder, loc(expr), bit, one);
+        result =
+            py::CastFromPrimOp::create(builder, loc(expr), boolType, bit)
+                .getResult();
+      }
+      return Value{result, boolType};
+    };
+    if (std::optional<Value> identity = unionClassIdentity(lhs, rhs))
+      return *identity;
+    if (std::optional<Value> identity = unionClassIdentity(rhs, lhs))
+      return *identity;
     if (auto lhsType = mlir::dyn_cast_if_present<py::TypeType>(lhs.type))
       if (auto rhsType = mlir::dyn_cast_if_present<py::TypeType>(rhs.type)) {
+        if (std::optional<Value> dynamic =
+                emitClassValueIdentity(expr, lhs, rhs, negatedIdentity))
+          return *dynamic;
         bool same = typeObjectsNameOneClass(lhsType.getInstanceType(),
                                            rhsType.getInstanceType());
         bool truth = negatedIdentity ? !same : same;
@@ -3110,6 +3227,15 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   auto attr = ast::string(expr, "attr");
   if (!attr)
     return emitNone(expr);
+  // A class attribute read through a class value the static type does not
+  // decide is answered by the class the value names.
+  if (mlir::isa_and_nonnull<py::TypeType>(object.type) &&
+      *attr != "__name__" && *attr != "__qualname__" &&
+      *attr != "__module__" && *attr != "__class__" &&
+      !classValueIsExact(ast::node(expr, "value"), object.type))
+    if (std::optional<Value> dispatched =
+            emitClassValueAttribute(expr, object, *attr))
+      return *dispatched;
   // ⭐ `C.__name__` IS A COMPILE-TIME STRING. It was "attr.get type object has
   // no static runtime attribute '__name__'", for a user class and for `int`
   // alike, and the name is the one thing a type object cannot fail to know.
@@ -3122,17 +3248,36 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   // type-object surface to hang it on -- `print(int)`, `int is int` and
   // `C.__class__` are all still refused, and this fold deliberately does not
   // pretend otherwise.
-  if (*attr == "__name__")
+  // ⭐ AND `__qualname__` AND `__module__`, the other two names a report
+  // spells a class by (unittest's `strclass` is "%s.%s" of them). A class
+  // here is always a module-level statement, so the qualified name is the
+  // name; the module is the contract's prefix -- `__main__` for the
+  // program's own, `builtins` for a builtin.
+  // ⭐ A CLASS VALUE THE STATIC TYPE DOES NOT DECIDE ANSWERS AT RUN TIME, from
+  // the type object it names: `t.__name__` for a `t: type[Base]` that holds a
+  // subclass is the subclass's name.
+  if (*attr == "__name__" || *attr == "__qualname__" || *attr == "__module__")
     if (auto typeObject = mlir::dyn_cast_if_present<py::TypeType>(object.type))
       if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(
               typeObject.getInstanceType())) {
+        if (!classValueIsExact(ast::node(expr, "value"), object.type)) {
+          mlir::Type strType = types.contract("builtins.str");
+          auto dynamic = py::TypeNameOp::create(
+              builder, loc(expr), strType, object.value,
+              builder.getStringAttr(*attr));
+          return Value{dynamic.getResult(), strType};
+        }
         llvm::StringRef qualified = contract.getContractName();
         llvm::StringRef simple = qualified;
-        if (auto dot = qualified.rfind('.'); dot != llvm::StringRef::npos)
+        llvm::StringRef moduleName = "__main__";
+        if (auto dot = qualified.rfind('.'); dot != llvm::StringRef::npos) {
           simple = qualified.drop_front(dot + 1);
-        mlir::Type type = types.literal("\"" + simple.str() + "\"");
+          moduleName = qualified.take_front(dot);
+        }
+        llvm::StringRef answer = *attr == "__module__" ? moduleName : simple;
+        mlir::Type type = types.literal("\"" + answer.str() + "\"");
         auto constant = py::StrConstantOp::create(
-            builder, loc(expr), type, builder.getStringAttr(simple));
+            builder, loc(expr), type, builder.getStringAttr(answer));
         return Value{constant.getResult(), type};
       }
   // ⭐ A FUNCTION'S `__name__` IS A COMPILE-TIME STRING TOO, and it had no arm
@@ -5463,6 +5608,58 @@ Value ModuleEmitter::coerceValue(Value value, mlir::Type targetType,
               isNumericPrimitiveContract(valueElement))
             return value;
         }
+    }
+  // ⭐ AN UPCAST IS A RETYPING, SO IT NEEDS A SUBCLASS. Two unrelated classes
+  // share no representation, and retyping one as the other read its payload as
+  // the other's:
+  //
+  //     x: int = 1
+  //     x = "hello"
+  //     print(x)        # printed 5708990769494611528448228004894173606255027560
+  //
+  // -- the string's bytes as an integer. The same happened to a field `__init__`
+  // typed int that another method stored a str into. CPython stores the str;
+  // here the declared type is the storage, so the store is refused instead.
+  if (auto targetContract = mlir::dyn_cast<py::ContractType>(targetType))
+    if (auto valueContract = mlir::dyn_cast_if_present<py::ContractType>(
+            types.widenLiteral(value.type));
+        valueContract &&
+        valueContract.getContractName() != targetContract.getContractName() &&
+        !py::isPyObjectType(targetContract) &&
+        !pythonSubclassOf(valueContract, targetContract, types, module)) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, anchor.range.start,
+          "a " + pythonTypeSpelling(valueContract) +
+              " value cannot be stored where " +
+              pythonTypeSpelling(targetContract) +
+              " is declared: the declared type is the storage here, and the "
+              "two share no representation"});
+      return value;
+    }
+  // ⭐ AND A CLASS VALUE ONLY OF A SUBCLASS. A `type[A]` whose class is
+  // closed names A and nothing else, so a call through it is answered
+  // statically: `t: type[A] = B` with B unrelated put a B where every
+  // `t()` built an A. Along the numeric tower too -- a bool, an int and a
+  // float are three representations (`isAssignableWithStaticEvidence`).
+  if (auto targetClass = mlir::dyn_cast<py::TypeType>(targetType))
+    if (auto valueClass = mlir::dyn_cast_if_present<py::TypeType>(
+            types.widenLiteral(value.type));
+        valueClass && valueClass != targetClass &&
+        !isAssignableWithStaticEvidence(valueClass, targetClass, module)) {
+      bool numericPair = isNumericPrimitiveContract(valueClass.getInstanceType()) &&
+                         isNumericPrimitiveContract(targetClass.getInstanceType());
+      if (numericPair ||
+          !pythonSubclassOf(valueClass.getInstanceType(),
+                            targetClass.getInstanceType(), types, module)) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, anchor.range.start,
+            "a " + pythonTypeSpelling(valueClass) +
+                " value cannot be stored where " +
+                pythonTypeSpelling(targetClass) +
+                " is declared: a call through it would build the declared "
+                "class, which this class is not a subclass of"});
+        return value;
+      }
     }
   if (mlir::isa<py::ContractType, py::LiteralType, py::CallableType,
                 py::TypeType, py::SelfType, py::TypeVarType, py::ParamSpecType>(

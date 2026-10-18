@@ -104,7 +104,11 @@ mlir::LogicalResult defineOne(mlir::ModuleOp module, const Definition &definitio
 
   llvm::SmallVector<ImageField, 8> fields;
   appendImageWord(fields, kImmortal);
-  appendImageWord(fields, 0);
+  // ⭐ A CLASS IS AN OBJECT, whose class is `type` -- `type`'s own included,
+  // as CPython's `type(type) is type`. A class value is a reference to this
+  // image, and a box holding one reads its class from here like any other.
+  declare(module, "builtins.type");
+  appendImageAddress(fields, symbolFor("builtins.type"));
   if (definition.base.empty()) {
     appendImageWord(fields, 0);
   } else {

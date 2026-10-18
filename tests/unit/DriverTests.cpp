@@ -2011,12 +2011,33 @@ TEST(DriverTest, AnOptionalFieldIsBoxedLikeThePayloadAlone) {
          "and the member's inline lanes would widen the instance";
 }
 
-// A union of two OBJECTS still has no box to be stored in, so a class that
-// names itself through one has no finite layout and is refused. The refusal is
-// what keeps the expansion from recursing until the compiler dies with SIGILL
-// and no diagnostic, which is what it did.
+// A union with TWO class-value members still has no box to be stored in --
+// every class value's box names `type`, so the box cannot say which member it
+// holds -- and a class that names itself through one has no finite layout and
+// is refused. The refusal is what keeps the expansion from recursing until the
+// compiler dies with SIGILL and no diagnostic, which is what it did.
 TEST(DriverTest, AUnionOfTwoObjectsCannotReachItsOwnClass) {
-  CompileResult result = compileSource("class Node:\n"
+  CompileResult result =
+      compileSource("class Leaf:\n"
+                    "    pass\n"
+                    "\n"
+                    "class Node:\n"
+                    "    v: int\n"
+                    "    nxt: \"Node | type[Node] | type[Leaf]\"\n"
+                    "    def __init__(self, v: int) -> None:\n"
+                    "        self.v = v\n"
+                    "        self.nxt = Node\n"
+                    "\n"
+                    "print(Node(1).v)\n");
+  EXPECT_FALSE(result.succeeded);
+  EXPECT_NE(result.diagnostics.find("contains itself through a union-typed "
+                                    "field that is stored inline"),
+            std::string::npos)
+      << result.diagnostics;
+
+  // One class-value member is boxed like any object member, so the same class
+  // through `Node | type[Node]` terminates.
+  CompileResult single = compileSource("class Node:\n"
                                        "    v: int\n"
                                        "    nxt: \"Node | type[Node]\"\n"
                                        "    def __init__(self, v: int) -> None:\n"
@@ -2024,17 +2045,12 @@ TEST(DriverTest, AUnionOfTwoObjectsCannotReachItsOwnClass) {
                                        "        self.nxt = Node\n"
                                        "\n"
                                        "print(Node(1).v)\n");
-  EXPECT_FALSE(result.succeeded);
-  EXPECT_NE(result.diagnostics.find("contains itself through a union-typed "
-                                    "field that is stored inline"),
-            std::string::npos)
-      << result.diagnostics;
+  EXPECT_TRUE(single.succeeded) << single.diagnostics;
 }
 
 // And a union of two OBJECTS no longer does. Each member fits a box, so the
 // field is one payload handle whose class word names the member -- which is
-// what `Node | Leaf` needs to terminate, and what a `type[X]` member, whose
-// value is empty, cannot have.
+// what `Node | Leaf` needs to terminate.
 TEST(DriverTest, AUnionOfTwoObjectsReachesItsOwnClass) {
   CompileResult result = compileSource("class Leaf:\n"
                                        "    n: int\n"

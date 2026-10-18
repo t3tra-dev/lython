@@ -1905,6 +1905,14 @@ void TypeSystem::seedBuiltins() {
   bindClass("slice", contract("builtins.slice"));
 }
 
+std::optional<mlir::Type>
+TypeSystem::builtinClassValue(llvm::StringRef name) const {
+  for (llvm::StringRef builtin : {"list", "dict", "tuple", "set", "type"})
+    if (name == builtin)
+      return typeObject(contract((llvm::Twine("builtins.") + name).str()));
+  return std::nullopt;
+}
+
 mlir::Type TypeSystem::object() const { return contract("builtins.object"); }
 mlir::Type TypeSystem::any() const { return contract("typing.Any"); }
 mlir::Type TypeSystem::none() const { return literal("None"); }
@@ -3133,6 +3141,11 @@ mlir::Type TypeSystem::annotationTypeForName(llvm::StringRef rawName) const {
     return none();
   if (annotationNameIs(name, "Self"))
     return py::SelfType::get(&context);
+  // A bare `type` is typeshed's `type[Any]`: a class value naming any class.
+  // ⛔ Not the `builtins.type` contract, which no value of the program has --
+  // `type(o)` is a `type[...]` -- so `dict[type, str]` refused every key.
+  if (annotationNameIs(name, "type"))
+    return typeObject(object());
   // ⭐ A CLASS THE PROGRAM DECLARES WINS OVER A MANIFEST NAME. Five bare
   // spellings are claimed by manifest contracts whether or not anything
   // imported them -- `Task`, `Future`, `AbstractEventLoop`, `CancelledError`,
@@ -3849,6 +3862,8 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       return *found;
     if (std::optional<mlir::Type> constant = staticStringLiteral(name))
       return *constant;
+    if (std::optional<mlir::Type> classValue = builtinClassValue(name))
+      return *classValue;
     return object();
   }
   if (node->kind == "Attribute") {
@@ -3876,6 +3891,15 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     if (mlir::Type objectType = lenientRecurse(ast::node(*node, "value"))) {
       const py::protocols::Table &table = py::protocols::Table::get(context);
       if (auto attr = ast::string(*node, "attr")) {
+        // `x.__class__` is `type(x)`; `C.__qualname__` and `C.__module__` are
+        // strs as `C.__name__` is.
+        if (*attr == "__class__")
+          if (auto contractType = mlir::dyn_cast_if_present<py::ContractType>(
+                  widenLiteral(objectType)))
+            return typeObject(contractType);
+        if ((*attr == "__qualname__" || *attr == "__module__") &&
+            mlir::isa_and_nonnull<py::TypeType>(widenLiteral(objectType)))
+          return strType();
         // ⭐ `C.__name__` is the string constant the emitter folds it to, and
         // this channel has to say so too. Without it the emitter's fold was
         // invisible to every consumer that asks the TYPE first: a list of two of
@@ -4682,6 +4706,32 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       }
       if (name == "isinstance")
         return boolType();
+      // `type(v)` is v's class, as a class value: the emitter answers it from
+      // the static class where that decides it and from the value's header
+      // where it does not, and either way the value is a `type[C]`.
+      if (name == "type" && positional.size() == 1 && keywords.empty() &&
+          !lookupSymbol(name)) {
+        auto classOf = [&](mlir::Type subject) -> mlir::Type {
+          subject = widenLiteral(subject);
+          if (subject == none())
+            return typeObject(contract("types.NoneType"));
+          if (auto contractType =
+                  mlir::dyn_cast_if_present<py::ContractType>(subject))
+            return typeObject(contractType.getContractName() == "typing.Any"
+                                  ? object()
+                                  : mlir::Type(contractType));
+          return typeObject(object());
+        };
+        // A union's class is its active member's: the join of their classes.
+        if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(
+                widenLiteral(positional.front()))) {
+          llvm::SmallVector<mlir::Type, 4> classes;
+          for (mlir::Type member : unionType.getMemberTypes())
+            classes.push_back(classOf(member));
+          return join(classes);
+        }
+        return classOf(positional.front());
+      }
       // open()'s return type depends on the MODE: a str literal containing
       // 'b' selects the binary arm statically (FileIO); everything else is
       // the text wrapper. A non-literal binary mode cannot type as FileIO
@@ -5603,6 +5653,29 @@ mlir::Type TypeSystem::join(mlir::ArrayRef<mlir::Type> types) const {
     return base;
   if (mlir::Type callable = commonCallableJoin(present))
     return callable;
+  // ⭐ CLASS VALUES JOIN AT THE CLASS VALUE OF THEIR INSTANCES' JOIN.
+  // `[A, B]` with `class B(A)` is a `list[type[A]]`, the list a loop that
+  // constructs through each element needs; a union of two class values has
+  // no construction and no class attribute to read, and no representation of
+  // its own either -- every class value is the same reference to a type
+  // object, whichever class it names.
+  // Classes with no common source base (`{int, str}`) join at `type[object]`:
+  // a class value that may name any class, whose name, identity, hash and
+  // subclass tests are all answered at run time.
+  if (llvm::all_of(present, [](mlir::Type member) {
+        return mlir::isa<py::TypeType>(member);
+      })) {
+    llvm::SmallVector<mlir::Type, 4> instances;
+    for (mlir::Type member : present)
+      instances.push_back(mlir::cast<py::TypeType>(member).getInstanceType());
+    mlir::Type instanceJoin = join(instances);
+    if (!mlir::isa_and_nonnull<py::ContractType>(instanceJoin))
+      if (mlir::Type common = nearestCommonClass(instances))
+        instanceJoin = common;
+    return typeObject(mlir::isa_and_nonnull<py::ContractType>(instanceJoin)
+                          ? instanceJoin
+                          : object());
+  }
   return py::UnionType::getNormalized(&context, present);
 }
 
@@ -5658,6 +5731,63 @@ TypeSystem::commonCallableJoin(mlir::ArrayRef<mlir::Type> members) const {
     if (withResult(callable) != joined)
       return {};
   return joined;
+}
+
+mlir::Type
+TypeSystem::nearestCommonClass(mlir::ArrayRef<mlir::Type> members) const {
+  // Every ancestor of `name`, nearest first: declared bases breadth-first,
+  // and a builtin exception's taxonomy chain (primary base and extra edges).
+  auto ancestry = [&](llvm::StringRef name) {
+    llvm::SmallVector<std::string, 8> order{name.str()};
+    llvm::StringSet<> seen{name};
+    for (unsigned index = 0; index < order.size(); ++index) {
+      std::string current = order[index];
+      auto push = [&](llvm::StringRef next) {
+        if (!next.empty() && seen.insert(next).second)
+          order.push_back(next.str());
+      };
+      if (auto entry = declaredBases.find(current);
+          entry != declaredBases.end())
+        for (const std::string &base : entry->second)
+          push(base);
+      const py::exceptions::BuiltinExceptionInfo *info =
+          py::exceptions::findByContract(current);
+      if (!info)
+        info = py::exceptions::findByName(current);
+      if (info) {
+        push(info->baseContract);
+        for (const py::exceptions::BuiltinExceptionExtraEdge &edge :
+             py::exceptions::kBuiltinExceptionExtraEdges)
+          if (edge.contract == info->contract)
+            push(edge.extraBaseContract);
+      }
+    }
+    return order;
+  };
+  llvm::SmallVector<llvm::SmallVector<std::string, 8>, 4> ancestries;
+  for (mlir::Type member : members) {
+    auto contract = mlir::dyn_cast_if_present<py::ContractType>(member);
+    if (!contract || !contract.getArguments().empty())
+      return {};
+    ancestries.push_back(ancestry(contract.getContractName()));
+  }
+  if (ancestries.empty())
+    return {};
+  for (const std::string &candidate : ancestries.front()) {
+    if (candidate == "builtins.object" || candidate == "object")
+      return {};
+    if (!llvm::all_of(llvm::ArrayRef(ancestries).drop_front(),
+                      [&](const llvm::SmallVector<std::string, 8> &other) {
+                        return llvm::is_contained(other, candidate);
+                      }))
+      continue;
+    if (std::optional<mlir::Type> declared = lookupClass(candidate))
+      return *declared;
+    if (py::exceptions::findByContract(candidate))
+      return contract(candidate);
+    return {};
+  }
+  return {};
 }
 
 mlir::Type

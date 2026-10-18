@@ -266,6 +266,13 @@ struct RuntimeBundle {
   static RuntimeBundle typeObject(mlir::Type typeContract,
                                   mlir::Type instanceContract);
   void copyEvidenceFrom(const RuntimeBundle &source);
+  // A class value that carries its type object's reference: an immortal
+  // object to every storage path, whose static paths still read
+  // `instanceContract`.
+  bool isClassValue() const {
+    return kind == Kind::TypeObject && !objectValue.values.empty();
+  }
+  bool isObjectLike() const { return kind == Kind::Object || isClassValue(); }
   llvm::ArrayRef<mlir::Value> physicalValues() const;
   std::string contractName() const;
   std::string instanceContractName() const;

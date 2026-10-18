@@ -258,8 +258,11 @@ mlir::LogicalResult RuntimeBundleLowerer::emitGeneratorFunctionTargetCallResult(
     // bundle", while the same parameter on a plain FUNCTION and the same class
     // as a LOCAL inside the generator both work.
     if (source && source->kind == RuntimeBundle::Kind::TypeObject) {
-      result.generatorSources.push_back(
-          RuntimeValue::object(source->contract, mlir::ValueRange{}));
+      result.generatorSources.push_back(source->objectValue.values.empty()
+                                            ? RuntimeValue::object(
+                                                  source->contract,
+                                                  mlir::ValueRange{})
+                                            : source->objectValue);
       result.generatorSourceBundles.push_back(
           std::make_shared<RuntimeBundle>(*source));
       continue;
@@ -360,7 +363,8 @@ mlir::LogicalResult RuntimeBundleLowerer::emitGeneratorFunctionTargetCallResult(
           return op->emitError()
                  << "generator argument " << index << " (" << lane->contract
                  << ") has no matching physical span to persist";
-        if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+        if (!lane->isClass &&
+            mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
                 op, *persisted, "generator argument")))
           return mlir::failure();
         // Retaining store, not the frame-lane transferring one: the retain
@@ -828,8 +832,8 @@ RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
     // does not have. The same capture of an `int | None` parameter works,
     // because a union has lanes.
     if (sourceIndex < logicalInputTypes.size() &&
-        (mlir::isa<py::TypeType>(logicalInputTypes[sourceIndex]) ||
-         py::isPyNoneType(logicalInputTypes[sourceIndex])))
+        RuntimeBundleLowerer::logicalTypeHasNoLanes(
+            logicalInputTypes[sourceIndex]))
       continue;
     if (inputIndex >= functionType.getNumInputs())
       return op.emitError()
@@ -1091,8 +1095,11 @@ mlir::LogicalResult RuntimeBundleLowerer::consumeFunctionTargetCallResult(
             // callable capture source must be an object bundle", while the same
             // closure over a `type[X]` LOCAL returns fine.
             if (sources[index]->kind == RuntimeBundle::Kind::TypeObject) {
-              alternative.closureValues.push_back(RuntimeValue::object(
-                  sources[index]->contract, mlir::ValueRange{}));
+              alternative.closureValues.push_back(
+                  sources[index]->objectValue.values.empty()
+                      ? RuntimeValue::object(sources[index]->contract,
+                                             mlir::ValueRange{})
+                      : sources[index]->objectValue);
               continue;
             }
             if (sources[index]->kind != RuntimeBundle::Kind::Object)
@@ -1193,8 +1200,8 @@ mlir::LogicalResult RuntimeBundleLowerer::emitSourceFunctionTargetCallResult(
   for (auto [sourceIndex, source] : llvm::enumerate(sources)) {
     // The same two zero-lane logical inputs the direct call skips.
     if (sourceIndex < logicalInputTypes.size() &&
-        (mlir::isa<py::TypeType>(logicalInputTypes[sourceIndex]) ||
-         py::isPyNoneType(logicalInputTypes[sourceIndex])))
+        RuntimeBundleLowerer::logicalTypeHasNoLanes(
+            logicalInputTypes[sourceIndex]))
       continue;
     if (inputIndex >= functionType.getNumInputs())
       return op->emitError()

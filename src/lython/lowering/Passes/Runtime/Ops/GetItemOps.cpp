@@ -494,6 +494,11 @@ std::optional<RuntimeValue>
 RuntimeBundleLowerer::retainEvidenceElement(mlir::Operation *op,
                                             const RuntimeValue &value,
                                             bool atOperation) {
+  // A class value references an immortal type object: reading it out of a
+  // container takes no reference, and the frame owns nothing to release.
+  if (mlir::isa_and_nonnull<py::TypeType>(value.contract) &&
+      !value.values.empty())
+    return value;
   std::string contract = runtimeContractName(value.contract);
   if (contract.empty() || value.values.empty())
     return std::nullopt;
@@ -629,6 +634,11 @@ std::optional<RuntimeValue>
 RuntimeBundleLowerer::rootOwnedEvidenceElement(mlir::Operation *op,
                                                const RuntimeValue &value,
                                                bool atOperation) {
+  // A class value references an immortal type object: reading it out of a
+  // container takes no reference, and the frame owns nothing to release.
+  if (mlir::isa_and_nonnull<py::TypeType>(value.contract) &&
+      !value.values.empty())
+    return value;
   std::string contract = runtimeContractName(value.contract);
   if (contract.empty() || value.values.empty())
     return std::nullopt;
@@ -1888,7 +1898,7 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
   if (container.contractName() != "builtins.dict" ||
       !RuntimeBundleLowerer::containerHasRuntimePayload(container))
     return false;
-  if (index.kind != RuntimeBundle::Kind::Object)
+  if (!index.isObjectLike())
     return false;
   // Evidence-backed dicts qualify only for RUNTIME keys (an int variable, a
   // frozenset): a literal key stays on the evidence tier below, which owns

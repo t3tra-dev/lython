@@ -90,6 +90,10 @@ NodePtr whileStmt(NodePtr test, std::vector<NodePtr> body,
                   std::vector<NodePtr> orelse, SourceRange range);
 // An expression evaluated as a statement (`Expr` wrapping it).
 NodePtr exprStmt(NodePtr value, SourceRange range);
+// `try: <body> except <exceptionType>: <handler>` -- one unnamed handler, no
+// else, no finally.
+NodePtr tryExcept(std::vector<NodePtr> body, NodePtr exceptionType,
+                  std::vector<NodePtr> handler, SourceRange range);
 NodePtr breakStmt(SourceRange range);
 NodePtr continueStmt(SourceRange range);
 // `yield <value>` as a STATEMENT (an Expr wrapping the Yield).

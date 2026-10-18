@@ -587,6 +587,16 @@ mlir::LogicalResult verifyManifestCandidate(mlir::Operation *op,
     return mlir::success();
 
   const protocols::Table &table = protocols::Table::get(*op->getContext());
+  // A class value is an object of class `type`: its own methods are type's
+  // (and object's), not the ones its instances have.
+  if (mlir::isa<TypeType>(*receiver))
+    for (llvm::StringRef owner : {"builtins.type", "builtins.object"})
+      for (const protocols::ContractResolution &candidate :
+           table.methodContractCandidatesWithEvidence(
+               ContractType::get(op->getContext(), owner), *methodName))
+        if (callableEvidenceSame(selected, candidate.method.signature) ||
+            callableMatchesCandidate(selected, candidate.method.signature, op))
+          return mlir::success();
   std::vector<protocols::ContractResolution> candidates =
       table.methodContractCandidatesWithEvidence(*receiver, *methodName);
   for (const protocols::ContractResolution &candidate : candidates)

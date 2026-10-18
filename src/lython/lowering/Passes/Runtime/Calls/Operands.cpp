@@ -291,6 +291,19 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
   }
 
   if (source.kind == RuntimeBundle::Kind::TypeObject &&
+      expected.isInteger(64) && source.isClassValue()) {
+    // A class value names its class at run time: `exc(msg)` for a
+    // `type[Exception]` constructs the class the value holds.
+    mlir::FailureOr<mlir::Value> word =
+        RuntimeBundleLowerer::classValueWord(op, source);
+    if (mlir::failed(word))
+      return mlir::failure();
+    operands.push_back(*word);
+    ++inputIndex;
+    return mlir::success();
+  }
+
+  if (source.kind == RuntimeBundle::Kind::TypeObject &&
       expected.isInteger(64)) {
     // Source classes too: user exceptions constructed through a builtin
     // exception initializer.
@@ -581,7 +594,8 @@ bool RuntimeBundleLowerer::canAppendRuntimeSource(
 
   if (source.kind == RuntimeBundle::Kind::TypeObject &&
       expected.isInteger(64) &&
-      RuntimeBundleLowerer::runtimeClassForContract(source.instanceContract)) {
+      (source.isClassValue() ||
+       RuntimeBundleLowerer::runtimeClassForContract(source.instanceContract))) {
     ++inputIndex;
     return true;
   }

@@ -1,0 +1,7 @@
+False -1
+True 3
+False
+True 1
+skip why
+20 cls-attr dflt
+default 20 ['default', 'unused']

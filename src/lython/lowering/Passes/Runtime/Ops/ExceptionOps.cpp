@@ -560,14 +560,28 @@ RuntimeBundleLowerer::lowerExceptMatch(py::ExceptMatchOp op) {
 
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerExceptCurrentMatch(py::ExceptCurrentMatchOp op) {
-  mlir::FailureOr<std::string> handlerId =
-      handlerClass(op.getOperation(), op.getHandler());
-  if (mlir::failed(handlerId))
-    return mlir::failure();
-
   builder.setInsertionPoint(op);
-  mlir::Value handler =
-      type_objects::classWord(builder, op.getLoc(), module, *handlerId);
+  mlir::Value handler;
+  // ⭐ A HANDLER WHOSE CLASS IS A VALUE (`except self.expected:`) matches the
+  // class that value names at run time, not its static bound -- which caught
+  // every exception for an `expected: type[BaseException]`.
+  if (mlir::Value dynamicHandler = op.getDynamicHandler()) {
+    const RuntimeBundle *classValue =
+        RuntimeBundleLowerer::bundleFor(dynamicHandler);
+    if (!classValue)
+      return op.emitError() << "except handler class has no lowered bundle";
+    mlir::FailureOr<mlir::Value> word =
+        RuntimeBundleLowerer::classValueWord(op, *classValue);
+    if (mlir::failed(word))
+      return mlir::failure();
+    handler = *word;
+  } else {
+    mlir::FailureOr<std::string> handlerId =
+        handlerClass(op.getOperation(), op.getHandler());
+    if (mlir::failed(handlerId))
+      return mlir::failure();
+    handler = type_objects::classWord(builder, op.getLoc(), module, *handlerId);
+  }
   mlir::func::FuncOp currentMatches =
       getOrCreateCurrentExceptionMatches(module, builder);
   auto call = mlir::func::CallOp::create(builder, op.getLoc(), currentMatches,

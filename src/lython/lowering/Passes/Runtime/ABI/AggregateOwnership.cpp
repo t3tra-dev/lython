@@ -193,6 +193,9 @@ mlir::LogicalResult
 RuntimeBundleLowerer::retainAggregateSlot(mlir::Operation *op,
                                           const RuntimeBundle &slotValue,
                                           llvm::StringRef slotName) {
+  // A class value references an immortal type object: nothing to count.
+  if (slotValue.isClassValue())
+    return mlir::success();
   const RuntimeBundle *concrete =
       RuntimeBundleLowerer::concreteObjectForOwnership(slotValue);
   if (!concrete || concrete->kind != RuntimeBundle::Kind::Object)
@@ -253,6 +256,8 @@ mlir::LogicalResult
 RuntimeBundleLowerer::releaseAggregateSlot(mlir::Operation *op,
                                            const RuntimeBundle &slotValue,
                                            llvm::StringRef slotName) {
+  if (slotValue.isClassValue())
+    return mlir::success();
   const RuntimeBundle *concrete =
       RuntimeBundleLowerer::concreteObjectForOwnership(slotValue);
   if (!concrete || concrete->kind != RuntimeBundle::Kind::Object)

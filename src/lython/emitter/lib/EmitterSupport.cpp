@@ -6,6 +6,7 @@
 #include "EmitterPyOps.h"
 
 #include "ExceptionTaxonomy.h"
+#include "Contracts.h"
 
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -45,10 +46,77 @@ bool isSourceDefinedContract(mlir::Type type) {
 
 bool isAssignableWithStaticEvidence(mlir::Type actual, mlir::Type expected,
                                     mlir::Operation *from) {
+  // `type[...]` is covariant: the class value of a subclass is a class value
+  // of its base, with the one representation every class value has.
+  // ⛔ Not along the numeric tower: a bool, an int and a float have three
+  // representations here, so `type[bool]` is no `type[int]` -- a call
+  // through the int class value would build an int where CPython builds a
+  // bool.
+  if (auto actualClass = mlir::dyn_cast_if_present<py::TypeType>(actual))
+    if (auto expectedClass = mlir::dyn_cast_if_present<py::TypeType>(expected)) {
+      if (actualClass == expectedClass ||
+          py::isPyObjectType(expectedClass.getInstanceType()))
+        return true;
+      auto numeric = [](mlir::Type type) {
+        auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+        if (!contract)
+          return false;
+        llvm::StringRef name = contract.getContractName();
+        return name == "builtins.bool" || name == "builtins.int" ||
+               name == "builtins.float" || name == "builtins.complex";
+      };
+      if (numeric(actualClass.getInstanceType()) &&
+          numeric(expectedClass.getInstanceType()))
+        return false;
+      return isAssignableWithStaticEvidence(actualClass.getInstanceType(),
+                                            expectedClass.getInstanceType(),
+                                            from);
+    }
   if (from && isSourceDefinedContract(actual) &&
       isSourceDefinedContract(expected))
     return py::isAssignableTo(actual, expected, from);
   return py::isAssignableTo(actual, expected);
+}
+
+std::string pythonTypeSpelling(mlir::Type type) {
+  if (auto literal = mlir::dyn_cast_if_present<py::LiteralType>(type)) {
+    llvm::StringRef spelling = literal.getSpelling();
+    if (spelling == "None")
+      return "None";
+    if (spelling == "True" || spelling == "False")
+      return "bool";
+    if (!spelling.empty() && spelling.front() == '"')
+      return "str";
+    return spelling.contains('.') || spelling.contains('e') ? "float" : "int";
+  }
+  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type)) {
+    std::string text =
+        py::contracts::displayClassNameForContract(contract.getContractName());
+    if (contract.getContractName() == "types.NoneType")
+      return "None";
+    if (!contract.getArguments().empty()) {
+      text += "[";
+      for (auto [index, argument] : llvm::enumerate(contract.getArguments())) {
+        if (index)
+          text += ", ";
+        text += pythonTypeSpelling(argument);
+      }
+      text += "]";
+    }
+    return text;
+  }
+  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type)) {
+    std::string text;
+    for (auto [index, member] : llvm::enumerate(unionType.getMemberTypes())) {
+      if (index)
+        text += " | ";
+      text += pythonTypeSpelling(member);
+    }
+    return text;
+  }
+  if (auto typeObject = mlir::dyn_cast_if_present<py::TypeType>(type))
+    return "type[" + pythonTypeSpelling(typeObject.getInstanceType()) + "]";
+  return typeText(type);
 }
 
 mlir::ArrayAttr stringArray(mlir::Builder &builder,
@@ -309,8 +377,10 @@ bool containsObjectTop(mlir::Type type, const TypeSystem &types) {
         return true;
     return false;
   }
-  if (auto typeType = mlir::dyn_cast_if_present<py::TypeType>(type))
-    return containsObjectTop(typeType.getInstanceType(), types);
+  // A class value is a reference to the type object of the class it names,
+  // whatever its bound: `type[object]` erases nothing it stores.
+  if (mlir::isa<py::TypeType>(type))
+    return false;
   if (auto callable = mlir::dyn_cast_if_present<py::CallableType>(type)) {
     for (mlir::Type arg : callable.getPositionalTypes())
       if (containsObjectTop(arg, types))
@@ -398,40 +468,37 @@ std::optional<mlir::Type> isinstanceTargetType(const parser::Node *node,
   if (!node)
     return std::nullopt;
   mlir::Type inferred = types.inferExpr(node);
-  // ⛔ THE GENERIC BUILTINS ARE NOT BOUND AS CLASS OBJECTS. `int` and `str`
-  // infer to `!py.type<...>` and `list`/`dict`/`tuple`/`set` infer to plain
-  // `object`, so `isinstance(o, list)` was refused as "not a statically
-  // resolved class type" while `isinstance(o, str)` was not. The annotation
-  // resolver knows every builtin class spelling; asking it is what makes the
-  // two spellings agree.
-  //
+  // ⛔ A BARE CONTAINER SPELLING IS THE CONTAINER OF `object`. The class word
+  // compares the same either way, but the NARROWED value has to be a type
+  // with methods on it: an argument-less `!py.contract<"builtins.list">`
+  // answered "does not provide '__len__'" on the arm that had just proved it
+  // was a list. What the test proves about the elements is nothing, and
+  // `object` is how that is spelled.
+  auto narrowedInstance = [&](mlir::Type instance) -> mlir::Type {
+    auto contract = mlir::dyn_cast<py::ContractType>(instance);
+    if (!contract || !contract.getArguments().empty())
+      return instance;
+    llvm::StringRef name = contract.getContractName();
+    if (name == "builtins.list")
+      return types.listOf(types.object());
+    if (name == "builtins.set")
+      return types.contract("builtins.set", {types.object()});
+    if (name == "builtins.tuple")
+      return types.tupleOf(types.object());
+    if (name == "builtins.dict")
+      return types.dictOf(types.object(), types.object());
+    return instance;
+  };
+  // A name the inference says nothing about may still spell a class the
+  // annotation resolver knows.
   // Only from `object`, which says nothing: any other inference is a binding
   // the program made, and that is what the name means.
   if (inferred == types.object() && node->kind == "Name")
     if (mlir::Type annotated =
             types.annotationType(node))
-      if (auto contract = mlir::dyn_cast<py::ContractType>(annotated))
-        if (annotated != types.object()) {
-          // ⛔ A BARE CONTAINER SPELLING IS THE CONTAINER OF `object`. The
-          // class word compares the same either way, but the NARROWED value has
-          // to be a type with methods on it: an argument-less
-          // `!py.contract<"builtins.list">` answered "does not provide
-          // '__len__'" on the arm that had just proved it was a list. What the
-          // test proves about the elements is nothing, and `object` is how
-          // that is spelled.
-          if (contract.getArguments().empty()) {
-            llvm::StringRef name = contract.getContractName();
-            if (name == "builtins.list")
-              return types.listOf(types.object());
-            if (name == "builtins.set")
-              return types.contract("builtins.set", {types.object()});
-            if (name == "builtins.tuple")
-              return types.tupleOf(types.object());
-            if (name == "builtins.dict")
-              return types.dictOf(types.object(), types.object());
-          }
-          return annotated;
-        }
+      if (mlir::isa<py::ContractType>(annotated) &&
+          annotated != types.object())
+        return narrowedInstance(annotated);
   if (std::optional<mlir::Type> constructed =
           jsConstructedType(inferred, types))
     return constructed;
@@ -441,7 +508,7 @@ std::optional<mlir::Type> isinstanceTargetType(const parser::Node *node,
   mlir::Type instance = types.widenLiteral(typeObject.getInstanceType());
   if (!instance || !mlir::isa<py::ContractType>(instance))
     return std::nullopt;
-  return instance;
+  return narrowedInstance(instance);
 }
 
 std::optional<llvm::SmallVector<mlir::Type, 4>>
@@ -580,14 +647,28 @@ static bool sourceClassUnderManifestBase(mlir::Type sub, mlir::Type super,
   llvm::StringRef superLeaf = superName.rsplit('.').second;
   if (superLeaf.empty())
     superLeaf = superName;
-  if (types.declaredSubclassOf(subContract.getContractName(), superLeaf))
+  // ⭐ BOTH SPELLINGS OF THE BASE. An imported class records the base it was
+  // written with (`Exception`); a class of the program itself records the
+  // contract it resolved to (`builtins.Exception`). Only the first was asked,
+  // so for a class in the main module every question one level past its
+  // written base answered no, silently:
+  //
+  //     class Err(Exception): pass
+  //     print(issubclass(Err, BaseException))   # printed False
+  //     def classify(e: BaseException) -> str:
+  //         if isinstance(e, Err): return "err" # folded away: "other"
+  auto declaredUnder = [&](llvm::StringRef qualified, llvm::StringRef leaf) {
+    return types.declaredSubclassOf(subContract.getContractName(), qualified) ||
+           types.declaredSubclassOf(subContract.getContractName(), leaf);
+  };
+  if (declaredUnder(superName, superLeaf))
     return true;
   // Written under a base that is itself under the target: `class E(ValueError)`
   // asked about `Exception`. The taxonomy is the only place that edge exists.
   for (const py::exceptions::BuiltinExceptionInfo &entry :
        py::exceptions::kBuiltinExceptions)
     if (py::exceptions::isBuiltinExceptionSubclassName(entry.name, superLeaf) &&
-        types.declaredSubclassOf(subContract.getContractName(), entry.name))
+        declaredUnder(entry.contract, entry.name))
       return true;
   return false;
 }

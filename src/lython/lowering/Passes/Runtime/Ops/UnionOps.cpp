@@ -68,7 +68,7 @@ mlir::LogicalResult RuntimeBundleLowerer::appendUnionRuntimeValues(
     mlir::Operation *op, py::UnionType resultUnion, const RuntimeBundle &source,
     mlir::Type sourceType, llvm::SmallVectorImpl<mlir::Value> &values,
     RuntimeBundle *lanesSource) {
-  if (source.kind != RuntimeBundle::Kind::Object)
+  if (!source.isObjectLike())
     return op->emitError() << "union source must be an object bundle";
 
   const RuntimeBundle *sourceBundle = &source;

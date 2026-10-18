@@ -1,0 +1,9 @@
+AttributeError: 'StackTest' object has no attribute 'items'
+stack [1, 2, 3]
+count=5 5 True
+None
+4
+P(a=1, b=2) 3 True
+3
+AttributeError: 'Acc' object has no attribute 'last'
+first second

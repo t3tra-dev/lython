@@ -1,0 +1,7 @@
+caught fell through caught
+expected KeyError other ValueError expected LookupError
+False True
+KeyError caught KeyError other ValueError none
+LookupError caught KeyError other ValueError none
+ValueError other KeyError caught ValueError none
+trapped missed trapped

@@ -199,6 +199,20 @@ std::optional<Value> ModuleEmitter::emitStringifyValue(const parser::Node &ancho
   // text is a compile-time constant anyway.
   if (valueType == types.none())
     return emitStrLiteralPiece(anchor, "None");
+  // A class renders through `type.__str__`, from the type object it names:
+  // `<class 'int'>`, `<class '__main__.A'>`.
+  // The lowering dispatches it on the receiver, which is a `type` object.
+  // ⛔ The callee contract is object's `__str__` shape, not one asked of the
+  // class value: inference on `type[int]` answers int's own instance method.
+  if (mlir::isa<py::TypeType>(valueType))
+    if (CallInferenceResult strInference =
+            types.inferMethodCallWithEvidence(types.object(), "__str__", {})) {
+      auto op = py::StrOp::create(
+          builder, loc(anchor), strType,
+          mlir::FlatSymbolRefAttr::get(&context, "__str__"),
+          mlir::TypeAttr::get(callProtocolFor(strInference)), value.value);
+      return Value{op.getResult(), strType};
+    }
   if (std::optional<Value> dispatched = tryEmitClassDunder(anchor, value, "__str__"))
     return *dispatched;
   // ⭐ An EXCEPTION is the one builtin whose str and repr differ: str is the
@@ -304,25 +318,31 @@ ModuleEmitter::emitConversionValue(const parser::Node &anchor, Value value,
                               conversion);
   }
   std::optional<Value> repr;
-  if (dispatchIsUnresolvable(value, "__repr__", /*receiverNode=*/nullptr,
-                             /*throughSuper=*/false)) {
+  if (mlir::isa<py::TypeType>(valueType)) {
+    // A class's repr is its str: `<class 'NAME'>` either way.
+    repr = emitStringifyValue(anchor, value);
+  } else {
+    if (dispatchIsUnresolvable(value, "__repr__", /*receiverNode=*/nullptr,
+                               /*throughSuper=*/false)) {
+      if (std::optional<Value> dispatched =
+              tryEmitVirtualDispatchWithValues(anchor, value, "__repr__", {}))
+        return *dispatched;
+      if (refuseUnresolvableDispatch(anchor, value, "__repr__"))
+        return emitNone(anchor);
+    }
     if (std::optional<Value> dispatched =
-            tryEmitVirtualDispatchWithValues(anchor, value, "__repr__", {}))
-      return *dispatched;
-    if (refuseUnresolvableDispatch(anchor, value, "__repr__"))
-      return emitNone(anchor);
-  }
-  if (std::optional<Value> dispatched =
-          tryEmitClassDunder(anchor, value, "__repr__")) {
-    repr = *dispatched;
-  } else if (CallInferenceResult inference =
-                 types.inferMethodCallWithEvidence(valueType, "__repr__", {})) {
-    Value receiver = coerceValue(value, valueType, anchor);
-    auto op = py::ReprOp::create(
-        builder, loc(anchor), strType,
-        mlir::FlatSymbolRefAttr::get(&context, "__repr__"),
-        mlir::TypeAttr::get(callProtocolFor(inference)), receiver.value);
-    repr = Value{op.getResult(), strType};
+            tryEmitClassDunder(anchor, value, "__repr__")) {
+      repr = *dispatched;
+    } else if (CallInferenceResult inference =
+                   types.inferMethodCallWithEvidence(valueType, "__repr__",
+                                                     {})) {
+      Value receiver = coerceValue(value, valueType, anchor);
+      auto op = py::ReprOp::create(
+          builder, loc(anchor), strType,
+          mlir::FlatSymbolRefAttr::get(&context, "__repr__"),
+          mlir::TypeAttr::get(callProtocolFor(inference)), receiver.value);
+      repr = Value{op.getResult(), strType};
+    }
   }
   if (!repr)
     return std::nullopt;
@@ -413,8 +433,6 @@ Value ModuleEmitter::emitFormattedValue(const parser::Node &expr) {
         "malformed f-string interpolation"});
     return emitNone(expr);
   }
-  if (rendersAClass(*valueNode))
-    return *refuseClassRendering(expr, "an f-string");
   int64_t conversion = ast::integer(expr, "conversion").value_or(-1);
   const parser::Node *specNode = ast::node(expr, "format_spec");
 

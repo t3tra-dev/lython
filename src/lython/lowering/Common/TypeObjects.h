@@ -10,7 +10,7 @@
 // zero-extended; every supported target is little-endian):
 //
 //   0  refcount, INT64_MAX: immortal, as every static object here
-//   1  ob_type: 0 -- a type object is not yet a value a program can hold
+//   1  ob_type: `type`'s type object -- a class is a value of class `type`
 //   2  tp_base: the base's type object, 0 at the root (object)
 //   3  tp_name: a NUL-terminated name, the one a default repr prints
 //   4  the name's length, without the NUL

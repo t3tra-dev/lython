@@ -3977,9 +3977,12 @@ mlir::LogicalResult verifyGeneratorResumeFrames(mlir::ModuleOp module) {
             // ownership contract to anchor and no release for one to
             // discharge. Requiring the anchor refused every generator that
             // yields a bool once the state machine could carry one.
+            // `builtins.type` is a class value: a view of an immortal type
+            // object, which no release discharges either.
             if (anchors && size.getInt() > 0 &&
                 laneContract.getValue() != "types.NoneType" &&
                 laneContract.getValue() != "builtins.bool" &&
+                laneContract.getValue() != "builtins.type" &&
                 !anchors->contains(static_cast<unsigned>(begin.getInt()))) {
               function.emitError()
                   << "generator lane at " << attrName << " offset "

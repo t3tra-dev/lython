@@ -646,7 +646,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
                << "missing required class initializer field '" << fieldName
                << "'";
       }
-      if (!fieldValue || fieldValue->kind != RuntimeBundle::Kind::Object)
+      if (!fieldValue || !fieldValue->isObjectLike())
         return op.emitError()
                << "class initializer field source has no object bundle";
       if (!py::isAssignableTo(fieldValue->objectValue.contract,

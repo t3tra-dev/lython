@@ -362,9 +362,12 @@ def Py_ExceptCurrentMatchOp : Py_Op<"except.current_match", []> {
     later handler.
   }];
 
-  let arguments = (ins TypeAttrOf<Py_TypeType>:$handler);
+  let arguments = (ins TypeAttrOf<Py_TypeType>:$handler,
+      Optional<Py_TypeType>:$dynamic_handler);
   let results = (outs I1:$result);
-  let assemblyFormat = "$handler attr-dict";
+  let assemblyFormat =
+      "$handler (`(` $dynamic_handler^ `:` type($dynamic_handler) `)`)? "
+      "attr-dict";
   let hasVerifier = 1;
 }
 
@@ -670,7 +673,8 @@ def Py_IsOp : Py_Op<"is", [Pure]> {
     statically before this op is ever built.
   }];
 
-  let arguments = (ins Py_ContractType:$lhs, Py_ContractType:$rhs);
+  let arguments = (ins AnyTypeOf<[Py_ContractType, Py_TypeType]>:$lhs,
+      AnyTypeOf<[Py_ContractType, Py_TypeType]>:$rhs);
 
   let results = (outs I1:$result);
 
@@ -1083,6 +1087,48 @@ def Py_TypeObjectOp : Py_Op<"type.object", [Pure]> {
 
   let assemblyFormat = "$instance_contract attr-dict `:` type($result)";
   let hasVerifier = 1;
+}
+
+def Py_TypeOfOp : Py_Op<"type_of", []> {
+  let summary = "The runtime class of a value, as a class value";
+  let description = [{
+    `type(x)` where the static type does not decide the class: the static class
+    has subclasses, the value is an erased `object`, or the class is otherwise
+    only known at run time. The result is a reference to the class's type
+    object, viewed statically as `!py.type<T>` for the input's static class
+    `T`.
+  }];
+
+  let arguments = (ins AnyType:$input);
+  let results = (outs Py_TypeType:$result);
+  let assemblyFormat =
+      "`(` $input `:` type($input) `)` attr-dict `->` type($result)";
+}
+
+def Py_TypeNameOp : Py_Op<"type.name", [Pure]> {
+  let summary = "A class value's `__name__`, `__qualname__` or `__module__`";
+  let description = [{
+    Read from the class's type object at run time: the class value may name a
+    subclass of its static class, so the static name is not the answer.
+  }];
+
+  let arguments = (ins Py_TypeType:$type, StrAttr:$attribute);
+  let results = (outs Py_ContractType:$result);
+  let assemblyFormat =
+      "$attribute `(` $type `:` type($type) `)` attr-dict `->` type($result)";
+}
+
+def Py_TypeSubclassOp : Py_Op<"type.subclass", [Pure]> {
+  let summary = "`issubclass` over two class values";
+  let description = [{
+    Whether `base` is in `sub`'s method resolution order, asked at run time
+    because one of the two class values is not decided by its static type.
+  }];
+
+  let arguments = (ins Py_TypeType:$sub, Py_TypeType:$base);
+  let results = (outs I1:$result);
+  let assemblyFormat =
+      "`(` $sub `,` $base `)` attr-dict `:` type($sub) `,` type($base)";
 }
 
 def Py_ClassUpcastOp : Py_Op<"class.upcast", []> {

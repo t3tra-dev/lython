@@ -198,30 +198,30 @@ RuntimeBundleLowerer::classFieldContractTypes(py::ClassOp classOp) const {
 mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>>
 RuntimeBundleLowerer::runtimeValueTypesFor(mlir::Operation *op, mlir::Type type,
                                            llvm::StringRef purpose) const {
-  // ⭐ `type[X]` IS ITS OWN VALUE. A type object carries nothing a program can
-  // observe beyond WHICH class it is, and that is in the type -- so its
-  // physical shape is EMPTY, and a parameter, a field, a return and a
-  // suspension lane all carry it for free. Constructing through it stays
-  // statically resolved, which is the whole point: an i64 class word in a
-  // parameter would make `t(3)` a dispatch on a runtime value, and this
-  // compiler has no dynamic dispatch to fall back to.
+  // ⭐ A CLASS VALUE IS A REFERENCE TO ITS TYPE OBJECT: `builtins.type`'s
+  // shape, a view of the immortal `__ly_type.<class>`. So it carries WHICH
+  // class it is, and a subclass held in a `type[Base]` slot is that subclass
+  // at run time; a call through one is the emitter's dispatch over the
+  // classes it may name.
   //
-  // ⛔ Why NOT the i64 class word, which is what three earlier attempts built
-  // and reverted: each moved the refusal one layer down (no contract -> bad
-  // object header -> no unbox.i64 primitive -> the bundle is not a
-  // TypeObject) and the fourth layer is where it stops being a wiring
-  // question. `t(3)` on a parameter-held class word has to pick a constructor
-  // at run time, and every ancestor of that decision -- the ABI, the field
-  // slot, the operand -- was being built to support a dispatch that would
-  // then have to be refused anyway.
-  //
-  // The soundness condition is that the class is DETERMINED by the type, so a
-  // class with subclasses is refused here rather than silently constructing
-  // the base. Reaching those is the argument specializer's job: `make(Base)`
-  // and `make(Derived)` get one body each, and inside each the parameter's
-  // type names exactly one class.
+  // ⛔ Why NOT the i64 class word, which three earlier attempts built and
+  // reverted: a word is not an object, so every container, box and union
+  // position needed its own arm for it, and the header-carrying view is what
+  // those positions already take.
   if (auto typeType = mlir::dyn_cast_if_present<py::TypeType>(type)) {
     mlir::Type instance = typeType.getInstanceType();
+    if (RuntimeBundleLowerer::classValueRuntimeClass(instance)) {
+      const RuntimeValueShape *shape = manifest.valueShape("builtins.type");
+      if (!shape)
+        return op->emitError()
+               << "runtime manifest has no builtins.type ABI shape for "
+               << purpose;
+      return llvm::SmallVector<mlir::Type, 8>(shape->valueTypes.begin(),
+                                              shape->valueTypes.end());
+    }
+    // A class with no type object (a protocol, a ctypes type) has no value to
+    // carry, so its class has to be DETERMINED by the type: one with
+    // subclasses is refused rather than answered as the base.
     std::string instanceName = runtimeContractName(instance);
     if (instanceName.empty()) {
       op->emitError() << purpose << " has no concrete runtime contract: "
@@ -247,19 +247,20 @@ RuntimeBundleLowerer::runtimeValueTypesFor(mlir::Operation *op, mlir::Type type,
   // worst answer a compiler can give, so the cycle is reported where it is
   // entered.
   //
-  // ⛔ WHAT STILL ARRIVES HERE IS A MEMBER WITH NO CONTRACT. `T | None`, `Node
-  // | Leaf`, `int | bool` and every other union of boxable members are stored
-  // as one payload handle whose class word names the live member, so they
-  // terminate. `type[X]` is the one that cannot: its value is EMPTY, so there
-  // is nothing to box and no class word to name it back, and a class reached
-  // through a union holding one is reached through its own layout.
+  // ⛔ WHAT STILL ARRIVES HERE IS A UNION A BOX CANNOT NAME BACK. `T | None`,
+  // `Node | Leaf`, `int | bool`, `int | type[A]` and every other union of
+  // boxable members are stored as one payload handle whose class word names
+  // the live member, so they terminate. Two class-value members cannot: both
+  // boxes name `type`, and a class reached through such a union is reached
+  // through its own layout.
   if (!expandingContracts.insert(type).second)
     return op->emitError()
            << "class layout for " << type
            << " contains itself through a union-typed field that is stored "
               "inline, so it has no finite layout; a union whose members can "
-              "each be boxed -- which is every member but a `type[X]` -- is "
-              "stored as one reference and terminates";
+              "each be boxed and told apart -- which is every union with at "
+              "most one `type[X]` member -- is stored as one reference and "
+              "terminates";
   auto expanding = llvm::scope_exit([&] { expandingContracts.erase(type); });
   if (auto unionType = mlir::dyn_cast<py::UnionType>(type)) {
     llvm::SmallVector<mlir::Type, 8> types{mlir::IntegerType::get(context, 64)};
@@ -1038,7 +1039,7 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
             // N must be an object-header-like memref". A bool carries no
             // ownership -- its DecRef is a no-op -- so there is nothing to
             // transfer either.
-            if (lane.physicalCount > 0 && !lane.isBool)
+            if (lane.physicalCount > 0 && !lane.ownsNothing())
               generatorTransferArgs.push_back(begin);
             generatorResumeArgLanes.push_back(builder.getDictionaryAttr({
                 builder.getNamedAttr("contract",
@@ -1143,7 +1144,7 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
           // value follows. Marking it owned earns a release no deallocator
           // could discharge -- `LyBool_DecRef` is a no-op over an immortal
           // singleton, and the lane does not even hold that.
-          if (!lane.isNone && !lane.isBool) {
+          if (!lane.ownsNothing()) {
             generatorOwnedOffsets.push_back(begin);
             generatorOwnedContracts.push_back(
                 builder.getStringAttr(lane.contract));
@@ -1504,8 +1505,12 @@ mlir::LogicalResult RuntimeBundleLowerer::seedCallableEntryArgumentBundles(
     // `py.type.object` op and nothing made one for an entry argument, so an
     // attr.set on a class-valued parameter saw a bundle with no kind at all.
     if (auto typeType = mlir::dyn_cast<py::TypeType>(abiType)) {
-      valueBundles[logicalArg] =
+      RuntimeBundle classValue =
           RuntimeBundle::typeObject(abiType, typeType.getInstanceType());
+      if (!physicalArgs.empty())
+        classValue.objectValue = RuntimeValue::objectWithOwnership(
+            abiType, physicalArgs, ownership::OwnershipKind::Immortal);
+      valueBundles[logicalArg] = std::move(classValue);
       continue;
     }
     RuntimeBundle bundle;

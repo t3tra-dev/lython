@@ -501,7 +501,7 @@ RuntimeBundleLowerer::objectPayloadClassEntity(mlir::Operation *op,
 
   const RuntimeBundle *concrete =
       RuntimeBundleLowerer::concreteObjectForOwnership(value);
-  if (!concrete || concrete->kind != RuntimeBundle::Kind::Object)
+  if (!concrete || !concrete->isObjectLike())
     return op->emitError() << "collection payload element is not an object";
   if (concrete->contractName() == "types.NoneType")
     return emptyHandle();
@@ -652,13 +652,12 @@ RuntimeBundleLowerer::objectPayloadClassEntity(mlir::Operation *op,
   // `__repr__` that plainly exists into a runtime abort. Reject at the box, the
   // earliest point where the width is known.
   //
-  // A UNION WITH A `type[X]` MEMBER is what reaches this now. A class instance
-  // is one lane however many fields it has -- they live in its body, and a
-  // union field is one payload handle whose class word names the member it
-  // holds -- unless one of that union's members has no contract to be that
-  // handle. `type[X]` is the one: its value is EMPTY, so there is nothing to
-  // box and no class word that would name it back, and `int | type[U]` keeps
-  // its members' lanes with the class that holds it.
+  // A UNION WITH TWO `type[X]` MEMBERS is what reaches this now. A class
+  // instance is one lane however many fields it has -- they live in its body,
+  // and a union field is one payload handle whose class word names the member
+  // it holds -- unless that class word cannot tell two members apart. Every
+  // class value's box names `type`, so `int | type[A] | type[B]` keeps its
+  // members' lanes with the class that holds it (`classFieldStoredBoxed`).
   //
   // ⛔ READING a union element out of a container works and WRITING one does
   // not, and the asymmetry is in the direction, not an oversight. A read has
@@ -676,9 +675,9 @@ RuntimeBundleLowerer::objectPayloadClassEntity(mlir::Operation *op,
            << concrete->physicalValues().size()
            << " physical values and nothing can rebuild them from one address; "
               "it cannot be stored in a container slot or boxed field yet "
-              "(a union with a `type[X]` member keeps every member's lanes "
-              "-- a type object has no value to box -- and a field holding one "
-              "keeps them in its class)";
+              "(a union with two `type[X]` members keeps every member's lanes "
+              "-- the box of a class value does not say which member it is -- "
+              "and a field holding one keeps them in its class)";
 
   mlir::FailureOr<mlir::Value> header =
       RuntimeBundleLowerer::objectPhysicalHeader(op, concrete->objectValue);
@@ -725,7 +724,7 @@ RuntimeBundleLowerer::materializePayloadObjectBundle(
   RuntimeBundle value = valueRef;
   const RuntimeBundle *concrete =
       RuntimeBundleLowerer::concreteObjectForOwnership(value);
-  if (!concrete || concrete->kind != RuntimeBundle::Kind::Object)
+  if (!concrete || !concrete->isObjectLike())
     return op->emitError() << "collection payload requires an object bundle";
   if (concrete->contractName() == "types.NoneType")
     return *concrete;
