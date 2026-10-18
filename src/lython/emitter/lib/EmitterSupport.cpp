@@ -1384,6 +1384,85 @@ optionalBranchTypeNarrowing(const parser::Node &test, TypeSystem &types,
               }
             }
 
+  // ⭐ `type(x) is C` PROVES x IS A C, and `type(a) is type(b)` proves b has
+  // a's class -- the exact-class test unittest's `TestCase.__eq__` opens with
+  // (`if type(self) is not type(other): return NotImplemented`). The proof is
+  // the one `isinstance(x, C)` gives on its true side, so the narrowing is that
+  // analysis's: an exact class is one of the classes isinstance admits.
+  // ⛔ One side only: `type(x) is not C` leaves x any class but C, which
+  // includes C's subclasses -- no narrowing there.
+  if (test.kind == "Compare")
+    if (const auto *comparators = ast::nodeList(test, "comparators");
+        comparators && comparators->size() == 1)
+      if (const auto *ops = ast::nodeList(test, "ops");
+          ops && ops->size() == 1) {
+        const parser::Node *op = ops->front().get();
+        bool positive = ast::isOperator(op, "Is") || ast::isOperator(op, "Eq");
+        bool negative =
+            ast::isOperator(op, "IsNot") || ast::isOperator(op, "NotEq");
+        auto typeCallSubject = [](const parser::Node *node)
+            -> const parser::Node * {
+          if (!node || node->kind != "Call")
+            return nullptr;
+          const parser::Node *callee = ast::node(*node, "func");
+          const auto *args = ast::nodeList(*node, "args");
+          const auto *keywords = ast::nodeList(*node, "keywords");
+          if (!callee || callee->kind != "Name" ||
+              ast::nameSpelling(*callee) != "type" || !args ||
+              args->size() != 1 || !args->front() ||
+              (keywords && !keywords->empty()))
+            return nullptr;
+          return args->front().get();
+        };
+        const parser::Node *left = ast::node(test, "left");
+        const parser::Node *right = comparators->front().get();
+        if ((positive || negative) && left && right) {
+          // The subject is a name whose class the other side names.
+          auto narrowFor = [&](const parser::Node *subject,
+                               mlir::Type classInstance)
+              -> std::optional<BranchTypeNarrowing> {
+            if (!subject || subject->kind != "Name" || !classInstance)
+              return std::nullopt;
+            mlir::Type sourceType =
+                types.widenLiteral(types.inferExpr(subject));
+            if (!sourceType || !mlir::isa<py::ContractType>(classInstance))
+              return std::nullopt;
+            IsInstanceAnalysis analysis =
+                analyzeIsInstance(sourceType, classInstance, types, from);
+            if (analysis.kind != IsInstanceAnalysis::Kind::ClassTest &&
+                analysis.kind != IsInstanceAnalysis::Kind::AlwaysTrue)
+              return std::nullopt;
+            if (!analysis.trueType)
+              return std::nullopt;
+            BranchTypeNarrowing narrowing;
+            narrowing.name = std::string(ast::nameSpelling(*subject));
+            if (positive)
+              narrowing.trueType = analysis.trueType;
+            else
+              narrowing.falseType = analysis.trueType;
+            return narrowing;
+          };
+          auto classOf = [&](const parser::Node *node) -> mlir::Type {
+            if (const parser::Node *inner = typeCallSubject(node))
+              return types.widenLiteral(types.inferExpr(inner));
+            auto typeObject = mlir::dyn_cast_if_present<py::TypeType>(
+                types.widenLiteral(types.inferExpr(node)));
+            if (!typeObject || node->kind != "Name" ||
+                !types.lookupClass(ast::nameSpelling(*node)))
+              return {};
+            return typeObject.getInstanceType();
+          };
+          if (const parser::Node *subject = typeCallSubject(right))
+            if (std::optional<BranchTypeNarrowing> fact =
+                    narrowFor(subject, classOf(left)))
+              return fact;
+          if (const parser::Node *subject = typeCallSubject(left))
+            if (std::optional<BranchTypeNarrowing> fact =
+                    narrowFor(subject, classOf(right)))
+              return fact;
+        }
+      }
+
   std::optional<IsInstanceBranchAnalysis> analyzed =
       optionalIsInstanceBranchAnalysis(test, types, from);
   if (!analyzed)
@@ -1517,9 +1596,130 @@ branchTypeNarrowings(const parser::Node &test, TypeSystem &types,
   return facts;
 }
 
+// ⭐ `type(a) is type(b)` IS DECIDED WHEN THE CLASSES CANNOT MEET. Each side
+// names a class its static type bounds -- `type(x)` any class x's static class
+// admits, a class name that class alone -- and two sides whose classes cannot
+// coincide answer `is` with False. That is what lets a method inlined at a
+// call site drop the arm its argument cannot reach, as CPython never runs it:
+//
+//     def __eq__(self, other: object) -> bool:
+//         if type(self) is not type(other):
+//             return NotImplemented
+//         return self.n == other.n    # T("a") == 3: never runs in CPython,
+//                                     # refused here as `int.n`
+//
+// ⛔ A third class may derive from both bounds (a mixin), and a builtin
+// exception's subclasses are a taxonomy the module does not list, so either
+// keeps the answer open.
+static std::optional<bool>
+staticClassIdentityTruth(const parser::Node &test, TypeSystem &types,
+                         mlir::Operation *from) {
+  if (test.kind != "Compare" || !from)
+    return std::nullopt;
+  const auto *comparators = ast::nodeList(test, "comparators");
+  const auto *ops = ast::nodeList(test, "ops");
+  if (!comparators || comparators->size() != 1 || !ops || ops->size() != 1)
+    return std::nullopt;
+  const parser::Node *op = ops->front().get();
+  bool positive = ast::isOperator(op, "Is") || ast::isOperator(op, "Eq");
+  bool negative = ast::isOperator(op, "IsNot") || ast::isOperator(op, "NotEq");
+  if (!positive && !negative)
+    return std::nullopt;
+  mlir::ModuleOp module = mlir::dyn_cast<mlir::ModuleOp>(from);
+  if (!module)
+    module = from->getParentOfType<mlir::ModuleOp>();
+  if (!module)
+    return std::nullopt;
+  struct Side {
+    py::ContractType bound;
+    bool exact = false;
+  };
+  auto closed = [&](py::ContractType bound) {
+    llvm::StringRef name = bound.getContractName();
+    if (name == "builtins.object" || name == "typing.Any" ||
+        name == "builtins.type" || py::exceptions::findByContract(name))
+      return false;
+    bool subclassed = false;
+    module.walk([&](py::ClassOp classOp) {
+      if (subclassed)
+        return;
+      std::optional<mlir::Type> classType =
+          types.lookupClass(classOp.getSymName());
+      if (classType && *classType != mlir::Type(bound) &&
+          pythonSubclassOf(*classType, bound, types, from))
+        subclassed = true;
+    });
+    return !subclassed;
+  };
+  auto side = [&](const parser::Node *node) -> std::optional<Side> {
+    if (!node)
+      return std::nullopt;
+    if (node->kind == "Call") {
+      const parser::Node *callee = ast::node(*node, "func");
+      const auto *args = ast::nodeList(*node, "args");
+      const auto *keywords = ast::nodeList(*node, "keywords");
+      if (!callee || callee->kind != "Name" ||
+          ast::nameSpelling(*callee) != "type" || !args ||
+          args->size() != 1 || !args->front() ||
+          (keywords && !keywords->empty()))
+        return std::nullopt;
+      auto bound = mlir::dyn_cast_if_present<py::ContractType>(
+          types.widenLiteral(types.inferExpr(args->front().get())));
+      if (!bound || !bound.getArguments().empty())
+        return std::nullopt;
+      return Side{bound, closed(bound)};
+    }
+    // A class's own name names that class alone -- unless a local or a
+    // parameter shadows the spelling, and then it is a class value.
+    if (node->kind == "Name" && types.namesClassInScope(ast::nameSpelling(*node)))
+      if (std::optional<mlir::Type> cls =
+              types.lookupClass(ast::nameSpelling(*node)))
+        if (auto bound = mlir::dyn_cast<py::ContractType>(*cls);
+            bound && bound.getArguments().empty())
+          return Side{bound, /*exact=*/true};
+    return std::nullopt;
+  };
+  std::optional<Side> lhs = side(ast::node(test, "left"));
+  std::optional<Side> rhs = side(comparators->front().get());
+  if (!lhs || !rhs)
+    return std::nullopt;
+  auto under = [&](py::ContractType sub, py::ContractType base) {
+    return sub == base || pythonSubclassOf(sub, base, types, from);
+  };
+  bool mayMeet;
+  if (lhs->exact && rhs->exact) {
+    if (lhs->bound == rhs->bound)
+      return positive;
+    mayMeet = false;
+  } else if (lhs->exact) {
+    mayMeet = under(lhs->bound, rhs->bound);
+  } else if (rhs->exact) {
+    mayMeet = under(rhs->bound, lhs->bound);
+  } else {
+    mayMeet = under(lhs->bound, rhs->bound) || under(rhs->bound, lhs->bound) ||
+              (py::exceptions::findByContract(lhs->bound.getContractName()) &&
+               py::exceptions::findByContract(rhs->bound.getContractName()));
+    if (!mayMeet)
+      module.walk([&](py::ClassOp classOp) {
+        if (mayMeet)
+          return;
+        std::optional<mlir::Type> classType =
+            types.lookupClass(classOp.getSymName());
+        if (classType && pythonSubclassOf(*classType, lhs->bound, types, from) &&
+            pythonSubclassOf(*classType, rhs->bound, types, from))
+          mayMeet = true;
+      });
+  }
+  if (mayMeet)
+    return std::nullopt;
+  return negative;
+}
+
 std::optional<bool> optionalStaticBranchTruth(const parser::Node &test,
                                               TypeSystem &types,
                                               mlir::Operation *from) {
+  if (std::optional<bool> classes = staticClassIdentityTruth(test, types, from))
+    return classes;
   if (test.kind == "Constant") {
     if (std::optional<bool> value = ast::boolean(test, "value"))
       return *value;
