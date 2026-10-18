@@ -948,6 +948,11 @@ private:
   std::optional<Value> emitClassValueAttribute(const parser::Node &expr,
                                                Value classValue,
                                                llvm::StringRef attribute);
+  Value emitClassOfValue(const parser::Node &anchor, Value value,
+                         mlir::Type resultType);
+  // An isinstance/issubclass operand, or an element of a tuple of them, that
+  // is a class value the static type does not decide.
+  bool targetHasDynamicClassValue(const parser::Node *node);
   std::optional<Value>
   emitClassValueSubclassTest(const parser::Node &expr,
                              const parser::Node *subjectNode,

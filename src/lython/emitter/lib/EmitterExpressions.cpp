@@ -3095,85 +3095,14 @@ ModuleEmitter::tryEmitDynamicClassName(const parser::Node &expr) {
   if (!args || args->size() != 1 || !args->front())
     return std::nullopt;
   mlir::Type subject = types.widenLiteral(types.inferExpr(args->front().get()));
-  // ⭐ A UNION KNOWS ITS MEMBERS, and the value carries which one it is -- so
-  // `type(v).__name__` over `int | str` is the member's name selected by the
-  // same tag test `isinstance` uses. It was refused as "needs a statically
-  // resolved class", which is true of the union and false of the value.
-  //
-  // ⛔ Written as the conditional expression a reader would have written, so
-  // the tag tests, the narrowing and the string constants all come from paths
-  // that already exist. That is also why the subject must be a NAME: the chain
-  // mentions it once per member, and re-evaluating a call would run it N times.
-  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(subject)) {
-    const parser::Node *subjectNode = args->front().get();
-    // ⭐ AN EXPRESSION IS BOUND FIRST. The chain mentions the subject once per
-    // member, so a call or a subscript would run N times -- which is why this
-    // took a NAME only, and why `type(d[k]).__name__` was refused while
-    // `v = d[k]` on the line above made the same program compile. A temporary
-    // is what the source would have written.
-    parser::NodePtr temporary;
-    if (subjectNode->kind != "Name") {
-      std::string name = "__lytypesubject" + std::to_string(++listCompCounter);
-      parser::NodePtr binding = synth::assign(
-          synth::name(name, expr.range), args->front(), expr.range);
-      emitStatement(*binding);
-      synthesizedIteratorDefs.push_back(binding);
-      temporary = synth::name(name, expr.range);
-      subjectNode = temporary.get();
-    }
-    llvm::SmallVector<std::pair<mlir::Type, std::string>, 4> members;
-    for (mlir::Type rawMember : unionType.getMemberTypes()) {
-      mlir::Type member = types.widenLiteral(rawMember);
-      if (isNoneTypeLike(member)) {
-        members.push_back({member, "NoneType"});
-        continue;
-      }
-      auto memberContract = mlir::dyn_cast_if_present<py::ContractType>(member);
-      if (!memberContract)
-        return std::nullopt;
-      llvm::StringRef qualified = memberContract.getContractName();
-      // A member with a subclass would answer the static name, which is the
-      // same wrong answer tryEmitTypeCall refuses for a bare value.
-      for (const auto &entry : classMros)
-        if (entry.getKey() != qualified &&
-            llvm::is_contained(entry.second, qualified))
-          return std::nullopt;
-      llvm::StringRef simple = qualified;
-      if (auto dot = qualified.rfind('.'); dot != llvm::StringRef::npos)
-        simple = qualified.drop_front(dot + 1);
-      members.push_back({member, simple.str()});
-    }
-    if (members.size() < 2)
-      return std::nullopt;
-    parser::SourceRange range = expr.range;
-    parser::NodePtr chain =
-        synth::strConstant(members.back().second, range);
-    for (auto it = members.rbegin() + 1; it != members.rend(); ++it) {
-      parser::NodePtr test;
-      if (isNoneTypeLike(it->first)) {
-        test = synth::compare(synth::name(std::string(ast::nameSpelling(*subjectNode)),
-                                          range),
-                              "Is", synth::noneConstant(range), range);
-      } else {
-        auto memberContract = mlir::cast<py::ContractType>(it->first);
-        llvm::StringRef qualified = memberContract.getContractName();
-        llvm::StringRef simple = qualified;
-        if (auto dot = qualified.rfind('.'); dot != llvm::StringRef::npos)
-          simple = qualified.drop_front(dot + 1);
-        test = synth::call(
-            synth::name(std::string("isinstance"), range),
-            std::vector<parser::NodePtr>{
-                synth::name(std::string(ast::nameSpelling(*subjectNode)), range),
-                synth::name(simple.str(), range)},
-            range);
-      }
-      chain = synth::ifExp(std::move(test),
-                           synth::strConstant(it->second, range),
-                           std::move(chain), range);
-    }
-    synthesizedIteratorDefs.push_back(chain);
-    return emitExpr(chain.get());
-  }
+  // ⛔ A UNION IS NOT ANSWERED HERE. `type(v)` over one is its active
+  // member's class value (`emitClassOfValue`), and `__name__` reads that at
+  // run time. The tag chain that stood here answered each member's STATIC
+  // name, and a member with subclasses the program does not declare -- the
+  // exception taxonomy -- printed "BaseException" for a ValueError held in a
+  // `BaseException | None`.
+  if (mlir::isa_and_nonnull<py::UnionType>(subject))
+    return std::nullopt;
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(subject);
   if (!contract)
     return std::nullopt;

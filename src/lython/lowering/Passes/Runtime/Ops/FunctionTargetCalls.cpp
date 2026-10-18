@@ -859,8 +859,7 @@ RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
                 op, *source, "boxed.object.consuming.argument")))
           return mlir::failure();
       }
-      if (concrete && concrete->kind == RuntimeBundle::Kind::Object &&
-          !sourceAlreadyBoxed &&
+      if (concrete && concrete->isObjectLike() && !sourceAlreadyBoxed &&
           !RuntimeBundleLowerer::isBuiltinsObjectContract(concrete->contract)) {
         mlir::FailureOr<RuntimeBundle> boxed =
             RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(

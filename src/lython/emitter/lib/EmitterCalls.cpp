@@ -3264,6 +3264,67 @@ ModuleEmitter::emitClassValueAttribute(const parser::Node &expr,
   return emitClassValueDispatch(expr, classValue, bound, resultType, armFor);
 }
 
+// ⭐ THE CLASS OF AN ALREADY-EMITTED VALUE, as a class value of
+// `resultType`: a static class where the value's type decides it, its header's
+// where it does not, and a union's active member's, chosen by the tag -- each
+// arm unwraps its member and answers the way a value of the member's own type
+// would.
+Value ModuleEmitter::emitClassOfValue(const parser::Node &anchor, Value value,
+                                      mlir::Type resultType) {
+  auto classOf = [&](Value subject) -> mlir::Value {
+    mlir::Type widened = types.widenLiteral(subject.type);
+    mlir::Value classValue;
+    mlir::Type classType;
+    auto contract = mlir::dyn_cast_if_present<py::ContractType>(widened);
+    if (isNoneTypeLike(widened) || !contract) {
+      mlir::Type instance = isNoneTypeLike(widened)
+                                ? types.contract("types.NoneType")
+                                : types.object();
+      classType = types.typeObject(instance);
+      classValue =
+          py::TypeObjectOp::create(builder, loc(anchor), classType, instance)
+              .getResult();
+    } else if (!classIsClosed(contract.getContractName())) {
+      classType = types.typeObject(contract);
+      classValue = py::TypeOfOp::create(builder, loc(anchor), classType,
+                                        subject.value)
+                       .getResult();
+    } else {
+      classType = types.typeObject(contract);
+      classValue =
+          py::TypeObjectOp::create(builder, loc(anchor), classType, contract)
+              .getResult();
+    }
+    return coerceValue(Value{classValue, classType}, resultType, anchor).value;
+  };
+  auto unionType =
+      mlir::dyn_cast_if_present<py::UnionType>(types.widenLiteral(value.type));
+  if (!unionType)
+    return Value{classOf(value), resultType};
+  llvm::SmallVector<mlir::Type, 4> members(unionType.getMemberTypes().begin(),
+                                           unionType.getMemberTypes().end());
+  auto classOfMember = [&](mlir::Type member) {
+    return classOf(Value{py::UnionUnwrapOp::create(builder, loc(anchor), member,
+                                                   value.value)
+                             .getResult(),
+                         member});
+  };
+  std::function<mlir::Value(std::size_t)> chain =
+      [&](std::size_t index) -> mlir::Value {
+    if (index + 1 == members.size())
+      return classOfMember(members[index]);
+    mlir::Value active =
+        py::UnionTestOp::create(builder, loc(anchor), builder.getI1Type(),
+                                value.value, mlir::TypeAttr::get(members[index]))
+            .getResult();
+    return emitValueDiamond(
+        loc(anchor), active, resultType,
+        [&] { return classOfMember(members[index]); },
+        [&] { return chain(index + 1); });
+  };
+  return Value{chain(0), resultType};
+}
+
 std::optional<Value>
 ModuleEmitter::tryEmitTypeCall(const parser::Node &expr,
                                const parser::Node *calleeNode) {
@@ -3306,61 +3367,12 @@ ModuleEmitter::tryEmitTypeCall(const parser::Node &expr,
         py::TypeObjectOp::create(builder, loc(expr), typeType, noneClass);
     return Value{object.getResult(), typeType};
   }
-  // ⭐ A UNION'S CLASS IS ITS ACTIVE MEMBER'S, chosen by the tag: each arm
-  // unwraps its member and answers that member's class the way a value of
-  // the member's own type would.
-  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(subject)) {
+  if (mlir::isa_and_nonnull<py::UnionType>(subject)) {
     Value receiver = emitExpr(subjectNode);
     mlir::Type resultType = types.widenLiteral(types.inferExpr(&expr));
     if (!mlir::isa_and_nonnull<py::TypeType>(resultType))
       resultType = types.typeObject(types.object());
-    llvm::SmallVector<mlir::Type, 4> members(unionType.getMemberTypes().begin(),
-                                             unionType.getMemberTypes().end());
-    auto classOfMember = [&](mlir::Type member) -> mlir::Value {
-      mlir::Type widened = types.widenLiteral(member);
-      Value value{py::UnionUnwrapOp::create(builder, loc(expr), member,
-                                            receiver.value)
-                      .getResult(),
-                  member};
-      mlir::Value classValue;
-      mlir::Type classType;
-      auto memberContract = mlir::dyn_cast_if_present<py::ContractType>(widened);
-      if (isNoneTypeLike(widened) || !memberContract) {
-        mlir::Type instance = isNoneTypeLike(widened)
-                                  ? types.contract("types.NoneType")
-                                  : types.object();
-        classType = types.typeObject(instance);
-        classValue =
-            py::TypeObjectOp::create(builder, loc(expr), classType, instance)
-                .getResult();
-      } else if (!classIsClosed(memberContract.getContractName())) {
-        classType = types.typeObject(memberContract);
-        classValue = py::TypeOfOp::create(builder, loc(expr), classType,
-                                          value.value)
-                         .getResult();
-      } else {
-        classType = types.typeObject(memberContract);
-        classValue = py::TypeObjectOp::create(builder, loc(expr), classType,
-                                              memberContract)
-                         .getResult();
-      }
-      return coerceValue(Value{classValue, classType}, resultType, expr).value;
-    };
-    std::function<mlir::Value(std::size_t)> chain =
-        [&](std::size_t index) -> mlir::Value {
-      if (index + 1 == members.size())
-        return classOfMember(members[index]);
-      mlir::Value active =
-          py::UnionTestOp::create(builder, loc(expr), builder.getI1Type(),
-                                  receiver.value,
-                                  mlir::TypeAttr::get(members[index]))
-              .getResult();
-      return emitValueDiamond(
-          loc(expr), active, resultType,
-          [&] { return classOfMember(members[index]); },
-          [&] { return chain(index + 1); });
-    };
-    return Value{chain(0), resultType};
+    return emitClassOfValue(expr, receiver, resultType);
   }
   if (!contract)
     return refuse("type(x) needs a statically resolved class, and " +
@@ -3408,14 +3420,10 @@ ModuleEmitter::tryEmitIsInstanceCall(const parser::Node &expr,
   // the target names its bound or any subclass of it, so the static answer
   // for the bound -- what a `t: type[Base]` used to get -- is wrong for a
   // value naming a subclass. The value's own class walks its MRO for it.
-  if (const parser::Node *targetNode = (*args)[1].get();
-      targetNode->kind != "Tuple") {
-    mlir::Type targetType = types.widenLiteral(types.inferExpr(targetNode));
-    if (mlir::isa<py::TypeType>(targetType) &&
-        !classValueIsExact(targetNode, targetType))
-      return emitClassValueSubclassTest(expr, args->front().get(), targetNode,
-                                        /*subjectIsInstance=*/true);
-  }
+  if (targetHasDynamicClassValue((*args)[1].get()))
+    return emitClassValueSubclassTest(expr, args->front().get(),
+                                      (*args)[1].get(),
+                                      /*subjectIsInstance=*/true);
   std::optional<llvm::SmallVector<mlir::Type, 4>> targets =
       isinstanceTargetTypes((*args)[1].get(), types);
   if (!targets) {
@@ -5082,40 +5090,66 @@ ModuleEmitter::tryEmitAsciiCall(const parser::Node &expr,
 
 // `isinstance(x, t)` / `issubclass(s, t)` over class values: the class of x
 // (or s itself) has t in its MRO.
+bool ModuleEmitter::targetHasDynamicClassValue(const parser::Node *node) {
+  if (!node)
+    return false;
+  if (node->kind == "Tuple") {
+    if (const auto *elts = ast::nodeList(*node, "elts"))
+      for (const parser::NodePtr &elt : *elts)
+        if (targetHasDynamicClassValue(elt.get()))
+          return true;
+    return false;
+  }
+  mlir::Type type = types.widenLiteral(types.inferExpr(node));
+  return mlir::isa<py::TypeType>(type) && !classValueIsExact(node, type);
+}
+
 std::optional<Value> ModuleEmitter::emitClassValueSubclassTest(
     const parser::Node &expr, const parser::Node *subjectNode,
     const parser::Node *targetNode, bool subjectIsInstance) {
   Value subject = emitExpr(subjectNode);
-  Value target = emitExpr(targetNode);
-  auto refuse = [&](llvm::StringRef what) -> std::optional<Value> {
+  // A tuple of classes is any of them, each evaluated in order.
+  llvm::SmallVector<Value, 4> targets;
+  if (targetNode->kind == "Tuple") {
+    if (const auto *elts = ast::nodeList(*targetNode, "elts"))
+      for (const parser::NodePtr &elt : *elts)
+        targets.push_back(emitExpr(elt.get()));
+  } else {
+    targets.push_back(emitExpr(targetNode));
+  }
+  auto refuse = [&](mlir::Type offending) -> std::optional<Value> {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, expr.range.start,
-        what.str() + " needs class values on both sides here, and " +
-            typeText(subjectIsInstance ? target.type : subject.type) +
-            " is not one"});
+        std::string(subjectIsInstance ? "isinstance()" : "issubclass()") +
+            " needs class values on both sides here, and " +
+            typeText(offending) + " is not one"});
     return emitNone(expr);
   };
-  if (!mlir::isa<py::TypeType>(target.type))
-    return refuse(subjectIsInstance ? "isinstance()" : "issubclass()");
+  for (const Value &target : targets)
+    if (!mlir::isa<py::TypeType>(target.type))
+      return refuse(target.type);
+  if (targets.empty())
+    return refuse(types.inferExpr(targetNode));
   mlir::Value subjectClass = subject.value;
   if (subjectIsInstance) {
     mlir::Type instance = types.widenLiteral(subject.type);
-    if (mlir::isa<py::UnionType>(instance)) {
-      subject = coerceValue(subject, types.object(), expr);
-      instance = types.object();
-    }
     mlir::Type bound = mlir::isa<py::ContractType>(instance) ? instance
                                                              : types.object();
-    subjectClass = py::TypeOfOp::create(builder, loc(expr),
-                                        types.typeObject(bound), subject.value)
-                       .getResult();
+    subjectClass =
+        emitClassOfValue(expr, subject, types.typeObject(bound)).value;
   } else if (!mlir::isa<py::TypeType>(subject.type)) {
-    return refuse("issubclass()");
+    return refuse(subject.type);
   }
-  mlir::Value test =
-      py::TypeSubclassOp::create(builder, loc(expr), builder.getI1Type(),
-                                 subjectClass, target.value)
-          .getResult();
+  mlir::Value test;
+  for (const Value &target : targets) {
+    mlir::Value one =
+        py::TypeSubclassOp::create(builder, loc(expr), builder.getI1Type(),
+                                   subjectClass, target.value)
+            .getResult();
+    test = test ? mlir::arith::OrIOp::create(builder, loc(expr), test, one)
+                      .getResult()
+                : one;
+  }
   auto pyBool =
       py::CastFromPrimOp::create(builder, loc(expr), types.boolType(), test);
   return Value{pyBool.getResult(), types.boolType()};
@@ -5137,15 +5171,10 @@ ModuleEmitter::tryEmitIssubclassCall(const parser::Node &expr,
     return rejectIssubclass("issubclass() takes exactly two arguments");
   // A class value on either side that the static type does not decide is
   // answered at run time, from the MRO of the class it names.
-  for (const parser::NodePtr &arg : *args)
-    if (arg && arg->kind != "Tuple") {
-      mlir::Type argType = types.widenLiteral(types.inferExpr(arg.get()));
-      if (mlir::isa<py::TypeType>(argType) &&
-          !classValueIsExact(arg.get(), argType))
-        return emitClassValueSubclassTest(expr, (*args)[0].get(),
-                                          (*args)[1].get(),
-                                          /*subjectIsInstance=*/false);
-    }
+  if (targetHasDynamicClassValue((*args)[0].get()) ||
+      targetHasDynamicClassValue((*args)[1].get()))
+    return emitClassValueSubclassTest(expr, (*args)[0].get(), (*args)[1].get(),
+                                      /*subjectIsInstance=*/false);
   // Static classes only: the hierarchy is compile-time (C3 linearized), so
   // the answer folds to a constant.
   auto classOf = [&](const parser::Node *node) -> std::optional<mlir::Type> {

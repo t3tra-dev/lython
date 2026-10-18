@@ -1,0 +1,6 @@
+True False
+True True
+True False
+ValueError KeyError NoneType
+KeyError True False <class 'KeyError'>
+ZeroDivisionError False True <class 'ZeroDivisionError'>

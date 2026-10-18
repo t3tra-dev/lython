@@ -178,7 +178,7 @@ mlir::LogicalResult RuntimeBundleLowerer::appendBundlePhysicalOperands(
   bool boxIntoObject =
       destination &&
       RuntimeBundleLowerer::isBuiltinsObjectContract(destination) &&
-      bundle.kind == RuntimeBundle::Kind::Object &&
+      bundle.isObjectLike() &&
       !RuntimeBundleLowerer::isBuiltinsObjectContract(bundle.contract);
   if (values.size() == expectedTypes.size() && !boxIntoObject) {
     bool exact = true;
@@ -194,7 +194,7 @@ mlir::LogicalResult RuntimeBundleLowerer::appendBundlePhysicalOperands(
     }
   }
 
-  if (expectedTypes.size() == 1 && bundle.kind == RuntimeBundle::Kind::Object &&
+  if (expectedTypes.size() == 1 && bundle.isObjectLike() &&
       isBuiltinsObjectHandleType(expectedTypes.front())) {
     if (!RuntimeBundleLowerer::isBuiltinsObjectContract(bundle.contract)) {
       mlir::FailureOr<RuntimeBundle> boxed =

@@ -229,12 +229,26 @@ void ModuleEmitter::emitWithCleanup(const parser::Node &anchor,
   auto noneOp = py::NoneOp::create(builder, loc(anchor), types.none());
   Value none{noneOp.getResult(), types.none()};
   Value exception = exceptionNode ? emitExpr(exceptionNode) : none;
+  // The exception's class, as `type(e)` answers it: the class the raised
+  // object HAS, read from its header.
+  Value exceptionClass = none;
+  if (exceptionNode) {
+    mlir::Type bound = types.widenLiteral(exception.type);
+    if (!mlir::isa<py::ContractType>(bound))
+      bound = types.contract("builtins.BaseException");
+    mlir::Type classType = types.typeObject(bound);
+    exceptionClass = Value{py::TypeOfOp::create(builder, loc(anchor),
+                                                classType, exception.value)
+                               .getResult(),
+                           classType};
+  }
   if (cleanup.async) {
     // The source arm, which CAN carry the exception: a Python `__aexit__`
     // declares the three parameters, so the manifest's shape below is not the
     // constraint here.
-    if (std::optional<Value> exited = tryEmitClassDunder(
-            anchor, cleanup.manager, "__aexit__", {none, exception, none})) {
+    if (std::optional<Value> exited =
+            tryEmitClassDunder(anchor, cleanup.manager, "__aexit__",
+                               {exceptionClass, exception, none})) {
       Value suppress = emitAwaitValue(anchor, *exited);
       emitWithExitDecision(anchor, exceptionNode ? &suppress : nullptr);
       return;
@@ -248,8 +262,9 @@ void ModuleEmitter::emitWithCleanup(const parser::Node &anchor,
   }
 
   // The `__enter__` instance of the same rule; see emitWith.
-  if (std::optional<Value> exited = tryEmitClassDunder(
-          anchor, cleanup.manager, "__exit__", {none, exception, none})) {
+  if (std::optional<Value> exited =
+          tryEmitClassDunder(anchor, cleanup.manager, "__exit__",
+                             {exceptionClass, exception, none})) {
     Value suppress = *exited;
     emitWithExitDecision(anchor, exceptionNode ? &suppress : nullptr);
     return;
@@ -337,10 +352,10 @@ void ModuleEmitter::refuseUnrepresentableExitArguments(
     return;
   llvm::SmallVector<std::string, 4> names = parameterNames(*exit.method);
   const auto *body = ast::nodeList(*exit.method, "body");
-  // 1 = exc_type, 3 = traceback, counting self. 2 = the exception instance,
-  // which py.except.current_value DOES produce and which is therefore not
-  // named here.
-  for (std::size_t position : {std::size_t(1), std::size_t(3)}) {
+  // 3 = the traceback, counting self. The exception's class (1) is its class
+  // value and the instance (2) is the caught object, so neither is named
+  // here.
+  for (std::size_t position : {std::size_t(3)}) {
     if (position >= names.size())
       continue;
     bool observed = false;
@@ -352,10 +367,10 @@ void ModuleEmitter::refuseUnrepresentableExitArguments(
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, anchor.range.start,
         "__exit__ reads its '" + names[position] +
-            "' parameter, and this compiler cannot produce that argument: an "
-            "exception's class object and its traceback have no value "
-            "representation. Read the exception instance (the second "
-            "parameter) instead"});
+            "' parameter, and this compiler cannot produce that argument: a "
+            "traceback has no value representation. Read the exception "
+            "instance (the second parameter) or its class (the first) "
+            "instead"});
     return;
   }
 }

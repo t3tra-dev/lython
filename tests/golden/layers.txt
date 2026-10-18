@@ -43,7 +43,7 @@ errors/del_variable emit
 errors/dict_view_needs_a_consumer emit
 errors/eq_without_hash_unhashable emit
 errors/except_star_local_rebind emit
-errors/exit_reads_the_exception_class emit
+errors/exit_reads_the_traceback emit
 errors/float_truthiness emit
 errors/for_over_a_subclass_overridden_iter emit
 errors/generic_bare_reference emit

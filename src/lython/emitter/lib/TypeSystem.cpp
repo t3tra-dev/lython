@@ -4704,7 +4704,7 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           return inference.resultType;
         return fail(inference.failureReason);
       }
-      if (name == "isinstance")
+      if (name == "isinstance" || name == "issubclass")
         return boolType();
       // `type(v)` is v's class, as a class value: the emitter answers it from
       // the static class where that decides it and from the value's header
