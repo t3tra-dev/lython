@@ -69,4 +69,9 @@ namesReadByNestedCallables(const std::vector<parser::NodePtr> *body);
 
 std::string sanitizedSymbolPart(llvm::StringRef text);
 
+// Renames each comprehension target that shares its spelling with another
+// name of its scope, throughout the part of the comprehension that is the
+// target's scope.
+void scopeComprehensionTargets(const parser::Node &moduleNode);
+
 } // namespace lython::emitter

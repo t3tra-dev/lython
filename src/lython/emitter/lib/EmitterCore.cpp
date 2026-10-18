@@ -4,6 +4,7 @@
 #include "PyProtocols.h"
 
 #include "AstAccess.h"
+#include "ClosureAnalysis.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h" // IWYU pragma: keep
@@ -68,6 +69,13 @@ EmitResult ModuleEmitter::emit() {
     if (source.moduleNode && !source.isStub)
       desugarClassicGenerics(*source.moduleNode);
   desugarClassicGenerics(moduleNode);
+  // Before every binder, for the same reason: a comprehension target that
+  // shares a name with its scope is renamed, so nothing counts it as a
+  // binding of that scope.
+  for (const EmitOptions::SourceModule &source : options.sourceModules)
+    if (source.moduleNode && !source.isStub)
+      scopeComprehensionTargets(*source.moduleNode);
+  scopeComprehensionTargets(moduleNode);
   // After the generic desugar (a `Protocol[T]` base is what it leaves for a
   // generic protocol) and before any binder reads a base list.
   desugarProtocols();

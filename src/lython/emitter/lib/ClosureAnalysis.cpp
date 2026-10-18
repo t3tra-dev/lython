@@ -569,6 +569,228 @@ llvm::StringSet<> reboundNames(const parser::Node &scope) {
   return rebound;
 }
 
+namespace {
+
+bool isComprehensionNode(const parser::Node &node) {
+  return node.kind == "ListComp" || node.kind == "SetComp" ||
+         node.kind == "DictComp" || node.kind == "GeneratorExp";
+}
+
+// Every spelling `node`'s subtree uses for a name: a Name, a parameter, a
+// `global` or `nonlocal` declaration.
+void countNameSpellings(const parser::Node *node,
+                        llvm::StringMap<unsigned> &counts) {
+  if (!node)
+    return;
+  if (node->kind == "Name") {
+    if (auto id = ast::string(*node, "id"))
+      ++counts[*id];
+  } else if (node->kind == "arg") {
+    if (auto arg = ast::string(*node, "arg"))
+      ++counts[*arg];
+  } else if (node->kind == "Global" || node->kind == "Nonlocal") {
+    if (const auto *names = ast::stringList(*node, "names"))
+      for (const std::string &name : *names)
+        ++counts[name];
+  }
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value))
+      countNameSpellings(child->get(), counts);
+    else if (const auto *children =
+                 std::get_if<std::vector<parser::NodePtr>>(&field.value))
+      for (const parser::NodePtr &element : *children)
+        countNameSpellings(element.get(), counts);
+  }
+}
+
+void appendTargetSpellings(const parser::Node *target,
+                           llvm::SmallVectorImpl<std::string> &names) {
+  if (!target)
+    return;
+  if (target->kind == "Name") {
+    names.push_back(std::string(ast::nameSpelling(*target)));
+    return;
+  }
+  if (target->kind == "Starred") {
+    appendTargetSpellings(ast::node(*target, "value"), names);
+    return;
+  }
+  if (target->kind == "Tuple" || target->kind == "List")
+    if (const auto *elts = ast::nodeList(*target, "elts"))
+      for (const parser::NodePtr &elt : *elts)
+        appendTargetSpellings(elt.get(), names);
+}
+
+bool comprehensionBinds(const parser::Node &comprehension,
+                        llvm::StringRef name) {
+  const auto *generators = ast::nodeList(comprehension, "generators");
+  if (!generators)
+    return false;
+  for (const parser::NodePtr &generator : *generators) {
+    if (!generator)
+      continue;
+    llvm::SmallVector<std::string, 2> targets;
+    appendTargetSpellings(ast::node(*generator, "target"), targets);
+    if (llvm::is_contained(targets, name))
+      return true;
+  }
+  return false;
+}
+
+void renameNameNode(parser::Node &node, llvm::StringRef to) {
+  for (parser::Field &field : node.fields)
+    if (field.name == "id")
+      field.value = to.str();
+}
+
+// `from` becomes `to` wherever it still names the comprehension's binding:
+// not inside a lambda or a nested comprehension that binds `from` again, past
+// the nested comprehension's first iterable, which its ENCLOSING scope
+// evaluates.
+void renameBoundSpelling(parser::Node *node, llvm::StringRef from,
+                         llvm::StringRef to) {
+  if (!node)
+    return;
+  if (node->kind == "Name") {
+    if (llvm::StringRef(ast::nameSpelling(*node)) == from)
+      renameNameNode(*node, to);
+    return;
+  }
+  // A lambda that takes `from` as a parameter binds it again -- but its
+  // defaults are evaluated where the lambda is built, so `lambda x=x: x`
+  // reads the comprehension's `x` there.
+  if (node->kind == "Lambda") {
+    const parser::Node *arguments = ast::node(*node, "args");
+    bool parameter = false;
+    if (arguments)
+      for (const parser::Field &field : arguments->fields) {
+        auto takes = [&](const parser::Node *arg) {
+          return arg && arg->kind == "arg" &&
+                 llvm::StringRef(ast::nameSpelling(*arg)) == from;
+        };
+        if (const auto *one = std::get_if<parser::NodePtr>(&field.value))
+          parameter = parameter || takes(one->get());
+        else if (const auto *many =
+                     std::get_if<std::vector<parser::NodePtr>>(&field.value))
+          for (const parser::NodePtr &arg : *many)
+            parameter = parameter || takes(arg.get());
+      }
+    if (parameter) {
+      if (arguments)
+        for (llvm::StringRef defaults : {"defaults", "kw_defaults"})
+          if (const auto *values = ast::nodeList(*arguments, defaults))
+            for (const parser::NodePtr &value : *values)
+              renameBoundSpelling(value.get(), from, to);
+      return;
+    }
+  }
+  if (isComprehensionNode(*node) && comprehensionBinds(*node, from)) {
+    if (const auto *generators = ast::nodeList(*node, "generators"))
+      if (!generators->empty() && generators->front())
+        renameBoundSpelling(
+            const_cast<parser::Node *>(ast::node(*generators->front(), "iter")),
+            from, to);
+    return;
+  }
+  for (parser::Field &field : node->fields) {
+    if (auto *child = std::get_if<parser::NodePtr>(&field.value))
+      renameBoundSpelling(child->get(), from, to);
+    else if (auto *children =
+                 std::get_if<std::vector<parser::NodePtr>>(&field.value))
+      for (parser::NodePtr &element : *children)
+        renameBoundSpelling(element.get(), from, to);
+  }
+}
+
+void scopeTargetsOf(parser::Node &comprehension, const parser::Node &scope,
+                    unsigned &counter) {
+  auto *generators = const_cast<std::vector<parser::NodePtr> *>(
+      ast::nodeList(comprehension, "generators"));
+  if (!generators)
+    return;
+  llvm::StringMap<unsigned> inScope;
+  llvm::StringMap<unsigned> inComprehension;
+  countNameSpellings(&scope, inScope);
+  countNameSpellings(&comprehension, inComprehension);
+  llvm::SmallVector<std::string, 4> targets;
+  for (const parser::NodePtr &generator : *generators)
+    if (generator)
+      appendTargetSpellings(ast::node(*generator, "target"), targets);
+  llvm::StringSet<> renamed;
+  for (const std::string &name : targets) {
+    if (!renamed.insert(name).second ||
+        inScope.lookup(name) <= inComprehension.lookup(name))
+      continue;
+    std::string fresh = name + "$comp" + std::to_string(++counter);
+    // The comprehension's scope: every generator but the first one's
+    // iterable, the filters and the element.
+    for (auto [index, generator] : llvm::enumerate(*generators)) {
+      if (!generator)
+        continue;
+      for (parser::Field &field : generator->fields) {
+        if (field.name == "iter" && index == 0)
+          continue;
+        if (auto *child = std::get_if<parser::NodePtr>(&field.value))
+          renameBoundSpelling(child->get(), name, fresh);
+        else if (auto *children =
+                     std::get_if<std::vector<parser::NodePtr>>(&field.value))
+          for (parser::NodePtr &element : *children)
+            renameBoundSpelling(element.get(), name, fresh);
+      }
+    }
+    for (parser::Field &field : comprehension.fields)
+      if (field.name == "elt" || field.name == "key" || field.name == "value")
+        if (auto *child = std::get_if<parser::NodePtr>(&field.value))
+          renameBoundSpelling(child->get(), name, fresh);
+  }
+}
+
+void scopeComprehensionsUnder(parser::Node *node, const parser::Node *scope,
+                              unsigned &counter) {
+  if (!node)
+    return;
+  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
+      node->kind == "Lambda")
+    scope = node;
+  if (isComprehensionNode(*node))
+    scopeTargetsOf(*node, *scope, counter);
+  for (parser::Field &field : node->fields) {
+    if (auto *child = std::get_if<parser::NodePtr>(&field.value))
+      scopeComprehensionsUnder(child->get(), scope, counter);
+    else if (auto *children =
+                 std::get_if<std::vector<parser::NodePtr>>(&field.value))
+      for (parser::NodePtr &element : *children)
+        scopeComprehensionsUnder(element.get(), scope, counter);
+  }
+}
+
+} // namespace
+
+// ⭐ A COMPREHENSION'S TARGETS ARE ITS OWN, as CPython's comprehension scope
+// makes them. Every form is emitted INLINE here -- a loop in the enclosing
+// frame -- so a target spelled like another binding of that frame WAS that
+// binding:
+//
+//     k: int = 5
+//     print([k for k in "xy"])     # a str value cannot be stored where int
+//                                  # is declared
+//
+// and `sum(1 for k in s)` beside a local `k` was refused as one loop-carried
+// local of two types, while a module `k = 5` with a comprehension over `k`
+// anywhere stopped being bound once and became unreadable from a function.
+//
+// ⛔ Only on a collision, counted over the whole enclosing function (or
+// module): an unrenamed target keeps its own spelling in every diagnostic
+// about it.
+void scopeComprehensionTargets(const parser::Node &moduleNode) {
+  unsigned counter = 0;
+  for (const parser::Field &field : moduleNode.fields)
+    if (const auto *children =
+            std::get_if<std::vector<parser::NodePtr>>(&field.value))
+      for (const parser::NodePtr &statement : *children)
+        scopeComprehensionsUnder(statement.get(), &moduleNode, counter);
+}
+
 std::string sanitizedSymbolPart(llvm::StringRef text) {
   std::string result;
   result.reserve(text.size());
