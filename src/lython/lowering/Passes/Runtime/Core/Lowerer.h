@@ -1127,6 +1127,8 @@ private:
   // `__hash__` returning the i64 hash word (dict/set probing over erased
   // keys).
   mlir::LogicalResult generateBoxedHashHook();
+  mlir::LogicalResult generateBoxedBoolHook();
+  mlir::LogicalResult synthesizeLengthTruthAdapters();
   // Source-class `__hash__` adapters for the boxed hash dispatch: a compiled
   // `def __hash__(self) -> int` returns the boxed-int ABI, which the uniform
   // i64 dispatch cannot call directly.

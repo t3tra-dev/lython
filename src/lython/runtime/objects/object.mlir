@@ -37,6 +37,7 @@ module attributes {
   func.func private @__ly_int_to_immediate(%value: i64) -> i64
   func.func private @__ly_raise_static_message(%class_word: i64, %message: memref<?xi8>, %length: i64)
   func.func private @__ly_str_boxed_by_contract(%box: !llvm.ptr, %class_word: i64) -> (memref<2xi64>, memref<?xi8>, i1)
+  func.func private @__ly_bool_boxed_by_contract(%box: !llvm.ptr, %class_word: i64) -> (i1, i1)
   func.func private @release_payload_slot_ptr(%slot: !llvm.ptr)
   py.class @object attributes {
     ly.typing.abstract,
@@ -236,6 +237,39 @@ module attributes {
     %eq = func.call @LyObject_BoxedEq(%lhs, %rhs) : (memref<5xi64>, memref<5xi64>) -> i1
     %ne = arith.xori %eq, %true : i1
     func.return %ne : i1
+  }
+
+  // PyObject_IsTrue (Objects/object.c) of an erased box: None is false; a
+  // class answers through its type object's truth slot -- its `__bool__`, or
+  // its length when it has only `__len__`, which is how CPython's ladder runs
+  // from nb_bool to mp_length and sq_length; a class with neither is true.
+  // ⛔ None is answered HERE, before the hook: this function is None's arm of
+  // that hook (it takes the box), so asking the hook for None would call
+  // itself without end.
+  func.func @LyObject_BoxedBool(%box: memref<5xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.method = "__bool__"} {
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %true = arith.constant true
+    %false = arith.constant false
+    %class_word = memref.load %box[%c1] : memref<5xi64>
+    %entity = memref.load %box[%c2] : memref<5xi64>
+    %no_class = func.call @__ly_class_is_none(%class_word) : (i64) -> i1
+    %no_entity = func.call @__ly_word_is_none(%entity) : (i64) -> i1
+    %is_none = arith.andi %no_class, %no_entity : i1
+    cf.cond_br %is_none, ^done(%false : i1), ^try_hook
+
+  ^try_hook:
+    %box_idx = memref.extract_aligned_pointer_as_index %box : memref<5xi64> -> index
+    %box_i64 = arith.index_cast %box_idx : index to i64
+    %box_base_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
+    // The box's word 2 reads as a slot (BoxLayout.h).
+    %box_ptr = llvm.getelementptr %box_base_ptr[2] : (!llvm.ptr) -> !llvm.ptr, i64
+    %truth, %hit = func.call @__ly_bool_boxed_by_contract(%box_ptr, %class_word) : (!llvm.ptr, i64) -> (i1, i1)
+    %answer = arith.select %hit, %truth, %true : i1
+    cf.br ^done(%answer : i1)
+
+  ^done(%result: i1):
+    func.return %result : i1
   }
 
   func.func @LyObject_BoxedHash(%box: memref<5xi64>) -> i64 attributes {ly.runtime.contract = "builtins.object", ly.runtime.method = "__hash__"} {

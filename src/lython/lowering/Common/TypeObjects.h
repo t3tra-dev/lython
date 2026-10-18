@@ -70,9 +70,14 @@ inline constexpr SlotHook kSlotHooks[] = {
     {"__ly_gt_boxed_by_contract", 12, true},
     {"__ly_ge_boxed_by_contract", 13, true},
     {"__ly_release_boxed_by_contract", 14, false, true},
+    // nb_bool, or the length when the class has only that (PyObject_IsTrue).
+    {"__ly_bool_boxed_by_contract", 15, false},
 };
-inline constexpr std::int64_t kWordCount = 15;
+inline constexpr std::int64_t kWordCount = 16;
 const SlotHook *slotHookNamed(llvm::StringRef hookName);
+// On a hook's declaration until its body is written: the slot functions it
+// will call, which are what it does.
+inline constexpr llvm::StringLiteral kHookSlotsAttr{"ly.slots"};
 
 // A program's source classes, recorded while their `py.class` ops still exist
 // (the runtime lowering erases them): [qualified name, display name, base,

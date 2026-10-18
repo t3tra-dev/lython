@@ -123,6 +123,14 @@ module attributes {
     func.return %value : i1
   }
 
+  // The truth of a bool held in a box, whose entity is one of the two
+  // singletons: the truth slot rebuilds its operand from that entity, and
+  // `LyBool_Bool` takes the bit, which no entity is.
+  func.func @LyBool_BoxedBool(%header: memref<3xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bool", ly.runtime.method = "__bool__"} {
+    %value = func.call @LyBool_Unbox(%header) : (memref<3xi64>) -> i1
+    func.return %value : i1
+  }
+
   func.func @LyBool_And(%lhs: i1, %rhs: i1) -> i1 attributes {ly.runtime.contract = "builtins.bool", ly.runtime.method = "__and__"} {
     %result = arith.andi %lhs, %rhs : i1
     func.return %result : i1

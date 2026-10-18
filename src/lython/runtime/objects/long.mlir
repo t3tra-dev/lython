@@ -1486,20 +1486,38 @@ module attributes {
     func.return %result : i1
   }
 
-  // "__len__() should return >= 0"
-  memref.global "private" constant @__ly_msg_len_negative : memref<28xi8> = dense<[95, 95, 108, 101, 110, 95, 95, 40, 41, 32, 115, 104, 111, 117, 108, 100, 32, 114, 101, 116, 117, 114, 110, 32, 62, 61, 32, 48]>
-
   // What a class's `__len__` returned, as the length `len` and a truth test
   // read -- slot_sq_length (Objects/typeobject.c): a negative int is a
   // ValueError, asked before the size, and one past the word an
-  // OverflowError (PyNumber_AsSsize_t).
-  func.func @LyLong_AsLength(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__ly_length__"} {
+  // OverflowError (PyNumber_AsSsize_t). The status is 0 for a length, 1 for
+  // negative, 2 for too big; it is split from the raise so a caller that
+  // holds the int can release it first.
+  func.func @LyLong_LengthStatus(%header: memref<2xi64> {ly.ownership.object_header}) -> (i64, i64) attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "length_status"} {
     %meta_raw, %digits_raw = func.call @__ly_long_parts(%header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %meta, %digits = func.call @__ly_long_operand_view(%meta_raw, %digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
     %sign_slot = arith.constant 0 : index
     %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
     %sign = memref.load %meta[%sign_slot] : memref<2xi64>
     %negative = arith.cmpi slt, %sign, %zero : i64
+    %fits = func.call @__ly_long_view_fits_i64(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i1
+    %value = func.call @__ly_long_view_as_i64(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i64
+    %size_status = arith.select %fits, %zero, %two : i64
+    %status = arith.select %negative, %one, %size_status : i64
+    %ok = arith.cmpi eq, %status, %zero : i64
+    %length = arith.select %ok, %value, %zero : i64
+    func.return %length, %status : i64, i64
+  }
+
+  // "__len__() should return >= 0"
+  memref.global "private" constant @__ly_msg_len_negative : memref<28xi8> = dense<[95, 95, 108, 101, 110, 95, 95, 40, 41, 32, 115, 104, 111, 117, 108, 100, 32, 114, 101, 116, 117, 114, 110, 32, 62, 61, 32, 48]>
+
+  // The exception a nonzero `LyLong_LengthStatus` names; nothing for 0.
+  func.func @LyLong_RaiseLengthStatus(%status: i64) attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "raise_length_status"} {
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %negative = arith.cmpi eq, %status, %one : i64
     cf.cond_br %negative, ^negative, ^sized
 
   ^negative:
@@ -1508,19 +1526,24 @@ module attributes {
     %message = memref.cast %message_static : memref<28xi8> to memref<?xi8>
     %length = arith.constant 28 : i64
     func.call @__ly_raise_static_message(%value_error, %message, %length) : (i64, memref<?xi8>, i64) -> ()
-    func.return %zero : i64
+    func.return
 
   ^sized:
-    %fits = func.call @__ly_long_view_fits_i64(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i1
-    cf.cond_br %fits, ^fits, ^overflow
+    %overflow = arith.cmpi eq, %status, %two : i64
+    cf.cond_br %overflow, ^overflow, ^done
 
   ^overflow:
     func.call @__ly_raise_index_overflow() : () -> ()
-    func.return %zero : i64
+    func.return
 
-  ^fits:
-    %value = func.call @__ly_long_view_as_i64(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i64
-    func.return %value : i64
+  ^done:
+    func.return
+  }
+
+  func.func @LyLong_AsLength(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__ly_length__"} {
+    %length, %status = func.call @LyLong_LengthStatus(%header) : (memref<2xi64>) -> (i64, i64)
+    func.call @LyLong_RaiseLengthStatus(%status) : (i64) -> ()
+    func.return %length : i64
   }
 
   func.func @LyLong_Pos(%header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__pos__"} {
