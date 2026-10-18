@@ -4665,6 +4665,23 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStateMachineGeneratorThrow(
 
   builder.setInsertionPoint(op);
   mlir::Location loc = op.getLoc();
+  // ⭐ THE EXCEPTION BEING HANDLED IS LENT, AND THROW KEEPS WHAT IT IS GIVEN.
+  // The driver takes the reference it is handed (`transfer_args`) into the
+  // TLS slot, and the generator's handler gives it up when it is done -- but
+  // an `except ... as e` value is borrowed from the EH slot, which the
+  // caller's handler releases too. Throwing it was one release too many:
+  //
+  //     except ValueError as cur:
+  //         it.throw(cur)      # release_storage_raw_to_zero observed
+  //                            # non-positive refcount
+  //
+  // So the throw takes a reference of its own, the way a store into a slot
+  // does. The ownership pass cannot add it: the borrow comes from TLS, not
+  // from a value it tracks.
+  if (exception.objectEvidence.hasFlag(kCurrentExceptionBorrowFlag) &&
+      mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+          op.getOperation(), exception, "generator.throw.handled")))
+    return mlir::failure();
   // No traceback frame or context stash here: the throw-site frame is
   // pushed by the caller's unwind pad only if the exception actually comes
   // back out (a throw the body catches shows no traceback), and the

@@ -1284,6 +1284,35 @@ TEST(EmitterTest, AGenericMethodHasABodyOnlyWhereItIsCalled) {
   EXPECT_TRUE(accepted.ok());
 }
 
+// What: `@contextmanager` on a function with spelled-out parameters compiles,
+// and on one with *args or **kwargs it is refused by name -- the function that
+// wraps the generator would have to hand them on unpacked.
+TEST(EmitterTest, AContextManagerFunctionHandsItsParametersOnByName) {
+  mlir::MLIRContext spelled(testRegistry());
+  lython::emitter::EmitResult accepted = emitSource(
+      "from contextlib import contextmanager\n"
+      "from typing import Iterator\n"
+      "@contextmanager\n"
+      "def tag(name: str, *, depth: int = 0) -> Iterator[int]:\n"
+      "    yield len(name) + depth\n"
+      "with tag(\"a\", depth=1) as n:\n"
+      "    print(n)\n",
+      spelled);
+  EXPECT_TRUE(accepted.ok());
+
+  mlir::MLIRContext starred(testRegistry());
+  lython::emitter::EmitResult refused = emitSource(
+      "import contextlib\n"
+      "@contextlib.contextmanager\n"
+      "def sub(**params: int):\n"
+      "    yield\n",
+      starred);
+  EXPECT_FALSE(refused.ok());
+  EXPECT_TRUE(reportsDiagnostic(
+      refused, "@contextmanager on 'sub' is not supported with *args or "
+               "**kwargs"));
+}
+
 TEST(EmitterTest, AnAttributeASourceClassDoesNotHaveIsRefusedAtEmit) {
   // Nothing resolves the read -- not a field, a class attribute, a method or
   // a property -- and it used to be emitted anyway and die in the lowering as

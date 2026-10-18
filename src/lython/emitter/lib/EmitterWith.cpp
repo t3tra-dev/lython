@@ -1,5 +1,6 @@
 #include "AstSynth.h"
 #include "EmitterCore.h"
+#include "Parser.h"
 #include "EmitterPyOps.h"
 #include "EmitterSupport.h"
 
@@ -345,6 +346,303 @@ llvm::SmallVector<std::string, 4> parameterNames(const parser::Node &def) {
 }
 
 } // namespace
+
+namespace {
+
+parser::NodePtr cloneTree(const parser::Node &node) {
+  parser::NodePtr clone = parser::makeNode(node.kind, node.range);
+  for (const parser::Field &field : node.fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      parser::addField(*clone, field.name,
+                       *child ? cloneTree(**child) : parser::NodePtr());
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      std::vector<parser::NodePtr> copies;
+      copies.reserve(children->size());
+      for (const parser::NodePtr &element : *children)
+        copies.push_back(element ? cloneTree(*element) : element);
+      parser::addField(*clone, field.name, std::move(copies));
+    } else {
+      parser::addField(*clone, field.name, field.value);
+    }
+  }
+  return clone;
+}
+
+// CPython's contextlib._GeneratorContextManager, which every desugared
+// @contextmanager function returns: enter runs the generator to its yield,
+// exit resumes it, or throws the exception into it and reads the answer off
+// how the generator ends.
+// ⛔ The generator is held as `types.GeneratorType`, not `typing.Generator`:
+// a value typed by the protocol is not reference counted, so it could not be
+// resumed.
+constexpr const char *kGeneratorContextManagerSource = R"PY(
+from types import GeneratorType as __ly_GeneratorType
+
+
+class __ly_GeneratorContextManager[T]:
+    def __init__(self, gen: __ly_GeneratorType[T, None, None]) -> None:
+        self.gen = gen
+
+    def __enter__(self) -> T:
+        try:
+            return next(self.gen)
+        except StopIteration:
+            raise RuntimeError("generator didn't yield")
+
+    def __exit__(self, typ: type[BaseException] | None,
+                 value: BaseException | None, tb: object) -> bool:
+        if value is None:
+            try:
+                next(self.gen)
+            except StopIteration:
+                return False
+            raise RuntimeError("generator didn't stop")
+        try:
+            self.gen.throw(value)
+        except StopIteration as stopped:
+            return stopped is not value
+        except BaseException as raised:
+            if raised is value:
+                return False
+            raise
+        raise RuntimeError("generator didn't stop after throw()")
+)PY";
+
+} // namespace
+
+// ⭐ `@contextmanager` IS TWO DEFS. The decorated body stays a generator,
+// renamed `f$cmgen`, and `f` becomes a def of the same parameters that hands
+// them on and wraps the generator in `__ly_GeneratorContextManager` -- the
+// call CPython's decorator makes, written where the program can be typed:
+//
+//     @contextmanager
+//     def opened(name: str) -> Iterator[int]: ...
+//
+// is `def opened(name: str) -> __ly_GeneratorContextManager[int]:
+// return __ly_GeneratorContextManager(opened$cmgen(name))`. A method takes the
+// same rewrite with `self.f$cmgen(...)`.
+//
+// ⛔ Not a decorator applied at run time: the decorator returns a function
+// whose parameters are the decorated one's, which only a ParamSpec could type,
+// and a ParamSpec cannot be specialized here.
+void ModuleEmitter::desugarContextManagers(const parser::Node &moduleNode) {
+  auto *body = const_cast<std::vector<parser::NodePtr> *>(
+      ast::nodeList(moduleNode, "body"));
+  if (!body)
+    return;
+  // The spellings this module gives contextlib.contextmanager.
+  llvm::StringSet<> bareNames;
+  llvm::StringSet<> moduleAliases;
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement)
+      continue;
+    if (statement->kind == "ImportFrom" &&
+        ast::string(*statement, "module").value_or("") == "contextlib") {
+      if (const auto *names = ast::nodeList(*statement, "names"))
+        for (const parser::NodePtr &alias : *names)
+          if (alias && ast::string(*alias, "name").value_or("") ==
+                           "contextmanager")
+            bareNames.insert(ast::string(*alias, "asname")
+                                 .value_or(ast::string(*alias, "name")
+                                               .value_or("")));
+    } else if (statement->kind == "Import") {
+      if (const auto *names = ast::nodeList(*statement, "names"))
+        for (const parser::NodePtr &alias : *names)
+          if (alias && ast::string(*alias, "name").value_or("") == "contextlib")
+            moduleAliases.insert(ast::string(*alias, "asname")
+                                     .value_or("contextlib"));
+    }
+  }
+  if (bareNames.empty() && moduleAliases.empty())
+    return;
+  // The decorator is gone once the defs are rewritten, and contextlib's
+  // manifest has no `contextmanager` to import: the name leaves the import,
+  // and an import left with no names leaves the module.
+  for (std::size_t index = 0; index < body->size(); ++index) {
+    parser::NodePtr statement = (*body)[index];
+    if (!statement || statement->kind != "ImportFrom" ||
+        ast::string(*statement, "module").value_or("") != "contextlib")
+      continue;
+    auto *names = const_cast<std::vector<parser::NodePtr> *>(
+        ast::nodeList(*statement, "names"));
+    if (!names)
+      continue;
+    llvm::erase_if(*names, [](const parser::NodePtr &alias) {
+      return alias &&
+             ast::string(*alias, "name").value_or("") == "contextmanager";
+    });
+    if (names->empty()) {
+      body->erase(body->begin() + static_cast<std::ptrdiff_t>(index));
+      --index;
+    }
+  }
+  auto isContextManager = [&](const parser::Node *decorator) {
+    if (!decorator)
+      return false;
+    if (decorator->kind == "Name")
+      return bareNames.contains(ast::nameSpelling(*decorator));
+    if (decorator->kind == "Attribute")
+      if (const parser::Node *owner = ast::node(*decorator, "value");
+          owner && owner->kind == "Name" &&
+          moduleAliases.contains(ast::nameSpelling(*owner)))
+        return ast::string(*decorator, "attr").value_or("") == "contextmanager";
+    return false;
+  };
+  bool rewrote = false;
+  // Rewrites the decorated defs of one statement list; `inClass` makes the
+  // forwarding call go through the receiver.
+  std::function<void(std::vector<parser::NodePtr> &, bool)> rewrite =
+      [&](std::vector<parser::NodePtr> &statements, bool inClass) {
+        for (std::size_t index = 0; index < statements.size(); ++index) {
+          parser::NodePtr statement = statements[index];
+          if (!statement)
+            continue;
+          if (statement->kind == "ClassDef" && !inClass) {
+            if (auto *classBody = const_cast<std::vector<parser::NodePtr> *>(
+                    ast::nodeList(*statement, "body")))
+              rewrite(*classBody, /*inClass=*/true);
+            continue;
+          }
+          if (statement->kind != "FunctionDef")
+            continue;
+          auto *decorators = const_cast<std::vector<parser::NodePtr> *>(
+              ast::nodeList(*statement, "decorator_list"));
+          if (!decorators || decorators->size() != 1 ||
+              !isContextManager(decorators->front().get()))
+            continue;
+          std::string name(ast::string(*statement, "name").value_or(""));
+          std::string generatorName = name + "$cmgen";
+          parser::SourceRange range = statement->range;
+          // The wrapper hands its parameters on by name, and a starred one
+          // would be handed on as an unpacking whose size is not static.
+          if (const parser::Node *arguments = ast::node(*statement, "args");
+              arguments && (ast::node(*arguments, "vararg") ||
+                            ast::node(*arguments, "kwarg"))) {
+            diagnostics.push_back(parser::Diagnostic{
+                parser::Severity::Error, range.start,
+                "@contextmanager on '" + name +
+                    "' is not supported with *args or **kwargs: the function "
+                    "that wraps the generator would have to hand them on "
+                    "unpacked; spell the parameters out"});
+            continue;
+          }
+          // The generator keeps the body and the parameters.
+          decorators->clear();
+          if (parser::Field *field = parser::findField(*statement, "name"))
+            field->value = generatorName;
+
+          const parser::Node *arguments = ast::node(*statement, "args");
+          std::vector<parser::NodePtr> callArgs;
+          std::vector<parser::NodePtr> callKeywords;
+          parser::NodePtr callee;
+          bool receiverTaken = !inClass;
+          auto forwardPositional = [&](const parser::NodePtr &arg) {
+            if (!arg)
+              return;
+            std::string spelling(ast::string(*arg, "arg").value_or(""));
+            if (!receiverTaken) {
+              receiverTaken = true;
+              callee = synth::attribute(synth::name(spelling, range),
+                                        generatorName, range);
+              return;
+            }
+            callArgs.push_back(synth::name(spelling, range));
+          };
+          if (arguments) {
+            for (llvm::StringRef group : {"posonlyargs", "args"})
+              if (const auto *list = ast::nodeList(*arguments, group))
+                for (const parser::NodePtr &arg : *list)
+                  forwardPositional(arg);
+            if (const parser::Node *vararg = ast::node(*arguments, "vararg")) {
+              parser::NodePtr starred = parser::makeNode("Starred", range);
+              parser::addField(
+                  *starred, "value",
+                  synth::name(ast::string(*vararg, "arg").value_or(""), range));
+              callArgs.push_back(std::move(starred));
+            }
+            if (const auto *list = ast::nodeList(*arguments, "kwonlyargs"))
+              for (const parser::NodePtr &arg : *list)
+                if (arg) {
+                  std::string spelling(ast::string(*arg, "arg").value_or(""));
+                  callKeywords.push_back(synth::keyword(
+                      spelling, synth::name(spelling, range), range));
+                }
+            if (const parser::Node *kwarg = ast::node(*arguments, "kwarg")) {
+              parser::NodePtr keyword = parser::makeNode("keyword", range);
+              parser::addField(
+                  *keyword, "value",
+                  synth::name(ast::string(*kwarg, "arg").value_or(""), range));
+              callKeywords.push_back(std::move(keyword));
+            }
+          }
+          if (!callee)
+            callee = synth::name(generatorName, range);
+          parser::NodePtr generator = synth::callWithKeywords(
+              std::move(callee), std::move(callArgs), std::move(callKeywords),
+              range);
+          parser::NodePtr wrapped = synth::call(
+              synth::name("__ly_GeneratorContextManager", range),
+              std::vector<parser::NodePtr>{std::move(generator)}, range);
+
+          parser::NodePtr wrapper = parser::makeNode("FunctionDef", range);
+          parser::addField(*wrapper, "name", name);
+          parser::addField(*wrapper, "args",
+                           arguments ? cloneTree(*arguments)
+                                     : parser::makeNode("arguments", range));
+          parser::addField(*wrapper, "body",
+                           std::vector<parser::NodePtr>{
+                               synth::returnStmt(std::move(wrapped), range)});
+          parser::addField(*wrapper, "decorator_list",
+                           std::vector<parser::NodePtr>{});
+          // `Iterator[T]` (or Generator[T, ...]) returns T from __enter__.
+          if (const parser::Node *returns = ast::node(*statement, "returns");
+              returns && returns->kind == "Subscript")
+            if (const parser::Node *slice = ast::node(*returns, "slice")) {
+              const parser::Node *element = slice;
+              if (slice->kind == "Tuple")
+                if (const auto *elts = ast::nodeList(*slice, "elts");
+                    elts && !elts->empty())
+                  element = elts->front().get();
+              if (element)
+                parser::addField(
+                    *wrapper, "returns",
+                    synth::subscript(
+                        synth::name("__ly_GeneratorContextManager", range),
+                        cloneTree(*element), range));
+            }
+          if (const auto *params = ast::nodeList(*statement, "type_params"))
+            if (!params->empty()) {
+              std::vector<parser::NodePtr> copies;
+              for (const parser::NodePtr &param : *params)
+                copies.push_back(param ? cloneTree(*param) : param);
+              parser::addField(*wrapper, "type_params", std::move(copies));
+            }
+          statements.insert(statements.begin() +
+                                static_cast<std::ptrdiff_t>(index) + 1,
+                            std::move(wrapper));
+          ++index;
+          rewrote = true;
+        }
+      };
+  rewrite(*body, /*inClass=*/false);
+  if (!rewrote)
+    return;
+  parser::ParseResult helper =
+      parser::parse(kGeneratorContextManagerSource, "<contextmanager>");
+  const auto *helperBody =
+      helper.tree ? ast::nodeList(*helper.tree, "body") : nullptr;
+  if (!helper.ok() || !helperBody) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, moduleNode.range.start,
+        "internal: the @contextmanager helper did not parse"});
+    return;
+  }
+  // The helper's own tree owns its nodes; it is kept for as long as the
+  // module it is spliced into.
+  synthesizedHelperTrees.push_back(helper.tree);
+  body->insert(body->begin(), helperBody->begin(), helperBody->end());
+}
 
 void ModuleEmitter::refuseUnrepresentableExitArguments(
     const parser::Node &anchor, const MethodBinding &exit) {

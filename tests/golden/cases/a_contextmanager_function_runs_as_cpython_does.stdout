@@ -1,0 +1,7 @@
+enter abc
+body 3
+exit abc
+['enter a', 'body A', 'ok a', 'exit a', 'enter b', 'failed b: nope', 'exit b', 'enter c', 'exit c', "propagated KeyError('k')"]
+['ok', 'error boom']
+v 1
+RuntimeError: generator didn't stop
