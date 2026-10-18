@@ -1104,12 +1104,29 @@ ModuleEmitter::tryEmitLazyIteratorValueCall(const parser::Node &expr,
     }
   }
 
+  // ⭐ A CLASS VALUE HELD IN A LOCAL IS HANDED TO THE GENERATOR. The body is a
+  // def of its own at module level, where the local's spelling names nothing
+  // ("unresolved runtime binding 'cls'" for `map(cls, names)` with a
+  // `cls: type[Case]` parameter); a class value has a generator argument lane,
+  // so it travels as one.
+  // ⛔ A class value only: a function value has no such lane.
+  std::optional<Value> localCallee;
+  if (callable.callee && callable.callee->kind == "Name")
+    if (auto found = values.find(ast::nameSpelling(*callable.callee));
+        found != values.end() &&
+        mlir::isa<py::TypeType>(types.widenLiteral(found->second.type))) {
+      localCallee = emitExpr(callable.callee.get());
+      callable.callee = synth::name("__lyf", range);
+    }
+
   // Memoized synthesis, keyed by builtin + argument types + the callable's
   // spelling (map/filter bodies inline it syntactically).
   std::string memoKey = name.str();
   for (const Value &value : iterableValues)
     memoKey += "|" + typeText(types.widenLiteral(value.type));
-  if (callable.callee)
+  if (localCallee)
+    memoKey += "|f:local:" + typeText(types.widenLiteral(localCallee->type));
+  else if (callable.callee)
     memoKey += "|f:" + ast::qualifiedName(callable.callee.get());
   else if (callable.lambdaBody) {
     llvm::raw_string_ostream stream(memoKey);
@@ -1129,6 +1146,8 @@ ModuleEmitter::tryEmitLazyIteratorValueCall(const parser::Node &expr,
       params.push_back("__lyit" + std::to_string(index));
     if (name == "enumerate")
       params.push_back("__lyn");
+    if (localCallee)
+      params.push_back("__lyf");
 
     parser::SourceRange bodyRange = range;
     auto param = [&](unsigned index) {
@@ -1231,7 +1250,10 @@ ModuleEmitter::tryEmitLazyIteratorValueCall(const parser::Node &expr,
       types.overrideParameterType(paramNodes[index],
                                   types.widenLiteral(value.type));
     if (name == "enumerate")
-      types.overrideParameterType(paramNodes.back(), types.intType());
+      types.overrideParameterType(paramNodes[iterableCount], types.intType());
+    if (localCallee)
+      types.overrideParameterType(paramNodes.back(),
+                                  types.widenLiteral(localCallee->type));
 
     FunctionSignature sig = types.functionSignature(*def);
     emitCallableFunction(*def, symbol, sig, {}, /*isLambda=*/false);
@@ -1245,6 +1267,8 @@ ModuleEmitter::tryEmitLazyIteratorValueCall(const parser::Node &expr,
                                             iterableValues.end());
   if (startValue)
     callArguments.push_back(*startValue);
+  if (localCallee)
+    callArguments.push_back(*localCallee);
   Value callee = emitBindingRef(expr, memoized->second.symbol,
                                 memoized->second.callableType);
   return emitCallableDispatch(
