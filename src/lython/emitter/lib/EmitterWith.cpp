@@ -496,25 +496,88 @@ void ModuleEmitter::desugarContextManagers(const parser::Node &moduleNode) {
           std::string name(ast::string(*statement, "name").value_or(""));
           std::string generatorName = name + "$cmgen";
           parser::SourceRange range = statement->range;
-          // The wrapper hands its parameters on by name, and a starred one
-          // would be handed on as an unpacking whose size is not static.
-          if (const parser::Node *arguments = ast::node(*statement, "args");
-              arguments && (ast::node(*arguments, "vararg") ||
-                            ast::node(*arguments, "kwarg"))) {
-            diagnostics.push_back(parser::Diagnostic{
-                parser::Severity::Error, range.start,
-                "@contextmanager on '" + name +
-                    "' is not supported with *args or **kwargs: the function "
-                    "that wraps the generator would have to hand them on "
-                    "unpacked; spell the parameters out"});
-            continue;
-          }
           // The generator keeps the body and the parameters.
           decorators->clear();
           if (parser::Field *field = parser::findField(*statement, "name"))
             field->value = generatorName;
 
           const parser::Node *arguments = ast::node(*statement, "args");
+          // The wrapper keeps the signature as written.
+          parser::NodePtr wrapperArguments =
+              arguments ? cloneTree(*arguments)
+                        : parser::makeNode("arguments", range);
+          // ⭐ THE GENERATOR TAKES THE PACKS AS VALUES. `subTest(self, msg,
+          // **params)` is the shape unittest writes, and a generator that
+          // takes `**kwargs` has no argument lane for the dict to arrive in,
+          // so it is not a state machine and its frame cannot be resumed.
+          // The packs become the generator's FIRST parameters (after the
+          // receiver) under the same names, and the wrapper hands its own
+          // tuple and dict over whole.
+          // ⛔ First, not last nor keyword-only: the generator's only caller
+          // is the wrapper, so the order is this rewrite's to choose, and
+          // first keeps every default where it was.
+          std::vector<std::string> packNames;
+          if (arguments) {
+            auto *generatorArguments = const_cast<parser::Node *>(arguments);
+            const auto *posonly = ast::nodeList(*arguments, "posonlyargs");
+            if (posonly && !posonly->empty() &&
+                (ast::node(*arguments, "vararg") ||
+                 ast::node(*arguments, "kwarg"))) {
+              diagnostics.push_back(parser::Diagnostic{
+                  parser::Severity::Error, range.start,
+                  "@contextmanager on '" + name +
+                      "' is not supported with both positional-only "
+                      "parameters and *args or **kwargs"});
+              continue;
+            }
+            auto packAnnotation = [&](const parser::Node *pack) {
+              const parser::Node *annotation = ast::node(*pack, "annotation");
+              return annotation ? cloneTree(*annotation)
+                                : synth::name("object", range);
+            };
+            std::vector<parser::NodePtr> packs;
+            if (const parser::Node *vararg = ast::node(*arguments, "vararg")) {
+              packNames.push_back(
+                  std::string(ast::string(*vararg, "arg").value_or("")));
+              packs.push_back(synth::arg(
+                  packNames.back(),
+                  synth::subscript(synth::name("tuple", range),
+                                   packAnnotation(vararg), range),
+                  range));
+            }
+            if (const parser::Node *kwarg = ast::node(*arguments, "kwarg")) {
+              packNames.push_back(
+                  std::string(ast::string(*kwarg, "arg").value_or("")));
+              packs.push_back(synth::arg(
+                  packNames.back(),
+                  synth::subscript(
+                      synth::name("dict", range),
+                      synth::tuple({synth::name("str", range),
+                                    packAnnotation(kwarg)},
+                                   range),
+                      range),
+                  range));
+            }
+            if (!packs.empty()) {
+              for (llvm::StringRef pack : {"vararg", "kwarg"})
+                if (parser::Field *field =
+                        parser::findField(*generatorArguments, pack))
+                  field->value = parser::NodePtr();
+              std::vector<parser::NodePtr> positional;
+              if (const auto *list = ast::nodeList(*arguments, "args"))
+                positional = *list;
+              std::size_t at = inClass && !positional.empty() ? 1 : 0;
+              positional.insert(positional.begin() +
+                                    static_cast<std::ptrdiff_t>(at),
+                                packs.begin(), packs.end());
+              if (parser::Field *field =
+                      parser::findField(*generatorArguments, "args"))
+                field->value = std::move(positional);
+              else
+                parser::addField(*generatorArguments, "args",
+                                 std::move(positional));
+            }
+          }
           std::vector<parser::NodePtr> callArgs;
           std::vector<parser::NodePtr> callKeywords;
           parser::NodePtr callee;
@@ -531,18 +594,14 @@ void ModuleEmitter::desugarContextManagers(const parser::Node &moduleNode) {
             }
             callArgs.push_back(synth::name(spelling, range));
           };
+          // The generator's own list, packs included: the wrapper binds the
+          // packs under the same names, so each is handed on by name.
           if (arguments) {
             for (llvm::StringRef group : {"posonlyargs", "args"})
               if (const auto *list = ast::nodeList(*arguments, group))
                 for (const parser::NodePtr &arg : *list)
                   forwardPositional(arg);
-            if (const parser::Node *vararg = ast::node(*arguments, "vararg")) {
-              parser::NodePtr starred = parser::makeNode("Starred", range);
-              parser::addField(
-                  *starred, "value",
-                  synth::name(ast::string(*vararg, "arg").value_or(""), range));
-              callArgs.push_back(std::move(starred));
-            }
+            // The keyword-only parameters, by name.
             if (const auto *list = ast::nodeList(*arguments, "kwonlyargs"))
               for (const parser::NodePtr &arg : *list)
                 if (arg) {
@@ -550,13 +609,6 @@ void ModuleEmitter::desugarContextManagers(const parser::Node &moduleNode) {
                   callKeywords.push_back(synth::keyword(
                       spelling, synth::name(spelling, range), range));
                 }
-            if (const parser::Node *kwarg = ast::node(*arguments, "kwarg")) {
-              parser::NodePtr keyword = parser::makeNode("keyword", range);
-              parser::addField(
-                  *keyword, "value",
-                  synth::name(ast::string(*kwarg, "arg").value_or(""), range));
-              callKeywords.push_back(std::move(keyword));
-            }
           }
           if (!callee)
             callee = synth::name(generatorName, range);
@@ -569,9 +621,7 @@ void ModuleEmitter::desugarContextManagers(const parser::Node &moduleNode) {
 
           parser::NodePtr wrapper = parser::makeNode("FunctionDef", range);
           parser::addField(*wrapper, "name", name);
-          parser::addField(*wrapper, "args",
-                           arguments ? cloneTree(*arguments)
-                                     : parser::makeNode("arguments", range));
+          parser::addField(*wrapper, "args", std::move(wrapperArguments));
           parser::addField(*wrapper, "body",
                            std::vector<parser::NodePtr>{
                                synth::returnStmt(std::move(wrapped), range)});

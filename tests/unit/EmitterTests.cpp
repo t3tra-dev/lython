@@ -1413,8 +1413,8 @@ TEST(EmitterTest, AGenericMethodHasABodyOnlyWhereItIsCalled) {
 }
 
 // What: `@contextmanager` on a function with spelled-out parameters compiles,
-// and on one with *args or **kwargs it is refused by name -- the function that
-// wraps the generator would have to hand them on unpacked.
+// and so does one with *args or **kwargs, whose packs the generator takes as
+// values; one that also has positional-only parameters is refused by name.
 TEST(EmitterTest, AContextManagerFunctionHandsItsParametersOnByName) {
   mlir::MLIRContext spelled(testRegistry());
   lython::emitter::EmitResult accepted = emitSource(
@@ -1429,16 +1429,29 @@ TEST(EmitterTest, AContextManagerFunctionHandsItsParametersOnByName) {
   EXPECT_TRUE(accepted.ok());
 
   mlir::MLIRContext starred(testRegistry());
+  lython::emitter::EmitResult packed = emitSource(
+      "import contextlib\n"
+      "from typing import Iterator\n"
+      "@contextlib.contextmanager\n"
+      "def sub(*labels: str, **params: int) -> Iterator[int]:\n"
+      "    yield len(labels) + len(params)\n"
+      "with sub(\"a\", i=1) as n:\n"
+      "    print(n)\n",
+      starred);
+  EXPECT_TRUE(packed.ok());
+
+  mlir::MLIRContext positionalOnly(testRegistry());
   lython::emitter::EmitResult refused = emitSource(
       "import contextlib\n"
+      "from typing import Iterator\n"
       "@contextlib.contextmanager\n"
-      "def sub(**params: int):\n"
-      "    yield\n",
-      starred);
+      "def sub(a: int, /, **params: int) -> Iterator[int]:\n"
+      "    yield a\n",
+      positionalOnly);
   EXPECT_FALSE(refused.ok());
   EXPECT_TRUE(reportsDiagnostic(
-      refused, "@contextmanager on 'sub' is not supported with *args or "
-               "**kwargs"));
+      refused, "@contextmanager on 'sub' is not supported with both "
+               "positional-only parameters and *args or **kwargs"));
 }
 
 TEST(EmitterTest, AnAttributeASourceClassDoesNotHaveIsRefusedAtEmit) {
