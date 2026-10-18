@@ -406,6 +406,13 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     if (std::optional<Value> curried =
             tryEmitCurriedGenericCall(expr, *calleeNode))
       return *curried;
+  if (calleeNode &&
+      (calleeNode->kind == "Name" || calleeNode->kind == "Attribute"))
+    if (std::string spelled = ast::qualifiedName(calleeNode); !spelled.empty())
+      if (std::optional<std::string> canonical =
+              types.lookupCanonicalBinding(spelled);
+          canonical && *canonical == "sys.exc_info")
+        return emitExcInfo(expr);
   if (std::optional<Value> dispatched = emitClassValueCall(expr, calleeNode))
     return *dispatched;
   std::string calleeQualified = ast::qualifiedName(calleeNode);

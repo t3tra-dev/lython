@@ -3,11 +3,13 @@
 #include "EmitterSupport.h"
 
 #include "AstAccess.h"
+#include "AstSynth.h"
 
 #include <variant>
 #include "Contracts.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -2156,6 +2158,64 @@ void ModuleEmitter::emitTryStar(const parser::Node &statement) {
   }
 
   builder.setInsertionPointAfter(tryOp);
+}
+
+// ⭐ `sys.exc_info()` IS THE EXCEPTION THE ENCLOSING `except` HANDLES: its
+// class, itself, and its traceback -- which is how unittest's runner hands a
+// failure to its result (`result.addError(test, sys.exc_info())`).
+// ⛔ Only inside an `except` block, written there or inlined into one: which
+// exception is being handled anywhere else is decided at run time, by the
+// handlers active on the stack, and a static answer of (None, None, None)
+// would be wrong exactly where it was called from a handler.
+Value ModuleEmitter::emitExcInfo(const parser::Node &expr) {
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if ((args && !args->empty()) || (keywords && !keywords->empty())) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "sys.exc_info() takes no arguments"});
+    return emitNone(expr);
+  }
+  if (exceptHandlerDepth == 0) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "sys.exc_info() is answered inside an except block, where the "
+        "exception it reports is the one that block handles: elsewhere it "
+        "is the handler active on the stack at run time"});
+    return emitNone(expr);
+  }
+  if (!types.lookupSymbol(kTracebackModuleBinding)) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "sys.exc_info() builds its traceback with the traceback module, "
+        "which this program was not compiled with"});
+    return emitNone(expr);
+  }
+  mlir::Type exceptionType = types.contract("builtins.BaseException");
+  Value current{py::ExceptCurrentValueOp::create(
+                    builder, loc(expr), exceptionType,
+                    mlir::TypeAttr::get(types.typeObject(exceptionType)))
+                    .getResult(),
+                exceptionType};
+  std::string temp = "__ly_excinfo" + std::to_string(++syntheticFunctionCounter);
+  values[temp] = current;
+  types.bindSymbol(temp, exceptionType);
+  auto forget = llvm::scope_exit([&] { values.erase(temp); });
+  parser::SourceRange range = expr.range;
+  std::vector<parser::NodePtr> parts;
+  parts.push_back(synth::call(synth::name("type", range),
+                              {synth::name(temp, range)}, range));
+  parts.push_back(synth::name(temp, range));
+  parts.push_back(synth::call(
+      synth::attribute(synth::name(kTracebackModuleBinding, range),
+                       "_handled_tb", range),
+      {}, range));
+  parser::NodePtr tuple = synth::tuple(std::move(parts), range);
+  synthesizedIteratorDefs.push_back(tuple);
+  Value built = emitExpr(tuple.get());
+  mlir::Type declared = types.inferExpr(&expr);
+  return declared ? coerceValue(built, types.widenLiteral(declared), expr)
+                  : built;
 }
 
 } // namespace lython::emitter

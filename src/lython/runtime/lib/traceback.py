@@ -106,6 +106,20 @@ def _current_tb() -> Optional[types.TracebackType]:
     return built
 
 
+def _handled_tb() -> types.TracebackType:
+    """`sys.exc_info()[2]`: the traceback of the exception an `except` block
+    handles, which always has one -- the raise recorded the frame it ran in.
+
+    ⛔ Not `Optional`: the three values go out as one tuple, and a None-able
+    third would be a union the tuple has to prove before it can hold it.
+    """
+    tb = _current_tb()
+    if tb is None:
+        raise RuntimeError("sys.exc_info(): the exception being handled has "
+                           "no recorded traceback")
+    return tb
+
+
 def _is_closer(ch: str) -> bool:
     return ch == ")" or ch == "]"
 

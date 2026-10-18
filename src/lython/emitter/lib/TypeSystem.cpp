@@ -1243,7 +1243,19 @@ void bindAnnotationModuleAliases(
 enum class ImportCallableFactory {
   BuiltinsFunction,
   StaticZeroArgStr,
+  ExcInfo,
 };
+
+// `sys.exc_info()` where an `except` block handles an exception -- the only
+// place it is answered (ModuleEmitter::emitExcInfo): the exception's class,
+// the exception, and its traceback.
+py::CallableType makeExcInfoCallable(const TypeSystem &types) {
+  mlir::Type exception = types.contract("builtins.BaseException");
+  mlir::Type traceback = types.contract("types.TracebackType");
+  llvm::SmallVector<mlir::Type, 1> results{types.contract(
+      "builtins.tuple", {types.typeObject(exception), exception, traceback})};
+  return py::CallableType::get(&types.getContext(), {}, {}, {}, {}, results);
+}
 
 mlir::Type importCallableType(const TypeSystem &types,
                               ImportCallableFactory factory) {
@@ -1252,6 +1264,8 @@ mlir::Type importCallableType(const TypeSystem &types,
     return types.contract("builtins.function");
   case ImportCallableFactory::StaticZeroArgStr:
     return makeZeroArgStrCallable(types);
+  case ImportCallableFactory::ExcInfo:
+    return makeExcInfoCallable(types);
   }
   llvm_unreachable("unknown import callable factory");
 }
@@ -1348,6 +1362,7 @@ constexpr ModuleCallableImport kModuleCallableImports[] = {
      ImportCallableFactory::StaticZeroArgStr},
     {"sys", "getfilesystemencoding", "sys.getfilesystemencoding",
      ImportCallableFactory::StaticZeroArgStr},
+    {"sys", "exc_info", "sys.exc_info", ImportCallableFactory::ExcInfo},
     {"lyrt", "from_prim", "lyrt.from_prim",
      ImportCallableFactory::BuiltinsFunction},
     {"lyrt", "to_prim", "lyrt.to_prim",
@@ -1382,6 +1397,7 @@ constexpr NameCallableImport kNameCallableImports[] = {
      ImportCallableFactory::StaticZeroArgStr},
     {"sys", "getfilesystemencoding", "sys.getfilesystemencoding",
      ImportCallableFactory::StaticZeroArgStr},
+    {"sys", "exc_info", "sys.exc_info", ImportCallableFactory::ExcInfo},
     {"lyrt", "from_prim", "lyrt.from_prim",
      ImportCallableFactory::BuiltinsFunction},
     {"lyrt", "to_prim", "lyrt.to_prim",
