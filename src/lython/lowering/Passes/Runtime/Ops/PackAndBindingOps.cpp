@@ -137,7 +137,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
       if (!bundle)
         return op.emitError()
                << contractName << " literal element has no lowered bundle";
-      if (bundle->kind == RuntimeBundle::Kind::Object) {
+      // A class value carrying its type object is an element like any object;
+      // a class with no type object is static metadata only.
+      if (bundle->isObjectLike()) {
         elements.push_back(bundle->objectValue);
       } else {
         allElementsObject = false;
@@ -182,7 +184,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
             std::make_shared<RuntimeBundle>(std::move(materializedKey)));
         logicalKeySources.push_back(mlir::Value{});
       } else {
-        if (!keyBundle || keyBundle->kind != RuntimeBundle::Kind::Object)
+        if (!keyBundle || !keyBundle->isObjectLike())
           return op.emitError()
                  << "dict literal key has no lowered object bundle";
         dictKeyBundles.push_back(std::make_shared<RuntimeBundle>(*keyBundle));
@@ -193,7 +195,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
 
       const RuntimeBundle *valueBundle =
           RuntimeBundleLowerer::bundleFor(values[index + 1]);
-      if (!valueBundle || valueBundle->kind != RuntimeBundle::Kind::Object)
+      if (!valueBundle || !valueBundle->isObjectLike())
         return op.emitError()
                << "dict literal value has no lowered object bundle";
       dictValueBundles.push_back(std::make_shared<RuntimeBundle>(*valueBundle));
@@ -680,7 +682,11 @@ mlir::LogicalResult RuntimeBundleLowerer::appendClosureValues(
         index < closureTypes.size() &&
         mlir::isa<py::TypeType>(closureTypes[index])) {
       bundle.closureValues.push_back(
-          RuntimeValue::object(closureTypes[index], mlir::ValueRange{}));
+          captureBundle->objectValue.values.empty()
+              ? RuntimeValue::object(closureTypes[index], mlir::ValueRange{})
+              : RuntimeValue::objectWithOwnership(
+                    closureTypes[index], captureBundle->objectValue.values,
+                    ownership::OwnershipKind::Immortal));
       continue;
     }
     if (!captureBundle || captureBundle->kind != RuntimeBundle::Kind::Object)

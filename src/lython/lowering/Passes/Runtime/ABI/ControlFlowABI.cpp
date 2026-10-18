@@ -189,6 +189,13 @@ bool sameObjectEvidence(const RuntimeBundle &lhs, const RuntimeBundle &rhs) {
 
 } // namespace
 
+bool RuntimeBundleLowerer::hasControlFlowLanes(mlir::Type type) const {
+  if (hasRuntimeControlFlowABI(type))
+    return true;
+  return mlir::isa<py::TypeType>(type) &&
+         !RuntimeBundleLowerer::logicalTypeHasNoLanes(type);
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::ensureValueBundle(mlir::Operation *op,
                                                             mlir::Value value) {
   if (valueBundles.find(value) != valueBundles.end())
@@ -196,7 +203,7 @@ mlir::LogicalResult RuntimeBundleLowerer::ensureValueBundle(mlir::Operation *op,
 
   auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
   if (argument) {
-    if (!hasRuntimeControlFlowABI(argument.getType()))
+    if (!RuntimeBundleLowerer::hasControlFlowLanes(argument.getType()))
       return mlir::success();
     return RuntimeBundleLowerer::lowerControlFlowBlockArgument(op, argument);
   }
@@ -205,7 +212,7 @@ mlir::LogicalResult RuntimeBundleLowerer::ensureValueBundle(mlir::Operation *op,
   // The canonicalizer folds branch diamonds over already-computed values into
   // arith.select on the logical type: lower it as a borrow of both sides.
   if (auto select = mlir::dyn_cast_if_present<mlir::arith::SelectOp>(definition))
-    if (hasRuntimeControlFlowABI(value.getType()))
+    if (RuntimeBundleLowerer::hasControlFlowLanes(value.getType()))
       return RuntimeBundleLowerer::lowerRuntimeValueSelect(select);
   if (!definition || !definition->getDialect() ||
       definition->getDialect()->getNamespace() != "py")
@@ -312,7 +319,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
     return op->emitError()
            << "cyclic Python control-flow block argument ABI is not "
               "implemented yet";
-  if (!hasRuntimeControlFlowABI(argument.getType()))
+  if (!RuntimeBundleLowerer::hasControlFlowLanes(argument.getType()))
     return mlir::success();
 
   // Inside primitive-i64 clones, int-typed merges stay in the primitive

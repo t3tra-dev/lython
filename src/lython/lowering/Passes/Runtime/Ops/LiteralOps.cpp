@@ -450,9 +450,73 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCastToPrim(py::CastToPrimOp op) {
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerTypeObject(py::TypeObjectOp op) {
-  valueBundles[op.getResult()] = RuntimeBundle::typeObject(
-      op.getResult().getType(), op.getInstanceContract());
+  builder.setInsertionPoint(op);
+  valueBundles[op.getResult()] = RuntimeBundleLowerer::staticClassValue(
+      op.getLoc(), op.getResult().getType(), op.getInstanceContract());
   erase.push_back(op);
   return mlir::success();
+}
+
+// The class value of a class the program names: a view of its type object
+// when it has one, and the empty bundle of a class known only to the type
+// system otherwise (a protocol, a ctypes type).
+RuntimeBundle RuntimeBundleLowerer::staticClassValue(mlir::Location loc,
+                                                     mlir::Type typeContract,
+                                                     mlir::Type instance) {
+  RuntimeBundle bundle = RuntimeBundle::typeObject(typeContract, instance);
+  std::optional<std::string> runtimeClass =
+      RuntimeBundleLowerer::classValueRuntimeClass(instance);
+  if (!runtimeClass)
+    return bundle;
+  mlir::Value word = type_objects::classWord(builder, loc, module, *runtimeClass);
+  bundle.objectValue = RuntimeValue::objectWithOwnership(
+      typeContract,
+      mlir::ValueRange{RuntimeBundleLowerer::classValueView(loc, word)},
+      ownership::OwnershipKind::Immortal);
+  return bundle;
+}
+
+bool RuntimeBundleLowerer::logicalTypeHasNoLanes(mlir::Type type) const {
+  if (py::isPyNoneType(type))
+    return true;
+  auto typeType = mlir::dyn_cast_if_present<py::TypeType>(type);
+  return typeType &&
+         !RuntimeBundleLowerer::classValueRuntimeClass(typeType.getInstanceType());
+}
+
+// A memref view of the type object at a class word: what a class value holds.
+mlir::Value RuntimeBundleLowerer::classValueView(mlir::Location loc,
+                                                 mlir::Value word) {
+  auto viewType = mlir::MemRefType::get(
+      {type_objects::kWordCount}, builder.getI64Type());
+  mlir::Value size = mlir::arith::ConstantIntOp::create(
+                         builder, loc, type_objects::kWordCount, 64)
+                         .getResult();
+  return RuntimeBundleLowerer::memrefFromBoxWords(builder, loc, word, size,
+                                                  viewType);
+}
+
+// A class value's class word: the address of the type object it views, or the
+// static class's when it carries none.
+mlir::FailureOr<mlir::Value>
+RuntimeBundleLowerer::classValueWord(mlir::Operation *op,
+                                     const RuntimeBundle &bundle) {
+  mlir::Location loc = op->getLoc();
+  if (!bundle.objectValue.values.empty()) {
+    mlir::Value handle = bundle.objectValue.values.front();
+    mlir::Value index =
+        mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc,
+                                                             handle)
+            .getResult();
+    return mlir::arith::IndexCastOp::create(builder, loc, builder.getI64Type(),
+                                            index)
+        .getResult();
+  }
+  std::optional<std::string> runtimeClass =
+      RuntimeBundleLowerer::classValueRuntimeClass(bundle.instanceContract);
+  if (!runtimeClass)
+    return op->emitError() << "class value has no type object for "
+                           << bundle.instanceContractName();
+  return type_objects::classWord(builder, loc, module, *runtimeClass);
 }
 } // namespace py::lowering

@@ -371,6 +371,8 @@ Value ModuleEmitter::emitCallableDispatch(const parser::Node &anchor,
 
 Value ModuleEmitter::emitCall(const parser::Node &expr) {
   const parser::Node *calleeNode = ast::node(expr, "func");
+  if (std::optional<Value> dispatched = emitClassValueCall(expr, calleeNode))
+    return *dispatched;
   std::string calleeQualified = ast::qualifiedName(calleeNode);
   // ⭐ A LOCAL WINS OVER AN IMPORTED NAMESPACE. `from os import path` binds the
   // canonical symbol `path`, and that binding is visible while the STDLIB module
@@ -2981,6 +2983,287 @@ ModuleEmitter::tryEmitCallableCall(const parser::Node &expr,
   return Value{constant.getResult(), literalType};
 }
 
+// ⛔ `int` IS CLOSED although CPython's bool derives from it: a bool is a
+// truth bit here and an int is not, so a `type[int]` never names bool (the
+// coercion that would put it there is refused), and `t()` through one is
+// `int()`.
+bool ModuleEmitter::classIsClosed(llvm::StringRef contract) const {
+  if (contract == "builtins.object" || contract == "typing.Any" ||
+      contract == "builtins.type")
+    return false;
+  llvm::StringRef leaf = contract.rsplit('.').second;
+  if (leaf.empty())
+    leaf = contract;
+  // A generic's own instantiations are not its subclasses.
+  std::string ownSpecialization = (contract + "$spec").str();
+  for (const auto &entry : classMros)
+    if (entry.getKey() != contract &&
+        !entry.getKey().starts_with(ownSpecialization) &&
+        (llvm::is_contained(entry.second, contract) ||
+         llvm::is_contained(entry.second, leaf)))
+      return false;
+  if (py::exceptions::findByName(leaf))
+    for (const py::exceptions::BuiltinExceptionInfo &entry :
+         py::exceptions::kBuiltinExceptions)
+      if (entry.name != leaf &&
+          py::exceptions::isBuiltinExceptionSubclassName(entry.name, leaf))
+        return false;
+  return true;
+}
+
+bool ModuleEmitter::classValueIsExact(const parser::Node *expr,
+                                      mlir::Type type) const {
+  auto typeType =
+      mlir::dyn_cast_if_present<py::TypeType>(types.widenLiteral(type));
+  if (!typeType)
+    return false;
+  auto contract =
+      mlir::dyn_cast_if_present<py::ContractType>(typeType.getInstanceType());
+  if (!contract || classIsClosed(contract.getContractName()))
+    return true;
+  // `Box[int]` names the instantiation itself.
+  if (expr && expr->kind == "Subscript" && types.namesAType(expr))
+    return true;
+  if (!expr || (expr->kind != "Name" && expr->kind != "Attribute"))
+    return false;
+  std::string spelling = expr->kind == "Name"
+                             ? std::string(ast::nameSpelling(*expr))
+                             : ast::qualifiedName(expr);
+  if (spelling.empty())
+    return false;
+  // `type` and `list` spelled bare name their classes, as a declared class
+  // name does.
+  if (expr->kind == "Name" && values.find(spelling) == values.end() &&
+      !types.lookupSymbol(spelling) && types.builtinClassValue(spelling))
+    return true;
+  std::optional<mlir::Type> bound = types.lookupClass(spelling);
+  return bound && (*bound == mlir::Type(contract) || *bound == type);
+}
+
+llvm::SmallVector<std::string, 8>
+ModuleEmitter::classValueCandidates(llvm::StringRef contract) const {
+  llvm::SmallVector<std::string, 8> candidates;
+  auto add = [&](llvm::StringRef name) {
+    if (!llvm::is_contained(candidates, name))
+      candidates.push_back(name.str());
+  };
+  llvm::StringRef leaf = contract.rsplit('.').second;
+  if (leaf.empty())
+    leaf = contract;
+  for (const auto &entry : classMros)
+    if (entry.getKey() != contract &&
+        (llvm::is_contained(entry.second, contract) ||
+         llvm::is_contained(entry.second, leaf)))
+      add(entry.getKey());
+  // Builtin exceptions are built by the bound's arm with the value's class
+  // word, except those with an initializer of their own.
+  for (llvm::StringRef own : py::exceptions::kBuiltinExceptionsWithOwnInit)
+    if (own != contract &&
+        py::exceptions::isBuiltinExceptionSubclassContract(own, contract))
+      add(own);
+  add(contract);
+  return candidates;
+}
+
+// ⭐ A CLASS VALUE THE STATIC TYPE DOES NOT DECIDE DISPATCHES ON WHICH CLASS IT
+// NAMES. The call, the class attribute and the class method used to be
+// re-spelled as the STATIC class, which was right only while such a value
+// could not exist -- with class values carrying their type object it would
+// construct a Base for a value naming Sub:
+//
+//     for c in [A, B]:      # list[type[A]]
+//         print(c(2).n)     # printed A's n twice; CPython builds a B
+//
+// The arms are the program's own spelling of each class, chosen by identity
+// (`t is D`), so each arm is the static construction or attribute read that
+// class already compiles to. The bound itself is last, the fallback.
+std::optional<Value> ModuleEmitter::emitClassValueDispatch(
+    const parser::Node &anchor, Value classValue, py::ContractType bound,
+    mlir::Type resultType,
+    llvm::function_ref<parser::NodePtr(llvm::StringRef spelling)> armFor) {
+  llvm::SmallVector<std::string, 8> candidates =
+      classValueCandidates(bound.getContractName());
+  // ⛔ An instantiation of a generic subclass has no spelling of its own to
+  // put in an arm (`Labeled$spec0` is the compiler's name for it).
+  for (const std::string &candidate : candidates)
+    if (llvm::StringRef(candidate).contains('$')) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, anchor.range.start,
+          "a class value of '" +
+              py::contracts::displayClassNameForContract(
+                  bound.getContractName()) +
+              "' may name an instantiation of a generic subclass, which a "
+              "call through the value cannot spell; call the class by name"});
+      return emitNone(anchor);
+    }
+  auto spell = [](llvm::StringRef contract) {
+    contract.consume_front("builtins.");
+    return contract.str();
+  };
+  std::function<mlir::Value(std::size_t)> chain =
+      [&](std::size_t index) -> mlir::Value {
+    auto arm = [&]() -> mlir::Value {
+      parser::NodePtr node = armFor(spell(candidates[index]));
+      synthesizedIteratorDefs.push_back(node);
+      Value armValue = emitExpr(node.get());
+      pendingConstructionClass.reset();
+      return coerceValue(armValue, resultType, anchor).value;
+    };
+    if (index + 1 == candidates.size())
+      return arm();
+    mlir::Type candidateType = types.contract(candidates[index]);
+    auto candidate = py::TypeObjectOp::create(
+        builder, loc(anchor), types.typeObject(candidateType), candidateType);
+    mlir::Value same =
+        py::IsOp::create(builder, loc(anchor), builder.getI1Type(),
+                         classValue.value, candidate.getResult())
+            .getResult();
+    return emitValueDiamond(loc(anchor), same, resultType, arm,
+                            [&] { return chain(index + 1); });
+  };
+  return Value{chain(0), resultType};
+}
+
+std::optional<Value>
+ModuleEmitter::emitClassValueCall(const parser::Node &expr,
+                                  const parser::Node *calleeNode) {
+  if (!calleeNode)
+    return std::nullopt;
+  // `t(args)` constructs -- `self.cls(args)` too, a field holding a class;
+  // `t.m(args)` calls a class's method by name.
+  const parser::Node *classNode = calleeNode;
+  std::optional<std::string> method;
+  if (calleeNode->kind == "Attribute" &&
+      !mlir::isa_and_nonnull<py::TypeType>(
+          types.widenLiteral(types.inferExpr(calleeNode)))) {
+    classNode = ast::node(*calleeNode, "value");
+    if (auto attr = ast::string(*calleeNode, "attr"))
+      method = std::string(*attr);
+    if (!classNode || !method)
+      return std::nullopt;
+  }
+  mlir::Type classType = types.widenLiteral(types.inferExpr(classNode));
+  auto typeObject = mlir::dyn_cast_if_present<py::TypeType>(classType);
+  if (!typeObject || classValueIsExact(classNode, classType))
+    return std::nullopt;
+  auto bound =
+      mlir::dyn_cast_if_present<py::ContractType>(typeObject.getInstanceType());
+  if (!bound)
+    return std::nullopt;
+  auto refuse = [&](std::string reason) -> std::optional<Value> {
+    diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
+                                             expr.range.start,
+                                             std::move(reason)});
+    return emitNone(expr);
+  };
+  if (bound.getContractName() == "builtins.object")
+    return refuse("calling through a class value that may name any class is "
+                  "not supported: each class it could name would be an arm");
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if ((args && llvm::any_of(*args, [](const parser::NodePtr &arg) {
+         return !arg || arg->kind == "Starred";
+       })) ||
+      (keywords && llvm::any_of(*keywords, [](const parser::NodePtr &kw) {
+         return !kw || !ast::string(*kw, "arg");
+       })))
+    return refuse("a call through a class value takes its arguments spelled "
+                  "out, not unpacked");
+  // The class value first, then the arguments, each once and in order.
+  Value classValue = emitExpr(classNode);
+  std::vector<std::string> temps;
+  auto cleanup = llvm::scope_exit([&] {
+    for (const std::string &name : temps)
+      values.erase(name);
+  });
+  auto bindTemp = [&](const parser::Node *node) {
+    std::string name =
+        "__ly_classcall" + std::to_string(++syntheticFunctionCounter);
+    Value value = emitExpr(node);
+    values[name] = value;
+    types.bindSymbol(name, value.type);
+    temps.push_back(name);
+    return name;
+  };
+  std::vector<std::string> positional;
+  if (args)
+    for (const parser::NodePtr &arg : *args)
+      positional.push_back(bindTemp(arg.get()));
+  std::vector<std::pair<std::string, std::string>> named;
+  if (keywords)
+    for (const parser::NodePtr &kw : *keywords)
+      named.emplace_back(std::string(*ast::string(*kw, "arg")),
+                         bindTemp(ast::node(*kw, "value")));
+  parser::SourceRange range = expr.range;
+  // ⭐ THE BOUND'S ARM BUILDS EVERY BUILTIN EXCEPTION BELOW IT. They share
+  // one layout and one initializer here, which takes the class word as an
+  // argument, so the arm passes the value's class instead of enumerating
+  // sixty classes -- one of which (`_io.UnsupportedOperation`) no program
+  // can even spell.
+  bool builtinExceptionBound =
+      !method && py::exceptions::findByContract(bound.getContractName());
+  auto armFor = [&](llvm::StringRef spelling) {
+    parser::NodePtr callee = synth::name(spelling, range);
+    if (builtinExceptionBound &&
+        types.lookupClass(spelling) == mlir::Type(bound))
+      pendingConstructionClass = classValue;
+    if (method)
+      callee = synth::attribute(std::move(callee), *method, range);
+    std::vector<parser::NodePtr> callArgs;
+    for (const std::string &name : positional)
+      callArgs.push_back(synth::name(name, range));
+    std::vector<parser::NodePtr> callKeywords;
+    for (const auto &[keyword, name] : named)
+      callKeywords.push_back(
+          synth::keyword(keyword, synth::name(name, range), range));
+    return synth::callWithKeywords(std::move(callee), std::move(callArgs),
+                                   std::move(callKeywords), range);
+  };
+  // The bound's own answer types the merge: its construction is a `bound`,
+  // its method returns what the bound's method declares.
+  mlir::Type resultType = bound;
+  if (method) {
+    parser::NodePtr probe = armFor(bound.getContractName().starts_with(
+                                       "builtins.")
+                                       ? bound.getContractName().drop_front(9)
+                                       : bound.getContractName());
+    synthesizedIteratorDefs.push_back(probe);
+    resultType = types.widenLiteral(types.inferExpr(probe.get()));
+  }
+  return emitClassValueDispatch(expr, classValue, bound, resultType, armFor);
+}
+
+std::optional<Value>
+ModuleEmitter::emitClassValueAttribute(const parser::Node &expr,
+                                       Value classValue,
+                                       llvm::StringRef attribute) {
+  auto typeObject = mlir::dyn_cast_if_present<py::TypeType>(classValue.type);
+  auto bound = typeObject ? mlir::dyn_cast_if_present<py::ContractType>(
+                                typeObject.getInstanceType())
+                          : py::ContractType();
+  if (!bound)
+    return std::nullopt;
+  if (bound.getContractName() == "builtins.object") {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "reading '" + attribute.str() +
+            "' through a class value that may name any class is not "
+            "supported: each class it could name would be an arm"});
+    return emitNone(expr);
+  }
+  parser::SourceRange range = expr.range;
+  auto armFor = [&](llvm::StringRef spelling) {
+    return synth::attribute(synth::name(spelling, range), attribute, range);
+  };
+  parser::NodePtr probe =
+      armFor(bound.getContractName().starts_with("builtins.")
+                 ? bound.getContractName().drop_front(9)
+                 : bound.getContractName());
+  synthesizedIteratorDefs.push_back(probe);
+  mlir::Type resultType = types.widenLiteral(types.inferExpr(probe.get()));
+  return emitClassValueDispatch(expr, classValue, bound, resultType, armFor);
+}
+
 std::optional<Value>
 ModuleEmitter::tryEmitTypeCall(const parser::Node &expr,
                                const parser::Node *calleeNode) {
@@ -3014,27 +3297,89 @@ ModuleEmitter::tryEmitTypeCall(const parser::Node &expr,
                                              std::move(reason)});
     return emitNone(expr);
   };
+  // `type(None)` is NoneType, whose only value None is.
+  if (!contract && subject == types.none()) {
+    (void)emitExpr(subjectNode);
+    mlir::Type noneClass = types.contract("types.NoneType");
+    mlir::Type typeType = types.typeObject(noneClass);
+    auto object =
+        py::TypeObjectOp::create(builder, loc(expr), typeType, noneClass);
+    return Value{object.getResult(), typeType};
+  }
+  // ⭐ A UNION'S CLASS IS ITS ACTIVE MEMBER'S, chosen by the tag: each arm
+  // unwraps its member and answers that member's class the way a value of
+  // the member's own type would.
+  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(subject)) {
+    Value receiver = emitExpr(subjectNode);
+    mlir::Type resultType = types.widenLiteral(types.inferExpr(&expr));
+    if (!mlir::isa_and_nonnull<py::TypeType>(resultType))
+      resultType = types.typeObject(types.object());
+    llvm::SmallVector<mlir::Type, 4> members(unionType.getMemberTypes().begin(),
+                                             unionType.getMemberTypes().end());
+    auto classOfMember = [&](mlir::Type member) -> mlir::Value {
+      mlir::Type widened = types.widenLiteral(member);
+      Value value{py::UnionUnwrapOp::create(builder, loc(expr), member,
+                                            receiver.value)
+                      .getResult(),
+                  member};
+      mlir::Value classValue;
+      mlir::Type classType;
+      auto memberContract = mlir::dyn_cast_if_present<py::ContractType>(widened);
+      if (isNoneTypeLike(widened) || !memberContract) {
+        mlir::Type instance = isNoneTypeLike(widened)
+                                  ? types.contract("types.NoneType")
+                                  : types.object();
+        classType = types.typeObject(instance);
+        classValue =
+            py::TypeObjectOp::create(builder, loc(expr), classType, instance)
+                .getResult();
+      } else if (!classIsClosed(memberContract.getContractName())) {
+        classType = types.typeObject(memberContract);
+        classValue = py::TypeOfOp::create(builder, loc(expr), classType,
+                                          value.value)
+                         .getResult();
+      } else {
+        classType = types.typeObject(memberContract);
+        classValue = py::TypeObjectOp::create(builder, loc(expr), classType,
+                                              memberContract)
+                         .getResult();
+      }
+      return coerceValue(Value{classValue, classType}, resultType, expr).value;
+    };
+    std::function<mlir::Value(std::size_t)> chain =
+        [&](std::size_t index) -> mlir::Value {
+      if (index + 1 == members.size())
+        return classOfMember(members[index]);
+      mlir::Value active =
+          py::UnionTestOp::create(builder, loc(expr), builder.getI1Type(),
+                                  receiver.value,
+                                  mlir::TypeAttr::get(members[index]))
+              .getResult();
+      return emitValueDiamond(
+          loc(expr), active, resultType,
+          [&] { return classOfMember(members[index]); },
+          [&] { return chain(index + 1); });
+    };
+    return Value{chain(0), resultType};
+  }
   if (!contract)
     return refuse("type(x) needs a statically resolved class, and " +
                   typeText(subject) + " is not one");
   llvm::StringRef contractName = contract.getContractName();
-  if (contractName == "builtins.object" || contractName == "typing.Any")
-    return refuse(
-        "type(x) on a type-erased value would need the runtime class, which is "
-        "excluded from the static evidence kernel");
-  // ⛔ The SUBCLASS check is the soundness of the whole fold. `x: A = B()`
-  // makes the static class A and the runtime class B, and answering A there is
-  // a wrong answer with no diagnostic -- which is what the default repr does
-  // today and is recorded separately.
-  for (const auto &entry : classMros) {
-    if (entry.getKey() == contractName)
-      continue;
-    if (llvm::is_contained(entry.second, contractName))
-      return refuse("type(x) is not supported for '" + contractName.str() +
-                    "': '" + entry.getKey().str() +
-                    "' derives from it, so a value of this type can hold an "
-                    "instance of the subclass and the answer would name the "
-                    "static class instead");
+  // ⭐ A CLASS THE STATIC TYPE DOES NOT DECIDE IS READ AT RUN TIME. `x: A =
+  // B()` makes the static class A and the runtime class B; the value's header
+  // (or its box) keeps the class word, and the class value is that type
+  // object. It was refused, which took `type(self).__qualname__`,
+  // `type(a) is type(b)` and `type(self)(name)` with it.
+  if (contractName == "builtins.object" || contractName == "typing.Any" ||
+      !classIsClosed(contractName)) {
+    Value receiver = emitExpr(subjectNode);
+    mlir::Type bound = contractName == "typing.Any" ? types.object()
+                                                    : mlir::Type(contract);
+    mlir::Type typeType = types.typeObject(bound);
+    auto dynamic =
+        py::TypeOfOp::create(builder, loc(expr), typeType, receiver.value);
+    return Value{dynamic.getResult(), typeType};
   }
   // The argument still runs: `type(f())` calls f.
   (void)emitExpr(subjectNode);
@@ -3059,6 +3404,18 @@ ModuleEmitter::tryEmitIsInstanceCall(const parser::Node &expr,
     return emitNone(expr);
   }
 
+  // ⭐ A CLASS VALUE THE STATIC TYPE DOES NOT DECIDE IS TESTED AT RUN TIME:
+  // the target names its bound or any subclass of it, so the static answer
+  // for the bound -- what a `t: type[Base]` used to get -- is wrong for a
+  // value naming a subclass. The value's own class walks its MRO for it.
+  if (const parser::Node *targetNode = (*args)[1].get();
+      targetNode->kind != "Tuple") {
+    mlir::Type targetType = types.widenLiteral(types.inferExpr(targetNode));
+    if (mlir::isa<py::TypeType>(targetType) &&
+        !classValueIsExact(targetNode, targetType))
+      return emitClassValueSubclassTest(expr, args->front().get(), targetNode,
+                                        /*subjectIsInstance=*/true);
+  }
   std::optional<llvm::SmallVector<mlir::Type, 4>> targets =
       isinstanceTargetTypes((*args)[1].get(), types);
   if (!targets) {
@@ -4723,6 +5080,47 @@ ModuleEmitter::tryEmitAsciiCall(const parser::Node &expr,
   return emitNone(expr);
 }
 
+// `isinstance(x, t)` / `issubclass(s, t)` over class values: the class of x
+// (or s itself) has t in its MRO.
+std::optional<Value> ModuleEmitter::emitClassValueSubclassTest(
+    const parser::Node &expr, const parser::Node *subjectNode,
+    const parser::Node *targetNode, bool subjectIsInstance) {
+  Value subject = emitExpr(subjectNode);
+  Value target = emitExpr(targetNode);
+  auto refuse = [&](llvm::StringRef what) -> std::optional<Value> {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        what.str() + " needs class values on both sides here, and " +
+            typeText(subjectIsInstance ? target.type : subject.type) +
+            " is not one"});
+    return emitNone(expr);
+  };
+  if (!mlir::isa<py::TypeType>(target.type))
+    return refuse(subjectIsInstance ? "isinstance()" : "issubclass()");
+  mlir::Value subjectClass = subject.value;
+  if (subjectIsInstance) {
+    mlir::Type instance = types.widenLiteral(subject.type);
+    if (mlir::isa<py::UnionType>(instance)) {
+      subject = coerceValue(subject, types.object(), expr);
+      instance = types.object();
+    }
+    mlir::Type bound = mlir::isa<py::ContractType>(instance) ? instance
+                                                             : types.object();
+    subjectClass = py::TypeOfOp::create(builder, loc(expr),
+                                        types.typeObject(bound), subject.value)
+                       .getResult();
+  } else if (!mlir::isa<py::TypeType>(subject.type)) {
+    return refuse("issubclass()");
+  }
+  mlir::Value test =
+      py::TypeSubclassOp::create(builder, loc(expr), builder.getI1Type(),
+                                 subjectClass, target.value)
+          .getResult();
+  auto pyBool =
+      py::CastFromPrimOp::create(builder, loc(expr), types.boolType(), test);
+  return Value{pyBool.getResult(), types.boolType()};
+}
+
 std::optional<Value>
 ModuleEmitter::tryEmitIssubclassCall(const parser::Node &expr,
                                      const parser::Node *calleeNode) {
@@ -4737,6 +5135,17 @@ ModuleEmitter::tryEmitIssubclassCall(const parser::Node &expr,
   };
   if (!args || args->size() != 2 || (keywords && !keywords->empty()))
     return rejectIssubclass("issubclass() takes exactly two arguments");
+  // A class value on either side that the static type does not decide is
+  // answered at run time, from the MRO of the class it names.
+  for (const parser::NodePtr &arg : *args)
+    if (arg && arg->kind != "Tuple") {
+      mlir::Type argType = types.widenLiteral(types.inferExpr(arg.get()));
+      if (mlir::isa<py::TypeType>(argType) &&
+          !classValueIsExact(arg.get(), argType))
+        return emitClassValueSubclassTest(expr, (*args)[0].get(),
+                                          (*args)[1].get(),
+                                          /*subjectIsInstance=*/false);
+    }
   // Static classes only: the hierarchy is compile-time (C3 linearized), so
   // the answer folds to a constant.
   auto classOf = [&](const parser::Node *node) -> std::optional<mlir::Type> {
@@ -4882,38 +5291,6 @@ ModuleEmitter::tryEmitPowCall(const parser::Node &expr,
   return emitBinary(*rewritten);
 }
 
-// ⛔ The two SPELLINGS and not only the inferred type: `type(x)` is folded by
-// the emitter and the inference walk does not model the fold, so it answers
-// `object` for the very expression this is about.
-bool ModuleEmitter::rendersAClass(const parser::Node &argument) {
-  if (mlir::isa_and_nonnull<py::TypeType>(
-          types.widenLiteral(types.inferExpr(&argument))))
-    return true;
-  if (argument.kind == "Call")
-    return callsUnshadowedBuiltin(ast::node(argument, "func"), "type");
-  return argument.kind == "Attribute" &&
-         ast::string(argument, "attr") == "__class__";
-}
-
-// ⛔ ONE MESSAGE FOR THE FOUR SPELLINGS of the same question. `print(int)` said
-// this; `str(int)` rerouted to the repr path and said "unresolved name 'repr'",
-// naming the CALLEE for a problem in the argument; `str(type(xs))` reached the
-// lowering as "runtime method receiver has no concrete contract"; and
-// `f"{type(xs)}"` said a static type with no spelling in it does not provide
-// '__format__'. The refusal is the same one in every case, so it is written
-// once and says which spelling asked.
-std::optional<Value>
-ModuleEmitter::refuseClassRendering(const parser::Node &expr,
-                                    llvm::StringRef spelling) {
-  diagnostics.push_back(parser::Diagnostic{
-      parser::Severity::Error, expr.range.start,
-      spelling.str() +
-          " cannot render a class: a type object is compile-time "
-          "evidence here and has no runtime value, so write "
-          "`type(x).__name__` for the name"});
-  return emitNone(expr);
-}
-
 std::optional<Value>
 ModuleEmitter::tryEmitStrCall(const parser::Node &expr,
                               const parser::Node *calleeNode) {
@@ -4923,9 +5300,6 @@ ModuleEmitter::tryEmitStrCall(const parser::Node &expr,
     return std::nullopt;
   const auto *strArgs = ast::nodeList(expr, "args");
   const auto *strKeywords = ast::nodeList(expr, "keywords");
-  if (strArgs && strArgs->size() == 1 && strArgs->front() &&
-      strArgs->front()->kind != "Starred" && rendersAClass(*strArgs->front()))
-    return refuseClassRendering(expr, "str()");
   auto strClass = types.lookupClass("str");
   std::optional<llvm::StringRef> strSymbol =
       strClass ? contractName(*strClass) : std::nullopt;
@@ -4966,7 +5340,8 @@ ModuleEmitter::tryEmitStrCall(const parser::Node &expr,
     // A union renders by tag, which is `emitStringifyValue`'s union arm and
     // not anything the ladder below can ask: `str(d.get("b"))` fell all the
     // way through to the str CLASS and came out as "unresolved name 'repr'".
-    if (mlir::isa<py::UnionType>(argumentType))
+    // A class renders through its type object, the same arm.
+    if (mlir::isa<py::UnionType, py::TypeType>(argumentType))
       if (std::optional<Value> rendered =
               emitStringifyValue(expr, emitExpr(strArgs->front().get())))
         return *rendered;
@@ -5179,21 +5554,6 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
   // Rendering it here -- by tag, member by member -- is the only place that
   // question can be answered, because only the emitter still knows the
   // members.
-  // ⛔ A CLASS IS NOT A VALUE HERE, and the lowering could not say so: it
-  // reported "runtime method receiver has no concrete contract" for
-  // `print(type(1))` and `print(x.__class__)`, which describes the dispatch
-  // rather than the program. A type object is compile-time evidence in this
-  // compiler and has no object handle to render; `type(x).__name__` and
-  // `type(x) is int` are folds and keep working.
-  //
-  // ⛔ The two SPELLINGS and not only the inferred type: `type(x)` is folded by
-  // the emitter and the inference walk does not model the fold, so it answers
-  // `object` for the very expression this is about.
-  if (printArgs)
-    for (const parser::NodePtr &argument : *printArgs)
-      if (argument && argument->kind != "Starred" &&
-          rendersAClass(*argument))
-        return refuseClassRendering(expr, "print()");
   bool singleUnionArgument =
       printArgs && printArgs->size() == 1 && printArgs->front() &&
       printArgs->front()->kind != "Starred" &&
@@ -6488,9 +6848,6 @@ ModuleEmitter::tryEmitReprCall(const parser::Node &expr,
   bool hasKeywords = keywords && !keywords->empty();
   if (builtinVisible && args && args->size() == 1 && !hasKeywords &&
       (name == "repr" || name == "print")) {
-    if (args->front() && args->front()->kind != "Starred" &&
-        rendersAClass(*args->front()))
-      return *refuseClassRendering(expr, name.str() + "()");
     // Widen literals to their contract (`repr(5)` sees `builtins.int`, not
     // `literal<5>`) so the manifest `__repr__` resolves.
     //
@@ -6590,7 +6947,7 @@ ModuleEmitter::tryEmitReprCall(const parser::Node &expr,
       // `print(repr(None))`. `f"{v!r}"` renders it, `str(v)` renders it and
       // `print(v)` renders it, all three through `emitConversionValue`; this
       // was the one door that had its own copy.
-      if (mlir::isa<py::UnionType>(argumentType) ||
+      if (mlir::isa<py::UnionType, py::TypeType>(argumentType) ||
           isNoneTypeLike(argumentType))
         if (std::optional<Value> rendered = emitConversionValue(
                 expr, emitExpr(args->front().get()), 'r'))

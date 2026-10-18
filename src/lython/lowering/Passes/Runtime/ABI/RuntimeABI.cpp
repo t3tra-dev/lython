@@ -1,3 +1,4 @@
+#include "RuntimeClasses.h"
 #include "Ownership.h"
 #include "Runtime/Core/Lowerer.h"
 
@@ -580,6 +581,18 @@ RuntimeBundleLowerer::runtimeClassForClass(py::ClassOp classOp) const {
 }
 
 std::optional<std::string>
+RuntimeBundleLowerer::classValueRuntimeClass(mlir::Type instance) const {
+  if (std::optional<std::string> runtime =
+          RuntimeBundleLowerer::runtimeClassForContract(instance))
+    return runtime;
+  std::string contract = runtimeContractName(instance);
+  for (std::string_view known : py::runtime_classes::kRuntimeClasses)
+    if (!contract.empty() && known == contract)
+      return contract;
+  return std::nullopt;
+}
+
+std::optional<std::string>
 RuntimeBundleLowerer::runtimeClassForContract(mlir::Type type) const {
   std::string contract = runtimeContractName(type);
   if (!contract.empty())
@@ -726,6 +739,19 @@ RuntimeBundle RuntimeBundle::object(mlir::Type contract,
 RuntimeBundle RuntimeBundle::objectWithOwnership(mlir::Type contract,
                                                  mlir::ValueRange values,
                                                  own::OwnershipKind ownership) {
+  // ⭐ A `type[X]` value made from its lanes is a CLASS VALUE wherever it is
+  // made -- an element read out of a container, a cell, a starred element --
+  // because the static paths (construction, class attributes) read the
+  // instance contract only a class-value bundle carries. Its reference is
+  // immortal whatever ownership the caller asked for.
+  if (auto typeType = mlir::dyn_cast_if_present<py::TypeType>(contract)) {
+    RuntimeBundle bundle =
+        RuntimeBundle::typeObject(contract, typeType.getInstanceType());
+    if (!values.empty())
+      bundle.objectValue = RuntimeValue::objectWithOwnership(
+          contract, values, own::OwnershipKind::Immortal);
+    return bundle;
+  }
   RuntimeBundle bundle;
   bundle.kind = Kind::Object;
   bundle.contract = contract;
@@ -806,6 +832,9 @@ llvm::ArrayRef<mlir::Value> RuntimeBundle::physicalValues() const {
 std::string RuntimeBundle::contractName() const {
   if (kind == Kind::Object)
     return objectValue.contractName();
+  // A class value that carries its type object is an object of class `type`.
+  if (kind == Kind::TypeObject && !objectValue.values.empty())
+    return "builtins.type";
   return runtimeContractName(contract);
 }
 
@@ -953,7 +982,7 @@ RuntimeBundleLowerer::normalizeBoxSource(mlir::Operation *op,
 mlir::FailureOr<RuntimeBundle>
 RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
     mlir::Operation *op, const RuntimeBundle &source, bool retainPayload) {
-  if (source.kind != RuntimeBundle::Kind::Object)
+  if (!source.isObjectLike())
     return op->emitError() << "only runtime object bundles can be boxed";
   if (RuntimeBundleLowerer::isBuiltinsObjectContract(source.contract) &&
       source.boxedObject)
@@ -1542,7 +1571,9 @@ mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeClassObjectValue(
     llvm::SmallVector<mlir::Type, 8> fieldTypes =
         RuntimeBundleLowerer::classFieldContractTypes(classOp);
     for (unsigned index = 0; index < fieldTypes.size(); ++index) {
-      if (runtimeContractName(fieldTypes[index]) != "builtins.bool")
+      // A class value's word is an address, never 2: the same mark serves.
+      if (runtimeContractName(fieldTypes[index]) != "builtins.bool" &&
+          !mlir::isa<py::TypeType>(fieldTypes[index]))
         continue;
       std::optional<unsigned> word =
           RuntimeBundleLowerer::classFieldBodyWord(classOp, index);

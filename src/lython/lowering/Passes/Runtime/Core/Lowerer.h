@@ -146,6 +146,22 @@ private:
   // A class's qualified name: the name of its type object.
   std::optional<std::string> runtimeClassForClass(py::ClassOp classOp) const;
   std::optional<std::string> runtimeClassForContract(mlir::Type type) const;
+  // The type object a class value of `instance` references: the class's
+  // runtime class, or a runtime class no constructor marks
+  // (`types.NoneType`, whose one instance is None).
+  std::optional<std::string> classValueRuntimeClass(mlir::Type instance) const;
+  // Class values (type[X]): a reference to the class's type object.
+  RuntimeBundle staticClassValue(mlir::Location loc, mlir::Type typeContract,
+                                 mlir::Type instance);
+  mlir::Value classValueView(mlir::Location loc, mlir::Value word);
+  mlir::FailureOr<mlir::Value> classValueWord(mlir::Operation *op,
+                                              const RuntimeBundle &bundle);
+  // A logical type that expands to NO physical value: None, and a class value
+  // of a class with no type object (a protocol, a ctypes type).
+  bool logicalTypeHasNoLanes(mlir::Type type) const;
+  // Does a block argument of this logical type carry physical lanes across
+  // an edge: an object, a union, or a class value with a type object.
+  bool hasControlFlowLanes(mlir::Type type) const;
   mlir::FailureOr<llvm::SmallVector<std::string, 8>>
   runtimeClassesForNominalTarget(mlir::Operation *op,
                                  mlir::Type targetType) const;
@@ -1190,6 +1206,11 @@ private:
     // manifest value shape is an i1, which no frame slot could hold, so a
     // generator with a bool parameter had no argument lane at all.
     bool isBool = false;
+    // A class value (`type[X]`): one part, the view of an immortal type
+    // object. It rides the frame as an object part does, and like a bool it
+    // owns nothing, so no store retains it and no lane marks it owned.
+    bool isClass = false;
+    bool ownsNothing() const { return isNone || isBool || isClass; }
     unsigned physicalCount = 0;
     // The contract's physical parts, carried on the lane rather than looked up
     // from the manifest on each use.
@@ -1525,6 +1546,12 @@ private:
   }
 
   mlir::LogicalResult lowerClassName(py::ClassNameOp op);
+  mlir::LogicalResult lowerTypeOf(py::TypeOfOp op);
+  mlir::LogicalResult lowerTypeName(py::TypeNameOp op);
+  mlir::LogicalResult lowerTypeSubclass(py::TypeSubclassOp op);
+  // A class value's view of its type object, from its lane or its static class.
+  mlir::FailureOr<mlir::Value> classValueHandle(mlir::Operation *op,
+                                                const RuntimeBundle &bundle);
   mlir::LogicalResult lowerPyOp(mlir::Operation *op);
   mlir::LogicalResult lowerStructuredTryOps();
   mlir::LogicalResult lowerTry(py::TryOp op);

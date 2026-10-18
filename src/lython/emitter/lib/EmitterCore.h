@@ -915,6 +915,44 @@ private:
                                           const parser::Node *calleeNode);
   std::optional<Value> tryEmitCallableCall(const parser::Node &expr,
                                            const parser::Node *calleeNode);
+  // Whether a class can only be itself: nothing in the program derives from
+  // it, and it is not a builtin something derives from (bool is an int, an
+  // exception with subclasses, object).
+  bool classIsClosed(llvm::StringRef contract) const;
+  // Whether the class a `type[C]` value names is decided by its static type:
+  // C is closed, or the expression spells the class itself. Otherwise the
+  // value names C or any subclass, and only the run time knows which.
+  bool classValueIsExact(const parser::Node *expr, mlir::Type type) const;
+  std::optional<Value> emitClassValueIdentity(const parser::Node &expr,
+                                              Value lhs, Value rhs,
+                                              bool negated);
+  // The classes a `type[C]` value may name: every class of the program and
+  // every builtin exception deriving from C, then C itself last.
+  llvm::SmallVector<std::string, 8>
+  classValueCandidates(llvm::StringRef contract) const;
+  // The class value the next construction of its bound takes its class word
+  // from: a builtin exception constructed through `type[Exception]` is built
+  // by the bound's initializer with the class the value names.
+  std::optional<Value> pendingConstructionClass;
+  // One arm per candidate, chosen by identity with the class value; each arm's
+  // value is coerced to `resultType`.
+  std::optional<Value> emitClassValueDispatch(
+      const parser::Node &anchor, Value classValue, py::ContractType bound,
+      mlir::Type resultType,
+      llvm::function_ref<parser::NodePtr(llvm::StringRef spelling)> armFor);
+  // `t(args)` and `t.m(args)` for a class value the static type does not
+  // decide.
+  std::optional<Value> emitClassValueCall(const parser::Node &expr,
+                                          const parser::Node *calleeNode);
+  // `t.attr` -- a class attribute -- for such a value, already emitted.
+  std::optional<Value> emitClassValueAttribute(const parser::Node &expr,
+                                               Value classValue,
+                                               llvm::StringRef attribute);
+  std::optional<Value>
+  emitClassValueSubclassTest(const parser::Node &expr,
+                             const parser::Node *subjectNode,
+                             const parser::Node *targetNode,
+                             bool subjectIsInstance);
   std::optional<Value> tryEmitTypeCall(const parser::Node &expr,
                                        const parser::Node *calleeNode);
   std::optional<Value> tryEmitIsInstanceCall(const parser::Node &expr,
@@ -934,9 +972,6 @@ private:
                                       const parser::Node *calleeNode);
   Value emitFloatFromInt(const parser::Node &anchor, Value argument);
   Value emitIntFromBool(const parser::Node &anchor, Value argument);
-  bool rendersAClass(const parser::Node &argument);
-  std::optional<Value> refuseClassRendering(const parser::Node &expr,
-                                            llvm::StringRef spelling);
   std::optional<Value> tryEmitStrCall(const parser::Node &expr,
                                       const parser::Node *calleeNode);
   std::optional<Value>

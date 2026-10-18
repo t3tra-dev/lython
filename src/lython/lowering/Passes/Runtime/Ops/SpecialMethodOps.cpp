@@ -24,8 +24,7 @@ std::optional<mlir::Value> knownEvidenceEquality(mlir::Operation *op,
                                                  mlir::OpBuilder &builder,
                                                  const RuntimeBundle &lhs,
                                                  const RuntimeBundle &rhs) {
-  if (lhs.kind != RuntimeBundle::Kind::Object ||
-      rhs.kind != RuntimeBundle::Kind::Object)
+  if (!lhs.isObjectLike() || !rhs.isObjectLike())
     return std::nullopt;
   mlir::Location loc = op->getLoc();
   if (lhs.literalText && rhs.literalText)
@@ -235,6 +234,118 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerClassName(py::ClassNameOp op) {
           op, op.getResult(), methodReceiver, "__class_name__", sources,
           /*allowUnusedSources=*/false, /*preferManifestObjectResult=*/true)))
     return mlir::failure();
+  erase.push_back(op);
+  return mlir::success();
+}
+
+mlir::FailureOr<mlir::Value>
+RuntimeBundleLowerer::classValueHandle(mlir::Operation *op,
+                                       const RuntimeBundle &bundle) {
+  if (!bundle.objectValue.values.empty())
+    return bundle.objectValue.values.front();
+  mlir::FailureOr<mlir::Value> word =
+      RuntimeBundleLowerer::classValueWord(op, bundle);
+  if (mlir::failed(word))
+    return mlir::failure();
+  return RuntimeBundleLowerer::classValueView(op->getLoc(), *word);
+}
+
+// `type(x)` for a value whose static class does not decide it. A class value
+// is answered by `type`; a value with no header of its own (an int in its
+// word, a bool's bit, None) or of a closed manifest class is its static class;
+// everything else reads the class word its header (or its box) keeps.
+mlir::LogicalResult RuntimeBundleLowerer::lowerTypeOf(py::TypeOfOp op) {
+  const RuntimeBundle *input = RuntimeBundleLowerer::bundleFor(op.getInput());
+  if (!input)
+    return op.emitError() << "type_of operand has no lowered runtime bundle";
+  builder.setInsertionPoint(op);
+  mlir::Location loc = op.getLoc();
+  mlir::Type staticType = op.getInput().getType();
+  auto headerless = [&] {
+    return input->physicalValues().empty() ||
+           !mlir::isa<mlir::MemRefType>(input->physicalValues().front().getType());
+  };
+  mlir::Value word;
+  if (input->kind == RuntimeBundle::Kind::TypeObject) {
+    word = type_objects::classWord(builder, loc, module, "builtins.type");
+  } else if (headerless() ||
+             (!RuntimeBundleLowerer::isBuiltinsObjectContract(input->contract) &&
+              !RuntimeBundleLowerer::classForContract(staticType) &&
+              !RuntimeBundleLowerer::exceptionAncestorContractFor(staticType))) {
+    std::optional<std::string> runtimeClass =
+        RuntimeBundleLowerer::runtimeClassForContract(staticType);
+    if (!runtimeClass)
+      return op.emitError() << "type_of has no runtime class for " << staticType;
+    word = type_objects::classWord(builder, loc, module, *runtimeClass);
+  } else {
+    mlir::FailureOr<mlir::Value> exact =
+        RuntimeBundleLowerer::exactRuntimeClassWord(op, *input);
+    if (mlir::failed(exact))
+      return mlir::failure();
+    word = *exact;
+  }
+  auto typeType = mlir::cast<py::TypeType>(op.getResult().getType());
+  RuntimeBundle result =
+      RuntimeBundle::typeObject(typeType, typeType.getInstanceType());
+  result.objectValue = RuntimeValue::objectWithOwnership(
+      typeType, mlir::ValueRange{RuntimeBundleLowerer::classValueView(loc, word)},
+      ownership::OwnershipKind::Immortal);
+  valueBundles[op.getResult()] = std::move(result);
+  erase.push_back(op);
+  return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::lowerTypeName(py::TypeNameOp op) {
+  const RuntimeBundle *type = RuntimeBundleLowerer::bundleFor(op.getType());
+  if (!type)
+    return op.emitError() << "type name operand has no lowered runtime bundle";
+  llvm::StringRef attribute = op.getAttribute();
+  llvm::StringRef primitiveName =
+      attribute == "__module__" ? llvm::StringRef("module")
+                                : llvm::StringRef("name");
+  std::optional<RuntimeSymbol> primitive =
+      manifest.primitive("builtins.type", primitiveName);
+  if (!primitive)
+    return op.emitError() << "runtime manifest has no builtins.type "
+                          << primitiveName << " primitive";
+  builder.setInsertionPoint(op);
+  mlir::FailureOr<mlir::Value> handle =
+      RuntimeBundleLowerer::classValueHandle(op, *type);
+  if (mlir::failed(handle))
+    return mlir::failure();
+  mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+      op.getLoc(), *primitive, mlir::ValueRange{*handle});
+  RuntimeBundle named;
+  if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+          op, runtimeContractType(context, "builtins.str"), call, named)))
+    return mlir::failure();
+  valueBundles[op.getResult()] = std::move(named);
+  erase.push_back(op);
+  return mlir::success();
+}
+
+mlir::LogicalResult
+RuntimeBundleLowerer::lowerTypeSubclass(py::TypeSubclassOp op) {
+  const RuntimeBundle *sub = RuntimeBundleLowerer::bundleFor(op.getSub());
+  const RuntimeBundle *base = RuntimeBundleLowerer::bundleFor(op.getBase());
+  if (!sub || !base)
+    return op.emitError() << "issubclass operands have no lowered runtime "
+                             "bundles";
+  std::optional<RuntimeSymbol> primitive =
+      manifest.primitive("builtins.type", "is_subtype");
+  if (!primitive)
+    return op.emitError() << "runtime manifest has no builtins.type "
+                             "is_subtype primitive";
+  builder.setInsertionPoint(op);
+  mlir::FailureOr<mlir::Value> subHandle =
+      RuntimeBundleLowerer::classValueHandle(op, *sub);
+  mlir::FailureOr<mlir::Value> baseHandle =
+      RuntimeBundleLowerer::classValueHandle(op, *base);
+  if (mlir::failed(subHandle) || mlir::failed(baseHandle))
+    return mlir::failure();
+  mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+      op.getLoc(), *primitive, mlir::ValueRange{*subHandle, *baseHandle});
+  op.getResult().replaceAllUsesWith(call.getResult(0));
   erase.push_back(op);
   return mlir::success();
 }
@@ -912,7 +1023,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
       return mlir::success();
     }
     if (RuntimeBundleLowerer::containerHasRuntimePayload(container) &&
-        value.kind == RuntimeBundle::Kind::Object) {
+        value.isObjectLike()) {
       // Runtime-mode store (or a dynamic index on an evidence-backed list):
       // normalize/bounds-check against the runtime length and swap the
       // payload box in place. In-place: the receiver stays borrowed, so the
@@ -988,8 +1099,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
       container.contractName() == "builtins.dict" &&
       !container.mappingEvidenceBacked && container.mappingKeys.empty() &&
       RuntimeBundleLowerer::containerHasRuntimePayload(container) &&
-      index.kind == RuntimeBundle::Kind::Object &&
-      value.kind == RuntimeBundle::Kind::Object;
+      index.isObjectLike() && value.isObjectLike();
   if ((structuralMutation || op.getNumResults() == 0) && runtimeDictInsert) {
     // Runtime-mode dict (loop-built): contents are only known to the
     // runtime. Insert through the runtime probe; the rebind result carries
@@ -1065,9 +1175,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
     return mlir::success();
   }
   if (container.kind == RuntimeBundle::Kind::Object &&
-      container.contractName() == "builtins.dict" &&
-      index.kind == RuntimeBundle::Kind::Object &&
-      value.kind == RuntimeBundle::Kind::Object) {
+      container.contractName() == "builtins.dict" && index.isObjectLike() &&
+      value.isObjectLike()) {
     std::optional<std::string> key =
         RuntimeBundleLowerer::keywordNameFromValue(op.getIndex());
     if (!key && index.literalText)
@@ -1197,7 +1306,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
       container.contractName() == "builtins.dict" &&
       !container.mappingEvidenceBacked && container.mappingKeys.empty() &&
       RuntimeBundleLowerer::containerHasRuntimePayload(container) &&
-      index.kind == RuntimeBundle::Kind::Object) {
+      index.isObjectLike()) {
     // Runtime-mode dict delete: hash probe with a BORROWED transient key
     // box; the runtime raises KeyError (with the key's repr) on a miss and
     // compacts the dense entries in place, so the container's SSA
@@ -1499,6 +1608,21 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIs(py::IsOp op) {
   };
   builder.setInsertionPoint(op);
   mlir::Location loc = op.getLoc();
+  // Two class values are the same class when they view one type object.
+  if (sources.front()->kind == RuntimeBundle::Kind::TypeObject &&
+      sources.back()->kind == RuntimeBundle::Kind::TypeObject) {
+    mlir::FailureOr<mlir::Value> lhsWord =
+        RuntimeBundleLowerer::classValueWord(op, *sources.front());
+    mlir::FailureOr<mlir::Value> rhsWord =
+        RuntimeBundleLowerer::classValueWord(op, *sources.back());
+    if (mlir::failed(lhsWord) || mlir::failed(rhsWord))
+      return mlir::failure();
+    mlir::Value same = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::eq, *lhsWord, *rhsWord);
+    op.getResult().replaceAllUsesWith(same);
+    erase.push_back(op);
+    return mlir::success();
+  }
   // ⭐ AN `object` VALUE IS A BOX AROUND ITS ENTITY, and every value that
   // becomes one -- each argument, each read -- gets a box of its own, so the
   // box's address names the crossing, not the object: `def same(a: object, b:
@@ -1655,8 +1779,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
     erase.push_back(op);
     return mlir::success();
   };
-  if ((runtimeSetProbe || runtimeDictProbe) &&
-      item.kind == RuntimeBundle::Kind::Object)
+  if ((runtimeSetProbe || runtimeDictProbe) && item.isObjectLike())
     return emitBoxProbe();
   bool sequenceContainer = container.kind == RuntimeBundle::Kind::Object &&
                            (container.contractName() == "builtins.list" ||
@@ -1709,7 +1832,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
   }
   if (sequenceContainer &&
       RuntimeBundleLowerer::containerHasRuntimePayload(container) &&
-      item.kind == RuntimeBundle::Kind::Object)
+      item.isObjectLike())
     return emitBoxProbe();
   if (container.kind == RuntimeBundle::Kind::Object &&
       container.contractName() == "builtins.dict" &&

@@ -120,6 +120,8 @@ inline constexpr std::string_view kRuntimeClasses[] = {
     "builtins.ProcessLookupError",
     "builtins.TimeoutError",
     "_js.JsProxy",
+    // Every class's type object is an instance of it (word 1).
+    "builtins.type",
 };
 
 // Whether a name is a runtime class.

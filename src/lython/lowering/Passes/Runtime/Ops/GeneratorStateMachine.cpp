@@ -208,6 +208,12 @@ std::string generatorLaneKey(mlir::Type type) {
     return "builtins.int";
   if (isNoneLike(type))
     return "types.NoneType";
+  // A class value crosses as the reference to its type object, whichever
+  // class it names.
+  if (auto typeType = mlir::dyn_cast_if_present<py::TypeType>(type))
+    return mlir::isa<py::ContractType>(typeType.getInstanceType())
+               ? "builtins.type"
+               : std::string();
   if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type)) {
     // ⛔ A `type[X]` member has no value to box (`objectPayloadHandleWords`).
     for (mlir::Type member : unionType.getMemberTypes())
@@ -291,6 +297,19 @@ RuntimeBundleLowerer::computeGeneratorResumeLane(mlir::Operation *op,
     lane.physicalCount = 0;
     return lane;
   }
+  if (auto typeType = mlir::dyn_cast_if_present<py::TypeType>(type))
+    if (RuntimeBundleLowerer::classValueRuntimeClass(
+            typeType.getInstanceType())) {
+      const RuntimeValueShape *shape = manifest.valueShape("builtins.type");
+      if (!shape)
+        return op->emitError() << "runtime manifest has no builtins.type shape";
+      lane.contract = "builtins.type";
+      lane.isClass = true;
+      lane.physicalCount = static_cast<unsigned>(shape->valueTypes.size());
+      lane.physicalTypes.assign(shape->valueTypes.begin(),
+                                shape->valueTypes.end());
+      return lane;
+    }
   std::string contract = runtimeContractName(type);
   if (contract.empty())
     return op->emitError()
@@ -847,7 +866,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorClaimFunction(
   auto function = mlir::func::FuncOp::create(
       builder, loc, name, builder.getFunctionType(types, types));
   function.setPrivate();
-  if (!lane.isBool) {
+  if (!lane.ownsNothing()) {
     function->setAttr(ownership::kOwnedResultsAttr,
                       mlir::DenseI64ArrayAttr::get(
                           context, llvm::ArrayRef<std::int64_t>{0}));
@@ -973,7 +992,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorSpanStoreFunction(
   // anchor a transfer at, and marking one is "transfer_args argument 6 must be
   // an object-header-like memref". The load side already guards its owned
   // result the same way -- a bool carries no ownership at all.
-  if (lane.physicalCount > 0 && !lane.isBool) {
+  if (lane.physicalCount > 0 && !lane.ownsNothing()) {
     if (transferring)
       function->setAttr(ownership::kTransferArgsAttr,
                         builder.getI64ArrayAttr({2}));
@@ -1069,7 +1088,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorFrameLoadFunction(
       builder.getFunctionType({generatorStorageType(builder), i64},
                               laneTypes));
   function.setPrivate();
-  if (!lane.isBool) {
+  if (!lane.ownsNothing()) {
     function->setAttr(ownership::kOwnedResultsAttr,
                       mlir::DenseI64ArrayAttr::get(
                           context, llvm::ArrayRef<std::int64_t>{0}));
@@ -1440,6 +1459,17 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       // frame: `generatorArgumentFrameWords` gives it zero words and the ABI
       // skips its owned marking. The clone keeps the parameter's own type; a
       // lane describes the ABI expansion, not the value.
+      if (auto typeType = mlir::dyn_cast<py::TypeType>(positional);
+          typeType && RuntimeBundleLowerer::classValueRuntimeClass(
+                          typeType.getInstanceType())) {
+        mlir::FailureOr<GeneratorResumeLane> classLane =
+            RuntimeBundleLowerer::computeGeneratorResumeLane(
+                body.getOperation(), positional);
+        if (mlir::failed(classLane))
+          return mlir::failure();
+        argumentLanes.push_back(*classLane);
+        continue;
+      }
       if (mlir::isa<py::TypeType>(positional) || isNoneLike(positional)) {
         GeneratorResumeLane zeroWidth;
         zeroWidth.contract = "types.NoneType";
@@ -1644,6 +1674,13 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
           valueContract = contract;
         else if (valueContract != contract)
           eligible = false;
+        // A class value crosses as its type object's reference, the same for
+        // every class; the lane is typed with the generator's declared
+        // element so the reader rebuilds the class value it expects.
+        if (mlir::isa<py::TypeType>(yield.getValue().getType()) && !valueType)
+          valueType = declaredYield && mlir::isa<py::TypeType>(declaredYield)
+                          ? declaredYield
+                          : yield.getValue().getType();
         // A union is boxed, and the box says nothing of which union: every
         // yield has to be the same one for a reader to unbox it.
         if (mlir::isa<py::UnionType>(yield.getValue().getType())) {
@@ -1831,10 +1868,12 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       continue;
     }
 
+    bool classValueLane = valueType && mlir::isa<py::TypeType>(valueType);
     mlir::FailureOr<GeneratorResumeLane> valueLane =
         RuntimeBundleLowerer::computeGeneratorResumeLane(
             clone.getOperation(),
-            runtimeContractType(context, valueContract));
+            classValueLane ? valueType
+                           : runtimeContractType(context, valueContract));
     if (mlir::failed(valueLane))
       return mlir::failure();
 
@@ -1863,7 +1902,8 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
     for (unsigned lane = 0; lane < kResumeResultLanes; ++lane)
       resultTypes.push_back(
           lane == kResumeValueLaneIndex
-              ? runtimeContractType(context, valueContract)
+              ? (classValueLane ? valueType
+                                : runtimeContractType(context, valueContract))
           : lane == kResumeReturnLaneIndex && !returnLane.isControl()
               ? runtimeContractType(context, returnLane.contract)
               : intContract); // state', has, value, ret, hasret
@@ -3024,7 +3064,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFullFunction(
     llvm::SmallVector<std::int64_t, 2> ownedOffsets;
     llvm::SmallVector<mlir::Attribute, 2> ownedContracts;
     auto own = [&](const GeneratorResumeLane &lane, std::int64_t offset) {
-      if (lane.isControl() || lane.isNone || lane.isBool)
+      if (lane.isControl() || lane.ownsNothing())
         return;
       ownedOffsets.push_back(offset);
       ownedContracts.push_back(builder.getStringAttr(lane.contract));
@@ -3349,7 +3389,7 @@ mlir::LogicalResult RuntimeBundleLowerer::releaseGeneratorReturnSpan(
     mlir::Operation *op, const GeneratorResumeInfo &info,
     llvm::ArrayRef<mlir::Value> span) {
   const GeneratorResumeLane &lane = info.returnLane;
-  if (lane.isControl() || lane.isNone || lane.isBool)
+  if (lane.isControl() || lane.ownsNothing())
     return mlir::success();
   RuntimeBundle returned;
   if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
@@ -3392,8 +3432,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
   auto function = mlir::func::FuncOp::create(
       builder, loc, name, builder.getFunctionType(fullType.getInputs(), results));
   function.setPrivate();
-  if (!info.valueLane.isControl() && !info.valueLane.isNone &&
-      !info.valueLane.isBool) {
+  if (!info.valueLane.isControl() && !info.valueLane.ownsNothing()) {
     function->setAttr(ownership::kOwnedResultsAttr,
                       mlir::DenseI64ArrayAttr::get(
                           context, llvm::ArrayRef<std::int64_t>{1}));
@@ -5246,7 +5285,7 @@ RuntimeBundleLowerer::getOrCreateBoxedGeneratorDriver(
   if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
           function, runtimeContractType(context, lane.contract),
           llvm::ArrayRef<mlir::Value>(span).take_front(lane.physicalCount),
-          yielded, /*ownsObject=*/!lane.isNone && !lane.isBool)))
+          yielded, /*ownsObject=*/!lane.ownsNothing())))
     return mlir::failure();
   if (lane.isInt)
     yielded.primitiveI64 = RuntimePrimitiveI64Evidence{
@@ -5259,7 +5298,7 @@ RuntimeBundleLowerer::getOrCreateBoxedGeneratorDriver(
       RuntimeBundleLowerer::boxForObjectLane(anchor, yielded);
   if (mlir::failed(boxed))
     return mlir::failure();
-  if (!lane.isNone && !lane.isBool &&
+  if (!lane.ownsNothing() &&
       mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
           anchor, yielded, "generator yield boxed for a union read")))
     return mlir::failure();

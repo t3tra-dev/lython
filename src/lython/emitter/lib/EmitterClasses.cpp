@@ -5161,6 +5161,28 @@ Value ModuleEmitter::emitInlineMethodBody(
         if (llvm::is_contained(classMro(actualContract.getContractName()),
                                expectedContract.getContractName()))
           return;
+    // ⭐ A SUBCLASS IS A CLASS VALUE OF ITS BASE: `type[Sq]` passed where
+    // `type[Shape]` is declared is the class value naming Sq, which is what
+    // the parameter holds at run time.
+    // (Not along the numeric tower, which `isAssignableWithStaticEvidence`
+    // states for class values.)
+    if (auto expectedClass = mlir::dyn_cast<py::TypeType>(expected))
+      if (auto actualClass = mlir::dyn_cast<py::TypeType>(actual)) {
+        auto numeric = [](mlir::Type type) {
+          auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+          return contract && (contract.getContractName() == "builtins.bool" ||
+                              contract.getContractName() == "builtins.int" ||
+                              contract.getContractName() == "builtins.float" ||
+                              contract.getContractName() == "builtins.complex");
+        };
+        mlir::Type actualInstance = actualClass.getInstanceType();
+        mlir::Type expectedInstance = expectedClass.getInstanceType();
+        if (!(numeric(actualInstance) && numeric(expectedInstance)) &&
+            (isAssignableWithStaticEvidence(actual, expected, module) ||
+             pythonSubclassOf(actualInstance, expectedInstance, types,
+                              module)))
+          return;
+      }
     // ⭐ A BARE generic contract accepts any instantiation of itself. A generic
     // class's own methods spell the receiver without its arguments --
     // `def __add__(self, other: "Counter") -> "Counter"` -- and the argument
@@ -5745,8 +5767,14 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
     return emitNone(expr);
   }
   mlir::Type classType = types.typeObject(inferredInstanceType);
-  auto classObject = py::TypeObjectOp::create(builder, loc(expr), classType,
-                                              inferredInstanceType);
+  mlir::Value classObject;
+  if (pendingConstructionClass && pendingConstructionClass->type == classType)
+    classObject = pendingConstructionClass->value;
+  else
+    classObject = py::TypeObjectOp::create(builder, loc(expr), classType,
+                                           inferredInstanceType)
+                      .getResult();
+  pendingConstructionClass.reset();
   Value posPack = emitPack(operands.positional, operands.positionalUnpacked);
   Value namePack = emitPack(operands.keywordNames);
   Value valuePack = emitPack(operands.keywordValues);
@@ -5754,7 +5782,7 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
   auto newOp = py::NewOp::create(
       builder, loc(expr), inferredInstanceType,
       mlir::FlatSymbolRefAttr::get(&context, "__new__"), callableProtocol(),
-      classObject.getResult(), posPack.value, namePack.value, valuePack.value);
+      classObject, posPack.value, namePack.value, valuePack.value);
   newOp->setAttr("ly.constructor.owner", builder.getStringAttr(name));
   if (std::optional<MethodBinding> newBinding =
           lookupClassMethod(inferredInstanceType, "__new__")) {
@@ -6061,7 +6089,11 @@ mlir::Type ModuleEmitter::ensureCellClass(mlir::Type contentType,
     auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type);
     return unionType && unionType.isOptional();
   };
-  bool ordinaryStorage = tracksBinding || optionalContent(contentType);
+  // A class value is a body word of the instance, the slot an ordinary field
+  // of that type has; the boxed cell would write the word where its reader
+  // looks for a box.
+  bool ordinaryStorage = tracksBinding || optionalContent(contentType) ||
+                         mlir::isa_and_nonnull<py::TypeType>(contentType);
   std::string cellName =
       (llvm::Twine(ordinaryStorage ? kSlotClassPrefix : kCellClassPrefix) +
        llvm::Twine(++cellClassCounter))

@@ -23,8 +23,7 @@ bool primitiveI64EvidenceEqual(const RuntimeBundle &lhs,
 }
 
 bool evidenceValueEqual(const RuntimeBundle &lhs, const RuntimeBundle &rhs) {
-  if (lhs.kind != RuntimeBundle::Kind::Object ||
-      rhs.kind != RuntimeBundle::Kind::Object)
+  if (!lhs.isObjectLike() || !rhs.isObjectLike())
     return false;
   if (lhs.literalText && rhs.literalText)
     return *lhs.literalText == *rhs.literalText;
@@ -250,7 +249,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRuntimeListPop(
   mlir::Location loc = op.getLoc();
   mlir::Value rawIndex;
   if (sources.size() == 2) {
-    if (!sources[1] || sources[1]->kind != RuntimeBundle::Kind::Object)
+    if (!sources[1] || !sources[1]->isObjectLike())
       return op.emitError() << "list.pop index must be a Python object";
     mlir::FailureOr<mlir::Value> raw =
         RuntimeBundleLowerer::rawSequenceIndexValue(
@@ -323,7 +322,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRuntimeListInsert(
     py::CallOp op, const RuntimeBundle &receiver,
     llvm::ArrayRef<const RuntimeBundle *> sources) {
   if (!sources[1] || sources[1]->kind != RuntimeBundle::Kind::Object ||
-      !sources[2] || sources[2]->kind != RuntimeBundle::Kind::Object)
+      !sources[2] || !sources[2]->isObjectLike())
     return op.emitError()
            << "list.insert expects an index and one Python object argument";
   std::optional<RuntimeSymbol> ensure =
@@ -586,9 +585,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
       ((methodName == "get" && sources.size() == 3) ||
        (methodName == "pop" &&
         (sources.size() == 2 || sources.size() == 3))) &&
-      sources[1] && sources[1]->kind == RuntimeBundle::Kind::Object &&
-      (sources.size() < 3 ||
-       (sources[2] && sources[2]->kind == RuntimeBundle::Kind::Object))) {
+      sources[1] && sources[1]->isObjectLike() &&
+      (sources.size() < 3 || (sources[2] && sources[2]->isObjectLike()))) {
     bool isPop = methodName == "pop";
     bool hasDefault = sources.size() == 3;
     mlir::Type valueContract = op.getResult(0).getType();
@@ -863,7 +861,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
                         RuntimeBundleLowerer::containerHasRuntimePayload(receiver);
     if (listBoxMethod || tupleBoxMethod || setBoxMethod) {
       if (sources.size() != 2 || !sources[1] ||
-          sources[1]->kind != RuntimeBundle::Kind::Object)
+          !sources[1]->isObjectLike())
         return op.emitError() << receiverContract << "." << methodName
                               << " expects one Python object argument";
       std::string primitiveName = (methodName + llvm::Twine("_box")).str();
@@ -970,7 +968,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     // local -- while `s.add(x)` on a name and a parameter went through the
     // identical call.
     if (sources.size() != 2 || !sources[1] ||
-        sources[1]->kind != RuntimeBundle::Kind::Object)
+        !sources[1]->isObjectLike())
       return op.emitError() << "set.add expects one Python object argument";
     if (!RuntimeBundleLowerer::containerHasRuntimePayload(receiver))
       return op.emitError() << "set runtime object has no physical payload";
@@ -1071,7 +1069,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
   if (isMutableStructuralListObject(receiver) &&
       (methodName == "append" || methodName == "remove")) {
     if (sources.size() != 2 || !sources[1] ||
-        sources[1]->kind != RuntimeBundle::Kind::Object)
+        !sources[1]->isObjectLike())
       return op.emitError() << "sequence " << methodName
                             << " expects one Python object argument";
 

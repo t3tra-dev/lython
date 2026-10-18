@@ -1,0 +1,9 @@
+int 1
+class B
+[U, U] ['int 1', 'class A']
+1
+<class '__main__.B'>
+2
+<class '__main__.A'>
+<class '__main__.B'> {'k': <class '__main__.B'>}
+7 <class '__main__.B'> [7, <class '__main__.B'>]

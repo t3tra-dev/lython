@@ -815,6 +815,9 @@ bool callResultGroupIsOwned(mlir::func::FuncOp callee, unsigned resultIndex) {
 }
 
 OwnershipKind logicalOwnershipKind(mlir::Type logicalType, bool ownsObject) {
+  // A class value is a reference to an immortal type object: nothing to count.
+  if (mlir::isa_and_nonnull<py::TypeType>(logicalType))
+    return OwnershipKind::Immortal;
   std::string contractName = contracts::runtimeContractName(logicalType);
   if (contractName.empty())
     return OwnershipKind::NonObject;
@@ -917,12 +920,26 @@ deallocatorValueCountForType(mlir::ValueRange values, unsigned offset,
   return static_cast<unsigned>(deallocator->shapeTypes.size());
 }
 
+// A class value's one lane: the view of a type object, `memref<15xi64>`
+// (TypeObjects.h). A class with no type object has no lane at all.
+static bool isClassValueLane(mlir::ValueRange values, unsigned offset) {
+  if (offset >= values.size())
+    return false;
+  auto memref = mlir::dyn_cast<mlir::MemRefType>(values[offset].getType());
+  return memref && memref.getRank() == 1 && memref.hasStaticShape() &&
+         memref.getDimSize(0) == 15 && memref.getElementType().isInteger(64);
+}
+
 static void
 collectTypedResourceGroups(mlir::Type type, mlir::ValueRange values,
                            llvm::ArrayRef<RuntimeDeallocator> deallocators,
                            unsigned baseOffset,
                            llvm::SmallVectorImpl<ResourceGroup> &groups) {
   if (values.empty())
+    return;
+  // A class value references an immortal type object: there is nothing to
+  // release, whatever deallocator its lane's shape would match.
+  if (mlir::isa<py::TypeType>(type))
     return;
 
   OriginScope originScope("typed");
@@ -966,6 +983,8 @@ collectTypedResourceGroups(mlir::Type type, mlir::ValueRange values,
        llvm::enumerate(unionType.getMemberTypes())) {
     std::optional<unsigned> memberSize =
         deallocatorValueCountForType(values, offset, deallocators, member);
+    if (mlir::isa<py::TypeType>(member))
+      memberSize = isClassValueLane(values, offset) ? 1u : 0u;
     if (!memberSize) {
       if (isNoneLikeType(member))
         memberSize = 0;
@@ -1269,6 +1288,14 @@ static bool resourceGroupStartsAt(llvm::ArrayRef<ResourceGroup> groups,
   });
 }
 
+static bool returnsClassValue(mlir::func::FuncOp callee) {
+  auto callableAttr = callee->getAttrOfType<mlir::TypeAttr>(kCallableTypeAttr);
+  auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+      callableAttr ? callableAttr.getValue() : mlir::Type());
+  return callable && callable.getResultTypes().size() == 1 &&
+         mlir::isa<py::TypeType>(callable.getResultTypes().front());
+}
+
 static void appendUnresolvedOwnedResultRoot(
     mlir::func::CallOp call, unsigned offset,
     llvm::SmallVectorImpl<ResourceGroup> &groups) {
@@ -1479,7 +1506,9 @@ collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
     for (unsigned offset : functionContract->ownedResults.values)
       appendUnresolvedOwnedResultRoot(call, offset, ownedGroups);
   }
-  if (functionUsesOwnedReturnABI(callee))
+  // A function returning a class value hands back a reference to an immortal
+  // type object, which nothing owns.
+  if (functionUsesOwnedReturnABI(callee) && !returnsClassValue(callee))
     appendUnresolvedOwnedResultRoot(call, /*offset=*/0, ownedGroups);
 
   return ownedGroups;

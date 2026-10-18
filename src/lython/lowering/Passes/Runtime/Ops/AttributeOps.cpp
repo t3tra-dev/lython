@@ -57,8 +57,12 @@ bool isMethodDescriptorKind(py::AttrGetOp op) {
 // never the missing piece; the word was, and getting it back means a tagged
 // field -- a body word that holds either the value or a pointer to a box --
 // which is a different design and not a predicate.
+// ⭐ AND A CLASS VALUE, whose word is the class word itself: the type object
+// is immortal, so the field holds an address and owns nothing, and a store is
+// one word with no box and no reference to drop.
 bool isPrimitiveFieldContract(mlir::Type fieldType) {
-  return runtimeContractName(fieldType) == "builtins.bool";
+  return runtimeContractName(fieldType) == "builtins.bool" ||
+         mlir::isa_and_nonnull<py::TypeType>(fieldType);
 }
 
 bool isBoolFieldType(mlir::Type fieldType) {
@@ -262,11 +266,10 @@ bool RuntimeBundleLowerer::classFieldStoredBoxed(
     // (`unionValuesFromBoxWords`) -- so the tag needs no storage of its own and
     // the members need no shared width.
     //
-    // ⛔ WHAT DOES NOT FIT IS A MEMBER WITH NO CONTRACT OF ITS OWN, which is
-    // `type[X]`: its value is EMPTY (which class it names is in the type), so
-    // there is nothing to box and no class word that could name it back. A
-    // union holding one keeps every member's lanes, and the class holding that
-    // union keeps them too.
+    // A `type[X]` member fits too: a class value is the address of a type
+    // object, and the box's class word for it is `type`'s. ⛔ ONE such member
+    // at most, for the reason a lane-less member is limited below: that class
+    // word says "a class value" and not which of two it would be.
     //
     // Keeping them inline instead put the tag and every member's lanes into the
     // INSTANCE's own value group, and that one decision was four defects: an
@@ -285,7 +288,14 @@ bool RuntimeBundleLowerer::classFieldStoredBoxed(
     // primitive: its own value is an `i1` with no address, and its boxed form
     // is an immortal singleton that has one.
     unsigned laneLess = 0;
+    unsigned classValues = 0;
     for (mlir::Type member : unionType.getMemberTypes()) {
+      if (mlir::isa<py::TypeType>(member)) {
+        if (RuntimeBundleLowerer::logicalTypeHasNoLanes(member))
+          return false;
+        ++classValues;
+        continue;
+      }
       std::string memberName = runtimeShapeContractName(member);
       if (memberName.empty())
         return false;
@@ -297,7 +307,7 @@ bool RuntimeBundleLowerer::classFieldStoredBoxed(
           !manifest.primitive(memberName, "box"))
         return false;
     }
-    return laneLess <= 1;
+    return laneLess <= 1 && classValues <= 1;
   }
   // runtimeShapeContractName returns by value; a StringRef binding would
   // dangle past this declaration statement.
@@ -723,7 +733,14 @@ mlir::LogicalResult RuntimeBundleLowerer::storePrimitiveFieldSlot(
   builder.setInsertionPoint(op);
   mlir::Location loc = op->getLoc();
   mlir::Value word;
-  if (isBoolFieldType(fieldType)) {
+  if (mlir::isa<py::TypeType>(fieldType)) {
+    // A class value's word is its type object's address.
+    mlir::FailureOr<mlir::Value> classWord =
+        RuntimeBundleLowerer::classValueWord(op, value);
+    if (mlir::failed(classWord))
+      return mlir::failure();
+    word = *classWord;
+  } else if (isBoolFieldType(fieldType)) {
     if (value.physicalValues().size() != 1 ||
         !value.physicalValues().front().getType().isInteger(1))
       return op->emitError() << "attribute value " << value.contractName()
@@ -1600,11 +1617,46 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
       return op.emitError() << "class field metadata is malformed for "
                             << classOp.getSymName();
     mlir::Type fieldType = fieldTypes[*fieldIndex];
-    // The store wrote nothing, so the read loads nothing: a `type[X]` field's
-    // value is its declared type, and the bundle is rebuilt from it.
+    // A class value's field holds its class word; a class with no type object
+    // (a protocol, a ctypes type) has none and is rebuilt from the type.
     if (auto typeField = mlir::dyn_cast<py::TypeType>(fieldType)) {
-      valueBundles[op.getResult()] =
+      std::optional<unsigned> word =
+          RuntimeBundleLowerer::classFieldBodyWord(classOp, *fieldIndex);
+      if (!word || !RuntimeBundleLowerer::classValueRuntimeClass(
+                       typeField.getInstanceType())) {
+        valueBundles[op.getResult()] =
+            RuntimeBundle::typeObject(fieldType, typeField.getInstanceType());
+        erase.push_back(op);
+        return mlir::success();
+      }
+      builder.setInsertionPoint(op);
+      mlir::FailureOr<mlir::Value> body =
+          RuntimeBundleLowerer::classInstanceBody(op, *object, classOp);
+      if (mlir::failed(body))
+        return mlir::failure();
+      mlir::Value slotIndex =
+          mlir::arith::ConstantIndexOp::create(builder, op.getLoc(), *word);
+      mlir::Value classWord =
+          mlir::memref::LoadOp::create(builder, op.getLoc(), *body,
+                                       mlir::ValueRange{slotIndex})
+              .getResult();
+      if (op->hasAttr("ly.field.maybe_unset")) {
+        // The allocation marks the word 2 until its first store, as a bool's.
+        mlir::Value unset = mlir::arith::CmpIOp::create(
+            builder, op.getLoc(), mlir::arith::CmpIPredicate::eq, classWord,
+            mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 2, 64));
+        if (mlir::failed(raiseIfFieldUnset(op, *object, unset)))
+          return mlir::failure();
+        builder.setInsertionPoint(op);
+      }
+      RuntimeBundle classValue =
           RuntimeBundle::typeObject(fieldType, typeField.getInstanceType());
+      classValue.objectValue = RuntimeValue::objectWithOwnership(
+          fieldType,
+          mlir::ValueRange{
+              RuntimeBundleLowerer::classValueView(op.getLoc(), classWord)},
+          ownership::OwnershipKind::Immortal);
+      valueBundles[op.getResult()] = std::move(classValue);
       erase.push_back(op);
       return mlir::success();
     }
@@ -2706,7 +2758,12 @@ mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::unionTagFromBoxWords(
   for (auto [index, member] : llvm::enumerate(unionType.getMemberTypes())) {
     mlir::Value matched =
         mlir::arith::ConstantIntOp::create(builder, loc, 0, 1).getResult();
-    if (static_cast<std::int64_t>(index) != laneLessTag.value_or(-1)) {
+    if (mlir::isa<py::TypeType>(member)) {
+      // A class value's box names `type`, whichever class it holds.
+      matched = RuntimeBundleLowerer::classTestMatches(loc, exact,
+                                                       "builtins.type");
+    } else if (static_cast<std::int64_t>(index) !=
+               laneLessTag.value_or(-1)) {
       mlir::FailureOr<llvm::SmallVector<std::string, 8>> classes =
           RuntimeBundleLowerer::runtimeClassesForNominalTarget(op, member);
       if (mlir::failed(classes))
@@ -2759,6 +2816,19 @@ RuntimeBundleLowerer::unionValuesFromBoxWords(mlir::Operation *op,
       return mlir::failure();
     if (laneTypes->empty())
       continue;
+    // A class value's lane is a view of the type object the entity word
+    // addresses; the inactive arm views `object`'s, which no read dereferences
+    // past the view.
+    if (mlir::isa<py::TypeType>(member)) {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPoint(op);
+      mlir::Value standIn =
+          type_objects::classWord(builder, loc, module, "builtins.object");
+      mlir::Value entity = mlir::arith::SelectOp::create(
+          builder, loc, matches[index], entityWord, standIn);
+      values.push_back(RuntimeBundleLowerer::classValueView(loc, entity));
+      continue;
+    }
     std::string contractName = runtimeContractName(member);
     if (branchless) {
       // ⭐ THE INACTIVE ARM IS AN ADDRESS, NOT A BRANCH. Rebuilding a lane is
@@ -2958,13 +3028,36 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
       return RuntimeBundleLowerer::lowerStaticCtypesValueAttrSet(op, *object,
                                                                  value);
   }
-  // ⭐ Storing a `type[X]` STORES NOTHING. The field's physical shape is empty
-  // because which class the value names is decided by its type, so the write
-  // has no slot to write and the read reconstructs it from the field's
-  // declared type. The assignability the emitter already checked is what makes
-  // the two agree.
+  // ⭐ Storing a class value stores its class word in the field's body word
+  // (`isPrimitiveFieldContract`); a class with no type object has nothing to
+  // store, and its read rebuilds it from the declared type.
   if (value && value->kind == RuntimeBundle::Kind::TypeObject &&
       mlir::isa<py::TypeType>(op.getValue().getType())) {
+    py::ClassOp ownerClass =
+        RuntimeBundleLowerer::classForContract(op.getObject().getType());
+    std::optional<unsigned> fieldIndex =
+        ownerClass ? RuntimeBundleLowerer::classFieldIndex(ownerClass,
+                                                           op.getName())
+                   : std::nullopt;
+    std::optional<unsigned> word =
+        fieldIndex ? RuntimeBundleLowerer::classFieldBodyWord(ownerClass,
+                                                              *fieldIndex)
+                   : std::nullopt;
+    if (word && !value->objectValue.values.empty()) {
+      builder.setInsertionPoint(op);
+      mlir::FailureOr<mlir::Value> classWord =
+          RuntimeBundleLowerer::classValueWord(op, *value);
+      if (mlir::failed(classWord))
+        return mlir::failure();
+      mlir::FailureOr<mlir::Value> body =
+          RuntimeBundleLowerer::classInstanceBody(op, *object, ownerClass);
+      if (mlir::failed(body))
+        return mlir::failure();
+      mlir::Value slotIndex =
+          mlir::arith::ConstantIndexOp::create(builder, op.getLoc(), *word);
+      mlir::memref::StoreOp::create(builder, op.getLoc(), *classWord, *body,
+                                    mlir::ValueRange{slotIndex});
+    }
     erase.push_back(op);
     return mlir::success();
   }

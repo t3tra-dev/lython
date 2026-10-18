@@ -1193,6 +1193,10 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
 
         llvm::SmallVector<mlir::Type, 4> handlerTypes;
         llvm::SmallVector<mlir::Location, 4> handlerTypeLocs;
+        // The handler expressions whose class the static type does not decide
+        // (`except self.expected:`), by position in handlerTypes; evaluated
+        // in the check block, where CPython evaluates a clause's expression.
+        llvm::SmallVector<const parser::Node *, 4> dynamicHandlerNodes;
         if (!typeNode) {
           handlerTypes.push_back(
               types.typeObject(types.contract("builtins.BaseException")));
@@ -1234,6 +1238,10 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
             }
             handlerTypes.push_back(candidateType);
             handlerTypeLocs.push_back(loc(*candidate));
+            dynamicHandlerNodes.push_back(
+                classValueIsExact(candidate, types.widenLiteral(candidateType))
+                    ? nullptr
+                    : candidate);
           }
         }
         if (handlerTypes.empty())
@@ -1283,6 +1291,11 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
               matchLoc, py::ExceptCurrentMatchOp::getOperationName());
           matchState.addTypes(builder.getI1Type());
           matchState.addAttribute("handler", mlir::TypeAttr::get(handlerType));
+          if (matchIndex < dynamicHandlerNodes.size() &&
+              dynamicHandlerNodes[matchIndex]) {
+            Value classValue = emitExpr(dynamicHandlerNodes[matchIndex]);
+            matchState.addOperands(classValue.value);
+          }
           auto match =
               mlir::cast<py::ExceptCurrentMatchOp>(builder.create(matchState));
           mlir::Block *nextMiss = miss;

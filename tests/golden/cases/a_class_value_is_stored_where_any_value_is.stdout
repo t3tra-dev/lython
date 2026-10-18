@@ -1,0 +1,9 @@
+A
+B
+B
+True
+B
+['A', 'B', 'A']
+['B'] ['A', 'B']
+A B True 2
+[('float', 1), ('int', 2), ('str', 2)]

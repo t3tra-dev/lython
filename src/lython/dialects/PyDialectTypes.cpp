@@ -1149,9 +1149,25 @@ bool isSubtypeOfImpl(mlir::Type subtype, mlir::Type supertype,
 
   auto subtypeMeta = mlir::dyn_cast<TypeType>(subtype);
   auto supertypeMeta = mlir::dyn_cast<TypeType>(supertype);
-  if (subtypeMeta && supertypeMeta)
+  if (subtypeMeta && supertypeMeta) {
+    // ⛔ Not along the numeric tower: a bool, an int and a float are three
+    // representations, so a call through a `type[int]` naming bool would
+    // build an int where CPython builds a bool.
+    auto numeric = [](mlir::Type type) {
+      auto contract = mlir::dyn_cast<ContractType>(type);
+      if (!contract)
+        return false;
+      llvm::StringRef name = contract.getContractName();
+      return name == "builtins.bool" || name == "builtins.int" ||
+             name == "builtins.float" || name == "builtins.complex";
+    };
+    if (subtypeMeta.getInstanceType() != supertypeMeta.getInstanceType() &&
+        numeric(subtypeMeta.getInstanceType()) &&
+        numeric(supertypeMeta.getInstanceType()))
+      return false;
     return isSubtypeOfImpl(subtypeMeta.getInstanceType(),
                            supertypeMeta.getInstanceType(), context);
+  }
 
   auto subtypeProtocol = mlir::dyn_cast<ProtocolType>(subtype);
   auto supertypeProtocol = mlir::dyn_cast<ProtocolType>(supertype);

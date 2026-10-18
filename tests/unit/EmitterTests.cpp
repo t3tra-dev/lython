@@ -1058,8 +1058,9 @@ TEST(EmitterTest, TheImplicitClassHooksAreAccountedFor) {
 }
 
 // What: three reads that used to reach the LOWERING and fail there with a
-// sentence about the compiler. `(3).real` is a fold and now answers; `__doc__`
-// and a class in `print()` cannot answer at all and say so about the PROGRAM.
+// sentence about the compiler. `(3).real` is a fold and a class in `print()`
+// renders through its type object; `__doc__` cannot answer at all and says so
+// about the PROGRAM.
 TEST(EmitterTest, TheReadsThatUsedToFailInTheLowering) {
   mlir::MLIRContext folded(testRegistry());
   lython::emitter::EmitResult numeric =
@@ -1081,22 +1082,13 @@ TEST(EmitterTest, TheReadsThatUsedToFailInTheLowering) {
   mlir::MLIRContext classy(testRegistry());
   lython::emitter::EmitResult rendered =
       emitSource("print(type(1))\n", classy);
-  EXPECT_FALSE(rendered.ok());
-  bool saidClass = false;
-  for (const lython::parser::Diagnostic &diagnostic : rendered.diagnostics)
-    saidClass = saidClass ||
-                diagnostic.message.find("cannot render a class") !=
-                    std::string::npos;
-  EXPECT_TRUE(saidClass);
+  EXPECT_TRUE(rendered.ok());
 }
 
-TEST(EmitterTest, EveryWayToRenderAClassSaysTheSameThing) {
-  // A type object has no runtime value here, and the four spellings that ask
-  // for its text used to answer with four different sentences: print() said
-  // so, str() said "unresolved name 'repr'" (the callee, for a problem in the
-  // argument), str(type(x)) reached the lowering as "runtime method receiver
-  // has no concrete contract", and an f-string said a static type with no
-  // spelling in it does not provide '__format__'.
+// What: every spelling that asks for a class's text -- print(), str(),
+// repr(), an f-string, over a class name and over type(x) -- emits; the text
+// they all produce is golden.cases.every_way_to_render_a_class.
+TEST(EmitterTest, EveryWayToRenderAClassEmits) {
   for (const char *source : {"print(int)\n", "print(type([1]))\n",
                              "print(str(int))\n", "print(repr(int))\n",
                              "xs = [1]\nprint(str(type(xs)))\n",
@@ -1105,13 +1097,7 @@ TEST(EmitterTest, EveryWayToRenderAClassSaysTheSameThing) {
                              "class A:\n    pass\n\n\nprint(str(A))\n"}) {
     mlir::MLIRContext context(testRegistry());
     lython::emitter::EmitResult result = emitSource(source, context);
-    EXPECT_FALSE(result.ok()) << source;
-    bool saidClass = false;
-    for (const lython::parser::Diagnostic &diagnostic : result.diagnostics)
-      saidClass = saidClass ||
-                  diagnostic.message.find("cannot render a class") !=
-                      std::string::npos;
-    EXPECT_TRUE(saidClass) << source;
+    EXPECT_TRUE(result.ok()) << source;
   }
 }
 
@@ -1196,6 +1182,65 @@ TEST(EmitterTest, AGetattrDefaultASubclassMayAnswerIsRefused) {
                 "getattr(x, 'extra', default) cannot be answered: 'D' "
                 "derives from") != std::string::npos;
   EXPECT_TRUE(named);
+}
+
+// What: a call or an attribute read through a class value that may name ANY
+// class (`t: type`) is refused -- every class of the program would be an arm
+// -- while the same through a `type[Base]` compiles.
+TEST(EmitterTest, ACallThroughAClassValueThatMayNameAnyClassIsRefused) {
+  struct Case {
+    const char *source;
+    const char *message;
+  };
+  for (const Case &shape :
+       {Case{"def f(t: type) -> object:\n    return t()\nprint(f(int))\n",
+             "calling through a class value that may name any class is "
+             "not supported"},
+        Case{"def f(t: type) -> int:\n    return t.x\n",
+             "reading 'x' through a class value that may name any class is "
+             "not supported"}}) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult result = emitSource(shape.source, context);
+    EXPECT_FALSE(result.ok()) << shape.source;
+    bool told = false;
+    for (const lython::parser::Diagnostic &diagnostic : result.diagnostics)
+      told = told ||
+             diagnostic.message.find(shape.message) != std::string::npos;
+    EXPECT_TRUE(told) << shape.source;
+  }
+
+  mlir::MLIRContext bounded(testRegistry());
+  lython::emitter::EmitResult accepted = emitSource(
+      "class A:\n    x = 1\nclass B(A):\n    x = 2\n"
+      "def f(t: type[A]) -> int:\n    return t().x + t.x\n"
+      "print(f(B))\n",
+      bounded);
+  EXPECT_TRUE(accepted.ok());
+}
+
+// What: a class value is stored only where a class value of one of its bases
+// is declared: an unrelated class and a step along the numeric tower are
+// refused (a `type[int]` naming bool would build an int), a subclass is not.
+TEST(EmitterTest, AClassValueIsStoredOnlyWhereItsBaseIsDeclared) {
+  for (const char *source :
+       {"class A:\n    pass\nclass B:\n    pass\nt: type[A] = B\n",
+        "def f() -> None:\n    t: type[int] = bool\n    print(t(1))\n"}) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult result = emitSource(source, context);
+    EXPECT_FALSE(result.ok()) << source;
+    bool told = false;
+    for (const lython::parser::Diagnostic &diagnostic : result.diagnostics)
+      told = told || diagnostic.message.find("value cannot be stored where "
+                                             "type[") != std::string::npos;
+    EXPECT_TRUE(told) << source;
+  }
+
+  mlir::MLIRContext subclass(testRegistry());
+  lython::emitter::EmitResult accepted = emitSource(
+      "class A:\n    pass\nclass B(A):\n    pass\n"
+      "def f() -> str:\n    t: type[A] = B\n    return t.__name__\n",
+      subclass);
+  EXPECT_TRUE(accepted.ok());
 }
 
 TEST(EmitterTest, AnAttributeASourceClassDoesNotHaveIsRefusedAtEmit) {

@@ -36,6 +36,18 @@ mlir::LogicalResult RuntimeBundleLowerer::makeObjectBundle(
 mlir::LogicalResult RuntimeBundleLowerer::makeObjectBundleWithOwnership(
     mlir::Operation *op, mlir::Type contract, mlir::ValueRange values,
     RuntimeBundle &bundle, ownership::OwnershipKind ownership) const {
+  // ⭐ A CLASS VALUE REBUILT FROM ITS LANE IS STILL A CLASS VALUE: the static
+  // paths (construction, class attributes) read the bundle's instance contract,
+  // and an object bundle has none. Every place that rebuilds a value from its
+  // physical lanes -- an entry argument, a frame slot, a call result -- comes
+  // through here.
+  if (auto typeType = mlir::dyn_cast_if_present<py::TypeType>(contract)) {
+    bundle = RuntimeBundle::typeObject(contract, typeType.getInstanceType());
+    if (!values.empty())
+      bundle.objectValue = RuntimeValue::objectWithOwnership(
+          contract, values, ownership::OwnershipKind::Immortal);
+    return mlir::success();
+  }
   if (mlir::failed(validateObjectShape(op, contract, values)))
     return mlir::failure();
   bundle = RuntimeBundle::objectWithOwnership(contract, values, ownership);
@@ -351,7 +363,7 @@ mlir::FailureOr<RuntimeValue>
 RuntimeBundleLowerer::materializeObjectEvidenceValue(
     mlir::Operation *op, const RuntimeBundle &bundle,
     llvm::StringRef purpose) {
-  if (bundle.kind != RuntimeBundle::Kind::Object)
+  if (!bundle.isObjectLike())
     return op->emitError() << purpose << " requires an object bundle";
   if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(bundle))
     return RuntimeBundleLowerer::materializePrimitiveI64Object(op, bundle);
@@ -380,7 +392,7 @@ RuntimeBundleLowerer::materializeObjectBundleForStorage(
   // (see CallableOps.cpp); these are the rest of the same audit. Neither of
   // these keys is ever rewritten here, so the copy changes nothing else.
   RuntimeBundle bundle = bundleRef;
-  if (bundle.kind != RuntimeBundle::Kind::Object)
+  if (!bundle.isObjectLike())
     return op->emitError() << purpose << " requires an object bundle";
 
   RuntimeBundle result = bundle;

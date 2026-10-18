@@ -174,8 +174,14 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
     // as the ADDRESS spelling -- its cell is the machine word, which is what a
     // signal handler may read and what an `int` global deliberately no longer
     // is (see lowerGlobalGet).
-    bool storageBacked = mlir::isa<py::ContractType>(annotated) ||
-                         mlir::isa<py::CallableType>(annotated);
+    // A class value's cell holds its type object's reference, as a field of
+    // that type does.
+    bool storageBacked =
+        mlir::isa<py::ContractType>(annotated) ||
+        mlir::isa<py::CallableType>(annotated) ||
+        (mlir::isa<py::TypeType>(annotated) &&
+         mlir::isa<py::ContractType>(
+             mlir::cast<py::TypeType>(annotated).getInstanceType()));
     // ⭐ A UNION GETS A CELL WHEN A FUNCTION NEEDS ONE -- reads the name or
     // declares it `global`. Without it `_cache: dict | None = None` read from
     // any function was "unresolved name '_cache'", and `global _cache;

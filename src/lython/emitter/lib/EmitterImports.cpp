@@ -1891,6 +1891,10 @@ void ModuleEmitter::predeclareTopLevel() {
     }
     // An alias is only an alias while the module does not rebind it.
     llvm::StringSet<> boundOnce = singleAssignmentNames(moduleNode);
+    // ⛔ Nor while a function does. `current: type[A] = A` with
+    // `global current; current = B` in a function is a class VALUE that
+    // names B after the call, and as an alias every read of it folded to A.
+    llvm::StringSet<> reboundByFunctions = moduleGlobalDeclarations(moduleNode);
     // ⭐ A SECOND PASS FOR TYPE ALIASES, because an alias may name a class the
     // first pass has not reached yet -- `W = Widget` above `class Widget` is
     // legal Python only in an annotation, and that is exactly what an alias is
@@ -1922,6 +1926,8 @@ void ModuleEmitter::predeclareTopLevel() {
           aliasTarget = targets->front().get();
       }
       if (!aliasTarget || aliasTarget->kind != "Name")
+        continue;
+      if (reboundByFunctions.contains(ast::nameSpelling(*aliasTarget)))
         continue;
       const parser::Node *value = ast::node(*statement, "value");
       if (!types.namesAType(value))

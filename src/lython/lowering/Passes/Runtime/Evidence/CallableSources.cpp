@@ -22,7 +22,7 @@ mlir::LogicalResult RuntimeBundleLowerer::appendCallableArgumentEvidenceSources(
 
   auto appendEvidenceBundle =
       [&](const RuntimeBundle &bundle) -> mlir::LogicalResult {
-    if (bundle.kind != RuntimeBundle::Kind::Object)
+    if (!bundle.isObjectLike())
       return op.emitError() << "argument evidence source for " << targetName
                             << " must be an object bundle";
     evidenceSources.push_back(bundle);
@@ -79,7 +79,7 @@ mlir::LogicalResult RuntimeBundleLowerer::appendCallableArgumentEvidenceSources(
                             << ", but call has only " << logicalSourceCount
                             << " logical sources";
     const RuntimeBundle *source = sources[logicalIndex];
-    if (!source || source->kind != RuntimeBundle::Kind::Object)
+    if (!source || !source->isObjectLike())
       return op.emitError() << "argument evidence ABI source for " << targetName
                             << " must be an object bundle";
 
@@ -156,7 +156,7 @@ RuntimeBundleLowerer::appendCallableAggregateEvidenceSources(
              << " references logical argument " << sourceIndex
              << ", but call has only " << sources.size() << " logical sources";
     const RuntimeBundle *vararg = sources[sourceIndex];
-    if (!vararg || vararg->kind != RuntimeBundle::Kind::Object)
+    if (!vararg || !vararg->isObjectLike())
       return op.emitError() << "vararg evidence ABI source for " << targetName
                             << " must be an object bundle";
     if (!vararg->sequenceIndices.empty())
@@ -231,7 +231,7 @@ RuntimeBundleLowerer::appendCallableAggregateEvidenceSources(
              << " references logical argument " << sourceIndex
              << ", but call has only " << sources.size() << " logical sources";
     const RuntimeBundle *kwarg = sources[sourceIndex];
-    if (!kwarg || kwarg->kind != RuntimeBundle::Kind::Object)
+    if (!kwarg || !kwarg->isObjectLike())
       return op.emitError() << "kwarg evidence ABI source for " << targetName
                             << " must be an object bundle";
     for (auto [index, key] : llvm::enumerate(evidence.kwargKeys)) {

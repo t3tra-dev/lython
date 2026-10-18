@@ -2029,8 +2029,7 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
               "' names a module global this compiler does not give storage "
               "to, so the assignment cannot reach it; a module global is "
               "writable from a function when it is annotated with a concrete "
-              "type, which a union, a protocol, a callable and 'type[X]' are "
-              "not"});
+              "type, which a union, a protocol and a callable are not"});
       return;
     }
     if (isModuleGlobalWrite(name)) {

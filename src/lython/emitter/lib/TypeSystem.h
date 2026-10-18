@@ -341,6 +341,12 @@ public:
   // The nearest SOURCE class every member derives from, or null when there is
   // none -- what a join of source classes returns instead of a union of them.
   mlir::Type nearestCommonSourceBase(mlir::ArrayRef<mlir::Type> members) const;
+  // The nearest class every member derives from through the program's
+  // declared bases and the builtin exception taxonomy; null at `object`.
+  mlir::Type nearestCommonClass(mlir::ArrayRef<mlir::Type> members) const;
+  // `list`, `dict`, `tuple`, `set` and `type` read as values: their class
+  // values. Bound nowhere else, because a CALL of each is its own path.
+  std::optional<mlir::Type> builtinClassValue(llvm::StringRef name) const;
   // Monomorphization of `class C[T]`: the py ABI has no runtime
   // representation for a type parameter, so a generic class is never a
   // contract of its own — every ground instantiation becomes a separate

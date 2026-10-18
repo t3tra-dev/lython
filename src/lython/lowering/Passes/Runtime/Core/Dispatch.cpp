@@ -131,6 +131,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOpRule(mlir::Operation *op) {
       .Case<py::StrOp>(
           [&](auto str) { return lowerNamedUnaryMethodOp(str, "__str__"); })
       .Case<py::ClassNameOp>([&](auto name) { return lowerClassName(name); })
+      .Case<py::TypeOfOp>([&](auto typeOf) { return lowerTypeOf(typeOf); })
+      .Case<py::TypeNameOp>([&](auto name) { return lowerTypeName(name); })
+      .Case<py::TypeSubclassOp>(
+          [&](auto subclass) { return lowerTypeSubclass(subclass); })
       .Case<py::IntOp>(
           [&](auto conv) { return lowerNamedUnaryMethodOp(conv, "__int__"); })
       .Case<py::FloatOp>(
