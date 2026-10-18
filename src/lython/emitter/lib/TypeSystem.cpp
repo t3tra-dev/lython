@@ -2768,13 +2768,30 @@ void TypeSystem::bindClassPropertyType(llvm::StringRef className,
   classPropertyTypes[(className + "." + propertyName).str()] = type;
 }
 
+// ⭐ AN INHERITED PROPERTY IS FOUND THROUGH THE BASES, as attribute lookup
+// finds it. Keyed by the DEFINING class only, `o.prop` for a subclass-typed `o`
+// inferred `object`, and `type(o.prop).__name__` then asked the runtime for
+// the class word of an int that has no header ("builtins.int runtime object
+// has no physical header value").
 std::optional<mlir::Type>
 TypeSystem::lookupClassPropertyType(llvm::StringRef className,
                                     llvm::StringRef propertyName) const {
-  auto found = classPropertyTypes.find((className + "." + propertyName).str());
-  if (found == classPropertyTypes.end())
-    return std::nullopt;
-  return found->second;
+  llvm::SmallVector<llvm::StringRef, 8> worklist{className};
+  llvm::StringSet<> seen;
+  while (!worklist.empty()) {
+    llvm::StringRef current = worklist.front();
+    worklist.erase(worklist.begin());
+    if (!seen.insert(current).second)
+      continue;
+    auto found =
+        classPropertyTypes.find((current + "." + propertyName).str());
+    if (found != classPropertyTypes.end())
+      return found->second;
+    if (auto bases = declaredBases.find(current); bases != declaredBases.end())
+      for (const std::string &base : bases->second)
+        worklist.push_back(base);
+  }
+  return std::nullopt;
 }
 
 void TypeSystem::bindClassStaticMethod(llvm::StringRef className,

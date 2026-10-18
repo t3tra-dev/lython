@@ -10,6 +10,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 
+#include <set>
 #include <cstddef>
 #include <map>
 
@@ -907,6 +908,44 @@ private:
   std::string attributeProbe(llvm::StringRef cls, llvm::StringRef field,
                              parser::SourceRange range);
   llvm::StringMap<std::string> attributeProbes;
+  // Lookups by a COMPUTED name (EmitterCalls.cpp): the program's classes
+  // deriving from `cls`, whether `candidate` is one of them, and the names a
+  // class declares or inherits from the program's classes.
+  llvm::SmallVector<std::string, 8>
+  programSubclassesOf(llvm::StringRef cls) const;
+  bool programClassDerivesFrom(llvm::StringRef candidate,
+                               llvm::StringRef ancestor) const;
+  llvm::StringSet<> programAttributeNames(llvm::StringRef cls) const;
+  // `getattr(recv, name)(args)` and `hasattr(recv, name)` with `name`
+  // computed: a synthesized function comparing it with every name a value of
+  // the receiver's class can answer.
+  std::optional<Value>
+  tryEmitComputedGetattrCall(const parser::Node &expr,
+                             const parser::Node *calleeNode);
+  std::optional<Value> emitComputedHasattr(const parser::Node &expr,
+                                           const parser::NodePtr &receiver,
+                                           const parser::NodePtr &name);
+  // Their bodies, written once every class is declared.
+  std::vector<parser::NodePtr>
+  computedGetattrBody(parser::SourceRange range, llvm::StringRef cls,
+                      llvm::ArrayRef<std::string> hierarchy,
+                      llvm::ArrayRef<mlir::Type> argumentTypes);
+  std::vector<parser::NodePtr>
+  computedHasattrBody(parser::SourceRange range, llvm::StringRef cls,
+                      llvm::ArrayRef<std::string> hierarchy);
+  // The receiver class a computed-name lookup can enumerate, with the
+  // classes it may be; a diagnostic and nullopt when it cannot.
+  std::optional<llvm::SmallVector<std::string, 8>>
+  computedLookupHierarchy(const parser::Node &expr, llvm::StringRef what,
+                          mlir::Type receiverType);
+  llvm::StringMap<std::string> computedLookupDispatchers;
+  // `dir(C)` / `dir(t)` / `dir(o)` (EmitterCalls.cpp): the names a plain
+  // program class lists, nullopt with `why` for a class whose attributes are
+  // not all in class bodies.
+  std::optional<std::set<std::string>> classDirNames(llvm::StringRef cls,
+                                                     std::string &why) const;
+  std::optional<Value> tryEmitDirCall(const parser::Node &expr,
+                                      const parser::Node *calleeNode);
   std::optional<Value> tryEmitHasattrCall(const parser::Node &expr,
                                           const parser::Node *calleeNode);
   std::optional<std::string> unhashableClassName(mlir::Type type) const;
