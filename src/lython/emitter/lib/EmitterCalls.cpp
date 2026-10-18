@@ -3028,6 +3028,10 @@ std::string arityMismatch(llvm::StringRef qualname, const parser::Node &def,
 
 bool ModuleEmitter::programClassDerivesFrom(llvm::StringRef candidate,
                                             llvm::StringRef ancestor) const {
+  // A builtin base may be recorded as written (`ValueError`).
+  llvm::StringRef builtinLeaf = ancestor;
+  if (!builtinLeaf.consume_front("builtins."))
+    builtinLeaf = {};
   llvm::SmallVector<llvm::StringRef, 8> worklist{candidate};
   llvm::StringSet<> seen;
   while (!worklist.empty()) {
@@ -3036,7 +3040,7 @@ bool ModuleEmitter::programClassDerivesFrom(llvm::StringRef candidate,
     if (bases == declaredClassBases.end())
       continue;
     for (const std::string &base : bases->second) {
-      if (base == ancestor)
+      if (base == ancestor || (!builtinLeaf.empty() && base == builtinLeaf))
         return true;
       if (seen.insert(base).second)
         worklist.push_back(base);
@@ -3917,6 +3921,14 @@ bool ModuleEmitter::classIsClosed(llvm::StringRef contract) const {
         (llvm::is_contained(entry.second, contract) ||
          llvm::is_contained(entry.second, leaf)))
       return false;
+  // ⭐ AND EVERY CLASS THE PROGRAM DECLARES, emitted yet or not. `classMros`
+  // holds what has been emitted, and an imported module's functions are
+  // emitted before the module that imports it declares its classes -- so a
+  // `type[Base]` parameter there took Base for closed: `cls.__name__` folded
+  // to "Base", `cls(1)` built a Base and `cls is Base` was True, for a Sub,
+  // silently.
+  if (!programSubclassesOf(contract).empty())
+    return false;
   if (py::exceptions::findByName(leaf))
     for (const py::exceptions::BuiltinExceptionInfo &entry :
          py::exceptions::kBuiltinExceptions)
@@ -3970,6 +3982,9 @@ ModuleEmitter::classValueCandidates(llvm::StringRef contract) const {
         (llvm::is_contained(entry.second, contract) ||
          llvm::is_contained(entry.second, leaf)))
       add(entry.getKey());
+  // And the program's subclasses not emitted yet (see classIsClosed).
+  for (const std::string &subclass : programSubclassesOf(contract))
+    add(subclass);
   // Builtin exceptions are built by the bound's arm with the value's class
   // word, except those with an initializer of their own.
   for (llvm::StringRef own : py::exceptions::kBuiltinExceptionsWithOwnInit)
@@ -3995,7 +4010,8 @@ ModuleEmitter::classValueCandidates(llvm::StringRef contract) const {
 std::optional<Value> ModuleEmitter::emitClassValueDispatch(
     const parser::Node &anchor, Value classValue, py::ContractType bound,
     mlir::Type resultType,
-    llvm::function_ref<parser::NodePtr(llvm::StringRef spelling)> armFor) {
+    llvm::function_ref<parser::NodePtr(llvm::StringRef spelling)> armFor,
+    llvm::ArrayRef<std::string> capturedNames) {
   llvm::SmallVector<std::string, 8> candidates =
       classValueCandidates(bound.getContractName());
   // ⛔ An instantiation of a generic subclass has no spelling of its own to
@@ -4015,6 +4031,72 @@ std::optional<Value> ModuleEmitter::emitClassValueDispatch(
     contract.consume_front("builtins.");
     return contract.str();
   };
+  // ⭐ A CANDIDATE NOT DECLARED YET IS DISPATCHED FROM A FUNCTION WRITTEN
+  // LATER. An imported module's body is emitted before the importer declares
+  // the subclasses that are candidates here, and an arm that constructs or
+  // reads one cannot be typed until it is. The arms' syntax is built now and
+  // typed in a function emitted once every class is declared, which takes the
+  // class value and what the arms read from this scope.
+  // ⛔ Not for a builtin exception's bound: its arm reads the value's class
+  // word from this scope (`pendingConstructionClass`).
+  bool laterCandidate =
+      !py::exceptions::findByContract(bound.getContractName()) &&
+      llvm::any_of(candidates, [&](const std::string &candidate) {
+        return declaredClassNodes.count(candidate) &&
+               !classMros.count(candidate);
+      });
+  if (laterCandidate && !classDeclarationsEmitted) {
+    parser::SourceRange range = anchor.range;
+    std::string symbol =
+        "__lyclassdisp$" + std::to_string(++syntheticFunctionCounter);
+    std::string valueName = symbol + "$cls";
+    std::vector<std::pair<std::string, parser::NodePtr>> arms;
+    for (const std::string &candidate : candidates)
+      arms.push_back({spell(candidate), armFor(spell(candidate))});
+    llvm::SmallVector<synth::Param, 4> params{
+        synth::Param{"__ly_cls", nullptr}};
+    for (const std::string &name : capturedNames)
+      params.push_back(synth::Param{name, nullptr});
+    llvm::SmallVector<const parser::Node *, 4> paramNodes;
+    parser::NodePtr def = synth::functionDef(symbol, params, {}, {}, nullptr,
+                                             {}, range, &paramNodes);
+    synthesizedIteratorDefs.push_back(def);
+    types.overrideParameterType(paramNodes[0], classValue.type);
+    for (auto [index, name] : llvm::enumerate(capturedNames))
+      types.overrideParameterType(paramNodes[index + 1],
+                                  values.lookup(name).type);
+    types.pinResultType(def.get(), resultType);
+    FunctionSignature sig = types.functionSignature(*def);
+    types.bindRootSymbol(symbol, sig.publicCallable);
+    deferredDispatcherBodies.push_back(
+        [this, def, symbol, sig, range, arms = std::move(arms)] {
+          std::vector<parser::NodePtr> body;
+          for (auto [index, arm] : llvm::enumerate(arms)) {
+            parser::NodePtr answer = synth::returnStmt(arm.second, range);
+            if (index + 1 == arms.size()) {
+              body.push_back(std::move(answer));
+              continue;
+            }
+            body.push_back(synth::ifStmt(
+                synth::compare(synth::name("__ly_cls", range), "Is",
+                               synth::name(arm.first, range), range),
+                {std::move(answer)}, {}, range));
+          }
+          if (parser::Field *field = parser::findField(*def, "body"))
+            field->value = std::move(body);
+          emitDispatcherBody(*def, symbol, sig, /*suppressGate=*/false);
+        });
+    values[valueName] = classValue;
+    types.bindSymbol(valueName, classValue.type);
+    auto forget = llvm::scope_exit([&] { values.erase(valueName); });
+    std::vector<parser::NodePtr> callArguments{synth::name(valueName, range)};
+    for (const std::string &name : capturedNames)
+      callArguments.push_back(synth::name(name, range));
+    parser::NodePtr call = synth::call(synth::name(symbol, range),
+                                       std::move(callArguments), range);
+    synthesizedIteratorDefs.push_back(call);
+    return emitExpr(call.get());
+  }
   std::function<mlir::Value(std::size_t)> chain =
       [&](std::size_t index) -> mlir::Value {
     auto arm = [&]() -> mlir::Value {
@@ -4145,7 +4227,8 @@ ModuleEmitter::emitClassValueCall(const parser::Node &expr,
     synthesizedIteratorDefs.push_back(probe);
     resultType = types.widenLiteral(types.inferExpr(probe.get()));
   }
-  return emitClassValueDispatch(expr, classValue, bound, resultType, armFor);
+  return emitClassValueDispatch(expr, classValue, bound, resultType, armFor,
+                                temps);
 }
 
 std::optional<Value>

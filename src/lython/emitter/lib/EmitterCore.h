@@ -980,10 +980,12 @@ private:
   std::optional<Value> pendingConstructionClass;
   // One arm per candidate, chosen by identity with the class value; each arm's
   // value is coerced to `resultType`.
+  // `capturedNames` are the caller's bindings the arms read.
   std::optional<Value> emitClassValueDispatch(
       const parser::Node &anchor, Value classValue, py::ContractType bound,
       mlir::Type resultType,
-      llvm::function_ref<parser::NodePtr(llvm::StringRef spelling)> armFor);
+      llvm::function_ref<parser::NodePtr(llvm::StringRef spelling)> armFor,
+      llvm::ArrayRef<std::string> capturedNames = {});
   // `t(args)` and `t.m(args)` for a class value the static type does not
   // decide.
   std::optional<Value> emitClassValueCall(const parser::Node &expr,

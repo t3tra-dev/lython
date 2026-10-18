@@ -6210,6 +6210,9 @@ TypeSystem::functionSignature(const parser::Node &function,
     sig.resultType = sig.generatorReturnType;
   } else if (function.kind == "Lambda") {
     sig.resultType = inferExpr(ast::node(function, "body"));
+  } else if (auto pinned = pinnedResultTypes.find(&function);
+             pinned != pinnedResultTypes.end()) {
+    sig.resultType = pinned->second;
   } else if (returns && !monomorphize) {
     mlir::Type annotated = annotationType(returns);
     sig.resultType = annotated;
