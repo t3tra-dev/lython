@@ -481,25 +481,24 @@ TEST(EmitterTest, ExceptStarAndYieldAreEachStillFineApart) {
 // exempt because it is this compiler's spelling rather than the program's
 // (`TupleA(1) == TupleB(1)` is True in CPython while the synthesized `__eq__`
 // declares Self).
+// What: `sep`, `end`, `file` and `flush` are print's own keywords and compile
+// (`file=None` is sys.stdout); any other keyword is named rather than reported
+// as an unmatched contract.
 TEST(EmitterTest, NamesThePrintKeywordItCannotTake) {
   mlir::MLIRContext context(testRegistry());
-  // `sep` and `end` are this ladder's own join and terminator; every other
-  // keyword is named rather than reported as an unmatched contract.
-  lython::emitter::EmitResult end =
-      emitSource("print(\"a\", end=\"\")\n", context);
-  EXPECT_TRUE(end.ok());
-
-  lython::emitter::EmitResult flush =
-      emitSource("print(\"a\", flush=True)\n", context);
-  EXPECT_FALSE(flush.ok());
-  EXPECT_TRUE(
-      reportsDiagnostic(flush, "does not take the keyword argument 'flush'"));
+  for (const char *source :
+       {"print(\"a\", end=\"\")\n", "print(\"a\", flush=True)\n",
+        "print(\"a\", file=None)\n",
+        "import sys\nprint(\"a\", 1, sep=\",\", file=sys.stderr)\n"}) {
+    lython::emitter::EmitResult accepted = emitSource(source, context);
+    EXPECT_TRUE(accepted.ok()) << source;
+  }
 
   lython::emitter::EmitResult unknown =
-      emitSource("print(\"a\", file=None)\n", context);
+      emitSource("print(\"a\", color=1)\n", context);
   EXPECT_FALSE(unknown.ok());
   EXPECT_TRUE(
-      reportsDiagnostic(unknown, "does not take the keyword argument 'file'"));
+      reportsDiagnostic(unknown, "does not take the keyword argument 'color'"));
 }
 
 TEST(EmitterTest, RejectsMethodArgumentThatViolatesTheDeclaredParameter) {

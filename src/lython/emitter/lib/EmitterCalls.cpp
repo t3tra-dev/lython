@@ -5484,15 +5484,15 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
   // whole ladder decline, and the call then landed on `builtins.print`'s
   // contract -- which has no keyword parameters, so the report was "call
   // arguments do not match the Callable contract" with the offending keyword
-  // named nowhere in it.
-  //
-  // ⛔ `end=` is NOT here, and the reason is the sink rather than the join.
-  // The only builtin write is `LyUnicode_PrintLine`, which appends the
-  // newline; `LyUnicode_Print` next to it does not, and nothing names it as a
-  // builtin, so the emitter cannot reach it. Saying that by name beats the
-  // contract mismatch, which is what the diagnostic below is for.
+  // named nowhere in it. A keyword print does not take is refused by name
+  // below, which beats that contract mismatch.
   const parser::Node *separatorNode = nullptr;
   const parser::Node *endNode = nullptr;
+  // `file=` and `flush=` choose the sink: the line goes to that object's
+  // `write` (and then its `flush`), which is all CPython's print does with
+  // them.
+  const parser::Node *fileNode = nullptr;
+  parser::NodePtr flushNode;
   std::string refusedKeyword;
   if (printKeywords)
     for (const parser::NodePtr &keyword : *printKeywords) {
@@ -5509,6 +5509,18 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
       if (name && *name == "end" && !endNode) {
         endNode = ast::node(*keyword, "value");
         if (endNode)
+          continue;
+      }
+      if (name && *name == "file" && !fileNode) {
+        fileNode = ast::node(*keyword, "value");
+        if (fileNode)
+          continue;
+      }
+      if (name && *name == "flush" && !flushNode) {
+        if (const parser::Field *value = parser::findField(*keyword, "value"))
+          if (const auto *held = std::get_if<parser::NodePtr>(&value->value))
+            flushNode = *held;
+        if (flushNode)
           continue;
       }
       refusedKeyword = name ? name->str() : "**";
@@ -5530,11 +5542,23 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
   //
   // ⛔ ONE write and not two: `end` is concatenated onto the joined arguments
   // rather than written after them, so an interleaved failure cannot leave
-  // half a line. CPython makes two calls, but the difference is only
-  // observable through a `file` this fold does not take.
+  // half a line. CPython makes a call per piece, which only a sink of the
+  // program's own can observe -- and a `file=` takes the piece-by-piece path
+  // below; `sys.stdout` here is always the runtime's stream.
   auto writeWithEnd = [&](Value text) -> std::optional<Value> {
     mlir::Type strContract = types.contract("builtins.str");
-    Value end = coerceValue(emitExpr(endNode), strContract, expr);
+    Value end;
+    if (endNode) {
+      end = coerceValue(emitExpr(endNode), strContract, expr);
+    } else {
+      mlir::Type newlineType = types.literal("\"\\n\"");
+      end = coerceValue(Value{py::StrConstantOp::create(
+                                  builder, loc(expr), newlineType,
+                                  builder.getStringAttr("\n"))
+                                  .getResult(),
+                              newlineType},
+                        strContract, expr);
+    }
     text = emitBinarySpecial<py::AddOp>(expr, "__add__", text, end,
                                         strContract);
     mlir::Type wrapper = types.contract("_io.TextIOWrapper");
@@ -5544,7 +5568,7 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
     std::string textName =
         "__lyprinttext" + std::to_string(++syntheticFunctionCounter);
     values[streamName] = stream;
-    types.bindSymbol(streamName, wrapper);
+    types.bindSymbol(streamName, stream.type);
     values[textName] = text;
     types.bindSymbol(textName, text.type);
     parser::NodePtr write = synth::methodCall(
@@ -5556,6 +5580,126 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
     values.erase(textName);
     return emitNone(expr);
   };
+  // ⭐ A SINK OF ITS OWN IS WRITTEN PIECE BY PIECE, as `builtin_print_impl`
+  // writes it: every argument's str(), each separator and the end are one
+  // `file.write` each, then `file.flush()` when flush is true. A sink that
+  // records its writes sees the pieces, so they cannot be joined first the
+  // way the stdout line above is.
+  // The arguments are evaluated first and the keywords after them in their
+  // written order, which is when CPython evaluates a call's arguments; the
+  // str() of each argument is taken between the writes, as there.
+  bool chosenSink = fileNode || flushNode;
+  if (chosenSink) {
+    if (printArgs)
+      for (const parser::NodePtr &argument : *printArgs)
+        if (!argument || argument->kind == "Starred") {
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, expr.range.start,
+              "print() to a file takes its arguments spelled out, not "
+              "unpacked"});
+          return emitNone(expr);
+        }
+    mlir::Type strType = types.contract("builtins.str");
+    llvm::SmallVector<Value, 4> evaluated;
+    if (printArgs)
+      for (const parser::NodePtr &argument : *printArgs)
+        evaluated.push_back(emitExpr(argument.get()));
+    std::optional<Value> separator, end, stream, flush;
+    for (const parser::NodePtr &keyword : *printKeywords) {
+      llvm::StringRef name = ast::string(*keyword, "arg").value_or("");
+      const parser::Node *value = ast::node(*keyword, "value");
+      if (name == "sep")
+        separator = coerceValue(emitExpr(value), strType, expr);
+      else if (name == "end")
+        end = coerceValue(emitExpr(value), strType, expr);
+      else if (name == "file") {
+        // `file=None` is sys.stdout, as in CPython.
+        Value file = emitExpr(value);
+        if (!isNoneTypeLike(types.widenLiteral(file.type)))
+          stream = file;
+      }
+      else if (name == "flush")
+        flush = emitExpr(value);
+    }
+    auto constant = [&](llvm::StringRef text) {
+      mlir::Type literal = types.literal(
+          (llvm::Twine("\"") + (text == "\n" ? "\\n" : text) + "\"").str());
+      return coerceValue(
+          Value{py::StrConstantOp::create(builder, loc(expr), literal,
+                                          builder.getStringAttr(text))
+                    .getResult(),
+                literal},
+          strType, expr);
+    };
+    if (!separator)
+      separator = constant(" ");
+    if (!end)
+      end = constant("\n");
+    if (!stream)
+      stream = emitBindingRef(expr, "sys.stdout",
+                              types.contract("_io.TextIOWrapper"), {});
+    std::string streamName =
+        "__lyprintout" + std::to_string(++syntheticFunctionCounter);
+    values[streamName] = *stream;
+    types.bindSymbol(streamName, stream->type);
+    auto call = [&](llvm::StringRef method, std::optional<Value> argument) {
+      std::vector<parser::NodePtr> arguments;
+      std::string argumentName;
+      if (argument) {
+        argumentName =
+            "__lyprinttext" + std::to_string(++syntheticFunctionCounter);
+        values[argumentName] = *argument;
+        types.bindSymbol(argumentName, argument->type);
+        arguments.push_back(synth::name(argumentName, expr.range));
+      }
+      parser::NodePtr node =
+          synth::methodCall(synth::name(streamName, expr.range), method,
+                            std::move(arguments), expr.range);
+      (void)emitExpr(node.get());
+      synthesizedIteratorDefs.push_back(std::move(node));
+      if (!argumentName.empty())
+        values.erase(argumentName);
+    };
+    for (auto [index, value] : llvm::enumerate(evaluated)) {
+      if (index != 0)
+        call("write", separator);
+      std::optional<Value> piece = emitStringifyValue(expr, value);
+      if (!piece) {
+        std::string described;
+        llvm::raw_string_ostream os(described);
+        os << value.type;
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "print() cannot render argument " + std::to_string(index + 1) +
+                " of type " + described +
+                ": it has no __str__ or __repr__ this dispatch can resolve"});
+        values.erase(streamName);
+        return emitNone(expr);
+      }
+      call("write", piece);
+    }
+    call("write", end);
+    if (flush) {
+      mlir::Value truth = emitBoolValue(*flush, expr);
+      mlir::Block *entry = builder.getInsertionBlock();
+      mlir::Region *region = entry->getParent();
+      mlir::Block *continuation =
+          entry->splitBlock(builder.getInsertionPoint());
+      mlir::Block *flushBlock =
+          builder.createBlock(region, continuation->getIterator());
+      builder.setInsertionPointToEnd(entry);
+      mlir::cf::CondBranchOp::create(builder, loc(expr), truth, flushBlock,
+                                     mlir::ValueRange{}, continuation,
+                                     mlir::ValueRange{});
+      builder.setInsertionPointToStart(flushBlock);
+      call("flush", std::nullopt);
+      mlir::cf::BranchOp::create(builder, loc(expr), continuation,
+                                 mlir::ValueRange{});
+      builder.setInsertionPointToStart(continuation);
+    }
+    values.erase(streamName);
+    return emitNone(expr);
+  }
   bool noPrintKeywords = !separatorNode && !endNode;
   if (endNode && (!printArgs || printArgs->empty())) {
     mlir::Type emptyType = types.literal("\"\"");
