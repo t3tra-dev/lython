@@ -133,15 +133,7 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
       // would have to see through", and the hand-written spelling --
       // `shown = tagged("v")(show)` -- has compiled all along, so what was
       // missing was this desugaring and not the seeing.
-      parser::NodePtr callee;
-      if (decorator->kind == "Name" &&
-          moduleFunctionNames.count(ast::nameSpelling(*decorator)))
-        callee = synth::name(ast::nameSpelling(*decorator), statement->range);
-      else if (decorator->kind == "Call")
-        if (const parser::Node *factory = ast::node(*decorator, "func");
-            factory && factory->kind == "Name" &&
-            moduleFunctionNames.count(ast::nameSpelling(*factory)))
-          callee = decorator;
+      parser::NodePtr callee = bindingDecoratorCallee(decorator);
       if (!callee)
         continue;
       std::vector<parser::NodePtr> arguments;
@@ -152,9 +144,11 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
     }
     if (!rebinding)
       continue;
+    attemptedDecoratedDefs.insert(statement.get());
     mlir::Type decoratedType = types.widenLiteral(types.inferExpr(applied.get()));
     if (!mlir::isa_and_nonnull<py::CallableType>(decoratedType))
       continue;
+    rebindingDecoratedDefs.insert(statement.get());
     decoratorApplications.push_back(applied);
     moduleGlobals[*decorated] = decoratedType;
     types.bindSymbol(*decorated, decoratedType);

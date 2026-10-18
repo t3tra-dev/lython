@@ -1538,6 +1538,11 @@ private:
   // the emitted SYMBOL rather than to the cell it is about to fill.
   std::string decoratorSubjectName;
   static bool isRecognizedNonBindingDecorator(llvm::StringRef leaf);
+  parser::NodePtr bindingDecoratorCallee(const parser::NodePtr &decorator);
+  // Module-level defs whose decorators rebind them (`f = d(f)`), and those
+  // where the rebinding was asked for and the application is no function.
+  llvm::DenseSet<const parser::Node *> rebindingDecoratedDefs;
+  llvm::DenseSet<const parser::Node *> attemptedDecoratedDefs;
   llvm::StringSet<> moduleClassNames;
   // Main-module top-level `def`s whose spelling is also a manifest builtin's
   // binding name (`def len`), mapped to the symbol they are emitted under.

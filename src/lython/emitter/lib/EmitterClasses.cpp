@@ -342,6 +342,29 @@ bool ModuleEmitter::isRecognizedNonBindingDecorator(llvm::StringRef leaf) {
          leaf == "property" || leaf == "abstractmethod" || leaf == "dataclass";
 }
 
+// The expression a decorator CALLS when it rebinds the name it decorates:
+// `@d` is `f = d(f)` and `@d(arg)` is `f = d(arg)(f)`. Whatever function the
+// program can name answers -- a def of this module, an imported one, `mod.d`
+// -- and a factory call over one; null for a marker that rebinds nothing and
+// for anything else.
+parser::NodePtr
+ModuleEmitter::bindingDecoratorCallee(const parser::NodePtr &decorator) {
+  if (!decorator)
+    return nullptr;
+  auto [function, spelling] = decoratorCallee(*decorator);
+  if (!function || isRecognizedNonBindingDecorator(decoratorLeafName(spelling)))
+    return nullptr;
+  if (function->kind == "Name" &&
+      moduleFunctionNames.count(ast::nameSpelling(*function)))
+    return decorator;
+  if (function->kind != "Name" && function->kind != "Attribute")
+    return nullptr;
+  if (!mlir::isa_and_nonnull<py::CallableType>(
+          types.widenLiteral(types.inferExpr(function))))
+    return nullptr;
+  return decorator;
+}
+
 void ModuleEmitter::checkDecorators(const parser::Node &node,
                                     DecoratorRole role,
                                     const llvm::StringSet<> *propertyNames) {
@@ -385,10 +408,17 @@ void ModuleEmitter::checkDecorators(const parser::Node &node,
       // compiler would have to see through" -- and the hand-written spelling,
       // `shown = tagged("v")(show)`, has compiled all along. What was missing
       // was the desugaring in `declareModuleGlobals`, not the seeing.
+      // ⭐ AND ANY FUNCTION THE PROGRAM CAN NAME, not only a def of this
+      // module: `from decos import twice` then `@twice`, `@decos.twice`, a
+      // factory imported the same way. Each is the `f = d(f)` an imported
+      // function has always been callable in.
+      // ⛔ A module-level def whose application is not a function stays
+      // refused: its name is a cell typed by that application, and with no
+      // callable to hold, the undecorated body would answer under the name.
       recognized = leaf == "native" || isTypingMarker(leaf) ||
-                   ((decorator->kind == "Name" ||
-                     decorator->kind == "Call") &&
-                    moduleFunctionNames.count(leaf));
+                   (bindingDecoratorCallee(decorator) &&
+                    (!attemptedDecoratedDefs.contains(&node) ||
+                     rebindingDecoratedDefs.contains(&node)));
       break;
     case DecoratorRole::Class:
       recognized = leaf == "dataclass" || isTypingMarker(leaf);
@@ -398,6 +428,17 @@ void ModuleEmitter::checkDecorators(const parser::Node &node,
       continue;
     if (spelling.empty())
       spelling = "<expression>";
+    if (role == DecoratorRole::Function &&
+        attemptedDecoratedDefs.contains(&node) &&
+        bindingDecoratorCallee(decorator)) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, decorator->range.start,
+          "decorator '" + spelling +
+              "' does not return a function here: a decorated module-level "
+              "function is rebound to what its decorators return, and only a "
+              "callable can be held under its name"});
+      continue;
+    }
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, decorator->range.start,
         "decorator '" + spelling + "' is not supported (unrecognized "
@@ -4794,21 +4835,9 @@ void ModuleEmitter::applyFunctionDecorators(const parser::Node &statement) {
     // callee of the application, evaluated here rather than named: it is the
     // hand-written `f = deco(arg)(f)` this compiler already runs, one AST
     // shape away.
-    parser::NodePtr callee;
-    if (decorator->kind == "Name") {
-      llvm::StringRef spelling = ast::nameSpelling(*decorator);
-      if (!moduleFunctionNames.count(spelling))
-        continue;
-      callee = synth::name(spelling, statement.range);
-    } else if (decorator->kind == "Call") {
-      const parser::Node *factory = ast::node(*decorator, "func");
-      if (!factory || factory->kind != "Name" ||
-          !moduleFunctionNames.count(ast::nameSpelling(*factory)))
-        continue;
-      callee = decorator;
-    } else {
+    parser::NodePtr callee = bindingDecoratorCallee(decorator);
+    if (!callee)
       continue;
-    }
     std::vector<parser::NodePtr> arguments;
     arguments.push_back(synth::name(*name, statement.range));
     parser::NodePtr applied = synth::assign(

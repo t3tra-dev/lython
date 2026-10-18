@@ -589,6 +589,25 @@ TEST(EmitterTest, ImplicitTruthOfAnIntIsRefusedOnlyWhereTheIntIsDeclared) {
   }
 }
 
+// What: a decorator whose application is not a function is refused by name at
+// a module-level def -- the name is rebound to what the decorator returns,
+// and leaving the undecorated body under it would answer the wrong thing.
+TEST(EmitterTest, ADecoratorThatReturnsNoFunctionIsRefusedByName) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult refused = emitSource(
+      "from typing import Callable\n"
+      "def to_int(f: Callable[[int], int]) -> int:\n"
+      "    return f(10)\n"
+      "@to_int\n"
+      "def ten(n: int) -> int:\n"
+      "    return n + 1\n"
+      "print(ten)\n",
+      context);
+  EXPECT_FALSE(refused.ok());
+  EXPECT_TRUE(reportsDiagnostic(
+      refused, "decorator 'to_int' does not return a function here"));
+}
+
 // What: `Container` is covariant, as typeshed declares it, so a method taking
 // `Container[object]` accepts a list[int], a dict, a set and a tuple, while a
 // `Container[str]` parameter still refuses a list[int].
