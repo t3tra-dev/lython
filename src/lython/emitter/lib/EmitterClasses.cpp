@@ -2770,9 +2770,12 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       // Exception-backed classes get no standalone method symbols: their
       // bodies inline at call sites, and a standalone copy would transfer
       // the borrowed receiver's header through the runtime exception
-      // __init__ (an ownership violation the verifier rejects).
+      // __init__ (an ownership violation the verifier rejects). Nor does a
+      // generic method (`def m[T](self, x: T)`): its body has no type until
+      // a call site solves T, which the inlining does.
       if (kind != "class" && kind != "classmethod" &&
-          !isExceptionBackedClass(contractName)) {
+          !isExceptionBackedClass(contractName) &&
+          !hasTypeParameters(*statement)) {
         pendingBodies.push_back(statement.get());
         pendingBodySigs.push_back(bodySig);
         pendingBodySymbols.push_back(symbolName);
@@ -2874,6 +2877,8 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
                                       ? specialized.publicCallable
                                       : specialized.callable);
         methodSymbols.push_back(symbolName);
+        if (hasTypeParameters(*inherited.method))
+          continue;
         pendingBodies.push_back(inherited.method);
         pendingBodySigs.push_back(specialized);
         pendingBodySymbols.push_back(symbolName);
@@ -4834,6 +4839,11 @@ ModuleEmitter::notImplementedFallbackStatement(const parser::Node &statement) {
       range);
 }
 
+bool ModuleEmitter::hasTypeParameters(const parser::Node &def) {
+  const auto *params = ast::nodeList(def, "type_params");
+  return params && !params->empty();
+}
+
 Value ModuleEmitter::emitInlineMethodBody(
     const parser::Node &anchor, Value receiver, bool bindDescriptorReceiver,
     const MethodBinding &method, llvm::ArrayRef<Value> positional,
@@ -4880,6 +4890,16 @@ Value ModuleEmitter::emitInlineMethodBody(
   // the callee at the defining class. Taking it everywhere would turn every
   // overridden method into a base-class call. Here the callee is the method
   // already being inlined, so its class is the one the recursion is in.
+  if (llvm::is_contained(methodsBeingInlined, method.method) &&
+      hasTypeParameters(*method.method)) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, anchor.range.start,
+        "the generic method '" +
+            std::string(ast::string(*method.method, "name").value_or("")) +
+            "' calls itself: its body is specialized at each call site, and a "
+            "call cycle has no base case to stop the expansion"});
+    return emitNone(anchor);
+  }
   if (llvm::is_contained(methodsBeingInlined, method.method)) {
     py::CallableType recursive =
         method.signature.publicCallable
@@ -4966,12 +4986,68 @@ Value ModuleEmitter::emitInlineMethodBody(
     operands.positionalUnpacked.assign(arguments.size(), false);
     return emitCallableDispatch(anchor, callee, operands);
   }
-  const FunctionSignature &sig =
+  const FunctionSignature &declaredSig =
       method.bodySignature.callable ? method.bodySignature : method.signature;
+  // ⭐ A GENERIC METHOD IS SPECIALIZED HERE, at the one place its arguments
+  // are known: T is solved from them the way a generic function's call
+  // solves it, the signature is read at the solution, and the body below
+  // sees T as that type. Without it the body was emitted with T itself,
+  // which has no methods: `def assertEqual[T](self, a: T, b: T)` refused
+  // `a == b` while the same def at module level compiled.
+  std::optional<FunctionSignature> specializedSig;
+  TypeBindingMap typeArguments;
+  if (hasTypeParameters(*method.method)) {
+    py::CallableType declared =
+        mlir::dyn_cast_if_present<py::CallableType>(declaredSig.callable);
+    llvm::SmallVector<mlir::Type, 8> argumentTypes{receiver.type};
+    for (const Value &argument : positional)
+      argumentTypes.push_back(argument.type);
+    llvm::SmallVector<CallKeywordType, 4> keywordTypes;
+    for (const auto &entry : keywords)
+      keywordTypes.push_back(
+          CallKeywordType{entry.getKey().str(), entry.getValue().type});
+    CallInferenceResult solved =
+        declared ? types.inferCallWithEvidence(declared, argumentTypes,
+                                               keywordTypes)
+                 : CallInferenceResult();
+    auto resolved = solved ? mlir::dyn_cast_if_present<py::CallableType>(
+                                 solved.evidence.callableContract)
+                           : py::CallableType();
+    if (!resolved ||
+        !bindExpectedType(types, declared, resolved, typeArguments)) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, anchor.range.start,
+          "this call does not determine the type arguments of the generic "
+          "method '" +
+              std::string(ast::string(*method.method, "name").value_or("")) +
+              "'"});
+      return emitNone(anchor);
+    }
+    specializedSig = declaredSig;
+    auto substitute = [&](mlir::Type type) {
+      return type ? substituteType(types, type, typeArguments) : type;
+    };
+    for (mlir::Type &type : specializedSig->positionalTypes)
+      type = substitute(type);
+    for (mlir::Type &type : specializedSig->kwOnlyTypes)
+      type = substitute(type);
+    specializedSig->varargType = substitute(specializedSig->varargType);
+    specializedSig->callableVarargType =
+        substitute(specializedSig->callableVarargType);
+    specializedSig->kwargType = substitute(specializedSig->kwargType);
+    specializedSig->resultType = substitute(specializedSig->resultType);
+    types.refreshCallable(*specializedSig);
+  }
+  const FunctionSignature &sig = specializedSig ? *specializedSig : declaredSig;
   const auto *body = ast::nodeList(*method.method, "body");
   mlir::Type resultType = sig.resultType ? sig.resultType : types.none();
 
   ScopedEmitterScope scope(values, types);
+  // Body annotations spell the type parameters by name (`x: T`).
+  for (const auto &binding : typeArguments) {
+    types.bindLocalSymbol(binding.first, binding.second);
+    types.bindLocalTypeParameter(binding.first, binding.second);
+  }
   // A method of a source-module class executes under ITS module's globals
   // (Python scoping), not the use site's: re-establish the defining
   // module's environment around the inlined body. Clearing `values` and

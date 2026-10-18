@@ -1,8 +1,8 @@
 # WHAT: a class value kept in each kind of storage -- a module global a
 # function rebinds through `global`, a cell a nested function rebinds through
 # `nonlocal`, a field of a union type, a generator's yielded values, a tuple,
-# a dict keyed by class and built up by item assignment -- reads back as the
-# class that was stored last.
+# a dict keyed by class and built up by item assignment, an `object` parameter
+# and container -- reads back as the class that was stored last.
 #
 # WHY THIS IS RUN AND NOT CHECKED AT A LOWER LAYER: each store writes the
 # class value's type-object address into its own storage and each read
@@ -85,3 +85,14 @@ for v in [1, "s", 2, "t", 3.0]:
     t = type(v)
     counts[t] = counts.get(t, 0) + 1
 print(sorted((c.__name__, n) for c, n in counts.items()))
+
+
+def show(x: object) -> str:
+    return repr(x)
+
+
+print(show(int), show(A), show(type(1.5)))
+objects: list[object] = [int, A, 3]
+print(objects)
+keyed: dict[object, int] = {A: 1, int: 2}
+print(keyed[A], len(keyed))

@@ -2551,6 +2551,14 @@ std::optional<mlir::Type> TypeSystem::lookupSymbol(llvm::StringRef name) const {
   return found->second;
 }
 
+bool TypeSystem::namesClassInScope(llvm::StringRef name) const {
+  for (std::size_t level = scopes.size(); level > 0; --level)
+    if (scopes[level - 1].count(name))
+      return level - 1 < scopedClasses.size() &&
+             scopedClasses[level - 1].count(name);
+  return classes.count(name) != 0;
+}
+
 std::optional<std::string>
 TypeSystem::lookupCanonicalBinding(llvm::StringRef name) const {
   llvm::StringRef root = name.split('.').first;
@@ -4704,7 +4712,7 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           return inference.resultType;
         return fail(inference.failureReason);
       }
-      if (name == "isinstance")
+      if (name == "isinstance" || name == "issubclass")
         return boolType();
       // `type(v)` is v's class, as a class value: the emitter answers it from
       // the static class where that decides it and from the value's header

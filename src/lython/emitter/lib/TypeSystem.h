@@ -316,6 +316,9 @@ public:
   void bindCanonicalSymbol(llvm::StringRef name, llvm::StringRef canonical,
                            mlir::Type type);
   std::optional<mlir::Type> lookupSymbol(llvm::StringRef name) const;
+  // Does `name` here spell a class -- not a local or parameter that happens
+  // to share a class's spelling?
+  bool namesClassInScope(llvm::StringRef name) const;
   std::optional<std::string> lookupCanonicalBinding(llvm::StringRef name) const;
   // The callable a program IMPORTED under `name` (`from helpers import
   // range`), which outranks every builtin meaning of the spelling -- its class

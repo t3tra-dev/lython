@@ -1,4 +1,5 @@
 #include "Runtime/Core/Lowerer.h"
+#include "ExceptionTaxonomy.h"
 
 #include "mlir/IR/Dominance.h"
 
@@ -265,13 +266,21 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerTypeOf(py::TypeOfOp op) {
     return input->physicalValues().empty() ||
            !mlir::isa<mlir::MemRefType>(input->physicalValues().front().getType());
   };
+  // A builtin exception's value may be any class of the taxonomy below its
+  // static one, which only its header says; every other manifest contract is
+  // its own runtime class.
+  auto builtinException = [&] {
+    return py::exceptions::findByContract(runtimeContractName(staticType)) !=
+           nullptr;
+  };
   mlir::Value word;
   if (input->kind == RuntimeBundle::Kind::TypeObject) {
     word = type_objects::classWord(builder, loc, module, "builtins.type");
   } else if (headerless() ||
              (!RuntimeBundleLowerer::isBuiltinsObjectContract(input->contract) &&
               !RuntimeBundleLowerer::classForContract(staticType) &&
-              !RuntimeBundleLowerer::exceptionAncestorContractFor(staticType))) {
+              !RuntimeBundleLowerer::exceptionAncestorContractFor(staticType) &&
+              !builtinException())) {
     std::optional<std::string> runtimeClass =
         RuntimeBundleLowerer::runtimeClassForContract(staticType);
     if (!runtimeClass)

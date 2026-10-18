@@ -93,7 +93,7 @@ module attributes {
   //   [3] length    [4] capacity  [5] position  [6] closed  [7] reserved
   py.class @StringIO attributes {
     base_names = ["object"], ly.typing.final,
-    method_names = ["__init__", "write", "getvalue", "read", "seek", "tell", "truncate", "seekable", "close", "readable", "writable"],
+    method_names = ["__init__", "write", "getvalue", "read", "seek", "tell", "truncate", "seekable", "close", "readable", "writable", "flush"],
     method_contracts = [
       !py.callable<[!py.contract<"_io.StringIO">, !py.contract<"builtins.str">], arg_names = ["self", "initial_value"], arg_defaults = [false, true], returns = [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"_io.StringIO">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.int">]>,
@@ -105,14 +105,15 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"_io.StringIO">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"_io.StringIO">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"_io.StringIO">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"_io.StringIO">] -> [!py.contract<"builtins.bool">]>
+      !py.protocol<"Callable", [!py.contract<"_io.StringIO">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"_io.StringIO">] -> [!py.literal<None>]>
     ],
-    method_kinds = ["instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
+    method_kinds = ["instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
   } {}
 
   py.class @BytesIO attributes {
     base_names = ["object"], ly.typing.final,
-    method_names = ["__init__", "write", "getvalue", "read", "seek", "tell", "truncate", "seekable", "close", "readable", "writable"],
+    method_names = ["__init__", "write", "getvalue", "read", "seek", "tell", "truncate", "seekable", "close", "readable", "writable", "flush"],
     method_contracts = [
       !py.callable<[!py.contract<"_io.BytesIO">, !py.contract<"builtins.bytes">], arg_names = ["self", "initial_bytes"], arg_defaults = [false, true], returns = [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"_io.BytesIO">, !py.contract<"builtins.bytes">] -> [!py.contract<"builtins.int">]>,
@@ -124,9 +125,10 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"_io.BytesIO">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"_io.BytesIO">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"_io.BytesIO">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"_io.BytesIO">] -> [!py.contract<"builtins.bool">]>
+      !py.protocol<"Callable", [!py.contract<"_io.BytesIO">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"_io.BytesIO">] -> [!py.literal<None>]>
     ],
-    method_kinds = ["instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
+    method_kinds = ["instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
   } {}
 
   py.class @FileIO attributes {
@@ -1037,6 +1039,12 @@ module attributes {
     func.return %true_bit : i1
   }
 
+  // stringio.c flush: nothing is buffered, so only the closed check remains.
+  func.func @LyStringIO_Flush(%self: memref<8xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "_io.StringIO", ly.runtime.method = "flush", ly.runtime.result_contract = "types.NoneType"} {
+    func.call @__ly_membuf_check_open(%self) : (memref<8xi64>) -> ()
+    func.return
+  }
+
   func.func @LyStringIO_Close(%self: memref<8xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "_io.StringIO", ly.runtime.method = "close", ly.runtime.result_contract = "types.NoneType"} {
     func.call @__ly_membuf_close(%self) : (memref<8xi64>) -> ()
     func.return
@@ -1195,6 +1203,12 @@ module attributes {
   func.func @LyBytesIO_Seekable(%self: memref<8xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_io.BytesIO", ly.runtime.method = "seekable", ly.runtime.result_contract = "builtins.bool"} {
     %true_bit = arith.constant true
     func.return %true_bit : i1
+  }
+
+  // bytesio.c flush: the same closed check, and nothing to write out.
+  func.func @LyBytesIO_Flush(%self: memref<8xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "_io.BytesIO", ly.runtime.method = "flush", ly.runtime.result_contract = "types.NoneType"} {
+    func.call @__ly_membuf_check_open(%self) : (memref<8xi64>) -> ()
+    func.return
   }
 
   func.func @LyBytesIO_Close(%self: memref<8xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "_io.BytesIO", ly.runtime.method = "close", ly.runtime.result_contract = "types.NoneType"} {

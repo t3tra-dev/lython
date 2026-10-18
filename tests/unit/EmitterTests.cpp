@@ -481,25 +481,24 @@ TEST(EmitterTest, ExceptStarAndYieldAreEachStillFineApart) {
 // exempt because it is this compiler's spelling rather than the program's
 // (`TupleA(1) == TupleB(1)` is True in CPython while the synthesized `__eq__`
 // declares Self).
+// What: `sep`, `end`, `file` and `flush` are print's own keywords and compile
+// (`file=None` is sys.stdout); any other keyword is named rather than reported
+// as an unmatched contract.
 TEST(EmitterTest, NamesThePrintKeywordItCannotTake) {
   mlir::MLIRContext context(testRegistry());
-  // `sep` and `end` are this ladder's own join and terminator; every other
-  // keyword is named rather than reported as an unmatched contract.
-  lython::emitter::EmitResult end =
-      emitSource("print(\"a\", end=\"\")\n", context);
-  EXPECT_TRUE(end.ok());
-
-  lython::emitter::EmitResult flush =
-      emitSource("print(\"a\", flush=True)\n", context);
-  EXPECT_FALSE(flush.ok());
-  EXPECT_TRUE(
-      reportsDiagnostic(flush, "does not take the keyword argument 'flush'"));
+  for (const char *source :
+       {"print(\"a\", end=\"\")\n", "print(\"a\", flush=True)\n",
+        "print(\"a\", file=None)\n",
+        "import sys\nprint(\"a\", 1, sep=\",\", file=sys.stderr)\n"}) {
+    lython::emitter::EmitResult accepted = emitSource(source, context);
+    EXPECT_TRUE(accepted.ok()) << source;
+  }
 
   lython::emitter::EmitResult unknown =
-      emitSource("print(\"a\", file=None)\n", context);
+      emitSource("print(\"a\", color=1)\n", context);
   EXPECT_FALSE(unknown.ok());
   EXPECT_TRUE(
-      reportsDiagnostic(unknown, "does not take the keyword argument 'file'"));
+      reportsDiagnostic(unknown, "does not take the keyword argument 'color'"));
 }
 
 TEST(EmitterTest, RejectsMethodArgumentThatViolatesTheDeclaredParameter) {
@@ -1241,6 +1240,77 @@ TEST(EmitterTest, AClassValueIsStoredOnlyWhereItsBaseIsDeclared) {
       "def f() -> str:\n    t: type[A] = B\n    return t.__name__\n",
       subclass);
   EXPECT_TRUE(accepted.ok());
+}
+
+// What: a generic method is specialized where it is called, so the two uses
+// that have no call -- the method calling itself, and the method read as a
+// value -- are refused at emit with a sentence that says why, and an ordinary
+// call compiles.
+TEST(EmitterTest, AGenericMethodHasABodyOnlyWhereItIsCalled) {
+  struct Case {
+    const char *source;
+    const char *message;
+  };
+  for (const Case &shape :
+       {Case{"class C:\n"
+             "    def count[T](self, xs: list[T], i: int) -> int:\n"
+             "        if i == len(xs):\n"
+             "            return 0\n"
+             "        return 1 + self.count(xs, i + 1)\n"
+             "print(C().count([1, 2], 0))\n",
+             "the generic method 'count' calls itself"},
+        Case{"class C:\n"
+             "    def show[T](self, x: T) -> str:\n"
+             "        return repr(x)\n"
+             "m = C().show\n",
+             "the generic method 'show' cannot be used as a value"}}) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult result = emitSource(shape.source, context);
+    EXPECT_FALSE(result.ok()) << shape.source;
+    bool told = false;
+    for (const lython::parser::Diagnostic &diagnostic : result.diagnostics)
+      told = told ||
+             diagnostic.message.find(shape.message) != std::string::npos;
+    EXPECT_TRUE(told) << shape.source;
+  }
+
+  mlir::MLIRContext called(testRegistry());
+  lython::emitter::EmitResult accepted = emitSource(
+      "class C:\n"
+      "    def same[T](self, a: T, b: T) -> bool:\n"
+      "        return a == b\n"
+      "print(C().same(1, 1), C().same(\"a\", \"b\"))\n",
+      called);
+  EXPECT_TRUE(accepted.ok());
+}
+
+// What: `@contextmanager` on a function with spelled-out parameters compiles,
+// and on one with *args or **kwargs it is refused by name -- the function that
+// wraps the generator would have to hand them on unpacked.
+TEST(EmitterTest, AContextManagerFunctionHandsItsParametersOnByName) {
+  mlir::MLIRContext spelled(testRegistry());
+  lython::emitter::EmitResult accepted = emitSource(
+      "from contextlib import contextmanager\n"
+      "from typing import Iterator\n"
+      "@contextmanager\n"
+      "def tag(name: str, *, depth: int = 0) -> Iterator[int]:\n"
+      "    yield len(name) + depth\n"
+      "with tag(\"a\", depth=1) as n:\n"
+      "    print(n)\n",
+      spelled);
+  EXPECT_TRUE(accepted.ok());
+
+  mlir::MLIRContext starred(testRegistry());
+  lython::emitter::EmitResult refused = emitSource(
+      "import contextlib\n"
+      "@contextlib.contextmanager\n"
+      "def sub(**params: int):\n"
+      "    yield\n",
+      starred);
+  EXPECT_FALSE(refused.ok());
+  EXPECT_TRUE(reportsDiagnostic(
+      refused, "@contextmanager on 'sub' is not supported with *args or "
+               "**kwargs"));
 }
 
 TEST(EmitterTest, AnAttributeASourceClassDoesNotHaveIsRefusedAtEmit) {

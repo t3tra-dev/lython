@@ -559,6 +559,11 @@ private:
   // `class P(Protocol)` becomes a plain class and a base of every class (in
   // any module of the program) that has its members; EmitterProtocols.cpp.
   void desugarProtocols();
+  // `@contextlib.contextmanager` defs become a generator and a def that
+  // wraps it (EmitterWith.cpp).
+  void desugarContextManagers(const parser::Node &moduleNode);
+  // Parsed trees a desugar spliced into a module, alive as long as it is.
+  std::vector<parser::NodePtr> synthesizedHelperTrees;
   // The classes that were declared as protocols, by their own name.
   llvm::StringSet<> protocolClassNames;
   // "Class\0Protocol" (contract names) -> why the class does not satisfy it.
@@ -948,6 +953,13 @@ private:
   std::optional<Value> emitClassValueAttribute(const parser::Node &expr,
                                                Value classValue,
                                                llvm::StringRef attribute);
+  Value emitClassOfValue(const parser::Node &anchor, Value value,
+                         mlir::Type resultType);
+  // A `def` with PEP 695 type parameters of its own.
+  static bool hasTypeParameters(const parser::Node &def);
+  // An isinstance/issubclass operand, or an element of a tuple of them, that
+  // is a class value the static type does not decide.
+  bool targetHasDynamicClassValue(const parser::Node *node);
   std::optional<Value>
   emitClassValueSubclassTest(const parser::Node &expr,
                              const parser::Node *subjectNode,

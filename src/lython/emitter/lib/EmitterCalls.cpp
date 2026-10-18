@@ -3264,6 +3264,67 @@ ModuleEmitter::emitClassValueAttribute(const parser::Node &expr,
   return emitClassValueDispatch(expr, classValue, bound, resultType, armFor);
 }
 
+// ⭐ THE CLASS OF AN ALREADY-EMITTED VALUE, as a class value of
+// `resultType`: a static class where the value's type decides it, its header's
+// where it does not, and a union's active member's, chosen by the tag -- each
+// arm unwraps its member and answers the way a value of the member's own type
+// would.
+Value ModuleEmitter::emitClassOfValue(const parser::Node &anchor, Value value,
+                                      mlir::Type resultType) {
+  auto classOf = [&](Value subject) -> mlir::Value {
+    mlir::Type widened = types.widenLiteral(subject.type);
+    mlir::Value classValue;
+    mlir::Type classType;
+    auto contract = mlir::dyn_cast_if_present<py::ContractType>(widened);
+    if (isNoneTypeLike(widened) || !contract) {
+      mlir::Type instance = isNoneTypeLike(widened)
+                                ? types.contract("types.NoneType")
+                                : types.object();
+      classType = types.typeObject(instance);
+      classValue =
+          py::TypeObjectOp::create(builder, loc(anchor), classType, instance)
+              .getResult();
+    } else if (!classIsClosed(contract.getContractName())) {
+      classType = types.typeObject(contract);
+      classValue = py::TypeOfOp::create(builder, loc(anchor), classType,
+                                        subject.value)
+                       .getResult();
+    } else {
+      classType = types.typeObject(contract);
+      classValue =
+          py::TypeObjectOp::create(builder, loc(anchor), classType, contract)
+              .getResult();
+    }
+    return coerceValue(Value{classValue, classType}, resultType, anchor).value;
+  };
+  auto unionType =
+      mlir::dyn_cast_if_present<py::UnionType>(types.widenLiteral(value.type));
+  if (!unionType)
+    return Value{classOf(value), resultType};
+  llvm::SmallVector<mlir::Type, 4> members(unionType.getMemberTypes().begin(),
+                                           unionType.getMemberTypes().end());
+  auto classOfMember = [&](mlir::Type member) {
+    return classOf(Value{py::UnionUnwrapOp::create(builder, loc(anchor), member,
+                                                   value.value)
+                             .getResult(),
+                         member});
+  };
+  std::function<mlir::Value(std::size_t)> chain =
+      [&](std::size_t index) -> mlir::Value {
+    if (index + 1 == members.size())
+      return classOfMember(members[index]);
+    mlir::Value active =
+        py::UnionTestOp::create(builder, loc(anchor), builder.getI1Type(),
+                                value.value, mlir::TypeAttr::get(members[index]))
+            .getResult();
+    return emitValueDiamond(
+        loc(anchor), active, resultType,
+        [&] { return classOfMember(members[index]); },
+        [&] { return chain(index + 1); });
+  };
+  return Value{chain(0), resultType};
+}
+
 std::optional<Value>
 ModuleEmitter::tryEmitTypeCall(const parser::Node &expr,
                                const parser::Node *calleeNode) {
@@ -3306,61 +3367,12 @@ ModuleEmitter::tryEmitTypeCall(const parser::Node &expr,
         py::TypeObjectOp::create(builder, loc(expr), typeType, noneClass);
     return Value{object.getResult(), typeType};
   }
-  // ⭐ A UNION'S CLASS IS ITS ACTIVE MEMBER'S, chosen by the tag: each arm
-  // unwraps its member and answers that member's class the way a value of
-  // the member's own type would.
-  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(subject)) {
+  if (mlir::isa_and_nonnull<py::UnionType>(subject)) {
     Value receiver = emitExpr(subjectNode);
     mlir::Type resultType = types.widenLiteral(types.inferExpr(&expr));
     if (!mlir::isa_and_nonnull<py::TypeType>(resultType))
       resultType = types.typeObject(types.object());
-    llvm::SmallVector<mlir::Type, 4> members(unionType.getMemberTypes().begin(),
-                                             unionType.getMemberTypes().end());
-    auto classOfMember = [&](mlir::Type member) -> mlir::Value {
-      mlir::Type widened = types.widenLiteral(member);
-      Value value{py::UnionUnwrapOp::create(builder, loc(expr), member,
-                                            receiver.value)
-                      .getResult(),
-                  member};
-      mlir::Value classValue;
-      mlir::Type classType;
-      auto memberContract = mlir::dyn_cast_if_present<py::ContractType>(widened);
-      if (isNoneTypeLike(widened) || !memberContract) {
-        mlir::Type instance = isNoneTypeLike(widened)
-                                  ? types.contract("types.NoneType")
-                                  : types.object();
-        classType = types.typeObject(instance);
-        classValue =
-            py::TypeObjectOp::create(builder, loc(expr), classType, instance)
-                .getResult();
-      } else if (!classIsClosed(memberContract.getContractName())) {
-        classType = types.typeObject(memberContract);
-        classValue = py::TypeOfOp::create(builder, loc(expr), classType,
-                                          value.value)
-                         .getResult();
-      } else {
-        classType = types.typeObject(memberContract);
-        classValue = py::TypeObjectOp::create(builder, loc(expr), classType,
-                                              memberContract)
-                         .getResult();
-      }
-      return coerceValue(Value{classValue, classType}, resultType, expr).value;
-    };
-    std::function<mlir::Value(std::size_t)> chain =
-        [&](std::size_t index) -> mlir::Value {
-      if (index + 1 == members.size())
-        return classOfMember(members[index]);
-      mlir::Value active =
-          py::UnionTestOp::create(builder, loc(expr), builder.getI1Type(),
-                                  receiver.value,
-                                  mlir::TypeAttr::get(members[index]))
-              .getResult();
-      return emitValueDiamond(
-          loc(expr), active, resultType,
-          [&] { return classOfMember(members[index]); },
-          [&] { return chain(index + 1); });
-    };
-    return Value{chain(0), resultType};
+    return emitClassOfValue(expr, receiver, resultType);
   }
   if (!contract)
     return refuse("type(x) needs a statically resolved class, and " +
@@ -3408,14 +3420,10 @@ ModuleEmitter::tryEmitIsInstanceCall(const parser::Node &expr,
   // the target names its bound or any subclass of it, so the static answer
   // for the bound -- what a `t: type[Base]` used to get -- is wrong for a
   // value naming a subclass. The value's own class walks its MRO for it.
-  if (const parser::Node *targetNode = (*args)[1].get();
-      targetNode->kind != "Tuple") {
-    mlir::Type targetType = types.widenLiteral(types.inferExpr(targetNode));
-    if (mlir::isa<py::TypeType>(targetType) &&
-        !classValueIsExact(targetNode, targetType))
-      return emitClassValueSubclassTest(expr, args->front().get(), targetNode,
-                                        /*subjectIsInstance=*/true);
-  }
+  if (targetHasDynamicClassValue((*args)[1].get()))
+    return emitClassValueSubclassTest(expr, args->front().get(),
+                                      (*args)[1].get(),
+                                      /*subjectIsInstance=*/true);
   std::optional<llvm::SmallVector<mlir::Type, 4>> targets =
       isinstanceTargetTypes((*args)[1].get(), types);
   if (!targets) {
@@ -5082,40 +5090,66 @@ ModuleEmitter::tryEmitAsciiCall(const parser::Node &expr,
 
 // `isinstance(x, t)` / `issubclass(s, t)` over class values: the class of x
 // (or s itself) has t in its MRO.
+bool ModuleEmitter::targetHasDynamicClassValue(const parser::Node *node) {
+  if (!node)
+    return false;
+  if (node->kind == "Tuple") {
+    if (const auto *elts = ast::nodeList(*node, "elts"))
+      for (const parser::NodePtr &elt : *elts)
+        if (targetHasDynamicClassValue(elt.get()))
+          return true;
+    return false;
+  }
+  mlir::Type type = types.widenLiteral(types.inferExpr(node));
+  return mlir::isa<py::TypeType>(type) && !classValueIsExact(node, type);
+}
+
 std::optional<Value> ModuleEmitter::emitClassValueSubclassTest(
     const parser::Node &expr, const parser::Node *subjectNode,
     const parser::Node *targetNode, bool subjectIsInstance) {
   Value subject = emitExpr(subjectNode);
-  Value target = emitExpr(targetNode);
-  auto refuse = [&](llvm::StringRef what) -> std::optional<Value> {
+  // A tuple of classes is any of them, each evaluated in order.
+  llvm::SmallVector<Value, 4> targets;
+  if (targetNode->kind == "Tuple") {
+    if (const auto *elts = ast::nodeList(*targetNode, "elts"))
+      for (const parser::NodePtr &elt : *elts)
+        targets.push_back(emitExpr(elt.get()));
+  } else {
+    targets.push_back(emitExpr(targetNode));
+  }
+  auto refuse = [&](mlir::Type offending) -> std::optional<Value> {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, expr.range.start,
-        what.str() + " needs class values on both sides here, and " +
-            typeText(subjectIsInstance ? target.type : subject.type) +
-            " is not one"});
+        std::string(subjectIsInstance ? "isinstance()" : "issubclass()") +
+            " needs class values on both sides here, and " +
+            typeText(offending) + " is not one"});
     return emitNone(expr);
   };
-  if (!mlir::isa<py::TypeType>(target.type))
-    return refuse(subjectIsInstance ? "isinstance()" : "issubclass()");
+  for (const Value &target : targets)
+    if (!mlir::isa<py::TypeType>(target.type))
+      return refuse(target.type);
+  if (targets.empty())
+    return refuse(types.inferExpr(targetNode));
   mlir::Value subjectClass = subject.value;
   if (subjectIsInstance) {
     mlir::Type instance = types.widenLiteral(subject.type);
-    if (mlir::isa<py::UnionType>(instance)) {
-      subject = coerceValue(subject, types.object(), expr);
-      instance = types.object();
-    }
     mlir::Type bound = mlir::isa<py::ContractType>(instance) ? instance
                                                              : types.object();
-    subjectClass = py::TypeOfOp::create(builder, loc(expr),
-                                        types.typeObject(bound), subject.value)
-                       .getResult();
+    subjectClass =
+        emitClassOfValue(expr, subject, types.typeObject(bound)).value;
   } else if (!mlir::isa<py::TypeType>(subject.type)) {
-    return refuse("issubclass()");
+    return refuse(subject.type);
   }
-  mlir::Value test =
-      py::TypeSubclassOp::create(builder, loc(expr), builder.getI1Type(),
-                                 subjectClass, target.value)
-          .getResult();
+  mlir::Value test;
+  for (const Value &target : targets) {
+    mlir::Value one =
+        py::TypeSubclassOp::create(builder, loc(expr), builder.getI1Type(),
+                                   subjectClass, target.value)
+            .getResult();
+    test = test ? mlir::arith::OrIOp::create(builder, loc(expr), test, one)
+                      .getResult()
+                : one;
+  }
   auto pyBool =
       py::CastFromPrimOp::create(builder, loc(expr), types.boolType(), test);
   return Value{pyBool.getResult(), types.boolType()};
@@ -5137,15 +5171,10 @@ ModuleEmitter::tryEmitIssubclassCall(const parser::Node &expr,
     return rejectIssubclass("issubclass() takes exactly two arguments");
   // A class value on either side that the static type does not decide is
   // answered at run time, from the MRO of the class it names.
-  for (const parser::NodePtr &arg : *args)
-    if (arg && arg->kind != "Tuple") {
-      mlir::Type argType = types.widenLiteral(types.inferExpr(arg.get()));
-      if (mlir::isa<py::TypeType>(argType) &&
-          !classValueIsExact(arg.get(), argType))
-        return emitClassValueSubclassTest(expr, (*args)[0].get(),
-                                          (*args)[1].get(),
-                                          /*subjectIsInstance=*/false);
-    }
+  if (targetHasDynamicClassValue((*args)[0].get()) ||
+      targetHasDynamicClassValue((*args)[1].get()))
+    return emitClassValueSubclassTest(expr, (*args)[0].get(), (*args)[1].get(),
+                                      /*subjectIsInstance=*/false);
   // Static classes only: the hierarchy is compile-time (C3 linearized), so
   // the answer folds to a constant.
   auto classOf = [&](const parser::Node *node) -> std::optional<mlir::Type> {
@@ -5455,15 +5484,15 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
   // whole ladder decline, and the call then landed on `builtins.print`'s
   // contract -- which has no keyword parameters, so the report was "call
   // arguments do not match the Callable contract" with the offending keyword
-  // named nowhere in it.
-  //
-  // ⛔ `end=` is NOT here, and the reason is the sink rather than the join.
-  // The only builtin write is `LyUnicode_PrintLine`, which appends the
-  // newline; `LyUnicode_Print` next to it does not, and nothing names it as a
-  // builtin, so the emitter cannot reach it. Saying that by name beats the
-  // contract mismatch, which is what the diagnostic below is for.
+  // named nowhere in it. A keyword print does not take is refused by name
+  // below, which beats that contract mismatch.
   const parser::Node *separatorNode = nullptr;
   const parser::Node *endNode = nullptr;
+  // `file=` and `flush=` choose the sink: the line goes to that object's
+  // `write` (and then its `flush`), which is all CPython's print does with
+  // them.
+  const parser::Node *fileNode = nullptr;
+  parser::NodePtr flushNode;
   std::string refusedKeyword;
   if (printKeywords)
     for (const parser::NodePtr &keyword : *printKeywords) {
@@ -5480,6 +5509,18 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
       if (name && *name == "end" && !endNode) {
         endNode = ast::node(*keyword, "value");
         if (endNode)
+          continue;
+      }
+      if (name && *name == "file" && !fileNode) {
+        fileNode = ast::node(*keyword, "value");
+        if (fileNode)
+          continue;
+      }
+      if (name && *name == "flush" && !flushNode) {
+        if (const parser::Field *value = parser::findField(*keyword, "value"))
+          if (const auto *held = std::get_if<parser::NodePtr>(&value->value))
+            flushNode = *held;
+        if (flushNode)
           continue;
       }
       refusedKeyword = name ? name->str() : "**";
@@ -5501,11 +5542,23 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
   //
   // ⛔ ONE write and not two: `end` is concatenated onto the joined arguments
   // rather than written after them, so an interleaved failure cannot leave
-  // half a line. CPython makes two calls, but the difference is only
-  // observable through a `file` this fold does not take.
+  // half a line. CPython makes a call per piece, which only a sink of the
+  // program's own can observe -- and a `file=` takes the piece-by-piece path
+  // below; `sys.stdout` here is always the runtime's stream.
   auto writeWithEnd = [&](Value text) -> std::optional<Value> {
     mlir::Type strContract = types.contract("builtins.str");
-    Value end = coerceValue(emitExpr(endNode), strContract, expr);
+    Value end;
+    if (endNode) {
+      end = coerceValue(emitExpr(endNode), strContract, expr);
+    } else {
+      mlir::Type newlineType = types.literal("\"\\n\"");
+      end = coerceValue(Value{py::StrConstantOp::create(
+                                  builder, loc(expr), newlineType,
+                                  builder.getStringAttr("\n"))
+                                  .getResult(),
+                              newlineType},
+                        strContract, expr);
+    }
     text = emitBinarySpecial<py::AddOp>(expr, "__add__", text, end,
                                         strContract);
     mlir::Type wrapper = types.contract("_io.TextIOWrapper");
@@ -5515,7 +5568,7 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
     std::string textName =
         "__lyprinttext" + std::to_string(++syntheticFunctionCounter);
     values[streamName] = stream;
-    types.bindSymbol(streamName, wrapper);
+    types.bindSymbol(streamName, stream.type);
     values[textName] = text;
     types.bindSymbol(textName, text.type);
     parser::NodePtr write = synth::methodCall(
@@ -5527,6 +5580,126 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
     values.erase(textName);
     return emitNone(expr);
   };
+  // ⭐ A SINK OF ITS OWN IS WRITTEN PIECE BY PIECE, as `builtin_print_impl`
+  // writes it: every argument's str(), each separator and the end are one
+  // `file.write` each, then `file.flush()` when flush is true. A sink that
+  // records its writes sees the pieces, so they cannot be joined first the
+  // way the stdout line above is.
+  // The arguments are evaluated first and the keywords after them in their
+  // written order, which is when CPython evaluates a call's arguments; the
+  // str() of each argument is taken between the writes, as there.
+  bool chosenSink = fileNode || flushNode;
+  if (chosenSink) {
+    if (printArgs)
+      for (const parser::NodePtr &argument : *printArgs)
+        if (!argument || argument->kind == "Starred") {
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, expr.range.start,
+              "print() to a file takes its arguments spelled out, not "
+              "unpacked"});
+          return emitNone(expr);
+        }
+    mlir::Type strType = types.contract("builtins.str");
+    llvm::SmallVector<Value, 4> evaluated;
+    if (printArgs)
+      for (const parser::NodePtr &argument : *printArgs)
+        evaluated.push_back(emitExpr(argument.get()));
+    std::optional<Value> separator, end, stream, flush;
+    for (const parser::NodePtr &keyword : *printKeywords) {
+      llvm::StringRef name = ast::string(*keyword, "arg").value_or("");
+      const parser::Node *value = ast::node(*keyword, "value");
+      if (name == "sep")
+        separator = coerceValue(emitExpr(value), strType, expr);
+      else if (name == "end")
+        end = coerceValue(emitExpr(value), strType, expr);
+      else if (name == "file") {
+        // `file=None` is sys.stdout, as in CPython.
+        Value file = emitExpr(value);
+        if (!isNoneTypeLike(types.widenLiteral(file.type)))
+          stream = file;
+      }
+      else if (name == "flush")
+        flush = emitExpr(value);
+    }
+    auto constant = [&](llvm::StringRef text) {
+      mlir::Type literal = types.literal(
+          (llvm::Twine("\"") + (text == "\n" ? "\\n" : text) + "\"").str());
+      return coerceValue(
+          Value{py::StrConstantOp::create(builder, loc(expr), literal,
+                                          builder.getStringAttr(text))
+                    .getResult(),
+                literal},
+          strType, expr);
+    };
+    if (!separator)
+      separator = constant(" ");
+    if (!end)
+      end = constant("\n");
+    if (!stream)
+      stream = emitBindingRef(expr, "sys.stdout",
+                              types.contract("_io.TextIOWrapper"), {});
+    std::string streamName =
+        "__lyprintout" + std::to_string(++syntheticFunctionCounter);
+    values[streamName] = *stream;
+    types.bindSymbol(streamName, stream->type);
+    auto call = [&](llvm::StringRef method, std::optional<Value> argument) {
+      std::vector<parser::NodePtr> arguments;
+      std::string argumentName;
+      if (argument) {
+        argumentName =
+            "__lyprinttext" + std::to_string(++syntheticFunctionCounter);
+        values[argumentName] = *argument;
+        types.bindSymbol(argumentName, argument->type);
+        arguments.push_back(synth::name(argumentName, expr.range));
+      }
+      parser::NodePtr node =
+          synth::methodCall(synth::name(streamName, expr.range), method,
+                            std::move(arguments), expr.range);
+      (void)emitExpr(node.get());
+      synthesizedIteratorDefs.push_back(std::move(node));
+      if (!argumentName.empty())
+        values.erase(argumentName);
+    };
+    for (auto [index, value] : llvm::enumerate(evaluated)) {
+      if (index != 0)
+        call("write", separator);
+      std::optional<Value> piece = emitStringifyValue(expr, value);
+      if (!piece) {
+        std::string described;
+        llvm::raw_string_ostream os(described);
+        os << value.type;
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "print() cannot render argument " + std::to_string(index + 1) +
+                " of type " + described +
+                ": it has no __str__ or __repr__ this dispatch can resolve"});
+        values.erase(streamName);
+        return emitNone(expr);
+      }
+      call("write", piece);
+    }
+    call("write", end);
+    if (flush) {
+      mlir::Value truth = emitBoolValue(*flush, expr);
+      mlir::Block *entry = builder.getInsertionBlock();
+      mlir::Region *region = entry->getParent();
+      mlir::Block *continuation =
+          entry->splitBlock(builder.getInsertionPoint());
+      mlir::Block *flushBlock =
+          builder.createBlock(region, continuation->getIterator());
+      builder.setInsertionPointToEnd(entry);
+      mlir::cf::CondBranchOp::create(builder, loc(expr), truth, flushBlock,
+                                     mlir::ValueRange{}, continuation,
+                                     mlir::ValueRange{});
+      builder.setInsertionPointToStart(flushBlock);
+      call("flush", std::nullopt);
+      mlir::cf::BranchOp::create(builder, loc(expr), continuation,
+                                 mlir::ValueRange{});
+      builder.setInsertionPointToStart(continuation);
+    }
+    values.erase(streamName);
+    return emitNone(expr);
+  }
   bool noPrintKeywords = !separatorNode && !endNode;
   if (endNode && (!printArgs || printArgs->empty())) {
     mlir::Type emptyType = types.literal("\"\"");

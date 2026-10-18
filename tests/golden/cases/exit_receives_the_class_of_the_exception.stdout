@@ -1,0 +1,6 @@
+ok invalid literal for int() with base 10: 'x'
+exit with KeyError
+KeyError
+KeyError not raised
+exit with ValueError
+propagated wrong
