@@ -1,12 +1,22 @@
-# WHAT: a module the next case imports -- a decorator, a decorator factory
-# and one that records each call it wraps. Run alone it prints nothing.
+# WHAT: a module other cases import -- a decorator, a decorator factory, one
+# that records each call it wraps, and a generic one that records being
+# applied. Run alone it prints nothing.
 #
 # WHY THIS IS RUN AND NOT CHECKED AT A LOWER LAYER: it is the imported half of
-# a_decorator_is_any_function_the_program_names.py, which needs it on disk;
+# a_decorator_is_any_function_the_program_names.py and
+# a_decorated_method_is_what_its_decorators_return.py, which need it on disk;
 # running it alone keeps it a program of its own.
-from typing import Callable
+from typing import Callable, TypeVar
+
+F = TypeVar("F")
 
 calls: list[str] = []
+applied: list[str] = []
+
+
+def mark(f: F) -> F:
+    applied.append("mark")
+    return f
 
 
 def twice(f: Callable[[int], int]) -> Callable[[int], int]:

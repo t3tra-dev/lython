@@ -563,6 +563,25 @@ private:
   // `@contextlib.contextmanager` defs become a generator and a def that
   // wraps it (EmitterWith.cpp).
   void desugarContextManagers(const parser::Node &moduleNode);
+  void desugarMethodDecorators(const parser::Node &moduleNode);
+  // A method the desugar split: its body under `hiddenName`, and the cell
+  // `cellName` holding what its decorators returned, which the method of the
+  // written name forwards to.
+  struct DecoratedMethod {
+    const parser::Node *classDef = nullptr;
+    const parser::Node *hiddenDef = nullptr;
+    std::string className;
+    std::string hiddenName;
+    std::string cellName;
+    std::vector<parser::NodePtr> decorators;
+    parser::SourceRange range;
+    bool typed = false;
+  };
+  std::vector<DecoratedMethod> decoratedMethods;
+  parser::NodePtr decoratedMethodApplication(const DecoratedMethod &method,
+                                             parser::NodePtr subject);
+  void applyMethodDecorators(const parser::Node &classDef);
+  bool typeDecoratedMethod(DecoratedMethod &method, bool reportFailure);
   // Parsed trees a desugar spliced into a module, alive as long as it is.
   std::vector<parser::NodePtr> synthesizedHelperTrees;
   // The classes that were declared as protocols, by their own name.

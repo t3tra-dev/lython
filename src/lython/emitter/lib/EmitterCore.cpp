@@ -78,6 +78,7 @@ EmitResult ModuleEmitter::emit() {
       scopeComprehensionTargets(*source.moduleNode);
     }
   desugarContextManagers(moduleNode);
+  desugarMethodDecorators(moduleNode);
   scopeComprehensionTargets(moduleNode);
   // After the generic desugar (a `Protocol[T]` base is what it leaves for a
   // generic protocol) and before any binder reads a base list.

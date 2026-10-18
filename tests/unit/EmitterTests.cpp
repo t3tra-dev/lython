@@ -608,6 +608,40 @@ TEST(EmitterTest, ADecoratorThatReturnsNoFunctionIsRefusedByName) {
       refused, "decorator 'to_int' does not return a function here"));
 }
 
+// What: a decorated method compiles when its decorator returns a function,
+// and one whose decorator returns anything else is refused by name, with no
+// second sentence about the cell the rewrite reads.
+TEST(EmitterTest, ADecoratedMethodIsWhatItsDecoratorReturns) {
+  mlir::MLIRContext accepting(testRegistry());
+  lython::emitter::EmitResult accepted = emitSource(
+      "from typing import TypeVar\n"
+      "F = TypeVar(\"F\")\n"
+      "def mark(f: F) -> F:\n"
+      "    return f\n"
+      "class A:\n"
+      "    @mark\n"
+      "    def m(self, x: int = 1) -> int:\n"
+      "        return x\n"
+      "print(A().m(), A().m(2))\n",
+      accepting);
+  EXPECT_TRUE(accepted.ok());
+
+  mlir::MLIRContext refusing(testRegistry());
+  lython::emitter::EmitResult refused = emitSource(
+      "def to_int(f: object) -> int:\n"
+      "    return 1\n"
+      "class A:\n"
+      "    @to_int\n"
+      "    def m(self) -> int:\n"
+      "        return 1\n"
+      "print(A().m())\n",
+      refusing);
+  EXPECT_FALSE(refused.ok());
+  EXPECT_TRUE(reportsDiagnostic(
+      refused, "decorator 'to_int' on method 'm' does not return a function"));
+  EXPECT_FALSE(reportsDiagnostic(refused, "unresolved name"));
+}
+
 // What: `Container` is covariant, as typeshed declares it, so a method taking
 // `Container[object]` accepts a list[int], a dict, a set and a tuple, while a
 // `Container[str]` parameter still refuses a list[int].

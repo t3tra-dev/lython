@@ -1,0 +1,6 @@
+test_fixed_bug: unexpected success
+test_known_bug: expected failure
+test_not_skipped: ok
+test_plain: FAIL two is not greater
+test_skip_if: skipped (condition held)
+test_skipped: skipped (not today)

@@ -2595,6 +2595,10 @@ ModuleEmitter::attributePresence(mlir::Type subject, llvm::StringRef attribute,
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(subject);
   if (!contract)
     return AttributePresence::Undecided;
+  // ⛔ A name with `$` is a body this compiler split out, which no source
+  // identifier spells and CPython's class does not have.
+  if (attribute.contains('$') && isSourceClassContract(subject))
+    return AttributePresence::Absent;
   bool field = !throughClass && lookupClassField(subject, attribute).has_value();
   bool present = field || lookupClassMethod(subject, attribute).has_value() ||
                  lookupClassStaticAttr(subject, attribute).has_value();
@@ -3106,7 +3110,11 @@ ModuleEmitter::programAttributeNames(llvm::StringRef cls) const {
       if (auto found = declarations->find(current);
           found != declarations->end())
         for (const auto &name : found->second)
-          names.insert(name.getKey());
+          // ⛔ Not a name with `$`, which no source identifier has: it is a
+          // body this compiler split out (`m$cmgen`, `__ly_undecorated$m`),
+          // and CPython's class has no such attribute.
+          if (!name.getKey().contains('$'))
+            names.insert(name.getKey());
     if (auto bases = declaredClassBases.find(current);
         bases != declaredClassBases.end())
       for (const std::string &base : bases->second)
@@ -3740,7 +3748,8 @@ ModuleEmitter::classDirNames(llvm::StringRef cls, std::string &why) const {
           continue;
         if (member->kind == "FunctionDef" ||
             member->kind == "AsyncFunctionDef" || member->kind == "ClassDef") {
-          if (auto name = ast::string(*member, "name"))
+          if (auto name = ast::string(*member, "name");
+              name && !llvm::StringRef(*name).contains('$'))
             names.insert(std::string(*name));
         } else if (member->kind == "AnnAssign") {
           annotated = true;

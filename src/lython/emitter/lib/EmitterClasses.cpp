@@ -365,6 +365,182 @@ ModuleEmitter::bindingDecoratorCallee(const parser::NodePtr &decorator) {
   return decorator;
 }
 
+// ⭐ A DECORATED METHOD IS `m = d(m)` IN THE CLASS BODY: the class attribute
+// holds what the decorator returned, and a call through an instance binds
+// the receiver to it like any function. Here every call of a method is
+// inlined, so the rewrite keeps that shape in two methods and a cell --
+//
+//     class C:
+//         def __ly_undecorated$m(self, x): <the body>
+//         def m(self, x): return __ly_decorated$C$m(self, x)
+//     __ly_decorated$C$m = d(C.__ly_undecorated$m)    # after the class
+//
+// -- so the body keeps its class (`super()`, the fields it reads), the name
+// keeps the signature it was written with, and the decorator runs once.
+// ⛔ Only what the forwarder can restate: positional parameters, defaults
+// included. A pack, a keyword-only parameter, a generator or a coroutine
+// keeps its decorators and their refusal, as does a decorator beside
+// staticmethod, classmethod or property, which bind differently.
+// ⛔ The application runs after the class statement and not in its body:
+// CPython runs it before the class name is bound, which only a decorator
+// with a side effect interleaved with the rest of the body could tell.
+void ModuleEmitter::desugarMethodDecorators(const parser::Node &moduleNode) {
+  auto *body = const_cast<std::vector<parser::NodePtr> *>(
+      ast::nodeList(moduleNode, "body"));
+  if (!body)
+    return;
+  auto isTypingMarker = [](llvm::StringRef leaf) {
+    return leaf == "overload" || leaf == "override" || leaf == "final";
+  };
+  auto definesItsOwnGenerator = [](const parser::Node &def) {
+    bool found = false;
+    std::function<void(const parser::Node &)> walk =
+        [&](const parser::Node &node) {
+          if (found)
+            return;
+          if (&node != &def &&
+              (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
+               node.kind == "Lambda" || node.kind == "ClassDef"))
+            return;
+          if (node.kind == "Yield" || node.kind == "YieldFrom") {
+            found = true;
+            return;
+          }
+          for (const parser::Field &field : node.fields) {
+            if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+              if (*child)
+                walk(**child);
+            } else if (const auto *children =
+                           std::get_if<std::vector<parser::NodePtr>>(
+                               &field.value)) {
+              for (const parser::NodePtr &child : *children)
+                if (child)
+                  walk(*child);
+            }
+          }
+        };
+    walk(def);
+    return found;
+  };
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement || statement->kind != "ClassDef")
+      continue;
+    if (const auto *typeParams = ast::nodeList(*statement, "type_params");
+        typeParams && !typeParams->empty())
+      continue;
+    std::string className(ast::string(*statement, "name").value_or(""));
+    auto *members = const_cast<std::vector<parser::NodePtr> *>(
+        ast::nodeList(*statement, "body"));
+    if (className.empty() || !members)
+      continue;
+    for (std::size_t index = 0; index < members->size(); ++index) {
+      parser::NodePtr method = (*members)[index];
+      if (!method || method->kind != "FunctionDef")
+        continue;
+      auto *decorators = const_cast<std::vector<parser::NodePtr> *>(
+          ast::nodeList(*method, "decorator_list"));
+      if (!decorators || decorators->empty())
+        continue;
+      std::vector<parser::NodePtr> markers;
+      std::vector<parser::NodePtr> binding;
+      bool bindsOtherwise = false;
+      for (const parser::NodePtr &decorator : *decorators) {
+        if (!decorator)
+          continue;
+        auto [function, spelling] = decoratorCallee(*decorator);
+        llvm::StringRef leaf = decoratorLeafName(spelling);
+        if (isTypingMarker(leaf))
+          markers.push_back(decorator);
+        else if (isRecognizedNonBindingDecorator(leaf) ||
+                 !propertySetterTarget(*decorator).empty() || !function ||
+                 (function->kind != "Name" && function->kind != "Attribute"))
+          bindsOtherwise = true;
+        else
+          binding.push_back(decorator);
+      }
+      const parser::Node *arguments = ast::node(*method, "args");
+      const auto *kwonly =
+          arguments ? ast::nodeList(*arguments, "kwonlyargs") : nullptr;
+      if (bindsOtherwise || binding.empty() || !arguments ||
+          ast::node(*arguments, "vararg") || ast::node(*arguments, "kwarg") ||
+          (kwonly && !kwonly->empty()) || definesItsOwnGenerator(*method))
+        continue;
+      std::vector<std::string> positional;
+      for (llvm::StringRef group : {"posonlyargs", "args"})
+        if (const auto *list = ast::nodeList(*arguments, group))
+          for (const parser::NodePtr &arg : *list)
+            if (arg)
+              positional.push_back(
+                  std::string(ast::string(*arg, "arg").value_or("")));
+      if (positional.empty())
+        continue;
+      std::string name(ast::string(*method, "name").value_or(""));
+      parser::SourceRange range = method->range;
+      DecoratedMethod split;
+      split.classDef = statement.get();
+      split.hiddenDef = method.get();
+      split.className = className;
+      split.hiddenName = "__ly_undecorated$" + name;
+      split.cellName = "__ly_decorated$" + className + "$" + name;
+      split.decorators = binding;
+      split.range = range;
+      // The method of the written name: its parameters, defaults and
+      // markers, forwarding every argument to what the decorators returned.
+      parser::NodePtr forwarder = synth::cloneTree(*method);
+      if (parser::Field *field = parser::findField(*forwarder, "decorator_list"))
+        field->value = std::move(markers);
+      std::vector<parser::NodePtr> forwarded;
+      for (const std::string &parameter : positional)
+        forwarded.push_back(synth::name(parameter, range));
+      std::vector<parser::NodePtr> forwardingBody;
+      forwardingBody.push_back(synth::returnStmt(
+          synth::call(synth::name(split.cellName, range), std::move(forwarded),
+                      range),
+          range));
+      if (parser::Field *field = parser::findField(*forwarder, "body"))
+        field->value = std::move(forwardingBody);
+      // The body, under the hidden name and undecorated.
+      decorators->clear();
+      if (parser::Field *field = parser::findField(*method, "name"))
+        field->value = split.hiddenName;
+      members->insert(members->begin() + static_cast<std::ptrdiff_t>(index) + 1,
+                      std::move(forwarder));
+      ++index;
+      decoratedMethods.push_back(std::move(split));
+    }
+  }
+}
+
+// `d1(d2(subject))` -- `subject` the method's function, `C.__ly_undecorated$m`
+// -- with the decorator closest to the def applied first, as it is to a
+// function.
+parser::NodePtr
+ModuleEmitter::decoratedMethodApplication(const DecoratedMethod &method,
+                                          parser::NodePtr subject) {
+  parser::NodePtr applied = std::move(subject);
+  for (const parser::NodePtr &decorator : llvm::reverse(method.decorators)) {
+    std::vector<parser::NodePtr> arguments;
+    arguments.push_back(std::move(applied));
+    applied = synth::call(decorator, std::move(arguments), method.range);
+  }
+  return applied;
+}
+
+void ModuleEmitter::applyMethodDecorators(const parser::Node &classDef) {
+  for (const DecoratedMethod &method : decoratedMethods) {
+    if (method.classDef != &classDef || !method.typed)
+      continue;
+    parser::NodePtr applied = synth::assign(
+        synth::name(method.cellName, method.range),
+        decoratedMethodApplication(
+            method, synth::attribute(synth::name(method.className, method.range),
+                                     method.hiddenName, method.range)),
+        method.range);
+    synthesizedIteratorDefs.push_back(applied);
+    emitStatement(*applied);
+  }
+}
+
 void ModuleEmitter::checkDecorators(const parser::Node &node,
                                     DecoratorRole role,
                                     const llvm::StringSet<> *propertyNames) {
@@ -1977,6 +2153,9 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       symbolName.empty() ? std::string(*name) : symbolName.str();
   llvm::StringRef contractName(classSymbol);
   checkDecorators(classDef, DecoratorRole::Class);
+  for (DecoratedMethod &method : decoratedMethods)
+    if (method.classDef == &classDef)
+      typeDecoratedMethod(method, /*reportFailure=*/true);
 
   // @dataclass: init/repr/eq synthesize below (default True); frozen/order
   // are accepted only as explicit False.

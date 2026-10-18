@@ -56,6 +56,7 @@ void ModuleEmitter::emitStatements(
       if (statement->kind == "ClassDef") {
         emitClassAttrInitializers(*statement);
         emitInitSubclassHook(*statement);
+        applyMethodDecorators(*statement);
       }
       // A skipped module-level def still EXECUTES here in CPython terms:
       // its non-constant defaults evaluate at this spot, once, into their

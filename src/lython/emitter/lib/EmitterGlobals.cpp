@@ -153,6 +153,11 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
     moduleGlobals[*decorated] = decoratedType;
     types.bindSymbol(*decorated, decoratedType);
   }
+  // And a decorated METHOD's cell (desugarMethodDecorators): typed by its
+  // application, like a decorated function's -- here when its decorators'
+  // types are known already, else when its class is emitted.
+  for (DecoratedMethod &method : decoratedMethods)
+    typeDecoratedMethod(method, /*reportFailure=*/false);
   for (const parser::NodePtr &statement : *body) {
     if (!statement || statement->kind != "AnnAssign")
       continue;
@@ -528,6 +533,71 @@ void ModuleEmitter::rebindStructuralMutation(const parser::Node &at,
   auto op = py::GlobalSetOp::create(builder, loc(at),
                                     builder.getStringAttr(name), stored.value);
   markBoxedModuleGlobal(op);
+}
+
+
+// ⛔ Typed through the method's own signature, not `C.__ly_undecorated$m`:
+// the class's methods are not in its table until it is emitted, so the
+// attribute read answered `object` and an identity decorator
+// (`def mark(f: F) -> F`) handed that back as the method.
+// ⛔ And asked twice: a decorator that is an INSTANCE (`@skip("why")` with a
+// `__call__`) has no method table either until its class is emitted, which
+// it is before the class it decorates -- so a miss here is final only there.
+bool ModuleEmitter::typeDecoratedMethod(DecoratedMethod &method,
+                                        bool reportFailure) {
+  if (method.typed)
+    return true;
+  mlir::Type decoratedType;
+  mlir::Type undecoratedType;
+  if (std::optional<mlir::Type> classType =
+          types.lookupClass(method.className);
+      classType && method.hiddenDef) {
+    std::optional<llvm::StringRef> selfName;
+    if (const parser::Node *arguments = ast::node(*method.hiddenDef, "args"))
+      for (llvm::StringRef group : {"posonlyargs", "args"})
+        if (const auto *list = ast::nodeList(*arguments, group);
+            !selfName && list && !list->empty() && list->front())
+          selfName = ast::string(*list->front(), "arg");
+    FunctionSignature sig = types.functionSignature(
+        *method.hiddenDef, selfName, py::CallableType(), *classType);
+    undecoratedType = sig.publicCallable;
+    std::string subject = method.cellName + "$method";
+    types.bindSymbol(subject, sig.publicCallable);
+    parser::NodePtr applied = decoratedMethodApplication(
+        method, synth::name(subject, method.range));
+    synthesizedIteratorDefs.push_back(applied);
+    decoratedType = types.widenLiteral(types.inferExpr(applied.get()));
+  }
+  if (!mlir::isa_and_nonnull<py::CallableType>(decoratedType)) {
+    if (!reportFailure)
+      return false;
+    const parser::Node *decorator =
+        method.decorators.empty() ? nullptr : method.decorators.front().get();
+    const parser::Node *callee =
+        decorator && decorator->kind == "Call" ? ast::node(*decorator, "func")
+                                               : decorator;
+    std::string spelling = callee ? ast::qualifiedName(callee) : "";
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error,
+        decorator ? decorator->range.start : method.range.start,
+        "decorator '" + spelling + "' on method '" +
+            llvm::StringRef(method.hiddenName)
+                .drop_front(llvm::StringRef("__ly_undecorated$").size())
+                .str() +
+            "' does not return a function here: the method is bound to "
+            "what its decorators return, and only a callable can be"});
+    // The forwarder still names the cell; typed as the method itself, it
+    // adds no second sentence to the one above.
+    if (undecoratedType) {
+      moduleGlobals[method.cellName] = undecoratedType;
+      types.bindSymbol(method.cellName, undecoratedType);
+    }
+    return false;
+  }
+  method.typed = true;
+  moduleGlobals[method.cellName] = decoratedType;
+  types.bindSymbol(method.cellName, decoratedType);
+  return true;
 }
 
 } // namespace lython::emitter
