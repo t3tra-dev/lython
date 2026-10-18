@@ -419,6 +419,11 @@ public:
   // and a body that reads `c.n` on a source class inferred `object` there.
   void forgetSignature(const parser::Node *function);
   void forgetInferredResult(const parser::Node *function);
+  // False only during the module fixpoint's rounds; a signature read there is
+  // not the one read after it (see `defaultsDescribeParameters`).
+  bool describesParametersByDefaults() const {
+    return defaultsDescribeParameters;
+  }
   mlir::Type annotationType(const parser::Node *node) const;
   // True when the expression NAMES A TYPE rather than a value: a builtin
   // spelling, a declared class, a protocol or contract name, an alias already
