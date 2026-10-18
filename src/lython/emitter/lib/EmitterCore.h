@@ -883,6 +883,25 @@ private:
                                        llvm::StringRef binding,
                                        py::CallableType declared);
   std::optional<Value> tryEmitDynamicClassName(const parser::Node &expr);
+  // What the class line says about one attribute name, for `hasattr` and the
+  // default form of `getattr`.
+  enum class AttributePresence {
+    Absent,
+    Present,
+    // A field the program may read before a store fills it: the INSTANCE
+    // answers, through `attributeProbe`.
+    FieldMaybeUnset,
+    // Absent here, and a subclass may define it.
+    Undecided,
+  };
+  AttributePresence attributePresence(mlir::Type subject,
+                                      llvm::StringRef attribute,
+                                      std::string *undecidedBy = nullptr);
+  // `__ly_hasattr$<n>(recv: C) -> bool`, one per (class, field): reads the
+  // field inside `try` and answers whether the read raised.
+  std::string attributeProbe(llvm::StringRef cls, llvm::StringRef field,
+                             parser::SourceRange range);
+  llvm::StringMap<std::string> attributeProbes;
   std::optional<Value> tryEmitHasattrCall(const parser::Node &expr,
                                           const parser::Node *calleeNode);
   std::optional<std::string> unhashableClassName(mlir::Type type) const;

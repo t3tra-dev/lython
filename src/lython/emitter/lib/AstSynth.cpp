@@ -231,6 +231,19 @@ NodePtr exprStmt(NodePtr value, SourceRange range) {
   return node;
 }
 
+NodePtr tryExcept(std::vector<NodePtr> body, NodePtr exceptionType,
+                  std::vector<NodePtr> handler, SourceRange range) {
+  NodePtr except = parser::makeNode("ExceptHandler", range);
+  parser::addField(*except, "type", std::move(exceptionType));
+  parser::addField(*except, "body", std::move(handler));
+  NodePtr node = parser::makeNode("Try", range);
+  parser::addField(*node, "body", std::move(body));
+  parser::addField(*node, "handlers", std::vector<NodePtr>{std::move(except)});
+  parser::addField(*node, "orelse", std::vector<NodePtr>{});
+  parser::addField(*node, "finalbody", std::vector<NodePtr>{});
+  return node;
+}
+
 NodePtr breakStmt(SourceRange range) {
   return parser::makeNode("Break", range);
 }

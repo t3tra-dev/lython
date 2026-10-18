@@ -1178,6 +1178,26 @@ TEST(EmitterTest, AValueOfAnUnrelatedClassIsRefusedWhereAnotherIsDeclared) {
   EXPECT_TRUE(subclass.ok());
 }
 
+// What: `getattr(x, "name", default)` is refused when the receiver's class
+// lacks the name and a subclass declares it -- the class line cannot say which
+// one the instance is -- and names that subclass.
+TEST(EmitterTest, AGetattrDefaultASubclassMayAnswerIsRefused) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult result = emitSource(
+      "class B:\n    pass\nclass D(B):\n    extra = 1\n"
+      "def f(b: B) -> int:\n    return getattr(b, \"extra\", 0)\n"
+      "print(f(D()))\n",
+      context);
+  EXPECT_FALSE(result.ok());
+  bool named = false;
+  for (const lython::parser::Diagnostic &diagnostic : result.diagnostics)
+    named = named ||
+            diagnostic.message.find(
+                "getattr(x, 'extra', default) cannot be answered: 'D' "
+                "derives from") != std::string::npos;
+  EXPECT_TRUE(named);
+}
+
 TEST(EmitterTest, AnAttributeASourceClassDoesNotHaveIsRefusedAtEmit) {
   // Nothing resolves the read -- not a field, a class attribute, a method or
   // a property -- and it used to be emitted anyway and die in the lowering as

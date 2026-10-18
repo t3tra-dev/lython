@@ -2543,6 +2543,91 @@ bool ModuleEmitter::callsUnshadowedBuiltin(const parser::Node *calleeNode,
   return !programBindsName(name);
 }
 
+ModuleEmitter::AttributePresence
+ModuleEmitter::attributePresence(mlir::Type subject, llvm::StringRef attribute,
+                                 std::string *undecidedBy) {
+  // A CLASS answers with what its class line declares -- methods and class
+  // attributes; an instance field is not an attribute of the class.
+  bool throughClass = false;
+  if (auto typeObject = mlir::dyn_cast_if_present<py::TypeType>(subject)) {
+    subject = typeObject.getInstanceType();
+    throughClass = true;
+  }
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(subject);
+  if (!contract)
+    return AttributePresence::Undecided;
+  bool field = !throughClass && lookupClassField(subject, attribute).has_value();
+  bool present = field || lookupClassMethod(subject, attribute).has_value() ||
+                 lookupClassStaticAttr(subject, attribute).has_value();
+  if (!present) {
+    const py::protocols::Table &table = py::protocols::Table::get(context);
+    present = !table.methodContractCandidatesWithEvidence(subject, attribute)
+                   .empty() ||
+              (!throughClass &&
+               table.resolveFieldContractWithEvidence(subject, attribute)
+                   .has_value());
+  }
+  if (present) {
+    if (field && !fieldAlwaysStoredBeforeRead(contract.getContractName(),
+                                              attribute))
+      return AttributePresence::FieldMaybeUnset;
+    return AttributePresence::Present;
+  }
+  for (const auto &entry : classMros)
+    if (entry.getKey() != contract.getContractName() &&
+        llvm::is_contained(entry.second, contract.getContractName())) {
+      if (undecidedBy)
+        *undecidedBy = entry.getKey().str();
+      return AttributePresence::Undecided;
+    }
+  return AttributePresence::Absent;
+}
+
+// ⭐ A FIELD NO STORE MAY HAVE FILLED IS ASKED OF THE INSTANCE. `hasattr` used
+// to answer from the class alone, so a field a method creates -- or one the
+// class only annotates -- was there before anything stored it:
+//
+//     class T:
+//         def setUp(self) -> None:
+//             self.n = 3
+//     print(hasattr(T(), "n"))    # printed True; CPython prints False
+//
+// The probe is a synthesized function over surface that already compiles: the
+// field read raises AttributeError when the slot is empty
+// (`ly.field.maybe_unset`), and the `try` turns that into the answer.
+std::string ModuleEmitter::attributeProbe(llvm::StringRef cls,
+                                          llvm::StringRef field,
+                                          parser::SourceRange range) {
+  std::string key = (cls + "\x1f" + field).str();
+  if (auto found = attributeProbes.find(key); found != attributeProbes.end())
+    return found->second;
+  std::string symbol =
+      "__ly_hasattr$" + std::to_string(++syntheticFunctionCounter);
+  attributeProbes[key] = symbol;
+  std::vector<parser::NodePtr> body;
+  body.push_back(synth::tryExcept(
+      {synth::exprStmt(synth::attribute(synth::name("__ly_recv", range),
+                                        field, range),
+                       range)},
+      synth::name("AttributeError", range),
+      {synth::returnStmt(synth::constantBool(false, range), range)}, range));
+  body.push_back(synth::returnStmt(synth::constantBool(true, range), range));
+  parser::NodePtr def = synth::functionDef(
+      symbol, {synth::Param{"__ly_recv", synth::name(cls, range)}}, {},
+      std::move(body), synth::name("bool", range), {}, range);
+  synthesizedIteratorDefs.push_back(def);
+  FunctionSignature sig = types.functionSignature(*def);
+  types.bindRootSymbol(symbol, sig.publicCallable);
+  auto emitBody = [this, def, symbol, sig] {
+    emitDispatcherBody(*def, symbol, sig, /*suppressGate=*/false);
+  };
+  if (classDeclarationsEmitted)
+    emitBody();
+  else
+    deferredDispatcherBodies.push_back(std::move(emitBody));
+  return symbol;
+}
+
 std::optional<Value>
 ModuleEmitter::tryEmitHasattrCall(const parser::Node &expr,
                                   const parser::Node *calleeNode) {
@@ -2566,28 +2651,37 @@ ModuleEmitter::tryEmitHasattrCall(const parser::Node &expr,
                   "decided at compile time here");
   llvm::StringRef attribute = *name;
   mlir::Type subject = types.widenLiteral(types.inferExpr(args->front().get()));
-  auto contract = mlir::dyn_cast_if_present<py::ContractType>(subject);
-  if (!contract)
-    return refuse("hasattr() needs a statically resolved receiver, and " +
-                  typeText(subject) + " is not one");
-  bool present = lookupClassField(subject, attribute).has_value() ||
-                 lookupClassMethod(subject, attribute).has_value() ||
-                 lookupClassStaticAttr(subject, attribute).has_value();
-  if (!present) {
-    const py::protocols::Table &table = py::protocols::Table::get(context);
-    present = !table.methodContractCandidatesWithEvidence(subject, attribute)
-                   .empty() ||
-              table.resolveFieldContractWithEvidence(subject, attribute)
-                  .has_value();
+  std::string undecidedBy;
+  AttributePresence presence =
+      attributePresence(subject, attribute, &undecidedBy);
+  switch (presence) {
+  case AttributePresence::Undecided:
+    if (undecidedBy.empty())
+      return refuse("hasattr() needs a statically resolved receiver, and " +
+                    typeText(subject) + " is not one");
+    return refuse("hasattr(x, '" + attribute.str() + "') on '" +
+                  mlir::cast<py::ContractType>(
+                      mlir::isa<py::TypeType>(subject)
+                          ? mlir::cast<py::TypeType>(subject).getInstanceType()
+                          : subject)
+                      .getContractName()
+                      .str() +
+                  "' cannot be answered: '" + undecidedBy +
+                  "' derives from it and may define that attribute");
+  case AttributePresence::FieldMaybeUnset: {
+    std::string probe = attributeProbe(
+        mlir::cast<py::ContractType>(subject).getContractName(), attribute,
+        expr.range);
+    parser::NodePtr call = synth::call(synth::name(probe, expr.range),
+                                       {(*args)[0]}, expr.range);
+    synthesizedIteratorDefs.push_back(call);
+    return emitExpr(call.get());
   }
-  if (!present)
-    for (const auto &entry : classMros)
-      if (entry.getKey() != contract.getContractName() &&
-          llvm::is_contained(entry.second, contract.getContractName()))
-        return refuse("hasattr(x, '" + attribute.str() + "') on '" +
-                      contract.getContractName().str() +
-                      "' cannot be answered: '" + entry.getKey().str() +
-                      "' derives from it and may define that attribute");
+  case AttributePresence::Present:
+  case AttributePresence::Absent:
+    break;
+  }
+  bool present = presence == AttributePresence::Present;
   (void)emitExpr(args->front().get());
   mlir::Type literalType = types.literal(present ? "True" : "False");
   auto constant = py::BoolConstantOp::create(builder, loc(expr), literalType,
@@ -2775,19 +2869,71 @@ ModuleEmitter::tryEmitGetattrCall(const parser::Node &expr,
                                              std::move(reason)});
     return emitNone(expr);
   };
-  if (!args || args->size() != 2 || (keywords && !keywords->empty()) ||
-      !args->front() || !(*args)[1])
-    return refuse("getattr() takes exactly two arguments here: the default "
-                  "form would need a runtime attribute lookup");
+  if (!args || args->size() < 2 || args->size() > 3 ||
+      (keywords && !keywords->empty()) ||
+      llvm::any_of(*args, [](const parser::NodePtr &arg) { return !arg; }))
+    return refuse("getattr() takes two or three arguments");
   std::optional<llvm::StringRef> name =
       literalStringArgument((*args)[1].get());
   if (!name)
     return refuse("getattr() needs a literal attribute name: the lookup is "
                   "resolved at compile time here");
-  parser::NodePtr attribute =
-      synth::attribute(args->front(), name->str(), expr.range);
-  synthesizedIteratorDefs.push_back(attribute);
-  return emitExpr(attribute.get());
+  if (args->size() == 2) {
+    parser::NodePtr attribute =
+        synth::attribute(args->front(), name->str(), expr.range);
+    synthesizedIteratorDefs.push_back(attribute);
+    return emitExpr(attribute.get());
+  }
+  // ⭐ THE DEFAULT FORM IS `hasattr` PICKING AN ARM. `getattr(result,
+  // "addSkip", None)` is how unittest asks for an optional protocol method,
+  // and the class line answers it the way it answers `hasattr`: the attribute,
+  // or the default. CPython evaluates all three arguments before the lookup,
+  // so the receiver and the default are each emitted exactly once, in order,
+  // whichever arm is taken.
+  mlir::Type subject = types.widenLiteral(types.inferExpr(args->front().get()));
+  std::string undecidedBy;
+  AttributePresence presence =
+      attributePresence(subject, *name, &undecidedBy);
+  if (presence == AttributePresence::Undecided)
+    return refuse(
+        undecidedBy.empty()
+            ? "getattr() with a default needs a statically resolved "
+              "receiver, and " +
+                  typeText(subject) + " is not one"
+            : "getattr(x, '" + name->str() + "', default) cannot be answered: '" +
+                  undecidedBy +
+                  "' derives from the receiver's class and may define that "
+                  "attribute");
+  std::string receiverName =
+      "__getattr" + std::to_string(++syntheticFunctionCounter);
+  std::string defaultName = receiverName + "$default";
+  Value receiver = emitExpr(args->front().get());
+  values[receiverName] = receiver;
+  types.bindSymbol(receiverName, receiver.type);
+  Value fallback = emitExpr((*args)[2].get());
+  values[defaultName] = fallback;
+  types.bindSymbol(defaultName, fallback.type);
+  auto cleanup = llvm::scope_exit([&] {
+    values.erase(receiverName);
+    values.erase(defaultName);
+  });
+  if (presence == AttributePresence::Absent)
+    return fallback;
+  parser::NodePtr read = synth::attribute(synth::name(receiverName, expr.range),
+                                          name->str(), expr.range);
+  if (presence == AttributePresence::Present) {
+    synthesizedIteratorDefs.push_back(read);
+    return emitExpr(read.get());
+  }
+  std::string probe = attributeProbe(
+      mlir::cast<py::ContractType>(subject).getContractName(), *name,
+      expr.range);
+  parser::NodePtr choice = synth::ifExp(
+      synth::call(synth::name(probe, expr.range),
+                  {synth::name(receiverName, expr.range)}, expr.range),
+      std::move(read), synth::name(defaultName, expr.range), expr.range);
+  synthesizedIteratorDefs.push_back(choice);
+  return emitExpr(choice.get());
 }
 
 std::optional<Value>
