@@ -50,17 +50,17 @@ module attributes {
                     "instance", "instance", "instance", "instance", "instance"]
   } {}
 
-  // A class value is a view of its type object's fifteen words.
+  // A class value is a view of its type object's words (TypeObjects.h).
   // ⛔ `ly.runtime.class` is what makes this contract a runtime CLASS to the
   // manifest index, and the boxed hooks place their arms on that class's type
   // object: without it a class value held in a container renders through no
   // arm at all.
-  func.func private @LyType_Shape() -> memref<15xi64> attributes {ly.runtime.class, ly.runtime.contract = "builtins.type", ly.runtime.shape}
+  func.func private @LyType_Shape() -> memref<16xi64> attributes {ly.runtime.class, ly.runtime.contract = "builtins.type", ly.runtime.shape}
 
   // The class word: the image's address, which is what an instance's header
   // word 1 holds for the same class.
-  func.func private @__ly_type_word(%type: memref<15xi64> {ly.ownership.object_header}) -> i64 {
-    %index = memref.extract_aligned_pointer_as_index %type : memref<15xi64> -> index
+  func.func private @__ly_type_word(%type: memref<16xi64> {ly.ownership.object_header}) -> i64 {
+    %index = memref.extract_aligned_pointer_as_index %type : memref<16xi64> -> index
     %word = arith.index_cast %index : index to i64
     func.return %word : i64
   }
@@ -72,16 +72,16 @@ module attributes {
   // `<class 'NAME'>`, NAME being the type object's own name -- qualified for
   // a class with a module ("__main__.A"), bare for a builtin ("int"), which is
   // CPython's type_repr.
-  func.func @LyType_Repr(%type: memref<15xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.type", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
+  func.func @LyType_Repr(%type: memref<16xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.type", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
     %c4 = arith.constant 4 : index
     %c8 = arith.constant 8 : index
     %c10 = arith.constant 10 : index
-    %word = func.call @__ly_type_word(%type) : (memref<15xi64>) -> i64
+    %word = func.call @__ly_type_word(%type) : (memref<16xi64>) -> i64
     %name_ptr = func.call @LyType_Name(%word) : (i64) -> !llvm.ptr
-    %length = memref.load %type[%c4] : memref<15xi64>
+    %length = memref.load %type[%c4] : memref<16xi64>
     %length_index = arith.index_cast %length : i64 to index
     %total = arith.addi %length_index, %c10 : index
     %buffer = memref.alloc(%total) : memref<?xi8>
@@ -111,15 +111,15 @@ module attributes {
   }
 
   // `str(cls)` is its repr: type defines no __str__ of its own.
-  func.func @LyType_Str(%type: memref<15xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.type", ly.runtime.method = "__str__", ly.runtime.result_contract = "builtins.str"} {
-    %h, %b = func.call @LyType_Repr(%type) : (memref<15xi64>) -> (memref<2xi64>, memref<?xi8>)
+  func.func @LyType_Str(%type: memref<16xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.type", ly.runtime.method = "__str__", ly.runtime.result_contract = "builtins.str"} {
+    %h, %b = func.call @LyType_Repr(%type) : (memref<16xi64>) -> (memref<2xi64>, memref<?xi8>)
     func.return %h, %b : memref<2xi64>, memref<?xi8>
   }
 
   // CPython's _Py_HashPointer: the address rotated right by four, -1 being
   // reserved for "error".
-  func.func @LyType_Hash(%type: memref<15xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.type", ly.runtime.method = "__hash__"} {
-    %word = func.call @__ly_type_word(%type) : (memref<15xi64>) -> i64
+  func.func @LyType_Hash(%type: memref<16xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.type", ly.runtime.method = "__hash__"} {
+    %word = func.call @__ly_type_word(%type) : (memref<16xi64>) -> i64
     %four = arith.constant 4 : i64
     %sixty = arith.constant 60 : i64
     %low = arith.shrui %word, %four : i64
@@ -134,37 +134,37 @@ module attributes {
 
   // Two class values are equal exactly when they are the same class: type
   // compares by identity.
-  func.func @LyType_Eq(%lhs: memref<15xi64> {ly.ownership.object_header}, %rhs: memref<15xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.type", ly.runtime.method = "__eq__"} {
-    %a = func.call @__ly_type_word(%lhs) : (memref<15xi64>) -> i64
-    %b = func.call @__ly_type_word(%rhs) : (memref<15xi64>) -> i64
+  func.func @LyType_Eq(%lhs: memref<16xi64> {ly.ownership.object_header}, %rhs: memref<16xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.type", ly.runtime.method = "__eq__"} {
+    %a = func.call @__ly_type_word(%lhs) : (memref<16xi64>) -> i64
+    %b = func.call @__ly_type_word(%rhs) : (memref<16xi64>) -> i64
     %same = arith.cmpi eq, %a, %b : i64
     func.return %same : i1
   }
 
-  func.func @LyType_Ne(%lhs: memref<15xi64> {ly.ownership.object_header}, %rhs: memref<15xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.type", ly.runtime.method = "__ne__"} {
-    %a = func.call @__ly_type_word(%lhs) : (memref<15xi64>) -> i64
-    %b = func.call @__ly_type_word(%rhs) : (memref<15xi64>) -> i64
+  func.func @LyType_Ne(%lhs: memref<16xi64> {ly.ownership.object_header}, %rhs: memref<16xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.type", ly.runtime.method = "__ne__"} {
+    %a = func.call @__ly_type_word(%lhs) : (memref<16xi64>) -> i64
+    %b = func.call @__ly_type_word(%rhs) : (memref<16xi64>) -> i64
     %differ = arith.cmpi ne, %a, %b : i64
     func.return %differ : i1
   }
 
   // `cls.__name__`: the name after the last dot.
-  func.func @LyType_GetName(%type: memref<15xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.type", ly.runtime.primitive = "name", ly.runtime.result_contract = "builtins.str"} {
-    %word = func.call @__ly_type_word(%type) : (memref<15xi64>) -> i64
+  func.func @LyType_GetName(%type: memref<16xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.type", ly.runtime.primitive = "name", ly.runtime.result_contract = "builtins.str"} {
+    %word = func.call @__ly_type_word(%type) : (memref<16xi64>) -> i64
     %h, %b = func.call @LyObject_ClassNameFromId(%word) : (i64) -> (memref<2xi64>, memref<?xi8>)
     func.return %h, %b : memref<2xi64>, memref<?xi8>
   }
 
   // `cls.__module__`: the name before the last dot, or "builtins" for a class
   // whose name has none.
-  func.func @LyType_GetModule(%type: memref<15xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.type", ly.runtime.primitive = "module", ly.runtime.result_contract = "builtins.str"} {
+  func.func @LyType_GetModule(%type: memref<16xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.type", ly.runtime.primitive = "module", ly.runtime.result_contract = "builtins.str"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c4 = arith.constant 4 : index
     %dot = arith.constant 46 : i8
-    %word = func.call @__ly_type_word(%type) : (memref<15xi64>) -> i64
+    %word = func.call @__ly_type_word(%type) : (memref<16xi64>) -> i64
     %name_ptr = func.call @LyType_Name(%word) : (i64) -> !llvm.ptr
-    %length = memref.load %type[%c4] : memref<15xi64>
+    %length = memref.load %type[%c4] : memref<16xi64>
     %length_index = arith.index_cast %length : i64 to index
     %last_dot = scf.for %i = %c0 to %length_index step %c1 iter_args(%found = %length_index) -> (index) {
       %i_i64 = arith.index_cast %i : index to i64
@@ -200,9 +200,9 @@ module attributes {
 
   // `issubclass(sub, base)` for two class values, over the class words
   // (CPython's PyType_IsSubtype walks tp_mro; so does LyType_IsSubtype).
-  func.func @LyType_SubclassCheck(%sub: memref<15xi64> {ly.ownership.object_header}, %base: memref<15xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.type", ly.runtime.primitive = "is_subtype"} {
-    %sub_word = func.call @__ly_type_word(%sub) : (memref<15xi64>) -> i64
-    %base_word = func.call @__ly_type_word(%base) : (memref<15xi64>) -> i64
+  func.func @LyType_SubclassCheck(%sub: memref<16xi64> {ly.ownership.object_header}, %base: memref<16xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.type", ly.runtime.primitive = "is_subtype"} {
+    %sub_word = func.call @__ly_type_word(%sub) : (memref<16xi64>) -> i64
+    %base_word = func.call @__ly_type_word(%base) : (memref<16xi64>) -> i64
     %answer = func.call @LyType_IsSubtype(%sub_word, %base_word) : (i64, i64) -> i1
     func.return %answer : i1
   }

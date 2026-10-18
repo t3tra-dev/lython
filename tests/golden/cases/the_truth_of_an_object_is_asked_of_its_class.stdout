@@ -1,0 +1,7 @@
+False True False True False True
+False True False True False
+False True False True False True False True False True
+True False False True True True True
+['F', 'T', 'F', 'T', 'F', 'T', 'ValueError', 'OverflowError', 'F', 'F', 'T', 'F', 'T']
+['Box', 'Sub', 'Plain']
+3 False False False

@@ -2,6 +2,7 @@
 #include "Ownership.h"
 
 #include "Common/PythonSourceRange.h"
+#include "Common/TypeObjects.h"
 
 #include "PyDialectTypes.h"
 #include "Contracts.h"
@@ -920,14 +921,15 @@ deallocatorValueCountForType(mlir::ValueRange values, unsigned offset,
   return static_cast<unsigned>(deallocator->shapeTypes.size());
 }
 
-// A class value's one lane: the view of a type object, `memref<15xi64>`
-// (TypeObjects.h). A class with no type object has no lane at all.
+// A class value's one lane: the view of a type object, one i64 per type
+// object word (TypeObjects.h). A class with no type object has no lane at all.
 static bool isClassValueLane(mlir::ValueRange values, unsigned offset) {
   if (offset >= values.size())
     return false;
   auto memref = mlir::dyn_cast<mlir::MemRefType>(values[offset].getType());
   return memref && memref.getRank() == 1 && memref.hasStaticShape() &&
-         memref.getDimSize(0) == 15 && memref.getElementType().isInteger(64);
+         memref.getDimSize(0) == py::type_objects::kWordCount &&
+         memref.getElementType().isInteger(64);
 }
 
 static void

@@ -981,11 +981,17 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
 
   if (std::optional<Value> v = tryEmitTypeCall(expr, calleeNode))
     return *v;
+  if (std::optional<Value> v = tryEmitObjectSlotCall(expr, calleeNode))
+    return *v;
   if (std::optional<Value> v = tryEmitHasattrCall(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitCallableCall(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitGetattrCall(expr, calleeNode))
+    return *v;
+  if (std::optional<Value> v = tryEmitComputedGetattrCall(expr, calleeNode))
+    return *v;
+  if (std::optional<Value> v = tryEmitDirCall(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitSetattrCall(expr, calleeNode))
     return *v;
@@ -2649,8 +2655,7 @@ ModuleEmitter::tryEmitHasattrCall(const parser::Node &expr,
   std::optional<llvm::StringRef> name =
       literalStringArgument((*args)[1].get());
   if (!name)
-    return refuse("hasattr() needs a literal attribute name: the answer is "
-                  "decided at compile time here");
+    return emitComputedHasattr(expr, (*args)[0], (*args)[1]);
   llvm::StringRef attribute = *name;
   mlir::Type subject = types.widenLiteral(types.inferExpr(args->front().get()));
   std::string undecidedBy;
@@ -2878,8 +2883,9 @@ ModuleEmitter::tryEmitGetattrCall(const parser::Node &expr,
   std::optional<llvm::StringRef> name =
       literalStringArgument((*args)[1].get());
   if (!name)
-    return refuse("getattr() needs a literal attribute name: the lookup is "
-                  "resolved at compile time here");
+    return refuse("getattr() with a computed name is supported as the call "
+                  "`getattr(x, name)(...)`: the attribute itself has no type "
+                  "here that every name it may be shares");
   if (args->size() == 2) {
     parser::NodePtr attribute =
         synth::attribute(args->front(), name->str(), expr.range);
@@ -2936,6 +2942,1024 @@ ModuleEmitter::tryEmitGetattrCall(const parser::Node &expr,
       std::move(read), synth::name(defaultName, expr.range), expr.range);
   synthesizedIteratorDefs.push_back(choice);
   return emitExpr(choice.get());
+}
+
+namespace {
+// `dir(object)` in CPython 3.14: every instance answers these, whatever its
+// class.
+constexpr llvm::StringLiteral kObjectAttributeNames[] = {
+    "__class__",    "__delattr__",       "__dir__",       "__doc__",
+    "__eq__",       "__format__",        "__ge__",        "__getattribute__",
+    "__getstate__", "__gt__",            "__hash__",      "__init__",
+    "__init_subclass__", "__le__",       "__lt__",        "__ne__",
+    "__new__",      "__reduce__",        "__reduce_ex__", "__repr__",
+    "__setattr__",  "__sizeof__",        "__str__",       "__subclasshook__"};
+// And what a class statement gives every class without `__slots__`.
+constexpr llvm::StringLiteral kClassStatementAttributeNames[] = {
+    "__dict__", "__firstlineno__", "__module__", "__static_attributes__",
+    "__weakref__"};
+
+// CPython's list of parameter names in an arity message: 'a', 'a' and 'b',
+// 'a', 'b', and 'c'.
+std::string quotedNameList(llvm::ArrayRef<std::string> names) {
+  std::string out;
+  for (auto [index, name] : llvm::enumerate(names)) {
+    if (index > 0)
+      out += names.size() == 2 ? " and "
+             : index + 1 == names.size() ? ", and "
+                                         : ", ";
+    out += "'" + name + "'";
+  }
+  return out;
+}
+
+// What CPython says when `qualname` is called with `given` positional
+// arguments its parameters cannot take (`bound`: the first parameter is the
+// receiver, which CPython counts); empty when the count fits.
+std::string arityMismatch(llvm::StringRef qualname, const parser::Node &def,
+                          bool bound, unsigned given) {
+  const parser::Node *arguments = ast::node(def, "args");
+  if (!arguments)
+    return "";
+  llvm::SmallVector<std::string, 8> positional;
+  for (llvm::StringRef field : {"posonlyargs", "args"})
+    if (const auto *list = ast::nodeList(*arguments, field))
+      for (const parser::NodePtr &argument : *list)
+        if (argument)
+          positional.push_back(std::string(ast::nameSpelling(*argument)));
+  const auto *defaultList = ast::nodeList(*arguments, "defaults");
+  unsigned total = static_cast<unsigned>(positional.size());
+  unsigned defaults = std::min<unsigned>(
+      defaultList ? static_cast<unsigned>(defaultList->size()) : 0, total);
+  unsigned required = total - defaults;
+  if (bound)
+    ++given;
+  std::string head = (qualname + "() ").str();
+  auto count = [](unsigned n, llvm::StringRef noun) {
+    return std::to_string(n) + " " + noun.str() + (n == 1 ? "" : "s");
+  };
+  if (!ast::node(*arguments, "vararg") && given > total) {
+    std::string tail = " but " + std::to_string(given) +
+                       (given == 1 ? " was given" : " were given");
+    if (required != total)
+      return head + "takes from " + std::to_string(required) + " to " +
+             std::to_string(total) + " positional arguments" + tail;
+    return head + "takes " + count(total, "positional argument") + tail;
+  }
+  if (given < required)
+    return head + "missing " +
+           count(required - given, "required positional argument") + ": " +
+           quotedNameList(llvm::ArrayRef<std::string>(positional)
+                              .slice(given, required - given));
+  llvm::SmallVector<std::string, 4> keywordOnly;
+  const auto *kwonly = ast::nodeList(*arguments, "kwonlyargs");
+  const auto *kwDefaults = ast::nodeList(*arguments, "kw_defaults");
+  if (kwonly)
+    for (auto [index, argument] : llvm::enumerate(*kwonly))
+      if (argument && (!kwDefaults || index >= kwDefaults->size() ||
+                       !(*kwDefaults)[index]))
+        keywordOnly.push_back(std::string(ast::nameSpelling(*argument)));
+  if (!keywordOnly.empty())
+    return head + "missing " +
+           count(static_cast<unsigned>(keywordOnly.size()),
+                 "required keyword-only argument") +
+           ": " + quotedNameList(keywordOnly);
+  return "";
+}
+} // namespace
+
+bool ModuleEmitter::programClassDerivesFrom(llvm::StringRef candidate,
+                                            llvm::StringRef ancestor) const {
+  // A builtin base may be recorded as written (`ValueError`).
+  llvm::StringRef builtinLeaf = ancestor;
+  if (!builtinLeaf.consume_front("builtins."))
+    builtinLeaf = {};
+  llvm::SmallVector<llvm::StringRef, 8> worklist{candidate};
+  llvm::StringSet<> seen;
+  while (!worklist.empty()) {
+    llvm::StringRef current = worklist.pop_back_val();
+    auto bases = declaredClassBases.find(current);
+    if (bases == declaredClassBases.end())
+      continue;
+    for (const std::string &base : bases->second) {
+      if (base == ancestor || (!builtinLeaf.empty() && base == builtinLeaf))
+        return true;
+      if (seen.insert(base).second)
+        worklist.push_back(base);
+    }
+  }
+  return false;
+}
+
+llvm::SmallVector<std::string, 8>
+ModuleEmitter::programSubclassesOf(llvm::StringRef cls) const {
+  llvm::SmallVector<std::string, 8> subclasses;
+  for (const auto &entry : declaredClassBases)
+    if (entry.getKey() != cls && programClassDerivesFrom(entry.getKey(), cls))
+      subclasses.push_back(entry.getKey().str());
+  llvm::sort(subclasses);
+  return subclasses;
+}
+
+llvm::StringSet<>
+ModuleEmitter::programAttributeNames(llvm::StringRef cls) const {
+  llvm::StringSet<> names;
+  llvm::SmallVector<llvm::StringRef, 8> worklist{cls};
+  llvm::StringSet<> seen;
+  seen.insert(cls);
+  while (!worklist.empty()) {
+    llvm::StringRef current = worklist.pop_back_val();
+    for (const llvm::StringMap<llvm::StringSet<>> *declarations :
+         {&declaredClassMethods, &declaredClassAttributes,
+          &declaredClassStoredFields})
+      if (auto found = declarations->find(current);
+          found != declarations->end())
+        for (const auto &name : found->second)
+          names.insert(name.getKey());
+    if (auto bases = declaredClassBases.find(current);
+        bases != declaredClassBases.end())
+      for (const std::string &base : bases->second)
+        if (seen.insert(base).second)
+          worklist.push_back(base);
+  }
+  return names;
+}
+
+std::optional<llvm::SmallVector<std::string, 8>>
+ModuleEmitter::computedLookupHierarchy(const parser::Node &expr,
+                                       llvm::StringRef what,
+                                       mlir::Type receiverType) {
+  auto refuse = [&](std::string reason) {
+    diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
+                                             expr.range.start,
+                                             std::move(reason)});
+    return std::nullopt;
+  };
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(receiverType);
+  if (!contract || !declaredClassNodes.count(contract.getContractName()))
+    return refuse(what.str() +
+                  " with a computed name needs a receiver whose class this "
+                  "program declares, and " +
+                  typeText(receiverType) + " is not one");
+  llvm::StringRef cls = contract.getContractName();
+  // ⛔ Not a class whose members the compiler writes: a NamedTuple's or an
+  // enum's attributes are not in its class body, so a name lookup over the
+  // body would answer AttributeError for a field CPython has.
+  if (namedTupleContracts.count(cls) || enumClasses.count(cls))
+    return refuse(what.str() + " with a computed name is not supported on '" +
+                  cls.str() +
+                  "': its attributes are made by the compiler, not declared "
+                  "in its body");
+  llvm::SmallVector<std::string, 8> hierarchy{cls.str()};
+  for (const std::string &subclass : programSubclassesOf(cls))
+    hierarchy.push_back(subclass);
+  for (const std::string &member : hierarchy)
+    if (!types.lookupClass(member).value_or(mlir::Type()))
+      return refuse(what.str() + " with a computed name cannot be answered "
+                                 "here: '" +
+                    member + "' derives from '" + cls.str() +
+                    "' and is declared after this lookup");
+  return hierarchy;
+}
+
+// ⭐ A COMPUTED NAME IS ONE OF A CLOSED SET OF NAMES. `getattr(self, name)()`
+// is how unittest runs a test method, and the names a value of class `A` can
+// answer are the ones `A` and the program's subclasses of it declare, plus
+// what every object answers -- so the lookup is a function comparing the name
+// with each of them, one per (class, argument types):
+//
+//     def __lygetattr$1(__ly_recv: A, __ly_name: str) -> object:
+//         if __ly_name == "run":          # A answers it: A's call, which the
+//             return __ly_recv.run()      # virtual dispatcher resolves
+//         if __ly_name == "test_good":    # only a subclass answers it
+//             if isinstance(__ly_recv, MyTest):
+//                 return __ly_recv.test_good()
+//         raise AttributeError("'" + type(__ly_recv).__name__ + ...)
+//
+// An attribute the arguments do not fit raises the TypeError CPython raises:
+// the arity sentence for a method, "'str' object is not callable" for a
+// value, read from the value's own class.
+// ⛔ The arms are written when every class is declared, not at the call: a
+// framework's method is emitted before the module that subclasses it has
+// bound the subclass's methods, and arms read then took them for values.
+// The signature does not depend on them, so the call is typed at once.
+// ⛔ The CALL form only. `m = getattr(o, name)` has no type to give `m`
+// without one per attribute, so it keeps the refusal.
+// ⛔ Arguments that are names or constants only: CPython evaluates the call's
+// arguments AFTER the lookup, so one with an effect would run before an
+// AttributeError it should never have reached.
+std::optional<Value>
+ModuleEmitter::tryEmitComputedGetattrCall(const parser::Node &expr,
+                                          const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Call")
+    return std::nullopt;
+  const parser::Node *innerCallee = ast::node(*calleeNode, "func");
+  if (!callsUnshadowedBuiltin(innerCallee, "getattr"))
+    return std::nullopt;
+  const auto *lookup = ast::nodeList(*calleeNode, "args");
+  const auto *lookupKeywords = ast::nodeList(*calleeNode, "keywords");
+  if (!lookup || lookup->size() != 2 ||
+      (lookupKeywords && !lookupKeywords->empty()) || !(*lookup)[0] ||
+      !(*lookup)[1] || (*lookup)[0]->kind == "Starred" ||
+      (*lookup)[1]->kind == "Starred" ||
+      literalStringArgument((*lookup)[1].get()))
+    return std::nullopt;
+  parser::SourceRange range = expr.range;
+  auto refuse = [&](std::string reason) -> std::optional<Value> {
+    diagnostics.push_back(
+        parser::Diagnostic{parser::Severity::Error, range.start,
+                           std::move(reason)});
+    return emitNone(expr);
+  };
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (keywords && !keywords->empty())
+    return refuse("getattr(x, name)(...) with a computed name takes no keyword "
+                  "arguments here");
+  llvm::SmallVector<mlir::Type, 4> argumentTypes;
+  if (args)
+    for (const parser::NodePtr &argument : *args) {
+      if (!argument || (argument->kind != "Name" &&
+                        argument->kind != "Constant"))
+        return refuse("getattr(x, name)(...) with a computed name takes only "
+                      "names and constants as arguments here: CPython "
+                      "evaluates them after the lookup, which may raise");
+      argumentTypes.push_back(
+          types.widenLiteral(types.inferExpr(argument.get())));
+    }
+  mlir::Type nameType = types.widenLiteral(types.inferExpr((*lookup)[1].get()));
+  if (nameType != types.strType())
+    return refuse("getattr() needs a str attribute name, and " +
+                  typeText(nameType) + " is not one");
+  mlir::Type receiverType =
+      types.widenLiteral(types.inferExpr((*lookup)[0].get()));
+  std::optional<llvm::SmallVector<std::string, 8>> hierarchy =
+      computedLookupHierarchy(expr, "getattr()", receiverType);
+  if (!hierarchy)
+    return emitNone(expr);
+  std::string cls = hierarchy->front();
+
+  std::string key = "getattr|" + cls;
+  for (mlir::Type argumentType : argumentTypes)
+    key += "|" + typeText(argumentType);
+  std::string symbol;
+  if (auto found = computedLookupDispatchers.find(key);
+      found != computedLookupDispatchers.end()) {
+    symbol = found->second;
+  } else {
+    symbol = "__lygetattr$" + std::to_string(++syntheticFunctionCounter);
+    computedLookupDispatchers[key] = symbol;
+    llvm::SmallVector<synth::Param, 4> params{
+        synth::Param{"__ly_recv", nullptr}, synth::Param{"__ly_name", nullptr}};
+    for (unsigned index = 0; index < argumentTypes.size(); ++index)
+      params.push_back(
+          synth::Param{"__ly_a" + std::to_string(index), nullptr});
+    llvm::SmallVector<const parser::Node *, 4> paramNodes;
+    parser::NodePtr def =
+        synth::functionDef(symbol, params, {}, {}, synth::name("object", range),
+                           {}, range, &paramNodes);
+    synthesizedIteratorDefs.push_back(def);
+    types.overrideParameterType(paramNodes[0],
+                                types.lookupClass(cls).value_or(mlir::Type()));
+    types.overrideParameterType(paramNodes[1], types.strType());
+    for (auto [index, argumentType] : llvm::enumerate(argumentTypes))
+      types.overrideParameterType(paramNodes[index + 2], argumentType);
+    FunctionSignature sig = types.functionSignature(*def);
+    types.bindRootSymbol(symbol, sig.publicCallable);
+    auto emitBody = [this, def, symbol, sig, range, cls,
+                     members = *hierarchy, argumentTypes] {
+      if (parser::Field *body = parser::findField(*def, "body"))
+        body->value = computedGetattrBody(range, cls, members, argumentTypes);
+      emitDispatcherBody(*def, symbol, sig, /*suppressGate=*/false);
+    };
+    if (classDeclarationsEmitted)
+      emitBody();
+    else
+      deferredDispatcherBodies.push_back(std::move(emitBody));
+  }
+  std::vector<parser::NodePtr> callArguments{(*lookup)[0], (*lookup)[1]};
+  if (args)
+    callArguments.insert(callArguments.end(), args->begin(), args->end());
+  parser::NodePtr call =
+      synth::call(synth::name(symbol, range), std::move(callArguments), range);
+  synthesizedIteratorDefs.push_back(call);
+  return emitExpr(call.get());
+}
+
+std::vector<parser::NodePtr> ModuleEmitter::computedGetattrBody(
+    parser::SourceRange range, llvm::StringRef cls,
+    llvm::ArrayRef<std::string> hierarchy,
+    llvm::ArrayRef<mlir::Type> argumentTypes) {
+  llvm::StringMap<llvm::StringSet<>> namesOf;
+  std::set<std::string> universe;
+  for (const std::string &member : hierarchy) {
+    namesOf[member] = programAttributeNames(member);
+    for (const auto &name : namesOf[member])
+      if (!name.getKey().contains('.'))
+        universe.insert(name.getKey().str());
+  }
+  auto receiver = [&] { return synth::name("__ly_recv", range); };
+  auto forwarded = [&] {
+    std::vector<parser::NodePtr> out;
+    for (unsigned index = 0; index < argumentTypes.size(); ++index)
+      out.push_back(synth::name("__ly_a" + std::to_string(index), range));
+    return out;
+  };
+  auto callArm = [&](llvm::StringRef name) {
+    return synth::returnStmt(
+        synth::call(synth::attribute(receiver(), name, range), forwarded(),
+                    range),
+        range);
+  };
+  auto qualname = [&](llvm::StringRef definingClass, llvm::StringRef name) {
+    return py::contracts::displayClassNameForContract(definingClass) + "." +
+           name.str();
+  };
+  auto notCallable = [&](llvm::StringRef className) {
+    return synth::raiseCall(
+        "TypeError", "'" + className.str() + "' object is not callable",
+        range);
+  };
+  // The arm for `name` on a receiver of class `member`.
+  auto armFor = [&](llvm::StringRef member,
+                    llvm::StringRef name) -> parser::NodePtr {
+    mlir::Type memberType = types.lookupClass(member).value_or(mlir::Type());
+    std::optional<MethodBinding> method = lookupClassMethod(memberType, name);
+    // A method is called when its parameters take the count; the arm's own
+    // call checks the types, as any call does.
+    if (method && method->kind != "property") {
+      if (!method->method)
+        return types.inferMethodCallWithEvidence(memberType, name,
+                                                 argumentTypes)
+                   ? callArm(name)
+                   : synth::raiseCall("TypeError",
+                                      qualname(method->definingClass, name) +
+                                          "() cannot take these arguments here",
+                                      range);
+      std::string message =
+          arityMismatch(qualname(method->definingClass, name), *method->method,
+                        method->kind != "static",
+                        static_cast<unsigned>(argumentTypes.size()));
+      if (message.empty())
+        return callArm(name);
+      return synth::raiseCall("TypeError", message, range);
+    }
+    mlir::Type valueType;
+    if (method)
+      valueType = method->signature.resultType;
+    else if (std::optional<mlir::Type> field =
+                 lookupClassField(memberType, name))
+      valueType = *field;
+    else if (std::optional<mlir::Type> attribute =
+                 lookupClassStaticAttr(memberType, name))
+      valueType = *attribute;
+    valueType = types.widenLiteral(valueType);
+    if (valueType && (mlir::isa<py::CallableType>(valueType) ||
+                      mlir::isa<py::TypeType>(valueType)))
+      return callArm(name);
+    // CPython's sentence, with the class the value has at run time.
+    parser::NodePtr className = synth::attribute(
+        synth::call(synth::name("type", range),
+                    {synth::attribute(receiver(), name, range)}, range),
+        "__name__", range);
+    return synth::raiseStmt(
+        synth::call(
+            synth::name("TypeError", range),
+            {synth::binOp(
+                synth::binOp(synth::strConstant("'", range), "Add",
+                             std::move(className), range),
+                "Add", synth::strConstant("' object is not callable", range),
+                range)},
+            range),
+        range);
+  };
+  auto nameIs = [&](llvm::StringRef name) {
+    return synth::compare(synth::name("__ly_name", range), "Eq",
+                          synth::strConstant(name, range), range);
+  };
+  auto exactly = [&](llvm::StringRef member) {
+    return synth::compare(
+        synth::call(synth::name("type", range), {receiver()}, range), "Is",
+        synth::name(member, range), range);
+  };
+  std::vector<parser::NodePtr> body;
+  for (const std::string &name : universe) {
+    std::vector<parser::NodePtr> block;
+    llvm::SmallVector<llvm::StringRef, 4> definers;
+    for (const std::string &member : hierarchy)
+      if (namesOf[member].contains(name))
+        definers.push_back(member);
+    if (llvm::is_contained(definers, cls)) {
+      block.push_back(armFor(cls, name));
+    } else {
+      for (llvm::StringRef member : definers) {
+        bool inherited = llvm::any_of(definers, [&](llvm::StringRef other) {
+          return other != member && programClassDerivesFrom(member, other);
+        });
+        if (inherited)
+          continue;
+        block.push_back(synth::ifStmt(
+            synth::call(synth::name("isinstance", range),
+                        {receiver(), synth::name(member, range)}, range),
+            {armFor(member, name)}, {}, range));
+      }
+    }
+    body.push_back(synth::ifStmt(nameIs(name), std::move(block), {}, range));
+  }
+  mlir::Type receiverClassType =
+      types.lookupClass(cls).value_or(mlir::Type());
+  // What every instance answers. The data among it is never callable, and
+  // CPython's sentence names its class: a docstring is a str and its absence
+  // None, per class, since `__doc__` is not inherited.
+  static const llvm::StringMap<llvm::StringRef> kDataAttributeClasses = {
+      {"__dict__", "dict"},        {"__module__", "str"},
+      {"__weakref__", "NoneType"}, {"__firstlineno__", "int"},
+      {"__static_attributes__", "tuple"}};
+  for (llvm::ArrayRef<llvm::StringLiteral> list :
+       {llvm::ArrayRef<llvm::StringLiteral>(kObjectAttributeNames),
+        llvm::ArrayRef<llvm::StringLiteral>(kClassStatementAttributeNames)})
+    for (llvm::StringLiteral name : list) {
+      if (universe.count(name.str()))
+        continue;
+      std::vector<parser::NodePtr> block;
+      if (auto data = kDataAttributeClasses.find(name);
+          data != kDataAttributeClasses.end()) {
+        block.push_back(notCallable(data->second));
+      } else if (name == "__doc__") {
+        for (const std::string &member : hierarchy) {
+          const parser::Node *classDef = declaredClassNodes.lookup(member);
+          const auto *classBody =
+              classDef ? ast::nodeList(*classDef, "body") : nullptr;
+          const parser::Node *first = classBody && !classBody->empty()
+                                          ? classBody->front().get()
+                                          : nullptr;
+          const parser::Node *docstring =
+              first && first->kind == "Expr" ? ast::node(*first, "value")
+                                             : nullptr;
+          if (!docstring || !literalStringArgument(docstring))
+            continue;
+          block.push_back(
+              synth::ifStmt(exactly(member), {notCallable("str")}, {}, range));
+        }
+        block.push_back(notCallable("NoneType"));
+      } else if (name == "__class__") {
+        // The class called: a new instance of the class the receiver has at
+        // run time, refused as CPython refuses it when its `__init__` does
+        // not take the arguments.
+        for (const std::string &member : hierarchy) {
+          mlir::Type memberType =
+              types.lookupClass(member).value_or(mlir::Type());
+          std::string message;
+          std::optional<MethodBinding> init =
+              lookupClassMethod(memberType, "__init__");
+          if (init && init->method)
+            message = arityMismatch(
+                qualname(init->definingClass, "__init__"), *init->method,
+                /*bound=*/true, static_cast<unsigned>(argumentTypes.size()));
+          else if (!argumentTypes.empty())
+            message = py::contracts::displayClassNameForContract(member) +
+                      "() takes no arguments";
+          parser::NodePtr arm =
+              message.empty()
+                  ? synth::returnStmt(synth::call(synth::name(member, range),
+                                                  forwarded(), range),
+                                      range)
+                  : synth::raiseCall("TypeError", message, range);
+          block.push_back(
+              synth::ifStmt(exactly(member), {std::move(arm)}, {}, range));
+        }
+      } else if (types.inferMethodCallWithEvidence(receiverClassType, name,
+                                                   argumentTypes)) {
+        block.push_back(callArm(name));
+      } else {
+        block.push_back(synth::raiseCall(
+            "TypeError",
+            "getattr(x, '" + name.str() +
+                "')(...) is not supported here: a computed name calls the "
+                "attributes the program's classes declare",
+            range));
+      }
+      body.push_back(synth::ifStmt(nameIs(name), std::move(block), {}, range));
+    }
+  // CPython's sentence, naming the class the receiver has at run time.
+  parser::NodePtr message = synth::binOp(
+      synth::binOp(
+          synth::binOp(
+              synth::strConstant("'", range), "Add",
+              synth::attribute(
+                  synth::call(synth::name("type", range), {receiver()}, range),
+                  "__name__", range),
+              range),
+          "Add", synth::strConstant("' object has no attribute '", range),
+          range),
+      "Add",
+      synth::binOp(synth::name("__ly_name", range), "Add",
+                   synth::strConstant("'", range), range),
+      range);
+  body.push_back(synth::raiseStmt(
+      synth::call(synth::name("AttributeError", range), {std::move(message)},
+                  range),
+      range));
+  return body;
+}
+
+// `hasattr(recv, name)` with `name` computed: the same closed set of names,
+// each answered the way the literal form answers it -- and written as late as
+// the getattr arms, for the same reason.
+std::optional<Value>
+ModuleEmitter::emitComputedHasattr(const parser::Node &expr,
+                                   const parser::NodePtr &receiverNode,
+                                   const parser::NodePtr &nameNode) {
+  parser::SourceRange range = expr.range;
+  mlir::Type nameType = types.widenLiteral(types.inferExpr(nameNode.get()));
+  if (nameType != types.strType()) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, range.start,
+        "hasattr() needs a str attribute name, and " + typeText(nameType) +
+            " is not one"});
+    return emitNone(expr);
+  }
+  mlir::Type receiverType =
+      types.widenLiteral(types.inferExpr(receiverNode.get()));
+  std::optional<llvm::SmallVector<std::string, 8>> hierarchy =
+      computedLookupHierarchy(expr, "hasattr()", receiverType);
+  if (!hierarchy)
+    return emitNone(expr);
+  std::string cls = hierarchy->front();
+  std::string key = "hasattr|" + cls;
+  std::string symbol;
+  if (auto found = computedLookupDispatchers.find(key);
+      found != computedLookupDispatchers.end()) {
+    symbol = found->second;
+  } else {
+    symbol = "__lyhasattr$" + std::to_string(++syntheticFunctionCounter);
+    computedLookupDispatchers[key] = symbol;
+    llvm::SmallVector<const parser::Node *, 2> paramNodes;
+    parser::NodePtr def = synth::functionDef(
+        symbol,
+        {synth::Param{"__ly_recv", nullptr}, synth::Param{"__ly_name", nullptr}},
+        {}, {}, synth::name("bool", range), {}, range, &paramNodes);
+    synthesizedIteratorDefs.push_back(def);
+    types.overrideParameterType(paramNodes[0],
+                                types.lookupClass(cls).value_or(mlir::Type()));
+    types.overrideParameterType(paramNodes[1], types.strType());
+    FunctionSignature sig = types.functionSignature(*def);
+    types.bindRootSymbol(symbol, sig.publicCallable);
+    auto emitBody = [this, def, symbol, sig, range, cls, members = *hierarchy] {
+      if (parser::Field *body = parser::findField(*def, "body"))
+        body->value = computedHasattrBody(range, cls, members);
+      emitDispatcherBody(*def, symbol, sig, /*suppressGate=*/false);
+    };
+    if (classDeclarationsEmitted)
+      emitBody();
+    else
+      deferredDispatcherBodies.push_back(std::move(emitBody));
+  }
+  parser::NodePtr call = synth::call(synth::name(symbol, range),
+                                     {receiverNode, nameNode}, range);
+  synthesizedIteratorDefs.push_back(call);
+  return emitExpr(call.get());
+}
+
+std::vector<parser::NodePtr>
+ModuleEmitter::computedHasattrBody(parser::SourceRange range,
+                                   llvm::StringRef cls,
+                                   llvm::ArrayRef<std::string> hierarchy) {
+  llvm::StringMap<llvm::StringSet<>> namesOf;
+  std::set<std::string> universe;
+  for (const std::string &member : hierarchy) {
+    namesOf[member] = programAttributeNames(member);
+    for (const auto &name : namesOf[member])
+      if (!name.getKey().contains('.'))
+        universe.insert(name.getKey().str());
+  }
+  auto receiver = [&] { return synth::name("__ly_recv", range); };
+  auto answer = [&](bool present) {
+    return synth::returnStmt(synth::constantBool(present, range), range);
+  };
+  // A method or a class attribute is there; a field or a property is asked of
+  // the instance, as the literal form asks it.
+  auto armFor = [&](llvm::StringRef member,
+                    llvm::StringRef name) -> parser::NodePtr {
+    mlir::Type memberType = types.lookupClass(member).value_or(mlir::Type());
+    if (attributePresence(memberType, name) == AttributePresence::Present)
+      return answer(true);
+    return synth::returnStmt(
+        synth::call(synth::name(attributeProbe(member, name, range), range),
+                    {receiver()}, range),
+        range);
+  };
+  auto nameIs = [&](llvm::StringRef name) {
+    return synth::compare(synth::name("__ly_name", range), "Eq",
+                          synth::strConstant(name, range), range);
+  };
+  std::vector<parser::NodePtr> body;
+  for (const std::string &name : universe) {
+    std::vector<parser::NodePtr> block;
+    llvm::SmallVector<llvm::StringRef, 4> definers;
+    for (const std::string &member : hierarchy)
+      if (namesOf[member].contains(name))
+        definers.push_back(member);
+    if (llvm::is_contained(definers, cls)) {
+      block.push_back(armFor(cls, name));
+    } else {
+      for (llvm::StringRef member : definers) {
+        bool inherited = llvm::any_of(definers, [&](llvm::StringRef other) {
+          return other != member && programClassDerivesFrom(member, other);
+        });
+        if (inherited)
+          continue;
+        block.push_back(synth::ifStmt(
+            synth::call(synth::name("isinstance", range),
+                        {receiver(), synth::name(member, range)}, range),
+            {armFor(member, name)}, {}, range));
+      }
+      block.push_back(answer(false));
+    }
+    body.push_back(synth::ifStmt(nameIs(name), std::move(block), {}, range));
+  }
+  for (llvm::ArrayRef<llvm::StringLiteral> list :
+       {llvm::ArrayRef<llvm::StringLiteral>(kObjectAttributeNames),
+        llvm::ArrayRef<llvm::StringLiteral>(kClassStatementAttributeNames)})
+    for (llvm::StringLiteral name : list)
+      if (!universe.count(name.str()))
+        body.push_back(synth::ifStmt(nameIs(name), {answer(true)}, {}, range));
+  body.push_back(answer(false));
+  return body;
+}
+
+// ⭐ `dir(C)` IS A LIST THE CLASS BODIES SPELL. What CPython 3.14 lists for a
+// class written as a plain `class` statement is object's names, the five a
+// class statement adds, `__annotate_func__` when a body in its line
+// annotates, and the class attributes of its line -- every def, every
+// assignment, every annotation with a value -- sorted.
+// ⛔ Not a class whose attributes are made elsewhere: a decorator (a
+// dataclass), a base outside the program (an exception, NamedTuple, Enum,
+// Protocol), a generic class, a metaclass keyword or `__slots__` each add or
+// remove names this walk cannot see, and an answer missing one is wrong.
+std::optional<std::set<std::string>>
+ModuleEmitter::classDirNames(llvm::StringRef cls, std::string &why) const {
+  std::set<std::string> names;
+  for (llvm::StringLiteral name : kObjectAttributeNames)
+    names.insert(name.str());
+  for (llvm::StringLiteral name : kClassStatementAttributeNames)
+    names.insert(name.str());
+  bool annotated = false;
+  llvm::SmallVector<std::string, 8> worklist{cls.str()};
+  llvm::StringSet<> seen;
+  while (!worklist.empty()) {
+    std::string current = worklist.pop_back_val();
+    if (!seen.insert(current).second)
+      continue;
+    std::string shown = py::contracts::displayClassNameForContract(current);
+    const parser::Node *classDef = declaredClassNodes.lookup(current);
+    if (!classDef) {
+      why = "'" + shown + "' is not declared in this program";
+      return std::nullopt;
+    }
+    for (llvm::StringRef field : {"decorator_list", "keywords", "type_params"})
+      if (const auto *list = ast::nodeList(*classDef, field);
+          list && !list->empty()) {
+        why = "'" + shown + "' has " +
+              (field == "decorator_list" ? "a decorator"
+               : field == "keywords"     ? "a class keyword"
+                                         : "type parameters") +
+              ", which add names its body does not spell";
+        return std::nullopt;
+      }
+    if (const auto *body = ast::nodeList(*classDef, "body"))
+      for (const parser::NodePtr &member : *body) {
+        if (!member)
+          continue;
+        if (member->kind == "FunctionDef" ||
+            member->kind == "AsyncFunctionDef" || member->kind == "ClassDef") {
+          if (auto name = ast::string(*member, "name"))
+            names.insert(std::string(*name));
+        } else if (member->kind == "AnnAssign") {
+          annotated = true;
+          const parser::Node *target = ast::node(*member, "target");
+          if (target && target->kind == "Name" && ast::node(*member, "value"))
+            names.insert(std::string(ast::nameSpelling(*target)));
+        } else if (member->kind == "Assign") {
+          if (const auto *targets = ast::nodeList(*member, "targets"))
+            for (const parser::NodePtr &target : *targets)
+              if (target && target->kind == "Name") {
+                if (ast::nameSpelling(*target) == "__slots__") {
+                  why = "'" + shown + "' declares __slots__";
+                  return std::nullopt;
+                }
+                names.insert(std::string(ast::nameSpelling(*target)));
+              }
+        }
+      }
+    if (auto bases = declaredClassBases.find(current);
+        bases != declaredClassBases.end())
+      for (const std::string &base : bases->second) {
+        if (base == "object" || base == "builtins.object")
+          continue;
+        if (!declaredClassNodes.count(base)) {
+          why = "'" + shown + "' derives from '" +
+                py::contracts::displayClassNameForContract(base) +
+                "', whose attributes are not in a class body here";
+          return std::nullopt;
+        }
+        worklist.push_back(base);
+      }
+  }
+  if (annotated)
+    names.insert("__annotate_func__");
+  return names;
+}
+
+std::optional<Value>
+ModuleEmitter::tryEmitDirCall(const parser::Node &expr,
+                              const parser::Node *calleeNode) {
+  if (!callsUnshadowedBuiltin(calleeNode, "dir"))
+    return std::nullopt;
+  parser::SourceRange range = expr.range;
+  auto refuse = [&](std::string reason) -> std::optional<Value> {
+    diagnostics.push_back(
+        parser::Diagnostic{parser::Severity::Error, range.start,
+                           std::move(reason)});
+    return emitNone(expr);
+  };
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if ((keywords && !keywords->empty()) || (args && args->size() > 1) ||
+      (args && args->size() == 1 &&
+       (!args->front() || args->front()->kind == "Starred")))
+    return refuse("dir() takes at most one positional argument");
+  if (!args || args->empty())
+    return refuse("dir() without an argument lists the names of the scope it "
+                  "runs in, which is not supported here");
+  const parser::NodePtr &argument = args->front();
+  mlir::Type subject = types.widenLiteral(types.inferExpr(argument.get()));
+  mlir::Type listOfStr = types.contract("builtins.list", {types.strType()});
+  auto listOf = [&](const std::set<std::string> &names) {
+    std::vector<parser::NodePtr> elements;
+    for (const std::string &name : names)
+      elements.push_back(synth::strConstant(name, range));
+    parser::NodePtr list = parser::makeNode("List", range);
+    parser::addField(*list, "elts", std::move(elements));
+    return list;
+  };
+  std::string why;
+  if (auto classType = mlir::dyn_cast_if_present<py::TypeType>(subject)) {
+    auto bound =
+        mlir::dyn_cast_if_present<py::ContractType>(classType.getInstanceType());
+    if (!bound)
+      return refuse("dir() needs a class this program declares, and " +
+                    typeText(subject) + " is not one");
+    if (classValueIsExact(argument.get(), subject)) {
+      std::optional<std::set<std::string>> names =
+          classDirNames(bound.getContractName(), why);
+      if (!names)
+        return refuse("dir() of this class is not supported: " + why);
+      (void)emitExpr(argument.get());
+      parser::NodePtr list = listOf(*names);
+      synthesizedIteratorDefs.push_back(list);
+      return emitExpr(list.get());
+    }
+    llvm::StringMap<std::set<std::string>> namesBySpelling;
+    for (const std::string &candidate :
+         classValueCandidates(bound.getContractName())) {
+      std::optional<std::set<std::string>> names =
+          classDirNames(candidate, why);
+      if (!names)
+        return refuse("dir() of a class value of '" +
+                      py::contracts::displayClassNameForContract(
+                          bound.getContractName()) +
+                      "' is not supported: " + why);
+      llvm::StringRef spelling = candidate;
+      spelling.consume_front("builtins.");
+      namesBySpelling[spelling] = std::move(*names);
+    }
+    Value classValue = emitExpr(argument.get());
+    return emitClassValueDispatch(
+        expr, classValue, bound, listOfStr, [&](llvm::StringRef spelling) {
+          return listOf(namesBySpelling[spelling]);
+        });
+  }
+  // ⭐ AN INSTANCE ADDS WHAT IS IN ITS `__dict__`: the fields its methods
+  // store, for the class it has at run time -- one an `__init__` always
+  // stores is listed, one that may be unset is asked of the instance.
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(subject);
+  if (!contract || !declaredClassNodes.count(contract.getContractName()))
+    return refuse("dir() of " + typeText(subject) +
+                  " is not supported here: it lists a class this program "
+                  "declares, or an instance of one");
+  std::optional<llvm::SmallVector<std::string, 8>> hierarchy =
+      computedLookupHierarchy(expr, "dir()", subject);
+  if (!hierarchy)
+    return emitNone(expr);
+  for (const std::string &member : *hierarchy)
+    if (!classDirNames(member, why))
+      return refuse("dir() of an instance of '" +
+                    py::contracts::displayClassNameForContract(
+                        contract.getContractName()) +
+                    "' is not supported: " + why);
+  std::string cls = hierarchy->front();
+  std::string key = "dir|" + cls;
+  std::string symbol;
+  if (auto found = computedLookupDispatchers.find(key);
+      found != computedLookupDispatchers.end()) {
+    symbol = found->second;
+  } else {
+    symbol = "__lydir$" + std::to_string(++syntheticFunctionCounter);
+    computedLookupDispatchers[key] = symbol;
+    llvm::SmallVector<const parser::Node *, 1> paramNodes;
+    parser::NodePtr returns = synth::subscript(
+        synth::name("list", range), synth::name("str", range), range);
+    parser::NodePtr def =
+        synth::functionDef(symbol, {synth::Param{"__ly_recv", nullptr}}, {}, {},
+                           std::move(returns), {}, range, &paramNodes);
+    synthesizedIteratorDefs.push_back(def);
+    types.overrideParameterType(paramNodes[0],
+                                types.lookupClass(cls).value_or(mlir::Type()));
+    FunctionSignature sig = types.functionSignature(*def);
+    types.bindRootSymbol(symbol, sig.publicCallable);
+    auto emitBody = [this, def, symbol, sig, range, members = *hierarchy] {
+      auto receiver = [&] { return synth::name("__ly_recv", range); };
+      auto names = [&] { return synth::name("__ly_names", range); };
+      std::vector<parser::NodePtr> body;
+      for (const std::string &member : members) {
+        std::string unused;
+        std::set<std::string> listed = *classDirNames(member, unused);
+        mlir::Type memberType =
+            types.lookupClass(member).value_or(mlir::Type());
+        llvm::SmallVector<std::string, 4> probed;
+        llvm::SmallVector<llvm::StringRef, 8> line{member};
+        llvm::StringSet<> seen;
+        std::set<std::string> stored;
+        while (!line.empty()) {
+          llvm::StringRef current = line.pop_back_val();
+          if (!seen.insert(current).second)
+            continue;
+          if (auto fields = declaredClassStoredFields.find(current);
+              fields != declaredClassStoredFields.end())
+            for (const auto &field : fields->second)
+              stored.insert(field.getKey().str());
+          if (auto bases = declaredClassBases.find(current);
+              bases != declaredClassBases.end())
+            for (const std::string &base : bases->second)
+              line.push_back(base);
+        }
+        for (const std::string &field : stored) {
+          if (listed.count(field))
+            continue;
+          if (attributePresence(memberType, field) ==
+              AttributePresence::Present)
+            listed.insert(field);
+          else
+            probed.push_back(field);
+        }
+        std::vector<parser::NodePtr> arm;
+        std::vector<parser::NodePtr> elements;
+        for (const std::string &name : listed)
+          elements.push_back(synth::strConstant(name, range));
+        parser::NodePtr list = parser::makeNode("List", range);
+        parser::addField(*list, "elts", std::move(elements));
+        arm.push_back(synth::assign(names(), std::move(list), range));
+        for (const std::string &field : probed)
+          arm.push_back(synth::ifStmt(
+              synth::call(
+                  synth::name(attributeProbe(member, field, range), range),
+                  {receiver()}, range),
+              {synth::exprStmt(synth::methodCall(names(), "append",
+                                                 {synth::strConstant(field,
+                                                                     range)},
+                                                 range),
+                               range)},
+              {}, range));
+        if (!probed.empty())
+          arm.push_back(synth::exprStmt(
+              synth::methodCall(names(), "sort", {}, range), range));
+        arm.push_back(synth::returnStmt(names(), range));
+        body.push_back(synth::ifStmt(
+            synth::compare(
+                synth::call(synth::name("type", range), {receiver()}, range),
+                "Is", synth::name(member, range), range),
+            std::move(arm), {}, range));
+      }
+      body.push_back(synth::raiseCall(
+          "TypeError", "dir(): the instance's class is none of its line",
+          range));
+      if (parser::Field *field = parser::findField(*def, "body"))
+        field->value = std::move(body);
+      emitDispatcherBody(*def, symbol, sig, /*suppressGate=*/false);
+    };
+    if (classDeclarationsEmitted)
+      emitBody();
+    else
+      deferredDispatcherBodies.push_back(std::move(emitBody));
+  }
+  parser::NodePtr call =
+      synth::call(synth::name(symbol, range), {argument}, range);
+  synthesizedIteratorDefs.push_back(call);
+  return emitExpr(call.get());
+}
+
+// ⭐ `object.__repr__(x)` IS OBJECT'S OWN SLOT, NOT x's. It is how a
+// class's `__repr__` reaches the default it overrides, and how unittest's
+// `safe_repr` falls back when `repr(x)` raises -- and it reached the manifest
+// `object.__repr__`, whose body dispatches through the class's slot: it
+// answered "A()" for an A that overrides `__repr__`, and "1" for an int,
+// where CPython prints `<__main__.A object at 0x...>` and `<int object at
+// 0x...>`. Each spelling here is what CPython's object does:
+//   __repr__  `<{module}.{qualname} object at {hex(id(x))}>`, the module left
+//             out for a builtin (object_repr);
+//   __str__   `repr(x)` -- type(x).__repr__ (object_str);
+//   __hash__  the pointer hash of x, past the class's own `__hash__`.
+// ⛔ `__eq__` and `__ne__` are refused: for two different objects they answer
+// NotImplemented, which this compiler has no value for.
+std::optional<Value>
+ModuleEmitter::tryEmitObjectSlotCall(const parser::Node &expr,
+                                     const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Attribute")
+    return std::nullopt;
+  const parser::Node *owner = ast::node(*calleeNode, "value");
+  if (!owner || owner->kind != "Name" ||
+      ast::nameSpelling(*owner) != "object" || programBindsName("object"))
+    return std::nullopt;
+  std::optional<std::string_view> attr = ast::string(*calleeNode, "attr");
+  if (!attr)
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if ((keywords && !keywords->empty()) || !args ||
+      llvm::any_of(*args, [](const parser::NodePtr &arg) {
+        return !arg || arg->kind == "Starred";
+      }))
+    return std::nullopt;
+  parser::SourceRange range = expr.range;
+  if (*attr == "__eq__" || *attr == "__ne__") {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, range.start,
+        "object." + std::string(*attr) +
+            "(a, b) answers NotImplemented for two different objects, which "
+            "this compiler has no value for; compare with `a is b`"});
+    return emitNone(expr);
+  }
+  if ((*attr != "__repr__" && *attr != "__str__" && *attr != "__hash__") ||
+      args->size() != 1)
+    return std::nullopt;
+  if (*attr == "__str__") {
+    parser::NodePtr call = synth::reprCall(args->front(), range);
+    synthesizedIteratorDefs.push_back(call);
+    return emitExpr(call.get());
+  }
+  Value subject = emitExpr(args->front().get());
+  if (*attr == "__hash__") {
+    Value boxed = coerceValue(subject, types.object(), expr);
+    CallInferenceResult inference = types.inferMethodCallWithEvidence(
+        types.object(), "__ly_identity_hash__", {});
+    if (!inference)
+      return std::nullopt;
+    Value posPack = emitPack({});
+    Value namePack = emitPack({});
+    Value valuePack = emitPack({});
+    auto call = py::CallOp::create(
+        builder, loc(expr), mlir::TypeRange{inference.resultType},
+        callProtocolFor(inference), boxed.value, posPack.value,
+        namePack.value, valuePack.value);
+    call->setAttr("ly.bound_method",
+                  builder.getStringAttr("__ly_identity_hash__"));
+    return Value{call.getResults().front(), inference.resultType};
+  }
+  std::string temp =
+      "__ly_objrepr" + std::to_string(++syntheticFunctionCounter);
+  values[temp] = subject;
+  types.bindSymbol(temp, subject.type);
+  auto forget = llvm::scope_exit([&] { values.erase(temp); });
+  auto classOf = [&] {
+    return synth::call(synth::name("type", range), {synth::name(temp, range)},
+                       range);
+  };
+  auto classAttribute = [&](llvm::StringRef name) {
+    return synth::attribute(classOf(), name, range);
+  };
+  parser::NodePtr className = synth::ifExp(
+      synth::compare(classAttribute("__module__"), "Eq",
+                     synth::strConstant("builtins", range), range),
+      classAttribute("__qualname__"),
+      synth::binOp(synth::binOp(classAttribute("__module__"), "Add",
+                                synth::strConstant(".", range), range),
+                   "Add", classAttribute("__qualname__"), range),
+      range);
+  parser::NodePtr address = synth::call(
+      synth::name("hex", range),
+      {synth::call(synth::name("id", range), {synth::name(temp, range)},
+                   range)},
+      range);
+  parser::NodePtr text = synth::binOp(
+      synth::binOp(
+          synth::binOp(synth::binOp(synth::strConstant("<", range), "Add",
+                                    std::move(className), range),
+                       "Add", synth::strConstant(" object at ", range), range),
+          "Add", std::move(address), range),
+      "Add", synth::strConstant(">", range), range);
+  synthesizedIteratorDefs.push_back(text);
+  return emitExpr(text.get());
 }
 
 std::optional<Value>
@@ -3002,6 +4026,14 @@ bool ModuleEmitter::classIsClosed(llvm::StringRef contract) const {
         (llvm::is_contained(entry.second, contract) ||
          llvm::is_contained(entry.second, leaf)))
       return false;
+  // ⭐ AND EVERY CLASS THE PROGRAM DECLARES, emitted yet or not. `classMros`
+  // holds what has been emitted, and an imported module's functions are
+  // emitted before the module that imports it declares its classes -- so a
+  // `type[Base]` parameter there took Base for closed: `cls.__name__` folded
+  // to "Base", `cls(1)` built a Base and `cls is Base` was True, for a Sub,
+  // silently.
+  if (!programSubclassesOf(contract).empty())
+    return false;
   if (py::exceptions::findByName(leaf))
     for (const py::exceptions::BuiltinExceptionInfo &entry :
          py::exceptions::kBuiltinExceptions)
@@ -3055,6 +4087,9 @@ ModuleEmitter::classValueCandidates(llvm::StringRef contract) const {
         (llvm::is_contained(entry.second, contract) ||
          llvm::is_contained(entry.second, leaf)))
       add(entry.getKey());
+  // And the program's subclasses not emitted yet (see classIsClosed).
+  for (const std::string &subclass : programSubclassesOf(contract))
+    add(subclass);
   // Builtin exceptions are built by the bound's arm with the value's class
   // word, except those with an initializer of their own.
   for (llvm::StringRef own : py::exceptions::kBuiltinExceptionsWithOwnInit)
@@ -3080,7 +4115,8 @@ ModuleEmitter::classValueCandidates(llvm::StringRef contract) const {
 std::optional<Value> ModuleEmitter::emitClassValueDispatch(
     const parser::Node &anchor, Value classValue, py::ContractType bound,
     mlir::Type resultType,
-    llvm::function_ref<parser::NodePtr(llvm::StringRef spelling)> armFor) {
+    llvm::function_ref<parser::NodePtr(llvm::StringRef spelling)> armFor,
+    llvm::ArrayRef<std::string> capturedNames) {
   llvm::SmallVector<std::string, 8> candidates =
       classValueCandidates(bound.getContractName());
   // ⛔ An instantiation of a generic subclass has no spelling of its own to
@@ -3100,6 +4136,72 @@ std::optional<Value> ModuleEmitter::emitClassValueDispatch(
     contract.consume_front("builtins.");
     return contract.str();
   };
+  // ⭐ A CANDIDATE NOT DECLARED YET IS DISPATCHED FROM A FUNCTION WRITTEN
+  // LATER. An imported module's body is emitted before the importer declares
+  // the subclasses that are candidates here, and an arm that constructs or
+  // reads one cannot be typed until it is. The arms' syntax is built now and
+  // typed in a function emitted once every class is declared, which takes the
+  // class value and what the arms read from this scope.
+  // ⛔ Not for a builtin exception's bound: its arm reads the value's class
+  // word from this scope (`pendingConstructionClass`).
+  bool laterCandidate =
+      !py::exceptions::findByContract(bound.getContractName()) &&
+      llvm::any_of(candidates, [&](const std::string &candidate) {
+        return declaredClassNodes.count(candidate) &&
+               !classMros.count(candidate);
+      });
+  if (laterCandidate && !classDeclarationsEmitted) {
+    parser::SourceRange range = anchor.range;
+    std::string symbol =
+        "__lyclassdisp$" + std::to_string(++syntheticFunctionCounter);
+    std::string valueName = symbol + "$cls";
+    std::vector<std::pair<std::string, parser::NodePtr>> arms;
+    for (const std::string &candidate : candidates)
+      arms.push_back({spell(candidate), armFor(spell(candidate))});
+    llvm::SmallVector<synth::Param, 4> params{
+        synth::Param{"__ly_cls", nullptr}};
+    for (const std::string &name : capturedNames)
+      params.push_back(synth::Param{name, nullptr});
+    llvm::SmallVector<const parser::Node *, 4> paramNodes;
+    parser::NodePtr def = synth::functionDef(symbol, params, {}, {}, nullptr,
+                                             {}, range, &paramNodes);
+    synthesizedIteratorDefs.push_back(def);
+    types.overrideParameterType(paramNodes[0], classValue.type);
+    for (auto [index, name] : llvm::enumerate(capturedNames))
+      types.overrideParameterType(paramNodes[index + 1],
+                                  values.lookup(name).type);
+    types.pinResultType(def.get(), resultType);
+    FunctionSignature sig = types.functionSignature(*def);
+    types.bindRootSymbol(symbol, sig.publicCallable);
+    deferredDispatcherBodies.push_back(
+        [this, def, symbol, sig, range, arms = std::move(arms)] {
+          std::vector<parser::NodePtr> body;
+          for (auto [index, arm] : llvm::enumerate(arms)) {
+            parser::NodePtr answer = synth::returnStmt(arm.second, range);
+            if (index + 1 == arms.size()) {
+              body.push_back(std::move(answer));
+              continue;
+            }
+            body.push_back(synth::ifStmt(
+                synth::compare(synth::name("__ly_cls", range), "Is",
+                               synth::name(arm.first, range), range),
+                {std::move(answer)}, {}, range));
+          }
+          if (parser::Field *field = parser::findField(*def, "body"))
+            field->value = std::move(body);
+          emitDispatcherBody(*def, symbol, sig, /*suppressGate=*/false);
+        });
+    values[valueName] = classValue;
+    types.bindSymbol(valueName, classValue.type);
+    auto forget = llvm::scope_exit([&] { values.erase(valueName); });
+    std::vector<parser::NodePtr> callArguments{synth::name(valueName, range)};
+    for (const std::string &name : capturedNames)
+      callArguments.push_back(synth::name(name, range));
+    parser::NodePtr call = synth::call(synth::name(symbol, range),
+                                       std::move(callArguments), range);
+    synthesizedIteratorDefs.push_back(call);
+    return emitExpr(call.get());
+  }
   std::function<mlir::Value(std::size_t)> chain =
       [&](std::size_t index) -> mlir::Value {
     auto arm = [&]() -> mlir::Value {
@@ -3230,7 +4332,8 @@ ModuleEmitter::emitClassValueCall(const parser::Node &expr,
     synthesizedIteratorDefs.push_back(probe);
     resultType = types.widenLiteral(types.inferExpr(probe.get()));
   }
-  return emitClassValueDispatch(expr, classValue, bound, resultType, armFor);
+  return emitClassValueDispatch(expr, classValue, bound, resultType, armFor,
+                                temps);
 }
 
 std::optional<Value>
@@ -6621,6 +7724,33 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
   return std::nullopt;
 }
 
+// ⭐ A CLASS'S `__len__` IS A LENGTH ONLY AFTER slot_sq_length's CHECKS:
+// CPython raises ValueError for a negative answer and OverflowError for one
+// past the word, in `len` and in a truth test alike. Handed back as it was,
+// `len(b)` printed -1 and `bool(b)` answered True for a `__len__` returning
+// -1, and `len` printed 2**70.
+std::optional<Value>
+ModuleEmitter::tryEmitClassLength(const parser::Node &anchor, Value receiver) {
+  std::optional<Value> count = tryEmitClassDunder(anchor, receiver, "__len__");
+  if (!count)
+    return std::nullopt;
+  mlir::Type intType = types.intType();
+  Value counted = coerceValue(*count, intType, anchor);
+  CallInferenceResult inference =
+      types.inferMethodCallWithEvidence(intType, "__ly_length__", {});
+  if (!inference)
+    return counted;
+  Value posPack = emitPack({});
+  Value namePack = emitPack({});
+  Value valuePack = emitPack({});
+  auto call = py::CallOp::create(
+      builder, loc(anchor), mlir::TypeRange{inference.resultType},
+      callProtocolFor(inference), counted.value, posPack.value,
+      namePack.value, valuePack.value);
+  call->setAttr("ly.bound_method", builder.getStringAttr("__ly_length__"));
+  return Value{call.getResults().front(), inference.resultType};
+}
+
 std::optional<Value>
 ModuleEmitter::tryEmitLenCall(const parser::Node &expr,
                               const parser::Node *calleeNode) {
@@ -6650,7 +7780,7 @@ ModuleEmitter::tryEmitLenCall(const parser::Node &expr,
       }
     }
     Value input = emitExpr(argNode);
-  if (std::optional<Value> count = tryEmitClassDunder(expr, input, "__len__"))
+  if (std::optional<Value> count = tryEmitClassLength(expr, input))
     return *count;
   // ⭐ A UNION COUNTS BY TAG, like it adds by tag. `def f(x: "list[int] | str")`
   // is an ordinary Python signature and `len(x)` in its body was refused for a

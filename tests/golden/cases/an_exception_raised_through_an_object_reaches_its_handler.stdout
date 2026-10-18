@@ -1,0 +1,4 @@
+eq caught 'eq' | ne caught 'eq' | hash caught hash
+repr caught repr | str caught str | bool caught bool
+in caught 'eq' | dict caught hash | list caught repr
+True True 7 [1] 2.5 F True 7 [1, 'a']

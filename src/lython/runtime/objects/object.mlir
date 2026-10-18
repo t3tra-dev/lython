@@ -37,12 +37,16 @@ module attributes {
   func.func private @__ly_int_to_immediate(%value: i64) -> i64
   func.func private @__ly_raise_static_message(%class_word: i64, %message: memref<?xi8>, %length: i64)
   func.func private @__ly_str_boxed_by_contract(%box: !llvm.ptr, %class_word: i64) -> (memref<2xi64>, memref<?xi8>, i1)
+  func.func private @__ly_bool_boxed_by_contract(%box: !llvm.ptr, %class_word: i64) -> (i1, i1)
   func.func private @release_payload_slot_ptr(%slot: !llvm.ptr)
   py.class @object attributes {
     ly.typing.abstract,
     method_names = ["__init__", "__new__", "__repr__", "__str__", "__bool__",
                     "__eq__", "__ne__", "__hash__", "__getattribute__",
-                    "__setattr__", "__delattr__", "__ly_is_none__"],
+                    "__setattr__", "__delattr__", "__ly_is_none__",
+                    // ⛔ NOT A CPython DUNDER either: `object.__hash__(x)`, the
+                    // identity hash a class's own `__hash__` does not reach.
+                    "__ly_identity_hash__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"builtins.object">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.object">>] -> [!py.self]>,
@@ -62,11 +66,13 @@ module attributes {
       // fold is a lie. The emitter reaches this by name; a program that writes
       // `x.__ly_is_none__()` gets the same answer, which is the price of
       // routing it through the ordinary method table instead of a private op.
-      !py.protocol<"Callable", [!py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.object">] -> [!py.contract<"builtins.int">]>
     ],
     method_kinds = ["instance", "classmethod", "instance", "instance",
                     "instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance",
+                    "instance"]
   } {}
 
   // ABI shape declarations are manifest entries: they describe the physical
@@ -139,9 +145,10 @@ module attributes {
     // `object` parameter printed <object object ...> where CPython prints its
     // class -- the same defect the typed path had, read from the box instead of
     // the header.
-    %header_sub = memref.subview %box[0] [2] [1] : memref<5xi64> to memref<2xi64, strided<[1]>>
-    %header_view = memref.cast %header_sub : memref<2xi64, strided<[1]>> to memref<2xi64, strided<[1], offset: ?>>
-    %dh, %db = func.call @LyObject_DefaultReprDynamic(%header_view) : (memref<2xi64, strided<[1], offset: ?>>) -> (memref<2xi64>, memref<?xi8>)
+    // ⛔ The ENTITY's address, not the box's: the object is what `id` names,
+    // and the box is only how this value holds it -- `repr(o)` through an
+    // `object` parameter printed an address `hex(id(o))` never answers.
+    %dh, %db = func.call @__ly_default_repr_dynamic_from_addr(%entity, %class_word) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
     cf.br ^done(%dh, %db : memref<2xi64>, memref<?xi8>)
 
   ^done(%rh: memref<2xi64>, %rb: memref<?xi8>):
@@ -162,7 +169,8 @@ module attributes {
     func.return %h, %b : memref<2xi64>, memref<?xi8>
 
   ^fallback:
-    %addr = llvm.ptrtoint %box_ptr : !llvm.ptr to i64
+    // The entity the slot holds, which is the object (see LyObject_BoxedRepr).
+    %addr = llvm.load %box_ptr : !llvm.ptr -> i64
     %dh, %db = func.call @__ly_default_repr_dynamic_from_addr(%addr, %class_word) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
     func.return %dh, %db : memref<2xi64>, memref<?xi8>
   }
@@ -236,6 +244,55 @@ module attributes {
     %eq = func.call @LyObject_BoxedEq(%lhs, %rhs) : (memref<5xi64>, memref<5xi64>) -> i1
     %ne = arith.xori %eq, %true : i1
     func.return %ne : i1
+  }
+
+  // PyObject_IsTrue (Objects/object.c) of an erased box: None is false; a
+  // class answers through its type object's truth slot -- its `__bool__`, or
+  // its length when it has only `__len__`, which is how CPython's ladder runs
+  // from nb_bool to mp_length and sq_length; a class with neither is true.
+  // ⛔ None is answered HERE, before the hook: this function is None's arm of
+  // that hook (it takes the box), so asking the hook for None would call
+  // itself without end.
+  func.func @LyObject_BoxedBool(%box: memref<5xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.method = "__bool__"} {
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %true = arith.constant true
+    %false = arith.constant false
+    %class_word = memref.load %box[%c1] : memref<5xi64>
+    %entity = memref.load %box[%c2] : memref<5xi64>
+    %no_class = func.call @__ly_class_is_none(%class_word) : (i64) -> i1
+    %no_entity = func.call @__ly_word_is_none(%entity) : (i64) -> i1
+    %is_none = arith.andi %no_class, %no_entity : i1
+    cf.cond_br %is_none, ^done(%false : i1), ^try_hook
+
+  ^try_hook:
+    %box_idx = memref.extract_aligned_pointer_as_index %box : memref<5xi64> -> index
+    %box_i64 = arith.index_cast %box_idx : index to i64
+    %box_base_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
+    // The box's word 2 reads as a slot (BoxLayout.h).
+    %box_ptr = llvm.getelementptr %box_base_ptr[2] : (!llvm.ptr) -> !llvm.ptr, i64
+    %truth, %hit = func.call @__ly_bool_boxed_by_contract(%box_ptr, %class_word) : (!llvm.ptr, i64) -> (i1, i1)
+    %answer = arith.select %hit, %truth, %true : i1
+    cf.br ^done(%answer : i1)
+
+  ^done(%result: i1):
+    func.return %result : i1
+  }
+
+  // object.__hash__ itself, which a class's own `__hash__` does not reach:
+  // CPython's pointer hash (_Py_HashPointer, the address rotated right by 4)
+  // of the object the box holds -- the same answer `__ly_box_hash` gives a
+  // class with no `__hash__`.
+  func.func @LyObject_IdentityHash(%box: memref<5xi64>) -> i64 attributes {ly.runtime.contract = "builtins.object", ly.runtime.method = "__ly_identity_hash__"} {
+    %c2 = arith.constant 2 : index
+    %entity = memref.load %box[%c2] : memref<5xi64>
+    %c4 = arith.constant 4 : i64
+    %c60 = arith.constant 60 : i64
+    %lo = arith.shrui %entity, %c4 : i64
+    %hi = arith.shli %entity, %c60 : i64
+    %rot = arith.ori %lo, %hi : i64
+    %fixed = func.call @__ly_hash_fixup(%rot) : (i64) -> i64
+    func.return %fixed : i64
   }
 
   func.func @LyObject_BoxedHash(%box: memref<5xi64>) -> i64 attributes {ly.runtime.contract = "builtins.object", ly.runtime.method = "__hash__"} {

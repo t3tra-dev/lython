@@ -1,0 +1,13 @@
+0 3 False True
+nonempty
+empty
+False True
+len: ValueError __len__() should return >= 0
+bool: ValueError __len__() should return >= 0
+if: ValueError __len__() should return >= 0
+len: OverflowError cannot fit 'int' into an index-sized integer
+bool: OverflowError cannot fit 'int' into an index-sized integer
+if: OverflowError cannot fit 'int' into an index-sized integer
+len: ValueError __len__() should return >= 0
+bool: ValueError __len__() should return >= 0
+if: ValueError __len__() should return >= 0

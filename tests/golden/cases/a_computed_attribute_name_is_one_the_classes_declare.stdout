@@ -1,0 +1,56 @@
+Base
+   hello -> ok 'hello from Base' | hasattr True
+   helper -> ok 1 | hasattr True
+   two -> TypeError: Base.two() missing 2 required positional arguments: 'a' and 'b' | hasattr True
+   opt -> ok 1 | hasattr True
+   stat -> ok 'static' | hasattr True
+   clsm -> ok 'cls Base' | hasattr True
+   prop -> TypeError: 'int' object is not callable | hasattr True
+   kind -> TypeError: 'str' object is not callable | hasattr True
+   label -> TypeError: 'str' object is not callable | hasattr True
+   only_left -> AttributeError: 'Base' object has no attribute 'only_left' | hasattr False
+   only_right -> AttributeError: 'Base' object has no attribute 'only_right' | hasattr False
+   late -> AttributeError: 'Base' object has no attribute 'late' | hasattr False
+   missing -> AttributeError: 'Base' object has no attribute 'missing' | hasattr False
+   __repr__ -> ok repr | hasattr True
+   __class__ -> ok a new Base | hasattr True
+   __doc__ -> TypeError: 'NoneType' object is not callable | hasattr True
+   __dict__ -> TypeError: 'dict' object is not callable | hasattr True
+Left
+   hello -> ok 'left hello' | hasattr True
+   helper -> ok 1 | hasattr True
+   two -> TypeError: Base.two() missing 2 required positional arguments: 'a' and 'b' | hasattr True
+   opt -> ok 1 | hasattr True
+   stat -> ok 'static' | hasattr True
+   clsm -> ok 'cls Left' | hasattr True
+   prop -> TypeError: 'int' object is not callable | hasattr True
+   kind -> TypeError: 'str' object is not callable | hasattr True
+   label -> TypeError: 'str' object is not callable | hasattr True
+   only_left -> ok 'only left' | hasattr True
+   only_right -> AttributeError: 'Left' object has no attribute 'only_right' | hasattr False
+   late -> AttributeError: 'Left' object has no attribute 'late' | hasattr False
+   missing -> AttributeError: 'Left' object has no attribute 'missing' | hasattr False
+   __repr__ -> ok repr | hasattr True
+   __class__ -> ok a new Left | hasattr True
+   __doc__ -> TypeError: 'NoneType' object is not callable | hasattr True
+   __dict__ -> TypeError: 'dict' object is not callable | hasattr True
+Right
+   hello -> ok 'hello from Right' | hasattr True
+   helper -> ok 1 | hasattr True
+   two -> TypeError: Base.two() missing 2 required positional arguments: 'a' and 'b' | hasattr True
+   opt -> ok 1 | hasattr True
+   stat -> ok 'static' | hasattr True
+   clsm -> ok 'cls Right' | hasattr True
+   prop -> TypeError: 'int' object is not callable | hasattr True
+   kind -> TypeError: 'str' object is not callable | hasattr True
+   label -> TypeError: 'str' object is not callable | hasattr True
+   only_left -> AttributeError: 'Right' object has no attribute 'only_left' | hasattr False
+   only_right -> ok 'only right' | hasattr True
+   late -> TypeError: 'int' object is not callable | hasattr True
+   missing -> AttributeError: 'Right' object has no attribute 'missing' | hasattr False
+   __repr__ -> ok repr | hasattr True
+   __class__ -> ok a new Right | hasattr True
+   __doc__ -> TypeError: 'NoneType' object is not callable | hasattr True
+   __dict__ -> TypeError: 'dict' object is not callable | hasattr True
+3 5
+Base.helper() takes 1 positional argument but 2 were given

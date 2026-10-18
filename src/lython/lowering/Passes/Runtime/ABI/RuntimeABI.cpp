@@ -1001,8 +1001,8 @@ RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
   box.getDefiningOp()->setAttr(own::kObjectHeaderAttr, builder.getUnitAttr());
 
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> classEntity =
-      RuntimeBundleLowerer::objectPayloadClassEntity(op, concrete,
-                                                     retainPayload);
+      RuntimeBundleLowerer::objectPayloadClassEntityAtCurrentInsertion(
+          op, concrete, retainPayload);
   if (mlir::failed(classEntity))
     return mlir::failure();
   {
@@ -2167,10 +2167,12 @@ mlir::FailureOr<std::string> RuntimeBundleLowerer::slotFunction(
   if (hook && slotHook && !slotHook->calledByRuntime) {
     function.setPrivate();
     llvm::SmallVector<mlir::Attribute, 8> slots;
-    if (auto existing = hook->getAttrOfType<mlir::ArrayAttr>("ly.slots"))
+    if (auto existing =
+            hook->getAttrOfType<mlir::ArrayAttr>(type_objects::kHookSlotsAttr))
       slots.append(existing.begin(), existing.end());
     slots.push_back(mlir::FlatSymbolRefAttr::get(context, name));
-    hook->setAttr("ly.slots", mlir::ArrayAttr::get(context, slots));
+    hook->setAttr(type_objects::kHookSlotsAttr,
+                  mlir::ArrayAttr::get(context, slots));
   }
   return name;
 }
@@ -2893,6 +2895,173 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedHashHook() {
   mlir::Type i64 = mlir::IntegerType::get(context, 64);
   return generateBoxedMethodHookFor("__ly_hash_boxed_by_contract", "__hash__",
                                     {i64});
+}
+
+// ⭐ THE TRUTH SLOT IS PyObject_IsTrue's LADDER, ONE RUNG PER CLASS: a class
+// with `__bool__` answers through it, a class with only `__len__` through its
+// length (nb_bool, then mp_length / sq_length), and one with neither misses,
+// which `LyObject_BoxedBool` reads as true. The length rung is an adapter
+// (synthesizeLengthTruthAdapters).
+mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBoolHook() {
+  if (!boxedHookIsDemanded("__ly_bool_boxed_by_contract"))
+    return mlir::success();
+  if (mlir::failed(RuntimeBundleLowerer::synthesizeLengthTruthAdapters()))
+    return mlir::failure();
+  mlir::Type i1 = mlir::IntegerType::get(context, 1);
+  return generateBoxedMethodHookFor("__ly_bool_boxed_by_contract", "__bool__",
+                                    {i1});
+}
+
+// The length rung of the truth slot, as a `__bool__` the slot can call: for
+// each class with `__len__` and no `__bool__`, `len != 0`. A native `__len__`
+// answers the bare i64; a compiled one answers the boxed int, which is a
+// length only after slot_sq_length's checks -- and those raise, so the int is
+// released before the raise, not after.
+// ⛔ Not a miss for a class it cannot adapt: a miss reads as TRUE, which is
+// the wrong answer for an empty instance. Such a class stops the program
+// here instead.
+mlir::LogicalResult RuntimeBundleLowerer::synthesizeLengthTruthAdapters() {
+  mlir::Type i64 = mlir::IntegerType::get(context, 64);
+  mlir::Type i1 = mlir::IntegerType::get(context, 1);
+  auto rankOneMemrefs = [](mlir::FunctionType type) {
+    if (type.getNumInputs() == 0 || type.getNumInputs() > 5)
+      return false;
+    return llvm::all_of(type.getInputs(), [](mlir::Type input) {
+      auto memref = mlir::dyn_cast<mlir::MemRefType>(input);
+      return memref && memref.getRank() == 1;
+    });
+  };
+  llvm::StringSet<> answersBool;
+  llvm::SmallVector<mlir::func::FuncOp, 16> nativeLengths;
+  module.walk([&](mlir::func::FuncOp function) {
+    auto method = function->getAttrOfType<mlir::StringAttr>(
+        contracts::kManifestMethodAttr);
+    auto contract = function->getAttrOfType<mlir::StringAttr>(
+        contracts::kManifestContractAttr);
+    if (!method || !contract)
+      return;
+    if (method.getValue() == "__bool__")
+      answersBool.insert(contract.getValue());
+    else if (method.getValue() == "__len__" && !function.isExternal())
+      nativeLengths.push_back(function);
+  });
+
+  mlir::OpBuilder builder(context);
+  mlir::Location loc = module.getLoc();
+  auto adapterFor = [&](llvm::StringRef name, llvm::StringRef contract,
+                        mlir::FunctionType sourceType) -> mlir::func::FuncOp {
+    if (module.lookupSymbol<mlir::func::FuncOp>(name))
+      return mlir::func::FuncOp();
+    builder.setInsertionPointToEnd(module.getBody());
+    auto adapter = mlir::func::FuncOp::create(
+        builder, loc, name,
+        builder.getFunctionType(sourceType.getInputs(), {i1}));
+    adapter.setPrivate();
+    adapter->setAttr(contracts::kManifestContractAttr,
+                     builder.getStringAttr(contract));
+    adapter->setAttr(contracts::kManifestMethodAttr,
+                     builder.getStringAttr("__bool__"));
+    builder.setInsertionPointToStart(adapter.addEntryBlock());
+    return adapter;
+  };
+  auto nonZero = [&](mlir::Value length) {
+    mlir::Value zero = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
+    return mlir::arith::CmpIOp::create(builder, loc,
+                                       mlir::arith::CmpIPredicate::ne, length,
+                                       zero)
+        .getResult();
+  };
+
+  for (mlir::func::FuncOp length : nativeLengths) {
+    llvm::StringRef contract =
+        length->getAttrOfType<mlir::StringAttr>(contracts::kManifestContractAttr)
+            .getValue();
+    mlir::FunctionType type = length.getFunctionType();
+    if (answersBool.contains(contract) || !rankOneMemrefs(type) ||
+        type.getNumResults() != 1 || type.getResult(0) != i64)
+      continue;
+    mlir::func::FuncOp adapter = adapterFor(
+        ("__ly_truth_adapter$" + length.getSymName()).str(), contract, type);
+    if (!adapter)
+      continue;
+    mlir::Block *body = &adapter.getBody().front();
+    auto call = mlir::func::CallOp::create(
+        builder, loc, length,
+        llvm::SmallVector<mlir::Value, 6>(body->getArguments().begin(),
+                                          body->getArguments().end()));
+    mlir::func::ReturnOp::create(builder, loc,
+                                 mlir::ValueRange{nonZero(call.getResult(0))});
+  }
+
+  std::optional<RuntimeSymbol> status =
+      manifest.primitive("builtins.int", "length_status");
+  std::optional<RuntimeSymbol> raise =
+      manifest.primitive("builtins.int", "raise_length_status");
+  mlir::func::FuncOp intRelease;
+  for (const ownership::RuntimeDeallocator &deallocator : *settledDeallocators)
+    if (deallocator.contractName == "builtins.int" && !deallocator.alias)
+      intRelease = deallocator.function;
+  llvm::SmallVector<std::pair<py::ClassOp, mlir::func::FuncOp>, 4> pending;
+  mlir::LogicalResult outcome = mlir::success();
+  module.walk([&](py::ClassOp classOp) {
+    if (mlir::failed(outcome) ||
+        RuntimeBundleLowerer::classMethodSymbol(classOp, "__bool__"))
+      return;
+    std::optional<std::string> symbol =
+        RuntimeBundleLowerer::classMethodSymbol(classOp, "__len__");
+    if (!symbol)
+      return;
+    auto method = module.lookupSymbol<mlir::func::FuncOp>(*symbol);
+    std::optional<std::string> runtimeClass =
+        RuntimeBundleLowerer::runtimeClassForClass(classOp);
+    if (!method || method.isExternal() || !runtimeClass ||
+        !RuntimeBundleLowerer::boxMayHoldContract(classOp.getSymName()))
+      return;
+    mlir::FunctionType type = method.getFunctionType();
+    unsigned intWords =
+        status ? status->function.getFunctionType().getNumInputs() : 0;
+    bool boxedInt = status && raise && intRelease && rankOneMemrefs(type) &&
+                    type.getNumResults() == intWords + 2;
+    for (unsigned index = 0; boxedInt && index < intWords; ++index)
+      boxedInt = type.getResult(index) ==
+                 status->function.getFunctionType().getInput(index);
+    if (!boxedInt) {
+      outcome = classOp.emitError()
+                << "the truth of a '" << classOp.getSymName()
+                << "' held as `object` is its `__len__`, which the truth slot "
+                   "cannot call";
+      return;
+    }
+    pending.push_back({classOp, method});
+  });
+  if (mlir::failed(outcome))
+    return mlir::failure();
+  for (auto [classOp, method] : pending) {
+    mlir::func::FuncOp adapter =
+        adapterFor(("__ly_truth_adapter$" + classOp.getSymName()).str(),
+                   classOp.getSymName(), method.getFunctionType());
+    if (!adapter)
+      continue;
+    mlir::Block *body = &adapter.getBody().front();
+    auto call = mlir::func::CallOp::create(
+        builder, loc, method,
+        llvm::SmallVector<mlir::Value, 6>(body->getArguments().begin(),
+                                          body->getArguments().end()));
+    unsigned intWords = status->function.getFunctionType().getNumInputs();
+    llvm::SmallVector<mlir::Value, 4> intValues(
+        call.getResults().begin(), call.getResults().begin() + intWords);
+    auto checked = mlir::func::CallOp::create(builder, loc, status->function,
+                                              intValues);
+    mlir::func::CallOp::create(
+        builder, loc, intRelease,
+        llvm::ArrayRef<mlir::Value>(intValues)
+            .take_front(intRelease.getFunctionType().getNumInputs()));
+    mlir::func::CallOp::create(builder, loc, raise->function,
+                               mlir::ValueRange{checked.getResult(1)});
+    mlir::func::ReturnOp::create(
+        builder, loc, mlir::ValueRange{nonZero(checked.getResult(0))});
+  }
+  return mlir::success();
 }
 
 // Binary variant of the uniform boxed-method dispatch, for same-class binary

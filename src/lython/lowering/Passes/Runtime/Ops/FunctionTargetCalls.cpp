@@ -549,12 +549,25 @@ mlir::LogicalResult RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
     py::CallOp op, mlir::func::FuncOp original, llvm::StringRef originalName,
     mlir::func::FuncOp clone, llvm::ArrayRef<const RuntimeBundle *> sources,
     RuntimeBundle &result) {
-  mlir::Type resultType = op.getResult(0).getType();
-  if (runtimeContractName(resultType).empty()) {
-    if (py::CallableType callable = callableTypeOf(original))
-      if (callable.getResultTypes().size() == 1)
-        resultType = callable.getResultTypes().front();
-  }
+  mlir::Type declared = op.getResult(0).getType();
+  mlir::Type actual = RuntimeBundleLowerer::functionTargetResultType(original);
+  bool viewed = RuntimeBundleLowerer::callResultNeedsView(op, actual, declared);
+  mlir::Type resultType = declared;
+  if (viewed || (runtimeContractName(resultType).empty() && actual))
+    resultType = actual;
+  // The int or float as the original returns it, seen as the type the call
+  // was made through (see viewCallResultAsDeclared).
+  auto seenAsDeclared = [&]() -> mlir::LogicalResult {
+    if (!viewed)
+      return mlir::success();
+    mlir::FailureOr<RuntimeBundle> view =
+        RuntimeBundleLowerer::viewCallResultAsDeclared(op, result, resultType,
+                                                       declared);
+    if (mlir::failed(view))
+      return mlir::failure();
+    result = std::move(*view);
+    return mlir::success();
+  };
   bool floatResult = runtimeContractName(resultType) == "builtins.float";
   if (!floatResult && runtimeContractName(resultType) != "builtins.int")
     return op.emitError()
@@ -667,7 +680,7 @@ mlir::LogicalResult RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
     result.primitiveF64 =
         RuntimePrimitiveI64Evidence{ifOp.getResult(objectTypes->size()),
                                     ifOp.getResult(objectTypes->size() + 1)};
-    return mlir::success();
+    return seenAsDeclared();
   }
   if ((*fallbackCall).getNumResults() != ifResultTypes.size())
     return op.emitError() << "primitive i64 clone fallback call returned "
@@ -692,7 +705,7 @@ mlir::LogicalResult RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
   result.primitiveI64 =
       RuntimePrimitiveI64Evidence{ifOp.getResult(objectTypes->size()),
                                   ifOp.getResult(objectTypes->size() + 1)};
-  return mlir::success();
+  return seenAsDeclared();
 }
 
 mlir::FailureOr<mlir::func::CallOp>
@@ -908,21 +921,108 @@ RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
   return call;
 }
 
+mlir::Type
+RuntimeBundleLowerer::functionTargetResultType(mlir::func::FuncOp target) const {
+  py::CallableType callable = callableTypeOf(target);
+  if (!callable || callable.getResultTypes().size() != 1)
+    return mlir::Type();
+  mlir::Type result = callable.getResultTypes().front();
+  // A lambda's `-> Literal[1]` is laid out as its int.
+  if (mlir::isa<py::LiteralType>(result) && !py::isPyNoneType(result))
+    if (std::string contract = runtimeContractName(result); !contract.empty())
+      return runtimeContractType(context, contract);
+  return result;
+}
+
+bool RuntimeBundleLowerer::callResultNeedsView(mlir::Operation *op,
+                                               mlir::Type actual,
+                                               mlir::Type declared) const {
+  if (!actual || !declared || actual == declared ||
+      !py::isAssignableTo(actual, declared, op))
+    return false;
+  if (mlir::isa<py::UnionType>(declared))
+    return true;
+  return isBuiltinsObjectContract(declared) &&
+         !isBuiltinsObjectContract(actual);
+}
+
+// ⭐ A CALL THROUGH A CALLABLE VALUE ANSWERS WITH ITS TARGET'S RESULT, which
+// the callable's type only bounds: a `Callable[[], object]` holds a function
+// returning an int, and what comes back is the int's lanes. Read as the
+// declared type's lanes they were "runtime bundle value 0 for
+// 'builtins.object' has type 'memref<2xi64>'", and a `Callable[[], int |
+// None]` read the int's header as the union's tag. The result is taken as the
+// target lays it out and then seen as the declared type, by the view a
+// `class.upcast` or a `union.wrap` gives any other value (`x: object =
+// one()`).
+// ⛔ At the builder's insertion point, never before `op`: a dispatch arm calls
+// its target in a block of its own, and a view made before the call op would
+// sit in another block from the result it reads.
+mlir::FailureOr<RuntimeBundle> RuntimeBundleLowerer::viewCallResultAsDeclared(
+    mlir::Operation *op, const RuntimeBundle &result, mlir::Type actual,
+    mlir::Type declared) {
+  auto declaredUnion = mlir::dyn_cast<py::UnionType>(declared);
+  if (!declaredUnion)
+    return RuntimeBundleLowerer::aliasViewBundle(op, result, actual, declared);
+  RuntimeBundle source = result;
+  if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(source)) {
+    mlir::FailureOr<RuntimeValue> materialized =
+        RuntimeBundleLowerer::materializePrimitiveI64ObjectAtCurrentInsertion(
+            op, source);
+    if (mlir::failed(materialized))
+      return mlir::failure();
+    source.objectValue = *materialized;
+  }
+  if (RuntimeBundleLowerer::hasLazyPrimitiveF64Object(source)) {
+    mlir::FailureOr<RuntimeValue> materialized =
+        RuntimeBundleLowerer::materializePrimitiveF64ObjectAtCurrentInsertion(
+            op, source);
+    if (mlir::failed(materialized))
+      return mlir::failure();
+    source.objectValue = *materialized;
+  }
+  llvm::SmallVector<mlir::Value, 8> values;
+  RuntimeBundle lanesSource;
+  if (mlir::failed(RuntimeBundleLowerer::appendUnionRuntimeValues(
+          op, declaredUnion, source, actual, values, &lanesSource)))
+    return mlir::failure();
+  RuntimeBundle wrapped;
+  if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(op, declared, values,
+                                                          wrapped)))
+    return mlir::failure();
+  wrapped.copyEvidenceFrom(source);
+  // The member whose lanes the union holds names the reference, as
+  // `lowerUnionWrap` records it.
+  if (!mlir::isa<py::UnionType>(actual))
+    wrapped.unionActiveMember =
+        std::make_shared<RuntimeBundle>(std::move(lanesSource));
+  return wrapped;
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::bundleFunctionTargetCallResult(
     py::CallOp op, mlir::func::FuncOp target, llvm::StringRef targetName,
     mlir::func::CallOp call, llvm::ArrayRef<const RuntimeBundle *> sources,
     RuntimeBundle &result) {
-  mlir::Type expectedResult = op.getResult(0).getType();
-  if (runtimeContractName(expectedResult).empty()) {
-    if (py::CallableType callable = callableTypeOf(target)) {
-      if (callable.getResultTypes().size() == 1)
-        expectedResult = callable.getResultTypes().front();
-    }
-  }
-  return RuntimeBundleLowerer::consumeFunctionTargetCallResult(
-      op.getOperation(), targetName, call, expectedResult, sources,
-      /*applyReturnedSummaries=*/true,
-      "function target result object ABI", result);
+  mlir::Type declared = op.getResult(0).getType();
+  mlir::Type actual = RuntimeBundleLowerer::functionTargetResultType(target);
+  bool viewed = RuntimeBundleLowerer::callResultNeedsView(op, actual, declared);
+  mlir::Type expectedResult = declared;
+  if (viewed || (runtimeContractName(expectedResult).empty() && actual))
+    expectedResult = actual;
+  if (mlir::failed(RuntimeBundleLowerer::consumeFunctionTargetCallResult(
+          op.getOperation(), targetName, call, expectedResult, sources,
+          /*applyReturnedSummaries=*/true,
+          "function target result object ABI", result)))
+    return mlir::failure();
+  if (!viewed)
+    return mlir::success();
+  mlir::FailureOr<RuntimeBundle> view =
+      RuntimeBundleLowerer::viewCallResultAsDeclared(op, result, actual,
+                                                     declared);
+  if (mlir::failed(view))
+    return mlir::failure();
+  result = std::move(*view);
+  return mlir::success();
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::consumeFunctionTargetCallResult(

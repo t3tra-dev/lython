@@ -1,6 +1,7 @@
 #include "Passes/Runtime/Cleanup/Transforms.h"
 
 #include "Common/PythonSourceRange.h"
+#include "Common/TypeObjects.h"
 #include "Ownership.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -93,6 +94,29 @@ unsigned markCannotRaiseFunctions(mlir::ModuleOp module) {
 
   for (unsigned index = 0; index < functions.size(); ++index) {
     mlir::FunctionOpInterface function = functions[index];
+    // ⭐ A BOXED HOOK DOES WHAT ITS SLOTS DO. Its body -- a call through the
+    // slot word -- is written only at the LLVM layer, so here it is still a
+    // declaration, and the name test said a `__ly_*` declaration cannot raise:
+    // a class's raising `__eq__` reached through `a == b` on two `object`s
+    // walked straight past the `try` around it, because `LyObject_BoxedEq`
+    // called nothing that raised. The slots it will call are on it, and it
+    // raises exactly when one of them does.
+    if (auto slots = function->getAttrOfType<mlir::ArrayAttr>(
+            type_objects::kHookSlotsAttr);
+        slots && function.isExternal()) {
+      for (mlir::Attribute slot : slots) {
+        auto symbol = mlir::dyn_cast<mlir::FlatSymbolRefAttr>(slot);
+        mlir::Operation *callee =
+            symbol ? symbols.lookup(symbol.getValue()) : nullptr;
+        auto found = callee ? indexOf.find(callee) : indexOf.end();
+        if (found == indexOf.end()) {
+          seed(index);
+          break;
+        }
+        callers[found->second].push_back(index);
+      }
+      continue;
+    }
     Verdict verdict = classify(function);
     if (verdict == Verdict::Raises)
       seed(index);

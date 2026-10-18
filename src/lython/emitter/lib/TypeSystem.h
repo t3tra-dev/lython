@@ -516,6 +516,12 @@ public:
   void overrideParameterType(const parser::Node *argNode, mlir::Type type) {
     parameterTypeOverrides[argNode] = type;
   }
+  // And its result, for a synthesized dispatcher whose result is a type no
+  // annotation spells (a class of another module, a union): read where an
+  // annotation would be.
+  void pinResultType(const parser::Node *function, mlir::Type type) {
+    pinnedResultTypes[function] = type;
+  }
 
   // `selfType` is the receiver's CONCRETE type, and it matters for more than
   // the signature: the body is inferred inside this call, so with the
@@ -608,6 +614,7 @@ private:
   // declared attribute rather than falling back to the erased object.
   llvm::StringMap<mlir::Type> classStaticAttrTypes;
   llvm::StringMap<mlir::Type> classPropertyTypes;
+  llvm::DenseMap<const parser::Node *, mlir::Type> pinnedResultTypes;
   // Static-method signatures, keyed "<class>.<method>".
   llvm::StringMap<mlir::Type> classStaticMethodTypes;
   llvm::StringMap<std::string> canonicalBindings;

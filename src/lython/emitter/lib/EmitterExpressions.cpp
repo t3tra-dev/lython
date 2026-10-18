@@ -5717,17 +5717,24 @@ mlir::Value ModuleEmitter::emitBoolValue(Value value,
       return dispatch(0, dispatch);
     }
   }
+  // ⭐ A TRUTH THE STATIC CLASS CANNOT ANSWER IS ASKED OF THE INSTANCE. When a
+  // subclass overrides or adds `__bool__` or `__len__`, the base's ladder is
+  // the wrong one for a subclass instance, and the dispatch below refuses it;
+  // seen as `object`, the instance is boxed with the class it was made as,
+  // and that class's truth slot answers (LyObject_BoxedBool).
+  if (isSourceClassContract(widened) &&
+      (dispatchIsUnresolvable(value, "__bool__", nullptr, false) ||
+       dispatchIsUnresolvable(value, "__len__", nullptr, false)))
+    return emitBoolValue(coerceValue(value, types.object(), anchor), anchor);
   // Source-class truthiness walks CPython's ladder — __bool__, then __len__,
   // then object's default (always true) — here rather than through the
-  // manifest evidence below, for two reasons: the evidence path cannot see
-  // source methods (so a class with __bool__ reached lowering as a manifest
-  // call that does not exist), and object's default has no runtime
-  // implementation to dispatch to, because "the truth of an erased object" is
-  // not a runtime question — it is answered by the static class.
+  // manifest evidence below, because the evidence path cannot see source
+  // methods (a class with __bool__ reached lowering as a manifest call that
+  // does not exist). An erased `object` is the one value whose class is not
+  // known here, and it is asked at run time instead (LyObject_BoxedBool).
   if (std::optional<Value> truth = tryEmitClassDunder(anchor, value, "__bool__"))
     return emitBoolValue(*truth, anchor);
-  if (std::optional<Value> length =
-          tryEmitClassDunder(anchor, value, "__len__")) {
+  if (std::optional<Value> length = tryEmitClassLength(anchor, value)) {
     Value count = *length;
     mlir::Type zeroType = types.literal("0");
     Value zero{py::IntConstantOp::create(builder, loc(anchor), zeroType,

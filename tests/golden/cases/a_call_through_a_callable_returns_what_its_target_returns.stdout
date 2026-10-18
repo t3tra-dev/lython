@@ -1,0 +1,12 @@
+1
+B() B() True False
+None None True True
+True True True False
+0.5 0.5 True False
+3 3 True False
+None None True True
+(1, 'a') (1, 'a') True False
+{'k': [1]} {'k': [1]} True False
+-1 42 8 -1
+True True True
+5 None False True

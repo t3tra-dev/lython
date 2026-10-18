@@ -501,6 +501,69 @@ TEST(EmitterTest, NamesThePrintKeywordItCannotTake) {
       reportsDiagnostic(unknown, "does not take the keyword argument 'color'"));
 }
 
+// A computed attribute name is answered as a call or by hasattr/dir; each
+// shape it cannot answer exactly is refused at the call, with the reason.
+TEST(EmitterTest, AComputedAttributeNameIsRefusedWhereItCannotBeAnswered) {
+  mlir::MLIRContext context(testRegistry());
+  const char *classes = "class T:\n"
+                        "    def go(self, a: int) -> int:\n"
+                        "        return a\n"
+                        "def f() -> int:\n"
+                        "    return 1\n";
+  for (const char *use :
+       {"def use(t: T, n: str) -> None:\n"
+        "    print(getattr(t, n)(1), hasattr(t, n))\n",
+        "print(dir(T), dir(T()))\n"}) {
+    std::string source = std::string(classes) + use;
+    lython::emitter::EmitResult accepted = emitSource(source, context);
+    EXPECT_TRUE(accepted.ok()) << source;
+  }
+  struct Refused {
+    const char *use;
+    const char *reason;
+  };
+  for (const Refused &refused : std::initializer_list<Refused>{
+           {"def use(t: T, n: str) -> None:\n    m = getattr(t, n)\n",
+            "is supported as the call `getattr(x, name)(...)`"},
+           {"def use(t: T, n: str) -> None:\n    print(getattr(t, n)(f()))\n",
+            "takes only names and constants as arguments"},
+           {"def use(t: T, n: str) -> None:\n    print(getattr(t, n)(a=1))\n",
+            "takes no keyword arguments"},
+           {"def use(n: str) -> None:\n    print(getattr(5, n)())\n",
+            "needs a receiver whose class this program declares"},
+           {"print(dir())\n", "dir() without an argument"},
+           {"from dataclasses import dataclass\n@dataclass\nclass D:\n"
+            "    x: int\nprint(dir(D))\n",
+            "has a decorator"},
+           {"class E(Exception):\n    pass\nprint(dir(E))\n",
+            "derives from 'Exception'"}}) {
+    std::string source = std::string(classes) + refused.use;
+    lython::emitter::EmitResult result = emitSource(source, context);
+    EXPECT_FALSE(result.ok()) << source;
+    EXPECT_TRUE(reportsDiagnostic(result, refused.reason)) << source;
+  }
+}
+
+// object's own __eq__/__ne__ answer NotImplemented for two different
+// objects, which has no value here; the call is refused with that reason.
+TEST(EmitterTest, ObjectsOwnEqualityIsRefusedForItsNotImplemented) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult accepted = emitSource(
+      "class A:\n    pass\na = A()\n"
+      "print(object.__repr__(a), object.__str__(a), object.__hash__(a))\n",
+      context);
+  EXPECT_TRUE(accepted.ok());
+  for (const char *spelling : {"__eq__", "__ne__"}) {
+    std::string source = std::string("class A:\n    pass\n"
+                                     "print(object.") +
+                         spelling + "(A(), A()))\n";
+    lython::emitter::EmitResult result = emitSource(source, context);
+    EXPECT_FALSE(result.ok()) << spelling;
+    EXPECT_TRUE(reportsDiagnostic(result, "answers NotImplemented"))
+        << spelling;
+  }
+}
+
 TEST(EmitterTest, RejectsMethodArgumentThatViolatesTheDeclaredParameter) {
   mlir::MLIRContext context(testRegistry());
   lython::emitter::EmitResult method = emitSource(

@@ -1,0 +1,8 @@
+['test_add', 'test_error', 'test_fail'] ['test_upper']
+MathTest test_add -> ok ['setUp', 'tearDown']
+MathTest test_error -> ERROR: KeyError: 'missing' ['setUp', 'tearDown']
+MathTest test_fail -> FAIL: base is 10 ['setUp', 'tearDown']
+StrTest test_upper -> ok ['setUp', 'tearDown']
+StrTest test_add -> no such test method: test_add []
+MathTest nope -> no such test method: nope []
+MathTest helper -> ok ['setUp', 'tearDown']

@@ -1,0 +1,8 @@
+['__annotate_func__', '__class__', '__delattr__', '__dict__', '__dir__', '__doc__', '__eq__', '__firstlineno__', '__format__', '__ge__', '__getattribute__', '__getstate__', '__gt__', '__hash__', '__init__', '__init_subclass__', '__le__', '__lt__', '__module__', '__ne__', '__new__', '__reduce__', '__reduce_ex__', '__repr__', '__setattr__', '__sizeof__', '__static_attributes__', '__str__', '__subclasshook__', '__weakref__', 'later', 'm', 'x']
+['test_a', 'test_b']
+True 30 False
+['later', 'm', 'x'] ['helper', 'later', 'm', 'test_a', 'test_b', 'x']
+['f', 'later', 'm', 'x']
+['f', 'later', 'm', 'w', 'x']
+['f', 'helper', 'later', 'm', 'test_a', 'test_b', 'x']
+['f', 'helper', 'later', 'm', 'test_a', 'test_b', 'w', 'x']
