@@ -1,0 +1,3 @@
+ok FAIL 0 is not true ok FAIL 0.0 is not true
+ok ok FAIL nan is not false ok ok ok
+True False False True

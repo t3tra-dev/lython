@@ -564,6 +564,31 @@ TEST(EmitterTest, ObjectsOwnEqualityIsRefusedForItsNotImplemented) {
   }
 }
 
+// R1 refuses the truth test of an int the program typed as an int; a number
+// held by a parameter declared `object` is tested as the object it is there.
+TEST(EmitterTest, ImplicitTruthOfAnIntIsRefusedOnlyWhereTheIntIsDeclared) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult held = emitSource(
+      "class T:\n"
+      "    def check(self, expr: object) -> bool:\n"
+      "        return not expr\n"
+      "print(T().check(3), T().check(0.0))\n",
+      context);
+  EXPECT_TRUE(held.ok());
+  for (const char *declared : {"int", "float"}) {
+    std::string source = std::string("class T:\n"
+                                     "    def check(self, n: ") +
+                         declared +
+                         ") -> bool:\n"
+                         "        return not n\n"
+                         "print(T().check(3))\n";
+    lython::emitter::EmitResult result = emitSource(source, context);
+    EXPECT_FALSE(result.ok()) << declared;
+    EXPECT_TRUE(reportsDiagnostic(result, "implicit truthiness of"))
+        << declared;
+  }
+}
+
 TEST(EmitterTest, RejectsMethodArgumentThatViolatesTheDeclaredParameter) {
   mlir::MLIRContext context(testRegistry());
   lython::emitter::EmitResult method = emitSource(

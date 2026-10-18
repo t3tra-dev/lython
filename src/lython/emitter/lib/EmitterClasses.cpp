@@ -5195,8 +5195,21 @@ Value ModuleEmitter::emitInlineMethodBody(
       synthesizedClassMethods, [&](const parser::NodePtr &synthesized) {
         return synthesized.get() == method.method;
       });
+  // Forgotten when the body is done: a value of this emission means nothing
+  // to the next one, and an erased op's address can be reused.
+  llvm::SmallVector<mlir::Value, 2> heldAsObject;
+  llvm::scope_exit forgetHeldAsObject([&] {
+    for (mlir::Value held : heldAsObject)
+      numbersHeldAsObject.erase(held);
+  });
   auto checkArgument = [&](llvm::StringRef name, mlir::Type declared,
                            Value argument) {
+    if (declared && argument.value &&
+        types.widenLiteral(declared) == types.object() &&
+        (types.widenLiteral(argument.type) == types.intType() ||
+         types.widenLiteral(argument.type) == types.floatType()) &&
+        numbersHeldAsObject.insert(argument.value).second)
+      heldAsObject.push_back(argument.value);
     if (methodIsSynthesized || !declared || !argument.type)
       return;
     mlir::Type expected = types.widenLiteral(declared);

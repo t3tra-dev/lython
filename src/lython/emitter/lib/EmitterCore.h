@@ -1475,6 +1475,10 @@ private:
       const CallInferenceResult &inference,
       llvm::ArrayRef<mlir::Type> argumentTypes) const;
   mlir::Value emitBoolValue(Value value, const parser::Node &anchor);
+  mlir::Value emitNumberTruth(Value value, const parser::Node &anchor);
+  // Ints and floats an inlined method bound to a parameter declared
+  // `object`: their truth test is an object's, which R1 does not refuse.
+  llvm::DenseSet<mlir::Value> numbersHeldAsObject;
 
   template <typename Op>
   Value emitBinarySpecial(const parser::Node &anchor, llvm::StringRef method,
