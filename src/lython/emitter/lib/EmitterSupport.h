@@ -175,6 +175,9 @@ bool declaredSubclassOfType(mlir::Type sub, mlir::Type super,
 
 bool isAssignableWithStaticEvidence(mlir::Type actual, mlir::Type expected,
                                     mlir::Operation *from);
+// A type as a Python program spells it (`list[int]`, `int | None`), for a
+// diagnostic about the program rather than about the dialect.
+std::string pythonTypeSpelling(mlir::Type type);
 // Does Python's class hierarchy say `sub` is a subclass of `super`? Wider than
 // assignability by exactly one rung (bool < int); see the definition.
 bool pythonSubclassOf(mlir::Type sub, mlir::Type super, TypeSystem &types,

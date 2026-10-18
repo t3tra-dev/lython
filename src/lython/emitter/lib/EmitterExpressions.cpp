@@ -5464,6 +5464,33 @@ Value ModuleEmitter::coerceValue(Value value, mlir::Type targetType,
             return value;
         }
     }
+  // ⭐ AN UPCAST IS A RETYPING, SO IT NEEDS A SUBCLASS. Two unrelated classes
+  // share no representation, and retyping one as the other read its payload as
+  // the other's:
+  //
+  //     x: int = 1
+  //     x = "hello"
+  //     print(x)        # printed 5708990769494611528448228004894173606255027560
+  //
+  // -- the string's bytes as an integer. The same happened to a field `__init__`
+  // typed int that another method stored a str into. CPython stores the str;
+  // here the declared type is the storage, so the store is refused instead.
+  if (auto targetContract = mlir::dyn_cast<py::ContractType>(targetType))
+    if (auto valueContract = mlir::dyn_cast_if_present<py::ContractType>(
+            types.widenLiteral(value.type));
+        valueContract &&
+        valueContract.getContractName() != targetContract.getContractName() &&
+        !py::isPyObjectType(targetContract) &&
+        !pythonSubclassOf(valueContract, targetContract, types, module)) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, anchor.range.start,
+          "a " + pythonTypeSpelling(valueContract) +
+              " value cannot be stored where " +
+              pythonTypeSpelling(targetContract) +
+              " is declared: the declared type is the storage here, and the "
+              "two share no representation"});
+      return value;
+    }
   if (mlir::isa<py::ContractType, py::LiteralType, py::CallableType,
                 py::TypeType, py::SelfType, py::TypeVarType, py::ParamSpecType>(
           targetType)) {

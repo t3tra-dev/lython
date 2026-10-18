@@ -6,6 +6,7 @@
 #include "EmitterPyOps.h"
 
 #include "ExceptionTaxonomy.h"
+#include "Contracts.h"
 
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -49,6 +50,47 @@ bool isAssignableWithStaticEvidence(mlir::Type actual, mlir::Type expected,
       isSourceDefinedContract(expected))
     return py::isAssignableTo(actual, expected, from);
   return py::isAssignableTo(actual, expected);
+}
+
+std::string pythonTypeSpelling(mlir::Type type) {
+  if (auto literal = mlir::dyn_cast_if_present<py::LiteralType>(type)) {
+    llvm::StringRef spelling = literal.getSpelling();
+    if (spelling == "None")
+      return "None";
+    if (spelling == "True" || spelling == "False")
+      return "bool";
+    if (!spelling.empty() && spelling.front() == '"')
+      return "str";
+    return spelling.contains('.') || spelling.contains('e') ? "float" : "int";
+  }
+  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type)) {
+    std::string text =
+        py::contracts::displayClassNameForContract(contract.getContractName());
+    if (contract.getContractName() == "types.NoneType")
+      return "None";
+    if (!contract.getArguments().empty()) {
+      text += "[";
+      for (auto [index, argument] : llvm::enumerate(contract.getArguments())) {
+        if (index)
+          text += ", ";
+        text += pythonTypeSpelling(argument);
+      }
+      text += "]";
+    }
+    return text;
+  }
+  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type)) {
+    std::string text;
+    for (auto [index, member] : llvm::enumerate(unionType.getMemberTypes())) {
+      if (index)
+        text += " | ";
+      text += pythonTypeSpelling(member);
+    }
+    return text;
+  }
+  if (auto typeObject = mlir::dyn_cast_if_present<py::TypeType>(type))
+    return "type[" + pythonTypeSpelling(typeObject.getInstanceType()) + "]";
+  return typeText(type);
 }
 
 mlir::ArrayAttr stringArray(mlir::Builder &builder,

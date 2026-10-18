@@ -1147,6 +1147,37 @@ TEST(EmitterTest, AModuleLevelLambdaCannotFreezeAReboundName) {
   EXPECT_TRUE(stable.ok());
 }
 
+// What: a value of a class unrelated to the declared one is refused where it is
+// stored -- an annotated name, and a field `__init__` typed int that another
+// method stores a str into -- while a subclass is still stored where its base,
+// or a builtin exception two levels above it, is declared. The unrelated store
+// used to retype the value, and the str's payload printed as an integer.
+TEST(EmitterTest, AValueOfAnUnrelatedClassIsRefusedWhereAnotherIsDeclared) {
+  for (const char *source :
+       {"x: int = 1\nx = \"hello\"\nprint(x)\n",
+        "class C:\n    def __init__(self) -> None:\n        self.x = 1\n"
+        "    def b(self) -> None:\n        self.x = \"s\"\n"
+        "c = C()\nc.b()\nprint(c.x)\n"}) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult result = emitSource(source, context);
+    EXPECT_FALSE(result.ok()) << source;
+    bool named = false;
+    for (const lython::parser::Diagnostic &diagnostic : result.diagnostics)
+      named = named ||
+              diagnostic.message.find(
+                  "a str value cannot be stored where int is declared") !=
+                  std::string::npos;
+    EXPECT_TRUE(named) << source;
+  }
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult subclass = emitSource(
+      "class B:\n    pass\nclass D(B):\n    pass\nb: B = D()\n"
+      "class Err(Exception):\n    pass\ne: BaseException = Err(\"x\")\n"
+      "print(b, e)\n",
+      context);
+  EXPECT_TRUE(subclass.ok());
+}
+
 TEST(EmitterTest, AnAttributeASourceClassDoesNotHaveIsRefusedAtEmit) {
   // Nothing resolves the read -- not a field, a class attribute, a method or
   // a property -- and it used to be emitted anyway and die in the lowering as
