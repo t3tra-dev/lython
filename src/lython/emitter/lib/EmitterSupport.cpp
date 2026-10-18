@@ -580,14 +580,28 @@ static bool sourceClassUnderManifestBase(mlir::Type sub, mlir::Type super,
   llvm::StringRef superLeaf = superName.rsplit('.').second;
   if (superLeaf.empty())
     superLeaf = superName;
-  if (types.declaredSubclassOf(subContract.getContractName(), superLeaf))
+  // ⭐ BOTH SPELLINGS OF THE BASE. An imported class records the base it was
+  // written with (`Exception`); a class of the program itself records the
+  // contract it resolved to (`builtins.Exception`). Only the first was asked,
+  // so for a class in the main module every question one level past its
+  // written base answered no, silently:
+  //
+  //     class Err(Exception): pass
+  //     print(issubclass(Err, BaseException))   # printed False
+  //     def classify(e: BaseException) -> str:
+  //         if isinstance(e, Err): return "err" # folded away: "other"
+  auto declaredUnder = [&](llvm::StringRef qualified, llvm::StringRef leaf) {
+    return types.declaredSubclassOf(subContract.getContractName(), qualified) ||
+           types.declaredSubclassOf(subContract.getContractName(), leaf);
+  };
+  if (declaredUnder(superName, superLeaf))
     return true;
   // Written under a base that is itself under the target: `class E(ValueError)`
   // asked about `Exception`. The taxonomy is the only place that edge exists.
   for (const py::exceptions::BuiltinExceptionInfo &entry :
        py::exceptions::kBuiltinExceptions)
     if (py::exceptions::isBuiltinExceptionSubclassName(entry.name, superLeaf) &&
-        types.declaredSubclassOf(subContract.getContractName(), entry.name))
+        declaredUnder(entry.contract, entry.name))
       return true;
   return false;
 }
