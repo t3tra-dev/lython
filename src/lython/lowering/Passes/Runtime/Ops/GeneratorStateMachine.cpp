@@ -1419,6 +1419,13 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
     llvm::SmallVector<mlir::Type, 8> bodyArguments(
         callable.getPositionalTypes().begin(),
         callable.getPositionalTypes().end());
+    // ⭐ AND THE KEYWORD-ONLY ONES, between the positionals and `*args`: the
+    // order the body's entry block and the call's sources both have. Left
+    // out, every generator with a keyword-only parameter was refused --
+    // "generator resume clone entry argument count does not match
+    // callable_type" for `def gen(a: int, *, by: int)`.
+    bodyArguments.append(callable.getKwOnlyTypes().begin(),
+                         callable.getKwOnlyTypes().end());
     if (callable.hasVararg())
       bodyArguments.push_back(callable.getVarargType());
     // ⭐ AND THE CAPTURES, which the body takes as entry arguments after its

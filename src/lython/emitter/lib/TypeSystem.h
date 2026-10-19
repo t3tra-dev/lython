@@ -49,6 +49,21 @@ struct FunctionSignature {
   mlir::Type kwargType;
   std::optional<std::string> varargName;
   std::optional<std::string> kwargName;
+  // `*args: P.args` / `**kwargs: P.kwargs`: the ParamSpec each spells.
+  std::optional<std::string> paramSpecArgs;
+  std::optional<std::string> paramSpecKwargs;
+  // A specialization at one call's shape (ensureGenericSpecialization): what
+  // the call gave P are parameters of their own -- unnamed positional ones
+  // from `paramSpecPositionalStart`, keyword-only ones from
+  // `paramSpecKwOnlyStart` -- with no `*args`/`**kwargs` left in the ABI, and
+  // the body binds those names to packs of them, at the declared pack types.
+  bool paramSpecExpanded = false;
+  unsigned paramSpecPositionalStart = 0;
+  unsigned paramSpecPositionalCount = 0;
+  unsigned paramSpecKwOnlyStart = 0;
+  unsigned paramSpecKwOnlyCount = 0;
+  mlir::Type paramSpecArgsType;
+  mlir::Type paramSpecKwargsType;
   unsigned positionalOnlyCount = 0;
   mlir::Type resultType;
   mlir::Type publicResultType;
@@ -75,6 +90,12 @@ struct FunctionSignature {
   mlir::Type generatorSendType;
   mlir::Type generatorReturnType;
 };
+
+// A function whose `*args`/`**kwargs` spell a ParamSpec's `P.args`/`P.kwargs`:
+// what they hold is whatever each call passes on to the callable P describes.
+inline bool forwardsParamSpec(const FunctionSignature &sig) {
+  return sig.paramSpecArgs.has_value() || sig.paramSpecKwargs.has_value();
+}
 
 struct CallKeywordType {
   std::string name;

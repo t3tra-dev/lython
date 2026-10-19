@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace lython::emitter {
@@ -109,6 +110,38 @@ struct PrimitiveConstant {
   std::int64_t integerValue = 0;
 };
 
+// The keyword arguments a call gave a method that is inlined, in the order
+// it gave them -- which is the order its `**kwargs` dict holds them in.
+//
+// ⛔ NOT A StringMap, which is what this was: its iteration order is the
+// hash's, so `C().m(zeta=1, alpha=2)` handed `**kw` the keys as
+// ['alpha', 'zeta'] where CPython (and a call of a plain function here) gives
+// ['zeta', 'alpha'].
+class KeywordArguments {
+public:
+  struct Entry {
+    std::string name;
+    Value value;
+    llvm::StringRef getKey() const { return name; }
+    Value getValue() const { return value; }
+  };
+
+  Value &operator[](llvm::StringRef name) {
+    for (Entry &entry : entries)
+      if (entry.name == name)
+        return entry.value;
+    entries.push_back(Entry{name.str(), Value{}});
+    return entries.back().value;
+  }
+  bool empty() const { return entries.empty(); }
+  std::size_t size() const { return entries.size(); }
+  const Entry *begin() const { return entries.begin(); }
+  const Entry *end() const { return entries.end(); }
+
+private:
+  llvm::SmallVector<Entry, 4> entries;
+};
+
 struct CallOperands {
   bool valid = true;
   std::string failureReason;
@@ -118,6 +151,20 @@ struct CallOperands {
   llvm::SmallVector<Value, 4> keywordNames;
   llvm::SmallVector<Value, 4> keywordValues;
   llvm::SmallVector<CallKeywordType, 4> keywordTypes;
+  // A starred sequence whose length only the run time knows (`f(*xs)`, xs a
+  // list or a `tuple[T, ...]`) -- its index in `positional`, always the last
+  // -- and a `**mapping` whose keys only the run time knows -- its index in
+  // the keyword vectors, named "". Either leaves `valid` false: only a
+  // consumer that knows its callee's parameters can take them
+  // (ModuleEmitter::normalizeDynamicUnpacks), and every other one refuses
+  // with `failureReason` as before.
+  std::optional<unsigned> dynamicTail;
+  std::optional<unsigned> dynamicMapping;
+  // Invalid for a reason of its own, which normalizing cannot repair.
+  bool invalidBeyondDynamic = false;
+  // After normalizing: the last positional operand IS the callee's *args
+  // tuple, which the pack says with `ly.variadic_tail`.
+  bool variadicTail = false;
 };
 
 class ScopedEmitterScope {

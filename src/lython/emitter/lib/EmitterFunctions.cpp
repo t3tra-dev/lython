@@ -84,7 +84,8 @@ void ModuleEmitter::emitFunctionDecl(const parser::Node &function) {
   checkDecorators(function, DecoratorRole::Function);
   FunctionSignature sig = types.functionSignature(function);
   if (!diagnoseUnsupportedFunctionSignature(diagnostics, function, sig)) {
-    if (unboundStaticParameterCount(sig.publicCallable) != 0) {
+    if (unboundStaticParameterCount(sig.publicCallable) != 0 ||
+        forwardsParamSpec(sig)) {
       bool packParameterized = false;
       py::mapPyTypeStructure(
           sig.publicCallable, [&](mlir::Type node) -> std::optional<mlir::Type> {
@@ -163,9 +164,9 @@ ModuleEmitter::lookupMonomorphicFunction(llvm::StringRef name) {
 }
 
 std::optional<std::pair<std::string, py::CallableType>>
-ModuleEmitter::ensureGenericSpecialization(const parser::Node &anchor,
-                                           GenericFunctionInfo &generic,
-                                           py::CallableType target) {
+ModuleEmitter::ensureGenericSpecialization(
+    const parser::Node &anchor, GenericFunctionInfo &generic,
+    py::CallableType target, const ParamSpecCallShape *paramSpecShape) {
   auto name = ast::string(*generic.node, "name");
   auto fail = [&](llvm::StringRef detail) {
     diagnostics.push_back(parser::Diagnostic{
@@ -190,6 +191,10 @@ ModuleEmitter::ensureGenericSpecialization(const parser::Node &anchor,
   if (packParameterized)
     return fail("ParamSpec or TypeVarTuple parameters cannot be "
                 "specialized yet");
+  if (forwardsParamSpec(generic.signature) && !paramSpecShape)
+    return fail("its `*args: P.args` and `**kwargs: P.kwargs` take what each "
+                "call passes, so it is specialized at a call and has no value "
+                "of its own");
 
   TypeBindingMap bindings;
   if (!target ||
@@ -215,6 +220,48 @@ ModuleEmitter::ensureGenericSpecialization(const parser::Node &anchor,
   specialized.generatorSendType = substitute(specialized.generatorSendType);
   specialized.generatorReturnType =
       substitute(specialized.generatorReturnType);
+  // ⭐ P IS WHAT THE CALL PASSED. `Callable[P, R]` is erased to
+  // `Callable[..., R]` (any arguments), so nothing in the signature says what
+  // `*args: P.args` and `**kwargs: P.kwargs` hold -- the call does, and this
+  // body is specialized at its shape: one unnamed positional parameter per
+  // argument beyond the declared ones, one keyword-only parameter per keyword
+  // none of them takes. The body forwards them one by one
+  // (bindParamSpecPacks), so `f(*args, **kwargs)` reaches the callee with the
+  // arity and the names the call gave, which a tuple of one and a dict could
+  // not say.
+  if (paramSpecShape) {
+    if (specialized.paramSpecArgs) {
+      specialized.positionalDefaults.resize(specialized.positionalTypes.size(),
+                                            false);
+      specialized.paramSpecArgsType = specialized.varargType;
+      specialized.paramSpecPositionalStart =
+          static_cast<unsigned>(specialized.positionalTypes.size());
+      specialized.paramSpecPositionalCount =
+          static_cast<unsigned>(paramSpecShape->positional.size());
+      for (mlir::Type member : paramSpecShape->positional) {
+        specialized.positionalNames.push_back("");
+        specialized.positionalTypes.push_back(member);
+        specialized.positionalDefaults.push_back(false);
+      }
+      specialized.varargType = {};
+      specialized.callableVarargType = {};
+    }
+    if (specialized.paramSpecKwargs) {
+      specialized.kwOnlyDefaults.resize(specialized.kwOnlyTypes.size(), false);
+      specialized.paramSpecKwargsType = specialized.kwargType;
+      specialized.paramSpecKwOnlyStart =
+          static_cast<unsigned>(specialized.kwOnlyTypes.size());
+      specialized.paramSpecKwOnlyCount =
+          static_cast<unsigned>(paramSpecShape->keywords.size());
+      for (const CallKeywordType &member : paramSpecShape->keywords) {
+        specialized.kwOnlyNames.push_back(member.name);
+        specialized.kwOnlyTypes.push_back(member.type);
+        specialized.kwOnlyDefaults.push_back(false);
+      }
+      specialized.kwargType = {};
+    }
+    specialized.paramSpecExpanded = true;
+  }
   types.refreshCallable(specialized);
   if (unboundStaticParameterCount(specialized.publicCallable) != 0 ||
       unboundStaticParameterCount(specialized.callable) != 0)
@@ -259,6 +306,80 @@ ModuleEmitter::ensureGenericSpecialization(const parser::Node &anchor,
   else
     emitSpecializedBody();
   return std::make_pair(symbol, specialized.publicCallable);
+}
+
+ModuleEmitter::ParamSpecCallShape
+ModuleEmitter::paramSpecCallShape(const FunctionSignature &sig,
+                                  const CallOperands &operands) const {
+  ParamSpecCallShape shape;
+  if (sig.paramSpecArgs)
+    for (std::size_t index = sig.positionalTypes.size();
+         index < operands.positionalTypes.size(); ++index)
+      shape.positional.push_back(
+          types.widenLiteral(operands.positionalTypes[index]));
+  if (sig.paramSpecKwargs) {
+    llvm::StringSet<> named;
+    for (auto [index, name] : llvm::enumerate(sig.positionalNames))
+      if (index >= sig.positionalOnlyCount)
+        named.insert(name);
+    for (const std::string &name : sig.kwOnlyNames)
+      named.insert(name);
+    for (const CallKeywordType &keyword : operands.keywordTypes)
+      if (!named.contains(keyword.name))
+        shape.keywords.push_back(
+            CallKeywordType{keyword.name, types.widenLiteral(keyword.type)});
+  }
+  return shape;
+}
+
+llvm::SmallVector<mlir::Value, 2>
+ModuleEmitter::bindParamSpecPacks(const parser::Node &callable,
+                                  const FunctionSignature &sig,
+                                  mlir::Block *entry) {
+  llvm::SmallVector<mlir::Value, 2> held;
+  if (sig.varargName && sig.paramSpecArgs) {
+    llvm::SmallVector<Value, 4> members;
+    for (unsigned index = 0; index < sig.paramSpecPositionalCount; ++index) {
+      unsigned position = sig.paramSpecPositionalStart + index;
+      members.push_back(
+          Value{entry->getArgument(position), sig.positionalTypes[position]});
+    }
+    // ⛔ An EMPTY pack has no element type to infer; the declared one is the
+    // same expectation an inlined method's empty `*args` takes.
+    Value packed =
+        members.empty() && sig.paramSpecArgsType
+            ? emitExprExpected(
+                  synth::tuple(std::vector<parser::NodePtr>{}, callable.range)
+                      .get(),
+                  sig.paramSpecArgsType)
+            : emitPack(members);
+    if (packed.value &&
+        staticPositionalPacks.try_emplace(packed.value, members).second)
+      held.push_back(packed.value);
+    values[*sig.varargName] = packed;
+    types.bindSymbol(*sig.varargName, packed.type);
+  }
+  if (sig.kwargName && sig.paramSpecKwargs) {
+    llvm::SmallVector<std::pair<std::string, Value>, 4> members;
+    unsigned firstArgument = static_cast<unsigned>(sig.positionalTypes.size()) +
+                             sig.paramSpecKwOnlyStart;
+    for (unsigned index = 0; index < sig.paramSpecKwOnlyCount; ++index) {
+      unsigned kwIndex = sig.paramSpecKwOnlyStart + index;
+      members.push_back({sig.kwOnlyNames[kwIndex],
+                         Value{entry->getArgument(firstArgument + index),
+                               sig.kwOnlyTypes[kwIndex]}});
+    }
+    Value packed =
+        emitKeywordPackDict(callable, members, sig.paramSpecKwargsType);
+    // ⛔ Forwarded by name only while the body never writes it: after
+    // `kwargs["x"] = 1` the names the call gave are not its keys any more.
+    if (packed.value && keywordPackIsOnlyRead(callable, *sig.kwargName) &&
+        staticKeywordPacks.try_emplace(packed.value, members).second)
+      held.push_back(packed.value);
+    values[*sig.kwargName] = packed;
+    types.bindSymbol(*sig.kwargName, packed.type);
+  }
+  return held;
 }
 
 void ModuleEmitter::emitImportedClassAttrInitializers() {
@@ -790,6 +911,15 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   }
 
   builder.setInsertionPointToStart(entry);
+  llvm::SmallVector<mlir::Value, 2> paramSpecPacks;
+  if (sig.paramSpecExpanded)
+    paramSpecPacks = bindParamSpecPacks(callable, sig, entry);
+  auto dropParamSpecPacks = llvm::scope_exit([&] {
+    for (mlir::Value pack : paramSpecPacks) {
+      staticPositionalPacks.erase(pack);
+      staticKeywordPacks.erase(pack);
+    }
+  });
   // ⭐ A boxed PARAMETER gets its cell HERE, where the builder is finally
   // inside the entry block. The assignment path creates a cell on a name's
   // FIRST binding and a parameter is already bound when the body starts, so
@@ -1384,7 +1514,10 @@ mlir::ArrayAttr ModuleEmitter::emitCallableDefaultValues(
   const auto *defaults =
       arguments ? ast::nodeList(*arguments, "defaults") : nullptr;
   if (defaults && !defaults->empty()) {
-    unsigned firstDefault = positionalCount - defaults->size();
+    // The declared positionals end where a ParamSpec's members begin.
+    unsigned declaredPositional =
+        sig.paramSpecExpanded ? sig.paramSpecPositionalStart : positionalCount;
+    unsigned firstDefault = declaredPositional - defaults->size();
     for (auto [index, value] : llvm::enumerate(*defaults))
       if (firstDefault + index < slots.size())
         slots[firstDefault + index] =

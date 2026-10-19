@@ -211,6 +211,41 @@ callableUnpackedKeywordValueType(mlir::Type mappingType) {
   return std::nullopt;
 }
 
+// A positional ACTUAL that is a starred sequence of unknown length -- the
+// `xs` of `f(*xs)` for a `tuple[T, ...]` or a list -- spelled `*tuple[T]`, the
+// unpack of the arity-erased tuple. It is always the last positional actual,
+// and only a vararg can take it (lython::callable::matchInvocationWithObserver).
+inline std::optional<mlir::Type> variadicTailElement(mlir::Type actual) {
+  auto unpack = mlir::dyn_cast_if_present<UnpackType>(actual);
+  if (!unpack)
+    return std::nullopt;
+  auto tuple = mlir::dyn_cast_if_present<ContractType>(unpack.getPackedType());
+  if (!tuple || tuple.getContractName() != "builtins.tuple" ||
+      tuple.getArguments().size() != 1)
+    return std::nullopt;
+  return tuple.getArguments().front();
+}
+
+// The member type of a starred argument whose length only the run time
+// knows: a list's, or the arity-erased tuple's (`tuple[T, ...]`, spelled
+// `tuple[T]`). Nothing for a tuple whose type counts its members -- that one
+// is spread statically -- or for another iterable.
+inline std::optional<mlir::Type> dynamicStarElementType(mlir::Type type) {
+  auto contract = mlir::dyn_cast_if_present<ContractType>(type);
+  if (!contract || contract.getArguments().size() != 1)
+    return std::nullopt;
+  llvm::StringRef name = contract.getContractName();
+  if (name != "builtins.tuple" && name != "builtins.list")
+    return std::nullopt;
+  return contract.getArguments().front();
+}
+
+inline mlir::Type variadicTailType(mlir::Type element) {
+  mlir::MLIRContext *context = element.getContext();
+  return UnpackType::get(context,
+                         ContractType::get(context, "builtins.tuple", {element}));
+}
+
 template <typename Keyword, typename MatchExpected, typename KeywordName,
           typename KeywordValue, typename MatchObserver>
 bool matchCallableInvocationWithObserver(
@@ -218,6 +253,11 @@ bool matchCallableInvocationWithObserver(
     llvm::ArrayRef<Keyword> keywords, MatchExpected matchExpected,
     KeywordName keywordName, KeywordValue keywordValue, MatchObserver &observer,
     bool requireSatisfiedDefaults = true) {
+  std::optional<mlir::Type> tail;
+  if (!positional.empty())
+    tail = variadicTailElement(positional.back());
+  if (tail)
+    positional = positional.drop_back();
   return lython::callable::matchInvocationWithObserver(
       shape.signature(), positional, keywords, std::move(matchExpected),
       [](mlir::Type expected) { return callableVarargShape(expected); },
@@ -228,7 +268,7 @@ bool matchCallableInvocationWithObserver(
         return callableUnpackedKeywordValueType(actual);
       },
       std::move(keywordName), std::move(keywordValue), observer,
-      requireSatisfiedDefaults);
+      requireSatisfiedDefaults, tail);
 }
 
 template <typename Keyword, typename MatchExpected, typename KeywordName,

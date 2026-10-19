@@ -23,6 +23,7 @@ extern const llvm::StringLiteral kCallableKwargValueTypeAttr{
     "callable_kwarg_value_type"};
 extern const llvm::StringLiteral kPackUnpackedOperandsAttr{
     "ly.unpack_operands"};
+extern const llvm::StringLiteral kPackVariadicTailAttr{"ly.variadic_tail"};
 
 bool isPrimitiveOnlyCallable(py::CallableType callable) {
   if (!callable || callable.hasVararg() || callable.hasKwarg() ||

@@ -824,11 +824,11 @@ TEST(EmitterTest, AMethodForwardingItsPacksIsRefusedWhereItCannotBeExact) {
            {"        kwargs[\"c\"] = 9.5\n"
             "        return f(*args, **kwargs)\n"
             "print(T().call(show, 1))\n",
-            "`**` call arguments require statically known keyword names"},
+            "its keys could name 'c' of 'show', which Python binds first"},
            {"        return f(*args, **kwargs)\n"
             "xs = [1]\n"
             "print(T().call(show, *xs))\n",
-            "unless their length is known here"},
+            "its first members would fill 'a' and 'c' of 'show'"},
            {"        return f(*args, **kwargs)\n"
             "m = T().call\n",
             "it forwards its *args or **kwargs"}}) {
@@ -1427,7 +1427,10 @@ TEST(EmitterTest, AnExhaustiveMatchDoesNotFallThrough) {
 // Emit-layer and not golden: the refusal is the whole behaviour, and it used
 // to happen eight phases later as "kw names and kw values must have the same
 // size" against a fused location carrying no source line.
-TEST(EmitterTest, RefusesAMappingUnpackedIntoACall) {
+// A `**` mapping whose keys only the run time knows reaches a function's
+// **kwargs -- a dict, a display, a forwarded **kwargs -- and is refused where
+// its keys could name a parameter, which is named in the message.
+TEST(EmitterTest, AMappingOfUnknownKeysReachesOnlyKwargs) {
   mlir::MLIRContext context(testRegistry());
   const char *collector = "def show(**kwargs: int) -> int:\n"
                           "    return len(kwargs)\n";
@@ -1439,14 +1442,17 @@ TEST(EmitterTest, RefusesAMappingUnpackedIntoACall) {
         std::string(collector) + "print(show(**{\"a\": 7}))\n",
         std::string(collector) + "def outer(**kw: int) -> int:\n"
                                  "    return show(**kw)\n"
-                                 "print(outer(a=1))\n",
-        std::string(named) + "opts = {\"a\": 1, \"b\": 2}\nprint(f(**opts))\n"}) {
+                                 "print(outer(a=1))\n"}) {
     lython::emitter::EmitResult result = emitSource(source, context);
-    EXPECT_FALSE(result.ok()) << source;
-    EXPECT_TRUE(reportsDiagnostic(
-        result, "`**` call arguments require statically known keyword names"))
-        << source;
+    EXPECT_TRUE(result.ok()) << source;
   }
+
+  lython::emitter::EmitResult refused = emitSource(
+      std::string(named) + "opts = {\"a\": 1, \"b\": 2}\nprint(f(**opts))\n",
+      context);
+  EXPECT_FALSE(refused.ok());
+  EXPECT_TRUE(reportsDiagnostic(refused, "its keys could name 'a' and 'b' of "
+                                         "'f', which Python binds first"));
 
   lython::emitter::EmitResult spelled = emitSource(
       std::string(collector) + "print(show(a=7, b=8))\n", context);
@@ -1454,6 +1460,90 @@ TEST(EmitterTest, RefusesAMappingUnpackedIntoACall) {
   lython::emitter::EmitResult positional =
       emitSource(std::string(named) + "print(f(1, 2))\n", context);
   EXPECT_TRUE(positional.ok());
+}
+
+// A starred sequence whose length only the run time knows reaches *args, and
+// is refused where its first members would fill a positional parameter, after
+// which nothing positional may follow it, and before a builtin.
+TEST(EmitterTest, AStarredSequenceOfUnknownLengthReachesOnlyArgs) {
+  mlir::MLIRContext context(testRegistry());
+  struct Case {
+    const char *source;
+    const char *message;
+  };
+  for (const Case &item : {
+           Case{"def f(a: int = 0, *rest: int) -> int:\n"
+                "    return a\n"
+                "xs = [1]\n"
+                "print(f(*xs))\n",
+                "its first members would fill 'a' of 'f'"},
+           Case{"def h(*rest: int) -> int:\n"
+                "    return len(rest)\n"
+                "xs = [1]\n"
+                "print(h(*xs, 2))\n",
+                "must be the last positional argument"},
+           Case{"xs = [1, 2]\n"
+                "print(*xs)\n",
+                "only to the *args of a function or method this program "
+                "defines"},
+       }) {
+    mlir::MLIRContext caseContext(testRegistry());
+    lython::emitter::EmitResult result = emitSource(item.source, caseContext);
+    EXPECT_FALSE(result.ok()) << item.source;
+    EXPECT_TRUE(reportsDiagnostic(result, item.message)) << item.source;
+  }
+  lython::emitter::EmitResult forwarded = emitSource(
+      "def total(*args: int) -> int:\n"
+      "    return len(args)\n"
+      "def relay(*args: int) -> int:\n"
+      "    return total(*args)\n"
+      "xs = [1, 2]\n"
+      "print(total(*xs), total(0, *xs), relay(3, 4))\n",
+      context);
+  EXPECT_TRUE(forwarded.ok());
+}
+
+// A function forwarding `*args: P.args` and `**kwargs: P.kwargs` is compiled
+// at each call's shape; a call whose shape only the run knows, and a use that
+// is not a call, are refused, as is `Concatenate` outside `Callable`.
+TEST(EmitterTest, AParamSpecForwarderIsSpecializedAtEachCall) {
+  const char *forwarder =
+      "from collections.abc import Callable\n"
+      "def call[**P, R](f: Callable[P, R], *args: P.args,\n"
+      "                 **kwargs: P.kwargs) -> R:\n"
+      "    return f(*args, **kwargs)\n"
+      "def add(a: int, b: int = 0) -> int:\n"
+      "    return a + b\n";
+  {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult called = emitSource(
+        std::string(forwarder) + "print(call(add, 1), call(add, 1, b=2))\n",
+        context);
+    EXPECT_TRUE(called.ok());
+  }
+  struct Case {
+    std::string source;
+    const char *message;
+  };
+  for (const Case &item : {
+           Case{std::string(forwarder) + "xs = [1, 2]\nprint(call(add, *xs))\n",
+                "cannot fill `*args: P.args` or `**kwargs: P.kwargs`"},
+           Case{std::string(forwarder) +
+                    "d = {\"b\": 2}\nprint(call(add, 1, **d))\n",
+                "cannot fill `*args: P.args` or `**kwargs: P.kwargs`"},
+           Case{std::string(forwarder) + "g: Callable[..., int] = call\n",
+                "specialized at a call and has no value of its own"},
+           Case{"from typing import Concatenate\n"
+                "def f(x: Concatenate[int, str]) -> None:\n"
+                "    pass\n",
+                "`Concatenate[...]` is meaningful only as the first argument "
+                "of `Callable`"},
+       }) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult result = emitSource(item.source, context);
+    EXPECT_FALSE(result.ok()) << item.source;
+    EXPECT_TRUE(reportsDiagnostic(result, item.message)) << item.source;
+  }
 }
 
 TEST(EmitterTest, RepeatedEmitIsStable) {

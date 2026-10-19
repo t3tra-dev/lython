@@ -21,6 +21,10 @@ namespace lython::emitter {
 extern const llvm::StringLiteral kCallableVarargValueTypeAttr;
 extern const llvm::StringLiteral kCallableKwargValueTypeAttr;
 extern const llvm::StringLiteral kPackUnpackedOperandsAttr;
+// On a call's positional pack: its last operand is a starred tuple whose
+// length only the run time knows, and it is the callee's whole *args
+// (ModuleEmitter::normalizeDynamicUnpacks).
+extern const llvm::StringLiteral kPackVariadicTailAttr;
 
 bool isPrimitiveOnlyCallable(py::CallableType callable);
 

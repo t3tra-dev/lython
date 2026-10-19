@@ -1822,7 +1822,8 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
         FunctionSignature sig = types.functionSignature(*statement);
         std::string canonical =
             sourceModuleFunctionSymbol(source.moduleName, *name);
-        if (unboundStaticParameterCount(sig.publicCallable) != 0) {
+        if (unboundStaticParameterCount(sig.publicCallable) != 0 ||
+            forwardsParamSpec(sig)) {
           // Same monomorphization strategy as main-module generics: no
           // direct emission (the py ABI cannot carry a type parameter), one
           // specialization per ground instantiation demanded by a use site.
