@@ -62,6 +62,7 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
 | 2026-10-20 | `ut_unsupported_bound_builtin_method_as_callable`、`ut_unsupported_builtin_function_as_callable`、`wb_a_bound_method_off_a_builtin_instance` | 方針 3 (ビルトインを Callable の値に)。組み込みクラスのインスタンスから読んだメソッドは、読んだ時点の受け手をキャプチャしたフォワーダ (`return __ly_recv.method(...)`) になる。型は最短のオーバーロードの必須引数だけ (`xs.pop` は `Callable[[], int]`)。組み込み関数を Callable の値が期待される位置 (引数、注釈付き変数、辞書の値、戻り値) に渡すと、その期待型で型付けしたフォワーダになる (`print` の `*args` や `len` のオーバーロードは、受け取る側の型が決める)。途中で、`Iterable[str]` を取る関数が候補に入る間接呼び出しで、str を箱に入れずに渡して全体が拒否される既存の不具合を直した。これで試作の回避策はゼロになった。 |
 | 2026-10-20 | `ut_unsupported_subclasses` | 方針 1 (`__subclasses__` を静的に)。`C.__subclasses__()` を、C を基底に書いたプログラムのクラスの、作られる順 (取り込んだモジュールのものが先、各モジュールの中は書いた順) のリストで答える。受け手がクラスそのものならリストの表示、実行時にしか決まらないクラス値なら、C とその下のクラスのどれを持つかで選ぶ。関数の中で定義したクラスが並びうる問いは拒否する (関数が走ってから回収されるまでの間だけ部分クラスで、呼び出しごとに別のクラスになるので、静的には決まらない)。`object.__subclasses__()` は CPython ではインタプリタ自身のクラスも並ぶので答えない。試作の `main()` は引数を取らず、`loadTestsFromModule` が `TestCase.__subclasses__()` を下までたどって、`__module__` がそのモジュールのものを名前順 (`dir(module)` の順) に集める。t01 は `unittest.main()` のまま CPython と完全に一致する。 |
 | 2026-10-20 | `ut_unsupported_docstring` | 方針 2 (docstring は読まれる場合だけ残す)。docstring はどこにも格納しない。読む場所で答えが決まるなら定数に畳み、実行時に決まるなら答えうる相手の docstring だけを並べた関数で選ぶ。読まれない docstring は最初から出ない。CPython 3.14 のコンパイラと同じ整形をする (タブを 8 桁に展開、1 行目の先頭の空白を落とし、2 行目以降の共通の字下げを除く)。関数、クラス (継承しない)、メソッド、モジュール (`__doc__`、`lib.__doc__`) を畳む。クラス値、インスタンス、上書きのあるメソッドは実行時のクラスで選び、関数の値は関数オブジェクトの target id で選ぶ (新しい `py.target.is`)。デコレートされたメソッドは、デコレータが返したものの docstring。`getattr(x, name).__doc__` は名前ごとに答える。組み込みの docstring は持たないので、`len.__doc__` などは拒否する (computed name の腕では TypeError)。試作の `TestCase.__init__` と `shortDescription` を CPython の形で戻し、t01 は `-v` でも CPython と完全に一致する。 |
+| 2026-10-20 | `ut_bug_contextmanager_handler_traceback_lacks_body_frames`、`ut_bug_format_exception_only_drops_module` | A6 (トレースバック)。ジェネレータに throw する例外が、呼び出し側のハンドラが処理中の例外そのものなら、退避したフレームを戻してから raise する (CPython の `__traceback__` の上にジェネレータのフレームが積まれる形)。直すと、それまで消えていたテストのフレームが現れ、その下から前からある欠陥が 4 つ見えた。どれも直した。(1) emitter が合成した関数 (`__lygetattr$` など、CPython なら C の処理) が 1 フレームとして出ていた。展開された本体のフレームは残し、関数自身の段だけ外す。(2) 取り込んだモジュールのコードの中に展開した main のメソッドが、そのモジュールのファイル名で出ていた。(3) 1 つの関数の 2 つの `raise cls("...")` が、numeric kernel のフェーズの上流のパスのブロック併合で 1 つにされ、2 つ目がメッセージと自分のフレームを失っていた (黙った誤り)。テンソルを持たない関数は、そのフェーズの間だけ本体を外に預ける。lowering 前の正規化もブロック併合なしにした。(4) `__exit__` が投げた例外の位置が `with` の文脈式でなかった。あわせて `format_exception_only` がクラスを CPython と同じくモジュール名つきの修飾名で書くようにし、その確認の途中で、長いモジュール名の例外クラスの `__name__` と `repr` が 64 バイトで切れていたのを直した。**これで t01 と t02 が、`-v` の有無どちらでも CPython とバイト単位で一致する (初段の目標)。** |
 
 進捗の途中で決めたこと・見つけたこと:
 
@@ -123,6 +124,16 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
     その中で `join` する形。
   - `d.setdefault` のように、必須引数より多い引数で呼ぶ組み込みメソッドを値として
     使う形は型が付かない (必須引数だけの規則のため)。
+- **初段の目標に届いた (2026-10-20)。** 回避策のない試作で、t01 (16 件) と
+  t02 (9 件) の標準出力、標準エラー (所要時間の行を除く)、終了コードが、
+  `-v` の有無どちらでも CPython と一致する。AOT でも同じ。
+- **A6 の途中で見つけた、まだ開いているもの。**
+  - `wb_two_raises_in_a_function_with_a_primitive_tensor` (黙った誤り)。
+    primitive tensor を持つ関数そのものは numeric kernel のフェーズを通るので、
+    上流のパスのブロック併合が残る。テンソルを持たない関数は守られる。
+  - `wb_a_list_of_two_exception_classes_passed_as_their_base` (拒否)。
+    2 種類の例外クラスのインスタンスを並べたリストの要素を、`BaseException`
+    の引数に渡せない。`list[BaseException]` と注釈すれば通る。
 - **docstring で決めたこと。**
   - 読みの型は typeshed どおり `str | None`。答えが定数でも `.splitlines()` を
     直接呼ぶ形は型が合わない (`ut_unsupported_docstring` を絞り込みの形に直した)。
@@ -376,9 +387,10 @@ CPython も自分のインタプリタでテストを動かしているので、
 
 並びは、前の段が次の段の前提になる順にした。
 
-### A. 試作が回避策なしで動き、CPython と同じ結果を出す
+### A. 試作が回避策なしで動き、CPython と同じ結果を出す (済、2026-10-20)
 
-試作の `WORKAROUND(...)` を外せるようにする。
+試作の `WORKAROUND(...)` を外せるようにする。回避策はゼロになり、受け入れ条件を
+満たした (上の進捗の表)。
 
 受け入れ条件:
 

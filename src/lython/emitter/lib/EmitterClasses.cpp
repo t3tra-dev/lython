@@ -5945,6 +5945,13 @@ Value ModuleEmitter::emitInlineMethodBody(
                           /*diagnoseUnsupported=*/false);
     bindSourceModuleLocals(methodSource->moduleName, *methodSource->moduleNode,
                            methodSource->isStub);
+  } else if (sourceName != mainSourceName) {
+    // ⭐ A MAIN-MODULE METHOD WRITTEN INTO AN IMPORTED MODULE'S CODE is still
+    // main.py's. `getattr(self, name)()` in an imported runner inlines the
+    // program's test method there, and its frames carried the runner's file
+    // against the test's lines -- which a traceback filter by file then
+    // dropped as the runner's own.
+    savedSourceName.emplace(sourceName, mainSourceName);
   }
   // A generic class's method body still spells its type parameters (`item:
   // T`), and this inlining happens far from the specialization's emission

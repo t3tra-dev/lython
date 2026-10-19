@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+    body()
+    ~~~~^^
+    with refuse_quietly(1):
+         ~~~~~~~~~~~~~~^^^
+    raise ValueError("refused " + str(self.code))
+ValueError: refused 1

@@ -1856,10 +1856,33 @@ module attributes {
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
-  // Per-program builtin/user exception-class name table (synthesized by the
-  // lowering's support builder; user-defined ids resolve through its
-  // fallback hook). Returns a NUL-terminated ASCII name.
-  func.func private @exception_class_name(%class_word: i64) -> !llvm.ptr
+  // A class's `__name__` as CPython's `type(e).__name__` and `repr(e)` spell
+  // it: the leaf of the name its type object keeps, read with the length the
+  // type object records -- "Exception" for a word that names no class.
+  // ⛔ Not a copy to a NUL under a 64-byte cap, which is what this was: the
+  // cap was written for short taxonomy names, and a class of a module whose
+  // name is long printed the leaf of what fit -- `LibE` for `LibError` under a
+  // 59-character module, the module's own name past 64. LyObject_ClassNameFromId
+  // was fixed for the same cap and these two were left behind.
+  func.func private @LyObject_ClassNameFromId(%class_word: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "class_name_from_id", ly.runtime.result_contract = "builtins.str"}
+  memref.global "private" constant @__ly_exc_name_exception : memref<9xi8> = dense<[69, 120, 99, 101, 112, 116, 105, 111, 110]>
+  func.func private @__ly_exception_leaf_name(%class_word: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
+    %zero = arith.constant 0 : i64
+    %none = arith.cmpi eq, %class_word, %zero : i64
+    cf.cond_br %none, ^unknown, ^known
+
+  ^unknown:
+    %fallback = memref.get_global @__ly_exc_name_exception : memref<9xi8>
+    %fallback_dyn = memref.cast %fallback : memref<9xi8> to memref<?xi8>
+    %nine = arith.constant 9 : i64
+    %fh, %fb = func.call @__ly_unicode_from_valid_utf8(%fallback_dyn, %c0, %nine) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %fh, %fb : memref<2xi64>, memref<?xi8>
+
+  ^known:
+    %nh, %nb = func.call @LyObject_ClassNameFromId(%class_word) : (i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %nh, %nb : memref<2xi64>, memref<?xi8>
+  }
 
   // ⭐ `type(e).__name__`, keyed by the DYNAMIC class word the way the repr below
   // is: an instance caught through a base-class handler answers the class it
@@ -1870,52 +1893,9 @@ module attributes {
   // BaseException.__class_name__ -- so, like str.__int__, it is reachable only
   // through the emitter's own op and never appears in the class declaration.
   func.func @LyBaseException_ClassName(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__class_name__", ly.runtime.result_contract = "builtins.str"} {
-    %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
-    %zero_i8 = arith.constant 0 : i8
-    %cap = arith.constant 64 : index
     %class_word = memref.load %header[%c2] : memref<3xi64>
-    %name_ptr = func.call @exception_class_name(%class_word) : (i64) -> !llvm.ptr
-    // The same bounded copy the repr does: taxonomy names are short ASCII, and
-    // 64 caps a runaway pointer rather than a real name.
-    %buffer = memref.alloca() : memref<64xi8>
-    %true_scan = arith.constant true
-    %dot_byte = arith.constant 46 : i8
-    // ⛔ The taxonomy name is MODULE-QUALIFIED ("lib.SubErr") because the
-    // traceback prints it that way, and CPython's `__name__` and `repr(e)` are
-    // the LEAF -- so the scan also records where the last '.' left off, and the
-    // leaf is shifted down to offset 0 for every reader below.
-    %scan:3 = scf.while (%i = %c0, %go = %true_scan, %start = %c0) : (index, i1, index) -> (index, i1, index) {
-      %in_bounds = arith.cmpi ult, %i, %cap : index
-      %continue = arith.andi %in_bounds, %go : i1
-      scf.condition(%continue) %i, %go, %start : index, i1, index
-    } do {
-    ^bb0(%i: index, %go: i1, %start: index):
-      %i_i64 = arith.index_cast %i : index to i64
-      %slot = llvm.getelementptr %name_ptr[%i_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
-      %byte = llvm.load %slot : !llvm.ptr -> i8
-      %is_nul = arith.cmpi eq, %byte, %zero_i8 : i8
-      %true_x = arith.constant true
-      %not_nul = arith.xori %is_nul, %true_x : i1
-      scf.if %not_nul {
-        memref.store %byte, %buffer[%i] : memref<64xi8>
-      }
-      %next = arith.addi %i, %c1 : index
-      %kept = arith.select %is_nul, %i, %next : index
-      %is_dot = arith.cmpi eq, %byte, %dot_byte : i8
-      %next_start = arith.select %is_dot, %next, %start : index
-      scf.yield %kept, %not_nul, %next_start : index, i1, index
-    }
-    scf.for %i = %scan#2 to %scan#0 step %c1 {
-      %byte = memref.load %buffer[%i] : memref<64xi8>
-      %at = arith.subi %i, %scan#2 : index
-      memref.store %byte, %buffer[%at] : memref<64xi8>
-    }
-    %leaf_len = arith.subi %scan#0, %scan#2 : index
-    %name_len = arith.index_cast %leaf_len : index to i64
-    %name_dyn = memref.cast %buffer : memref<64xi8> to memref<?xi8>
-    %name_h, %name_b = func.call @__ly_unicode_from_valid_utf8(%name_dyn, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %name_h, %name_b = func.call @__ly_exception_leaf_name(%class_word) : (i64) -> (memref<2xi64>, memref<?xi8>)
     func.return %name_h, %name_b : memref<2xi64>, memref<?xi8>
   }
 
@@ -1926,48 +1906,7 @@ module attributes {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
-    %zero_i8 = arith.constant 0 : i8
-    %cap = arith.constant 64 : index
     %class_word = memref.load %header[%c2] : memref<3xi64>
-    %name_ptr = func.call @exception_class_name(%class_word) : (i64) -> !llvm.ptr
-    // Copy the NUL-terminated name into a bounded local buffer (taxonomy
-    // names are short ASCII; 64 caps runaway pointers, not real names).
-    %buffer = memref.alloca() : memref<64xi8>
-    %true_scan = arith.constant true
-    %dot_byte = arith.constant 46 : i8
-    // ⛔ The taxonomy name is MODULE-QUALIFIED ("lib.SubErr") because the
-    // traceback prints it that way, and CPython's `__name__` and `repr(e)` are
-    // the LEAF -- so the scan also records where the last '.' left off, and the
-    // leaf is shifted down to offset 0 for every reader below.
-    %scan:3 = scf.while (%i = %c0, %go = %true_scan, %start = %c0) : (index, i1, index) -> (index, i1, index) {
-      %in_bounds = arith.cmpi ult, %i, %cap : index
-      %continue = arith.andi %in_bounds, %go : i1
-      scf.condition(%continue) %i, %go, %start : index, i1, index
-    } do {
-    ^bb0(%i: index, %go: i1, %start: index):
-      %i_i64 = arith.index_cast %i : index to i64
-      %slot = llvm.getelementptr %name_ptr[%i_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
-      %byte = llvm.load %slot : !llvm.ptr -> i8
-      %is_nul = arith.cmpi eq, %byte, %zero_i8 : i8
-      %true_x = arith.constant true
-      %not_nul = arith.xori %is_nul, %true_x : i1
-      scf.if %not_nul {
-        memref.store %byte, %buffer[%i] : memref<64xi8>
-      }
-      %next = arith.addi %i, %c1 : index
-      %kept = arith.select %is_nul, %i, %next : index
-      %is_dot = arith.cmpi eq, %byte, %dot_byte : i8
-      %next_start = arith.select %is_dot, %next, %start : index
-      scf.yield %kept, %not_nul, %next_start : index, i1, index
-    }
-    scf.for %i = %scan#2 to %scan#0 step %c1 {
-      %byte = memref.load %buffer[%i] : memref<64xi8>
-      %at = arith.subi %i, %scan#2 : index
-      memref.store %byte, %buffer[%at] : memref<64xi8>
-    }
-    %leaf_len = arith.subi %scan#0, %scan#2 : index
-    %name_len = arith.index_cast %leaf_len : index to i64
-    %name_dyn = memref.cast %buffer : memref<64xi8> to memref<?xi8>
     // ExceptionGroup carrying members renders CPython's two-argument form:
     // Name('msg', [member reprs...]); every other exception (and a group
     // whose member block is absent) keeps the message-only form.
@@ -1982,7 +1921,7 @@ module attributes {
     %result:2 = scf.if %grouped -> (memref<2xi64>, memref<?xi8>) {
       %c1_i64 = arith.constant 1 : i64
       %c2_i64 = arith.constant 2 : i64
-      %name_h, %name_b = func.call @__ly_unicode_from_valid_utf8(%name_dyn, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %name_h, %name_b = func.call @__ly_exception_leaf_name(%class_word) : (i64) -> (memref<2xi64>, memref<?xi8>)
       %lparen_ref = memref.get_global @__ly_exc_lparen : memref<1xi8>
       %lparen_dyn = memref.cast %lparen_ref : memref<1xi8> to memref<?xi8>
       %lp_h, %lp_b = func.call @__ly_unicode_from_valid_utf8(%lparen_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
@@ -2066,7 +2005,7 @@ module attributes {
       %preplain:2 = scf.if %args_repr -> (memref<2xi64>, memref<?xi8>) {
         %ac1 = arith.constant 1 : i64
         %ac2 = arith.constant 2 : i64
-        %an_h, %an_b = func.call @__ly_unicode_from_valid_utf8(%name_dyn, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %an_h, %an_b = func.call @__ly_exception_leaf_name(%class_word) : (i64) -> (memref<2xi64>, memref<?xi8>)
         %alp_ref = memref.get_global @__ly_exc_lparen : memref<1xi8>
         %alp_dyn = memref.cast %alp_ref : memref<1xi8> to memref<?xi8>
         %alp_h, %alp_b = func.call @__ly_unicode_from_valid_utf8(%alp_dyn, %c0, %ac1) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
@@ -2110,7 +2049,7 @@ module attributes {
         func.call @LyUnicode_DecRef(%arp_h) : (memref<2xi64>) -> ()
         scf.yield %aout_h, %aout_b : memref<2xi64>, memref<?xi8>
       } else {
-        %fallback:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+        %fallback:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %class_word) : (memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
         scf.yield %fallback#0, %fallback#1 : memref<2xi64>, memref<?xi8>
       }
       scf.yield %preplain#0, %preplain#1 : memref<2xi64>, memref<?xi8>
@@ -2125,11 +2064,11 @@ module attributes {
   // ClassName('')).
   memref.global "private" constant @__ly_exc_lparen : memref<1xi8> = dense<40>
   memref.global "private" constant @__ly_exc_rparen : memref<1xi8> = dense<41>
-  func.func private @__ly_exception_repr(%message_header: memref<2xi64>, %message_bytes: memref<?xi8>, %name: memref<?xi8>, %name_len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
+  func.func private @__ly_exception_repr(%message_header: memref<2xi64>, %message_bytes: memref<?xi8>, %class_word: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1_i64 = arith.constant 1 : i64
     %zero = arith.constant 0 : i64
-    %name_h, %name_b = func.call @__ly_unicode_from_valid_utf8(%name, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %name_h, %name_b = func.call @__ly_exception_leaf_name(%class_word) : (i64) -> (memref<2xi64>, memref<?xi8>)
     %lparen_ref = memref.get_global @__ly_exc_lparen : memref<1xi8>
     %lparen_dyn = memref.cast %lparen_ref : memref<1xi8> to memref<?xi8>
     %lp_h, %lp_b = func.call @__ly_unicode_from_valid_utf8(%lparen_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)

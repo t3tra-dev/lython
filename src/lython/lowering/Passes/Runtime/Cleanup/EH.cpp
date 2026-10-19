@@ -388,21 +388,29 @@ void emitTracebackPush(llvm::IRBuilder<> &builder, llvm::Module &module,
                         i32Constant(builder, frameEndColumn),
                         i32Constant(builder, frameMarker)});
   };
+  // The level that names the function itself is left out of one the
+  // emitter wrote for what CPython does in C; the bodies inlined into it are
+  // still frames.
+  bool frameless = isSynthesizedFramelessFunction(
+      builder.GetInsertBlock()->getParent()->getName());
+  bool namedInner = site && !site->innerFunctionName.empty();
   llvm::StringRef innerName =
-      site && !site->innerFunctionName.empty()
-          ? llvm::StringRef(site->innerFunctionName)
-          : functionName;
-  push(innerName, line, column, endLine, endColumn, marker);
+      namedInner ? llvm::StringRef(site->innerFunctionName) : functionName;
+  if (namedInner || !frameless)
+    push(innerName, line, column, endLine, endColumn, marker);
   // Up to the level the exception is caught at, when a `try` written that
   // deep catches it (ExceptionOps.cpp, pushInlinedTracebackFrames).
   if (site && site->inlinedAt.size() > depth)
     for (const PythonInlineFrame &frame : llvm::ArrayRef<PythonInlineFrame>(
              site->inlinedAt)
-             .take_front(site->inlinedAt.size() - depth))
+             .take_front(site->inlinedAt.size() - depth)) {
+      if (frame.functionName.empty() && frameless)
+        continue;
       push(frame.functionName.empty() ? functionName
                                       : llvm::StringRef(frame.functionName),
            frame.line, frame.column, frame.endLine, frame.endColumn,
            frame.noAnchor ? 0 : 1, frame.filename);
+    }
 }
 
 void buildPythonCleanupBlock(llvm::CallInst &call, llvm::BasicBlock *unwindDest,

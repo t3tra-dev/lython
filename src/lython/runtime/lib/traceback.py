@@ -341,8 +341,16 @@ def print_tb(tb: Optional[types.TracebackType],
 
 
 def format_exception_only(exc: BaseException) -> list[str]:
-    """The last line of a traceback: the class and, when it has one, the str."""
-    label = type(exc).__name__
+    """The last line of a traceback: the class and, when it has one, the str.
+
+    The class is spelled as TracebackException spells it: its qualified name,
+    after its module unless that is __main__ or builtins.
+    """
+    cls = type(exc)
+    label = cls.__qualname__
+    module = cls.__module__
+    if module not in ("__main__", "builtins"):
+        label = module + "." + label
     message = str(exc)
     if message == "":
         return [label + "\n"]

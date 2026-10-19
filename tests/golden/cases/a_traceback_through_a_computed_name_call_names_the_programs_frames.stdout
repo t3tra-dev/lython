@@ -1,0 +1,3 @@
+test_compare AssertionError('differ') ['main_lib.py", line 20, in run', 'main.py", line 13, in test_compare', 'main_lib.py", line 13, in same', 'main_lib.py", line 16, in fail']
+test_fail AssertionError('direct') ['main_lib.py", line 20, in run', 'main.py", line 16, in test_fail', 'main_lib.py", line 16, in fail']
+test_helper AssertionError('from a helper') ['main_lib.py", line 20, in run', 'main.py", line 19, in test_helper', 'main.py", line 23, in helper']

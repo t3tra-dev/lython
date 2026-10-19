@@ -90,6 +90,20 @@ struct TensorLoweringTarget {
 inline constexpr llvm::StringLiteral kIndirectCallDispatcherPrefix{
     "__ly_dispatch_"};
 
+// The functions the EMITTER writes for what CPython does in C -- a computed
+// `getattr(x, name)(...)` (`__lygetattr$N`), a virtual dispatch
+// (`__lyvdisp$N`), a builtin made a callable value (`__lybfn$N`), the
+// docstring dispatchers -- are named `__ly<word>$...`. Like an indirect-call
+// dispatcher they are no frame of the program, but a method body the emitter
+// wrote into one is: only the level that names the function itself is left
+// out of a traceback.
+inline bool isSynthesizedFramelessFunction(llvm::StringRef name) {
+  if (!name.consume_front("__ly") || name.empty() ||
+      !(name.front() >= 'a' && name.front() <= 'z'))
+    return false;
+  return name.contains('$');
+}
+
 struct PythonCallSiteRange {
   std::string caller;
   std::string callee;

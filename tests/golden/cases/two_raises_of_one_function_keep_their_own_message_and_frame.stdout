@@ -1,0 +1,2 @@
+AssertionError('first') ['20, in <module>', '14, in check']
+AssertionError('second') ['20, in <module>', '15, in check']

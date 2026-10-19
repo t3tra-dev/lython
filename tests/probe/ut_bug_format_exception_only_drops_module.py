@@ -5,9 +5,9 @@
 #   uncaught-exception printer gets it right.
 # KIND: バグ (bug) -- silent: prints the wrong text
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# differential: expect-wrong the module prefix is missing
-# CLASSIFICATION @ lang-gaps fa5c535a: 2 silent 誤実行
-#   cpython="['ut_mod_lib_error.LibError: lib\\n']['MainError: main\\n']['ValueError: v\\n']" lyc="['LibError: lib\\n']['MainError: main\\n']['ValueError: v\\n']"
+# FIXED: 2026-10-20 -- the class is its module and qualified name, as
+#   TracebackException spells it (cases/format_exception_only_spells_the_class_as_cpython_does).
+# CLASSIFICATION @ lang-gaps 90ef0204 + the fix: 1 正しい
 # CPython 3.14 expects: ['ut_mod_lib_error.LibError: lib\n']['MainError: main\n']['ValueError: v\n']
 import traceback
 import ut_mod_lib_error

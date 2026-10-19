@@ -1,6 +1,7 @@
 #include "Common/ExceptionABI.h"
 #include "Mangling.h"
 #include "Common/PythonSourceRange.h"
+#include "Common/RuntimeSupport.h"
 #include "Runtime/Core/Lowerer.h"
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -58,6 +59,15 @@ llvm::StringRef currentCallableName(mlir::Operation *op) {
     return name;
   }
   return "<unknown>";
+}
+
+// The symbol of the function `op` is in, which is what says whether the
+// function is a frame of the program at all.
+llvm::StringRef functionSymbolOf(mlir::Operation *op) {
+  if (auto function = op ? op->getParentOfType<mlir::func::FuncOp>()
+                         : mlir::func::FuncOp())
+    return function.getName();
+  return {};
 }
 
 void createDeadContinuation(mlir::OpBuilder &builder, mlir::Operation *op) {
@@ -199,8 +209,10 @@ RuntimeBundleLowerer::emitTracebackFrame(mlir::Operation *op,
                          i32Const(frameColumn), i32Const(frameEndLine),
                          i32Const(frameEndColumn), i32Const(frameMarker)});
   };
-  push(innerFunction.empty() ? enclosing : llvm::StringRef(innerFunction), line,
-       column, endLine, endColumn, hasMarker);
+  if (!innerFunction.empty() || !isSynthesizedFramelessFunction(
+                                     functionSymbolOf(op)))
+    push(innerFunction.empty() ? enclosing : llvm::StringRef(innerFunction),
+         line, column, endLine, endColumn, hasMarker);
   pushInlinedTracebackFrames(op, filename, inlinedAt,
                              enclosingTryInlineDepth(op->getBlock()));
   return mlir::success();
@@ -235,8 +247,11 @@ void RuntimeBundleLowerer::pushInlinedTracebackFrames(
     return mlir::arith::ConstantIntOp::create(builder, loc, value, 32)
         .getResult();
   };
+  bool frameless = isSynthesizedFramelessFunction(functionSymbolOf(anchor));
   for (const PythonInlineFrame &frame :
        inlinedAt.take_front(inlinedAt.size() - depth)) {
+    if (frame.functionName.empty() && frameless)
+      continue;
     llvm::StringRef name = frame.functionName.empty()
                                ? enclosing
                                : llvm::StringRef(frame.functionName);

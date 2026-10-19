@@ -6,9 +6,9 @@
 #   handler, so its tracebacks show no test frames.
 # KIND: バグ (bug) -- silent: frames are missing
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# differential: expect-wrong the frames of the with-body are missing from the handler's traceback
-# CLASSIFICATION @ lang-gaps fa5c535a: 2 silent 誤実行
-#   cpython="['catch', '<module>', 'outer', 'inner']\n" lyc="['catch']\n"
+# FIXED: 2026-10-20 -- the exception thrown into the generator keeps the frames
+#   the caller's handler had parked (cases/a_context_managers_handler_sees_the_with_bodys_frames).
+# CLASSIFICATION @ lang-gaps 90ef0204 + the fix: 1 正しい
 # CPython 3.14 expects: ['catch', '<module>', 'outer', 'inner']
 import contextlib
 import sys
