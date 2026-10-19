@@ -1630,6 +1630,15 @@ void ModuleEmitter::emitDeferredMethodBodies() {
     // ⛔ The super() context is pushed inside: the module scope switch
     // starts from an empty one.
     auto emitBody = [&] {
+      // ⭐ A GENERIC CLASS'S BODY SPELLS ITS TYPE PARAMETERS (`self.x: E |
+      // None`), and the specialization bound them only for its own
+      // emission, which queued this body and returned. Drained here with
+      // nothing bound, `E` read as a class of that name, and the store was
+      // refused in the lowering against the field the contract had typed
+      // right: `Ctx[E](...)` built in a generic method called from any
+      // function body.
+      auto typeParameterScope = types.pushScope();
+      bindClassTypeArguments(entry.definer);
       if (instanceBody)
         superContexts.push_back(SuperContext{
             entry.contractName, entry.signature.positionalNames.front(),
@@ -2822,6 +2831,12 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   llvm::SmallVector<FunctionSignature, 8> pendingBodySigs;
   llvm::SmallVector<std::string, 8> pendingBodySymbols;
   llvm::SmallVector<std::string, 8> pendingBodyKinds;
+  // The module whose names each body reads: this class's, except for a copy
+  // of an inherited body (below), which reads the module that wrote it.
+  llvm::SmallVector<const EmitOptions::SourceModule *, 8> pendingBodySources;
+  // And the class whose type parameters it spells: this class, except for
+  // such a copy, which spells the parameters of the class that wrote it.
+  llvm::SmallVector<std::string, 8> pendingBodyDefiners;
   llvm::StringSet<> propertyNames = classPropertyNames(classDef);
   if (const auto *body = ast::nodeList(classDef, "body")) {
     for (const parser::NodePtr &statement : *body) {
@@ -3049,6 +3064,8 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
         pendingBodySigs.push_back(bodySig);
         pendingBodySymbols.push_back(symbolName);
         pendingBodyKinds.push_back(kind);
+        pendingBodySources.push_back(activeSourceModule);
+        pendingBodyDefiners.push_back(contractName.str());
       }
       if (kind == "static")
         types.bindClassStaticMethod(contractName, *methodName,
@@ -3152,6 +3169,15 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
         pendingBodySigs.push_back(specialized);
         pendingBodySymbols.push_back(symbolName);
         pendingBodyKinds.push_back("instance");
+        // ⭐ THE COPY STILL READS THE MODULE THAT WROTE IT. Only `self`
+        // changes class; every other name in the body is the defining
+        // module's global, and emitted in this class's module a helper
+        // function private to the base's module was an "unresolved name" --
+        // a main-module TestCase subclass overriding setUp lost unittest's
+        // own functions inside the run() it inherits.
+        pendingBodySources.push_back(
+            sourceModuleForClass(inherited.definingClass));
+        pendingBodyDefiners.push_back(inherited.definingClass);
       }
     }
   }
@@ -3231,6 +3257,8 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       pendingBodySigs.push_back(bodySig);
       pendingBodySymbols.push_back(symbolName);
       pendingBodyKinds.push_back("instance");
+      pendingBodySources.push_back(activeSourceModule);
+      pendingBodyDefiners.push_back(contractName.str());
       classMethodBindings[contractName][*fnName] =
           MethodBinding{fn.get(),   bodySig, bodySig,
                         "instance", symbolName, /*async=*/false,
@@ -3676,25 +3704,28 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   // sibling subclasses call the same base-typed method. `emitTopLevelDeclarations`
   // drains the queue once every class has been declared.
   if (deferClassMethodBodies) {
-    for (auto [statement, bodySig, symbolName, kind] :
+    for (auto [statement, bodySig, symbolName, kind, source, definer] :
          llvm::zip_equal(pendingBodies, pendingBodySigs, pendingBodySymbols,
-                         pendingBodyKinds))
+                         pendingBodyKinds, pendingBodySources,
+                         pendingBodyDefiners))
       deferredMethodBodies.push_back(DeferredMethodBody{
           statement, bodySig, symbolName, std::string(kind),
-          std::string(contractName), activeSourceModule});
+          std::string(contractName), source, definer});
     pendingBodies.clear();
     pendingBodySigs.clear();
     pendingBodySymbols.clear();
     pendingBodyKinds.clear();
+    pendingBodySources.clear();
+    pendingBodyDefiners.clear();
   }
-  for (auto [statement, bodySig, symbolName, kind] :
-       llvm::zip_equal(pendingBodies, pendingBodySigs, pendingBodySymbols,
-                       pendingBodyKinds)) {
-    bool instanceBody = kind == "instance" && !bodySig.positionalNames.empty();
-    if (instanceBody)
-      superContexts.push_back(SuperContext{
-          std::string(contractName), bodySig.positionalNames.front(),
-          !decoratedMethodBodies.contains(statement)});
+  for (std::size_t index = 0; index < pendingBodies.size(); ++index) {
+    const parser::Node *statement = pendingBodies[index];
+    const FunctionSignature &bodySig = pendingBodySigs[index];
+    const std::string &symbolName = pendingBodySymbols[index];
+    const EmitOptions::SourceModule *source = pendingBodySources[index];
+    const std::string &definer = pendingBodyDefiners[index];
+    bool instanceBody = pendingBodyKinds[index] == "instance" &&
+                        !bodySig.positionalNames.empty();
     // The frozen-field guard is off inside this class's own __init__, which is
     // where the fields are filled -- CPython goes around its own block there
     // with object.__setattr__. The body is emitted BOTH as a symbol (here) and
@@ -3704,10 +3735,24 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
     if (ast::string(*statement, "name").value_or("") == "__init__" &&
         frozenDataclassContracts.count(frozenOwner))
       frozenInit.emplace(frozenInitContract, &frozenOwner);
-    emitCallableFunction(*statement, symbolName, bodySig, {},
-                         /*isLambda=*/false);
-    if (instanceBody)
-      superContexts.pop_back();
+    // ⛔ The super() context is pushed inside: the module scope switch
+    // starts from an empty one.
+    auto emitBody = [&] {
+      auto typeParameterScope = types.pushScope();
+      bindClassTypeArguments(definer);
+      if (instanceBody)
+        superContexts.push_back(SuperContext{
+            std::string(contractName), bodySig.positionalNames.front(),
+            !decoratedMethodBodies.contains(statement)});
+      emitCallableFunction(*statement, symbolName, bodySig, {},
+                           /*isLambda=*/false);
+      if (instanceBody)
+        superContexts.pop_back();
+    };
+    if (source && source != activeSourceModule)
+      emitInDefiningModuleScope(*source, emitBody);
+    else
+      emitBody();
   }
 
   // A generic class's specialization is demanded from a use site — possibly

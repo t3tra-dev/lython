@@ -19,6 +19,7 @@
 # None here and in CPython; the golden pins that half.
 #
 # Measured 2026-09-03: CPython prints None, this prints the raise.
+# differential: expect-wrong a stub whose result cannot hold None raises NotImplementedError
 class Shape:
     def area(self) -> int: ...
 

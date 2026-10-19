@@ -5,8 +5,9 @@
 #   works. TestCase.run calls setUp, which every test class overrides.
 # KIND: バグ (bug) -- loud: well-typed code refused
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   unresolved name '_decorate'
+# FIXED: 2026-10-20 -- the copy of an inherited body is compiled in the module that
+#   wrote it.
+# CLASSIFICATION @ lang-gaps 9bf68b55 + the fix: 1 正しい
 # CPython 3.14 expects: <sub> <base>
 import ut_mod_inherited_method
 

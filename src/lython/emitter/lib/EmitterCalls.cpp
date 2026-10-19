@@ -2012,9 +2012,15 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         // ⛔ Only when the class name still names the class here: a program
         // that binds `bytes` to something else keeps the refusal rather than
         // calling whatever the name now holds.
+        // ⛔ Not a class the program declares: the call below binds `cls` to
+        // the receiver's class at run time, and its bare name is not even in
+        // scope outside its module -- a computed-name dispatcher written into
+        // the importer called `TestCase.setUpClass()` there and found no
+        // `TestCase`.
         if (auto instance = mlir::dyn_cast_if_present<py::ContractType>(
                 types.widenLiteral(types.inferExpr(receiverNode)));
-            instance && (types.isManifestClassMethod(instance, *methodName) ||
+            instance && !isSourceClassContract(instance) &&
+            (types.isManifestClassMethod(instance, *methodName) ||
                          llvm::is_contained(
                              {std::pair<llvm::StringRef, llvm::StringRef>{
                                   "builtins.str", "maketrans"},

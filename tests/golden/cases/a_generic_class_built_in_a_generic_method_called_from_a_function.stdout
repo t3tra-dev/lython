@@ -1,0 +1,4 @@
+nothing
+False nothing
+True ValueError: v
+True KeyError: 'k'

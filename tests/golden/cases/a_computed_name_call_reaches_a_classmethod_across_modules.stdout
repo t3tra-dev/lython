@@ -1,0 +1,4 @@
+test_a ran
+setUpClass of MyTests
+setUpClass of TestCase
+Special TestCase MyTests

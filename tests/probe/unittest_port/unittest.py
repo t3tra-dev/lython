@@ -16,10 +16,9 @@ Not here yet, each for a recorded reason:
 - subTest: the generator does not compile
   (ut_bug_class_body_field_object_into_inner_contextmanager), so _SubTest and
   the subTest arms of testPartExecutor are unused.
-- cleanups are DISCARDED, not run
+- cleanups are DISCARDED, not run, and there is no doCleanups
   (ut_bug_exc_info_after_calling_a_callable_from_a_list).
-- TestCase.run/__call__/debug/doCleanups: the run loop is the module function
-  _run_case (ut_bug_inherited_method_loses_its_module_globals).
+- TestCase.debug, which the runner does not use.
 
 Deviations from CPython that the static types themselves call for:
 - a skipped / expected-failure test is a WRAPPED method, not a function with
@@ -219,17 +218,12 @@ def expectedFailure[T: TestCase](test_item: Callable[[T], None]) -> Callable[[T]
 class _AssertRaisesContext[E: BaseException]:
     """A context manager used to implement TestCase.assertRaises* methods."""
 
-    # WORKAROUND(ut_bug_inherited_generic_method_annotation_in_importer): `self._exception: E | None = None` in __init__ is
-    # resolved in the test module's scope when a test class calls
-    # assertRaises, so the field is declared on the class instead.
-    _exception: E | None
-
     def __init__(self, expected: type[E], test_case: TestCase, msg: str | None = None) -> None:
         self.expected = expected
         self.test_case = test_case
         self.msg = msg
         self.obj_name: str | None = None
-        self._exception = None
+        self._exception: E | None = None
 
     @property
     def exception(self) -> E:
@@ -330,6 +324,63 @@ class TestCase:
 
     def __repr__(self) -> str:
         return "<%s testMethod=%s>" % (strclass(type(self)), self._testMethodName)
+
+    def defaultTestResult(self) -> TestResult:
+        return TestResult()
+
+    def _callSetUp(self) -> None:
+        self.setUp()
+
+    def _callTestMethod(self) -> None:
+        getattr(self, self._testMethodName)()
+
+    def _callTearDown(self) -> None:
+        self.tearDown()
+
+    def run(self, result: TestResult | None = None) -> TestResult:
+        stopTestRun = False
+        if result is None:
+            result = self.defaultTestResult()
+            result.startTestRun()
+            stopTestRun = True
+        result.startTest(self)
+        try:
+            outcome = _Outcome(result)
+            start_time = time.perf_counter()
+            try:
+                self._outcome = outcome
+                with outcome.testPartExecutor(self):
+                    self._callSetUp()
+                if outcome.success:
+                    with outcome.testPartExecutor(self):
+                        self._callTestMethod()
+                    with outcome.testPartExecutor(self):
+                        self._callTearDown()
+                # WORKAROUND(ut_bug_exc_info_after_calling_a_callable_from_a_list):
+                # cleanups are discarded. Calling one -- a callable taken off a
+                # list -- in a function whose handlers read the traceback stops
+                # the ownership verifier.
+                self._cleanups.clear()
+                result.addDuration(self, time.perf_counter() - start_time)
+                if outcome.success:
+                    expected = outcome.expectedFailure
+                    if expected is not None:
+                        result.addExpectedFailure(self, expected)
+                    elif outcome.unexpectedSuccess:
+                        result.addUnexpectedSuccess(self)
+                    else:
+                        result.addSuccess(self)
+                return result
+            finally:
+                outcome.expectedFailure = None
+                self._outcome = None
+        finally:
+            result.stopTest(self)
+            if stopTestRun:
+                result.stopTestRun()
+
+    def __call__(self, result: TestResult | None = None) -> TestResult:
+        return self.run(result)
 
     # WORKAROUND(ut_bug_class_body_field_object_into_inner_contextmanager):
     # subTest is not here -- its generator does not compile.
@@ -603,6 +654,12 @@ class TestResult:
     def stopTest(self, test: TestCase) -> None:
         """Called when the given test has been run"""
 
+    def startTestRun(self) -> None:
+        """Called once before any tests are executed."""
+
+    def stopTestRun(self) -> None:
+        """Called once after all tests are executed."""
+
     def addError(self, test: TestCase,
                  err: tuple[type[BaseException], BaseException, types.TracebackType]) -> None:
         """Called when an error has occurred."""
@@ -695,46 +752,6 @@ def _exc_info_to_string(err: tuple[type[BaseException], BaseException, types.Tra
     return ''.join(msgLines)
 
 
-# ---------------------------------------------------------------- running one test
-
-# WORKAROUND(ut_bug_inherited_method_loses_its_module_globals): a method of TestCase that calls a method a test class
-# overrides is compiled again for that class in the test file's module, where
-# this module's globals are not visible -- so the run loop is a function here.
-def _run_case(test: TestCase, result: TestResult) -> None:
-    result.startTest(test)
-    try:
-        outcome = _Outcome(result)
-        start_time = time.perf_counter()
-        try:
-            test._outcome = outcome
-            with outcome.testPartExecutor(test):
-                test.setUp()
-            if outcome.success:
-                with outcome.testPartExecutor(test):
-                    getattr(test, test._testMethodName)()
-                with outcome.testPartExecutor(test):
-                    test.tearDown()
-            # WORKAROUND(ut_bug_exc_info_after_calling_a_callable_from_a_list):
-            # cleanups are discarded. Calling one -- a callable taken off a
-            # list -- in a function whose handlers read the traceback stops
-            # the ownership verifier.
-            test._cleanups.clear()
-            result.addDuration(test, time.perf_counter() - start_time)
-            if outcome.success:
-                expected = outcome.expectedFailure
-                if expected is not None:
-                    result.addExpectedFailure(test, expected)
-                elif outcome.unexpectedSuccess:
-                    result.addUnexpectedSuccess(test)
-                else:
-                    result.addSuccess(test)
-        finally:
-            outcome.expectedFailure = None
-            test._outcome = None
-    finally:
-        result.stopTest(test)
-
-
 # ---------------------------------------------------------------- suite
 
 class TestSuite:
@@ -773,7 +790,7 @@ def _run_suite(suite: TestSuite, result: TestResult, topLevel: bool) -> None:
             result._previousTestClass = [type(test)]
             if result._classSetupFailed.get(type(test), False):
                 continue
-            _run_case(test, result)
+            test.run(result)
         else:
             _run_suite(test, result, False)
     if topLevel:
