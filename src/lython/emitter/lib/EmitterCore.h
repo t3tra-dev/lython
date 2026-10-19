@@ -1162,6 +1162,10 @@ private:
   // Whether an argument of type `actual` may bind a parameter declared
   // `expected` at an inlined method's call (EmitterClasses.cpp).
   bool inlineArgumentFits(mlir::Type actual, mlir::Type expected);
+  // `obj.attr` where a field shadows a class attribute: the field when it is
+  // set, `type(obj).attr` otherwise (EmitterExpressions.cpp).
+  Value emitFieldOrClassAttribute(const parser::Node &expr, Value object,
+                                  llvm::StringRef attr, mlir::Type fieldType);
   // The defaults a call leaves out, as keyword arguments of their types, for
   // the parameters whose declared type still names a type parameter
   // (EmitterCalls.cpp).
@@ -1867,6 +1871,11 @@ private:
   llvm::StringMap<llvm::StringSet<>> declaredClassReadableNames;
   // The names a class's own methods store on `self`.
   llvm::StringMap<llvm::StringSet<>> declaredClassStoredFields;
+  // Every attribute name any statement of the program stores to, through any
+  // receiver -- computed on first use, after every module is parsed.
+  const llvm::StringSet<> &programAttributeStoreNames() const;
+  mutable llvm::StringSet<> programAttributeStores;
+  mutable bool programAttributeStoresScanned = false;
   void recordClassBodyDeclarations(llvm::StringRef name,
                                    const parser::Node &classDef);
   // Every program class's ClassDef, by the name the declaration maps use.

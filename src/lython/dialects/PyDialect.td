@@ -1219,6 +1219,26 @@ def Py_AttrGetOp : Py_Op<"attr.get", []> {
   let hasVerifier = 1;
 }
 
+def Py_AttrIsSetOp : Py_Op<"attr.is_set", []> {
+  let summary = "Whether a declared field of a class instance holds a value";
+  let description = [{
+    Answers whether the field `name` of a class instance has been stored: a
+    field no store has filled since the instance was made answers false. An
+    attribute that is both a field and a class attribute is read through it
+    -- the field when set, the class attribute otherwise -- which is the
+    order CPython's lookup finds them in.
+
+    Example:
+      %set = py.attr.is_set %obj["maxDiff"] : !py.contract<"C">
+  }];
+
+  let arguments = (ins Py_ContractType:$object, StrAttr:$name);
+
+  let results = (outs I1:$result);
+
+  let assemblyFormat = "$object `[` $name `]` attr-dict `:` type($object)";
+}
+
 def Py_AttrSetOp : Py_Op<"attr.set", []> {
   let summary = "Set a statically declared field on a class instance";
   let description = [{

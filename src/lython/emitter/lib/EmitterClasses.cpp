@@ -1250,6 +1250,10 @@ bool ModuleEmitter::classLineBindsReadable(llvm::StringRef cls,
 
 bool ModuleEmitter::fieldEverStored(llvm::StringRef cls,
                                     llvm::StringRef fieldName) const {
+  // A store through another name may fill it too (`q.longMessage = True`),
+  // and which class that receiver has is not known before the types are.
+  if (programAttributeStoreNames().contains(fieldName))
+    return true;
   auto stores = [&](llvm::StringRef current) {
     auto found = declaredClassStoredFields.find(current);
     return found != declaredClassStoredFields.end() &&
@@ -2427,6 +2431,57 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
                      /*includeAnnAssignDefaults=*/isDataclass, contractName,
                      publishFieldsSoFar,
                      /*methodsDeclareFields=*/!isNamedTuple);
+  // ⭐ A CLASS ATTRIBUTE AN INSTANCE MAY SHADOW IS ALSO A FIELD, declared here
+  // on the class that binds it so that every instance of its line has the
+  // slot. `self.maxDiff = None` in a test's setUp -- the commonest line in a
+  // unittest fixture -- was refused ("would shadow the class attribute"),
+  // because a method other than `__init__` may not declare a field a class
+  // attribute already answers: that would be a second storage for one name.
+  // It is one, and CPython has both: the instance's when stored, the class's
+  // otherwise. The field starts unset, and a read that cannot prove a store
+  // asks which (emitAttribute).
+  // ⛔ Only a name some class of the line stores on `self` (the declaration
+  // pre-pass, which has seen every module's classes by now), or that any
+  // statement of the program stores through another name (`b.label = "b"`),
+  // whose receiver's class is not known before the types are: a class nobody
+  // shadows keeps its layout, and one that only looks shadowed gets a slot
+  // that stays unset.
+  // ⛔ Not a dataclass or NamedTuple, whose annotated names are fields
+  // already; not an exception, whose fields are kept in its header; not a
+  // callable attribute, which `self.f = ...` would make a bound-method
+  // question.
+  if (!isDataclass && !isNamedTuple && !isExceptionBackedClass(contractName))
+    for (auto [attrName, attrType] :
+         llvm::zip_equal(staticAttrNames, staticAttrTypes)) {
+      mlir::Type widened = attrType ? types.widenLiteral(attrType) : attrType;
+      if (!widened || mlir::isa<py::CallableType>(widened) ||
+          widened == types.none() || llvm::is_contained(fieldNames, attrName) ||
+          llvm::StringRef(attrName).starts_with("__"))
+        continue;
+      // ⛔ Not again under a subclass that redeclares the attribute: the
+      // base's field is the slot, with the type the base declared -- a
+      // subclass's `maxDiff = 10` retyped it `int` under the base's own
+      // `self.maxDiff = None`.
+      bool inherited = false;
+      for (const std::string &ancestor :
+           llvm::ArrayRef<std::string>(mro).drop_front())
+        if (auto fields = classFieldBindings.find(ancestor);
+            fields != classFieldBindings.end() &&
+            fields->second.count(attrName))
+          inherited = true;
+      if (inherited)
+        continue;
+      bool shadowed = programAttributeStoreNames().contains(attrName);
+      for (const auto &entry : declaredClassStoredFields)
+        if (entry.second.contains(attrName) &&
+            (entry.getKey() == contractName ||
+             programClassDerivesFrom(entry.getKey(), contractName)))
+          shadowed = true;
+      if (!shadowed)
+        continue;
+      fieldNames.push_back(attrName);
+      fieldTypes.push_back(widened);
+    }
 
   // Dataclass field defaults (AnnAssign initializers). dataclasses.field()
   // models default= and default_factory= only: the factory desugars to a
@@ -2689,10 +2744,17 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       // exists to opt out of), so the read is a shape question before it is a
       // storage one.
       auto storableAs = [&, attrName = attrName](mlir::Type widened) -> bool {
+        // ⭐ A CLASS VALUE TOO, which is a reference to an immortal type
+        // object -- a module global holds one already. Left on the constant
+        // channel, `failureException: type[BaseException] = AssertionError`
+        // could not be read at all, through the class or an instance
+        // ("unsupported static class attribute expression"), and that is the
+        // attribute every unittest assertion raises through.
         bool storable =
             widened == types.intType() || widened == types.strType() ||
             widened == types.floatType() || widened == types.boolType() ||
-            mlir::isa_and_nonnull<py::CallableType>(widened);
+            mlir::isa_and_nonnull<py::CallableType>(widened) ||
+            mlir::isa_and_nonnull<py::TypeType>(widened);
         if (!storable) {
           if (auto attrContract =
                   mlir::dyn_cast_if_present<py::ContractType>(widened)) {
@@ -6790,6 +6852,42 @@ mlir::Type ModuleEmitter::cellContentType(mlir::Type cellType) {
 // protocol table, the class op) and in the subclasses that inherited it.
 // ⛔ Only a field that is exactly None: any other disagreement is a store this
 // compiler still refuses where it is written.
+const llvm::StringSet<> &ModuleEmitter::programAttributeStoreNames() const {
+  if (programAttributeStoresScanned)
+    return programAttributeStores;
+  programAttributeStoresScanned = true;
+  std::function<void(const parser::Node &)> walk = [&](const parser::Node &node) {
+    auto record = [&](const parser::Node *target) {
+      if (target && target->kind == "Attribute")
+        if (auto attr = ast::string(*target, "attr"))
+          programAttributeStores.insert(*attr);
+    };
+    if (node.kind == "Assign") {
+      if (const auto *targets = ast::nodeList(node, "targets"))
+        for (const parser::NodePtr &target : *targets)
+          record(target.get());
+    } else if (node.kind == "AnnAssign" || node.kind == "AugAssign") {
+      record(ast::node(node, "target"));
+    }
+    for (const parser::Field &field : node.fields) {
+      if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+        if (*child)
+          walk(**child);
+      } else if (const auto *children =
+                     std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+        for (const parser::NodePtr &each : *children)
+          if (each)
+            walk(*each);
+      }
+    }
+  };
+  walk(moduleNode);
+  for (const EmitOptions::SourceModule &source : options.sourceModules)
+    if (source.moduleNode)
+      walk(*source.moduleNode);
+  return programAttributeStores;
+}
+
 void ModuleEmitter::applyForeignFieldWrites() {
   if (foreignFieldWrites.empty())
     return;

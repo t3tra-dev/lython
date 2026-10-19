@@ -6,8 +6,9 @@
 #   ut_unsupported_class_attribute_overridden_read_through_base.)
 # KIND: バグ (bug) -- loud, but only in the lowering
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   class Case has no field 'failureException'
+# FIXED: 2026-10-20 -- a class attribute holding a class value is slot-backed like
+#   a module global holding one.
+# CLASSIFICATION @ lang-gaps 51e1e5ed + the fix: 1 正しい
 # CPython 3.14 expects: True False
 class Case:
     failureException: type[BaseException] = AssertionError

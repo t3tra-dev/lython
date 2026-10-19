@@ -5920,6 +5920,9 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
   // the recursion at the base instead of relying on the suppressed gate.
   std::string fallbackClass;
   parser::NodePtr returns;
+  // The answer's type when it has no spelling a return annotation can carry
+  // (`type[BaseException]`, `int | None`): pinned on the def instead.
+  mlir::Type pinnedResult;
   parser::SourceRange range = expr.range;
   std::optional<MethodBinding> base;
   bool staticKind = false;
@@ -5947,9 +5950,12 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
           if (spelling.consume_front("builtins.") && spelling.contains('.'))
             spelling = {};
         }
-    if (spelling.empty())
+    if (!fieldType)
       return nullptr;
-    returns = synth::name(spelling, range);
+    if (spelling.empty())
+      pinnedResult = types.widenLiteral(*fieldType);
+    else
+      returns = synth::name(spelling, range);
   }
   if (asAttribute) {
     if (argumentCount != 0 || !keywordNames.empty())
@@ -5972,9 +5978,11 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
     }
     if (!attributeType)
       return nullptr;
-    // ⛔ Only a type the dispatcher can WRITE as its return annotation, which
-    // is the same restriction every synthesized def here lives under. A
-    // container-typed class attribute keeps the refusal rather than a guess.
+    // ⭐ ANY TYPE, pinned where it has no spelling. Only a type the
+    // dispatcher could WRITE as its return annotation used to qualify, so
+    // the attributes a test class overrides -- `failureException` (a class
+    // value) and `maxDiff` (`int | None`) -- kept the refusal when read
+    // through the base.
     llvm::StringRef spelling;
     if (auto attrContract =
             mlir::dyn_cast_if_present<py::ContractType>(
@@ -5984,10 +5992,11 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
         if (spelling.consume_front("builtins.") && spelling.contains('.'))
           spelling = {};
       }
-    if (spelling.empty())
-      return nullptr;
     fallbackClass = definingClass.str();
-    returns = synth::name(spelling, range);
+    if (spelling.empty())
+      pinnedResult = types.widenLiteral(attributeType);
+    else
+      returns = synth::name(spelling, range);
   }
 
   // ⭐ A DEFAULT THE BASE TAKES FROM OBJECT DISPATCHES TOO. `class Sub(Base)`
@@ -6385,7 +6394,12 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
                 if (seen.insert(base).second)
                   line.push_back(base);
           }
-          fieldArmThroughClass = !storedSomewhere;
+          // ⛔ A store through any other name counts too: the instance may
+          // then hold its own value (`q.longMessage = True`), and only the
+          // narrowed receiver's read asks.
+          fieldArmThroughClass =
+              !storedSomewhere &&
+              !programAttributeStoreNames().contains(methodName);
         }
       }
       parser::NodePtr subject =
@@ -6464,6 +6478,8 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
     parser::NodePtr def = synth::functionDef(symbol, params, {},
                                              std::move(body), returns, {}, range);
     synthesizedIteratorDefs.push_back(def);
+    if (pinnedResult)
+      types.pinResultType(def.get(), pinnedResult);
     FunctionSignature sig = types.functionSignature(*def);
     // ⭐ THE MEMO IS COMPLETE BEFORE THE BODY IS EMITTED, callable included.
     // A body reached from here may dispatch the same method again -- a

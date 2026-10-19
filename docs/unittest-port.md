@@ -53,6 +53,7 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
 | --- | --- | --- |
 | 2026-10-20 | `ut_bug_inherited_method_loses_its_module_globals`、`ut_bug_computed_getattr_classmethod_arm_in_importer`、`ut_bug_inherited_generic_method_annotation_in_importer` | A1 (継承したメソッド本体のスコープ)。サブクラス向けに複製した継承メソッドの本体を、定義元のモジュールで解決する。プログラムのクラスの classmethod をインスタンス経由で呼ぶとき、クラスの裸の名前に書き換えない。ジェネリッククラスの特殊化の、後回しにしたメソッド本体で型パラメータを束縛する (3 件目の引き金は継承ではなく、関数本体の中からの呼び出しだった)。 |
 | 2026-10-20 | `ut_bug_class_value_call_checks_every_subclass_init`、`ut_bug_computed_getattr_checks_subclass_init`、`ut_bug_computed_getattr_generic_method_with_defaults`、`ut_bug_class_value_call_checks_unrelated_subclasses` の半分 | A2 (振り分けの枝の静的検査)。クラス値の呼び出し、仮想ディスパッチ、計算された名前の呼び出しで、呼び出しを受けられない枝が CPython と同じ TypeError を実行時に投げる (`initialize_locals` の順序と文言、3.14 の "Did you mean" を含む)。ジェネリックの型パラメータを、省いた既定値から解く。 |
+| 2026-10-20 | `ut_bug_class_value_class_attribute_through_instance`、`ut_bug_class_value_class_attribute_shadowed`、`ut_unsupported_class_attribute_overridden_read_through_base`、`ut_unsupported_instance_shadows_class_attribute`、`ut_unsupported_object_with_class_value_union_field_held`、`ut_bug_class_value_call_checks_unrelated_subclasses` の残り | A5 の一部 (クラス属性)。クラス値を持つクラス属性をセルに置く。サブクラスが上書きしたクラス属性を基底の型から読むディスパッチで、注釈に書けない型 (`type[X]`、`int \| None`) を受ける。インスタンス経由の代入 (`self.maxDiff = None`) を、クラス属性の系統に未設定で始まるフィールドを足して受け、読みは「設定されていればフィールド、なければ `type(obj).attr`」にする (`py.attr.is_set`)。`type[X] \| None` のフィールドを箱に入れる。 |
 
 進捗の途中で決めたこと・見つけたこと:
 
@@ -66,6 +67,9 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
   (`xs: list[int] = [1]` など) を省いて呼ぶと、誰も書き込んでいないセルを読んで
   segfault していた。既定値は特殊化ごとではなく関数ごとに 1 つのセルにし、`def`
   文の位置で 1 回評価する (CPython と同じく、全呼び出しで同じオブジェクトを共有する)。
+- **既存の誤動作を 1 件直した。** クラス属性と同名のフィールドを `__init__` が
+  条件付きでしか書かないとき、書かなかったインスタンスの読みが AttributeError を
+  投げていた (CPython はクラス属性を返す)。上のインスタンス経由の代入と同じ読み方で直った。
 
 ## 計測の方法
 

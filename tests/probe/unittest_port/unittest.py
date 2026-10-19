@@ -255,14 +255,12 @@ class _AssertRaisesContext[E: BaseException]:
 class TestCase:
     """A class whose instances are single test cases."""
 
+    failureException: type[BaseException] = AssertionError
     longMessage: bool = True
     maxDiff: int | None = 80 * 8
     _diffThreshold: int = 2 ** 16
 
     def __init__(self, methodName: str = 'runTest') -> None:
-        # WORKAROUND(ut_bug_class_value_class_attribute_through_instance): a class attribute holding a class value cannot be
-        # read through an instance, so failureException is an instance field.
-        self.failureException: type[BaseException] = AssertionError
         self._testMethodName = methodName
         self._outcome: _Outcome | None = None
         if methodName != 'runTest' and not hasattr(self, methodName):
@@ -587,8 +585,7 @@ class _SubTest(TestCase):
         self._message = message
         self.test_case = test_case
         self.params = params
-        # WORKAROUND(ut_bug_class_value_class_attribute_shadowed): the instance does not
-        # take `failureException = test_case.failureException`.
+        self.failureException = test_case.failureException
 
     def runTest(self) -> None:
         raise NotImplementedError("subtests cannot be run directly")
@@ -628,10 +625,7 @@ class TestResult:
         self.unexpectedSuccesses: list[TestCase] = []
         self.collectedDurations: list[tuple[str, float]] = []
         self.shouldStop = False
-        # WORKAROUND(ut_unsupported_object_with_class_value_union_field_held): an object with a `type[X] | None` field cannot be
-        # held by another object or a list, so the previous class is a list
-        # of zero or one class.
-        self._previousTestClass: list[type[TestCase]] = []
+        self._previousTestClass: type[TestCase] | None = None
         self._classSetupFailed: dict[type[TestCase], bool] = {}
 
     def printErrors(self) -> None:
@@ -777,7 +771,7 @@ def _run_suite(suite: TestSuite, result: TestResult, topLevel: bool) -> None:
         if isinstance(test, TestCase):
             _tearDownPreviousClass(test, result)
             _handleClassSetUp(test, result)
-            result._previousTestClass = [type(test)]
+            result._previousTestClass = type(test)
             if result._classSetupFailed.get(type(test), False):
                 continue
             test.run(result)
@@ -789,7 +783,7 @@ def _run_suite(suite: TestSuite, result: TestResult, topLevel: bool) -> None:
 
 def _handleClassSetUp(test: TestCase, result: TestResult) -> None:
     currentClass = type(test)
-    if len(result._previousTestClass) != 0 and currentClass is result._previousTestClass[0]:
+    if currentClass is result._previousTestClass:
         return
     result._classSetupFailed[currentClass] = False
     try:
@@ -803,9 +797,9 @@ def _handleClassSetUp(test: TestCase, result: TestResult) -> None:
 
 
 def _tearDownPreviousClass(test: TestCase | None, result: TestResult) -> None:
-    if len(result._previousTestClass) == 0:
+    previousClass = result._previousTestClass
+    if previousClass is None:
         return
-    previousClass = result._previousTestClass[0]
     if test is not None and type(test) is previousClass:
         return
     if result._classSetupFailed.get(previousClass, False):

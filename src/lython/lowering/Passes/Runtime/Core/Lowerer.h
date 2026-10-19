@@ -265,6 +265,7 @@ private:
   mlir::FailureOr<mlir::Value> objectBoxFromFieldSlot(mlir::Operation *op,
                                                       mlir::Value body,
                                                       mlir::Value boxWord);
+  mlir::LogicalResult lowerAttrIsSet(py::AttrIsSetOp op);
   mlir::LogicalResult lowerCellAttrGet(py::AttrGetOp op,
                                        const RuntimeBundle &object,
                                        py::ClassOp classOp,

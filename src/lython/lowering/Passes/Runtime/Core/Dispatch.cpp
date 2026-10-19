@@ -60,6 +60,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOpRule(mlir::Operation *op) {
       .Case<py::UnionUnwrapOp>(
           [&](auto unwrap) { return lowerUnionUnwrap(unwrap); })
       .Case<py::AttrGetOp>([&](auto attr) { return lowerAttrGet(attr); })
+      .Case<py::AttrIsSetOp>(
+          [&](auto attr) { return lowerAttrIsSet(attr); })
       .Case<py::AttrSetOp>([&](auto attr) { return lowerAttrSet(attr); })
       .Case<py::GlobalGetOp>([&](auto get) { return lowerGlobalGet(get); })
       .Case<py::GlobalSetOp>([&](auto set) { return lowerGlobalSet(set); })

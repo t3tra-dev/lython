@@ -1,0 +1,8 @@
+AssertionError True 640
+KeyError True None
+AssertionError True 10
+KeyError True None 10
+AssertionError False 640
+AssertionError True 640 False
+[640, None, None, 640] [True, True, True, True]
+AssertionError True 640 640

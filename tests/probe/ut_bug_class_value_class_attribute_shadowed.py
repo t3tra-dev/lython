@@ -6,8 +6,9 @@
 #   failureException this way.
 # KIND: バグ (bug) -- loud, but only in the lowering
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   class Case has no field 'failureException'
+# FIXED: 2026-10-20 -- an instance store makes the class attribute's line carry an
+#   unset field; a read takes the field when set, type(obj).attr otherwise.
+# CLASSIFICATION @ lang-gaps 51e1e5ed + the fix: 1 正しい
 # CPython 3.14 expects: AssertionError ValueError
 class Case:
     failureException: type[BaseException] = AssertionError
