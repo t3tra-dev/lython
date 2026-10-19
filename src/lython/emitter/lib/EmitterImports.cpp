@@ -1665,7 +1665,19 @@ void ModuleEmitter::bindSourceModuleLocals(llvm::StringRef moduleName,
       std::optional<std::string_view> name = ast::string(*statement, "name");
       if (!name)
         continue;
-      FunctionSignature sig = types.functionSignature(*statement);
+      // LYTHON_ABLATE_SOURCE_LOCAL_SIGNATURE_MEMO=1 reads every signature
+      // again, for comparing the two with one binary.
+      static const bool ablateMemo =
+          std::getenv("LYTHON_ABLATE_SOURCE_LOCAL_SIGNATURE_MEMO") != nullptr;
+      std::pair<const parser::Node *, unsigned> key{
+          statement.get(), types.describesParametersByDefaults() ? 1u : 0u};
+      auto found = ablateMemo ? sourceLocalSignatures.end()
+                              : sourceLocalSignatures.find(key);
+      FunctionSignature sig = found != sourceLocalSignatures.end()
+                                  ? found->second
+                                  : types.functionSignature(*statement);
+      if (!ablateMemo && found == sourceLocalSignatures.end())
+        sourceLocalSignatures.try_emplace(key, sig);
       types.bindCanonicalSymbol(*name,
                                 sourceModuleFunctionSymbol(moduleName, *name),
                                 sig.publicCallable);
