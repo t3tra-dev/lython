@@ -506,6 +506,24 @@ bool bindExpectedType(const TypeSystem &types, mlir::Type expected,
   return typeAccepts(types, expected, actual);
 }
 
+bool bindSolvedInstantiation(const TypeSystem &types,
+                             py::CallableType declared,
+                             py::CallableType solved,
+                             TypeBindingMap &bindings) {
+  if (!declared || !solved ||
+      !bindExpectedType(types, declared, solved, bindings))
+    return false;
+  // A variadic that cannot be bound leaves its parameter to the caller's
+  // unbound check, which says so; it does not undo what the view bound.
+  if (declared.hasVararg() && solved.hasVararg())
+    (void)bindExpectedType(types, declared.getVarargType(),
+                           solved.getVarargType(), bindings);
+  if (declared.hasKwarg() && solved.hasKwarg())
+    (void)bindExpectedType(types, declared.getKwargType(),
+                           solved.getKwargType(), bindings);
+  return true;
+}
+
 py::CallableType substituteCallable(const TypeSystem &types,
                                     py::CallableType callable,
                                     const TypeBindingMap &bindings,

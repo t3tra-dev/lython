@@ -67,6 +67,16 @@ mlir::Type substituteType(const TypeSystem &types, mlir::Type type,
 bool bindExpectedType(const TypeSystem &types, mlir::Type expected,
                       mlir::Type actual, TypeBindingMap &bindings);
 
+// Recovers the instantiation of a generic callable from the ground contract
+// a call solved it to: the callable view of `bindExpectedType`, and then the
+// `*args` and `**kwargs` that view leaves out -- a type parameter only they
+// name is solved by them. Not in the view itself, which also decides whether
+// one callable may stand for another, and would then refuse what it accepts.
+bool bindSolvedInstantiation(const TypeSystem &types,
+                             py::CallableType declared,
+                             py::CallableType solved,
+                             TypeBindingMap &bindings);
+
 int unboundStaticParameterCount(mlir::Type type);
 
 std::optional<CallSolution>

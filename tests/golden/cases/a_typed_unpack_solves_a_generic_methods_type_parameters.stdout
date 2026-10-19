@@ -1,0 +1,6 @@
+[1, 2, 3] [0, 1, 2, 3] ['a', 'b'] [1, 2]
+3 2 [0, 1.5, 2.5] ['s', 1.5, 2.5]
+b:x=1.5,y=2.5 b:x=1.5,y=2.5,z=3.5 b:w=0.5 b:z=1,x=1.5,y=2.5
+['x1.5', 'y2.5'] ['kTrue'] b:x=1.5,y=2.5,t=True
+(9, 3) ('q', 2)
+TypeError: __main__.Bag.label() got multiple values for keyword argument 'x'

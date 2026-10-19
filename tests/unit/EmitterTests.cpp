@@ -1428,9 +1428,9 @@ TEST(EmitterTest, AnExhaustiveMatchDoesNotFallThrough) {
 // to happen eight phases later as "kw names and kw values must have the same
 // size" against a fused location carrying no source line.
 // A `**` mapping whose keys only the run time knows reaches a function's
-// **kwargs -- a dict, a display, a forwarded **kwargs, a generic one's -- and
-// is refused where its keys could name a parameter, which is named in the
-// message.
+// **kwargs -- a dict, a display, a forwarded **kwargs, a generic function's
+// or method's -- and is refused where its keys could name a parameter, which
+// is named in the message.
 TEST(EmitterTest, AMappingOfUnknownKeysReachesOnlyKwargs) {
   mlir::MLIRContext context(testRegistry());
   const char *collector = "def show(**kwargs: int) -> int:\n"
@@ -1447,7 +1447,12 @@ TEST(EmitterTest, AMappingOfUnknownKeysReachesOnlyKwargs) {
         std::string("def keys[V](**kwargs: V) -> int:\n"
                     "    return len(kwargs)\n"
                     "d = {\"a\": 1.5}\n"
-                    "print(keys(**d))\n")}) {
+                    "print(keys(**d))\n"),
+        std::string("class Bag:\n"
+                    "    def lines[V](self, **parts: V) -> list[str]:\n"
+                    "        return [k + str(v) for k, v in parts.items()]\n"
+                    "d = {\"a\": 1.5}\n"
+                    "print(Bag().lines(**d), Bag().lines(z=1, **d))\n")}) {
     lython::emitter::EmitResult result = emitSource(source, context);
     EXPECT_TRUE(result.ok()) << source;
   }
@@ -1468,9 +1473,9 @@ TEST(EmitterTest, AMappingOfUnknownKeysReachesOnlyKwargs) {
 }
 
 // A starred sequence whose length only the run time knows reaches *args -- a
-// generic function's too -- and is refused where its first members would fill
-// a positional parameter, after which nothing positional may follow it, and
-// before a builtin.
+// generic function's or method's too -- and is refused where its first
+// members would fill a positional parameter, after which nothing positional
+// may follow it, and before a builtin.
 TEST(EmitterTest, AStarredSequenceOfUnknownLengthReachesOnlyArgs) {
   mlir::MLIRContext context(testRegistry());
   struct Case {
@@ -1505,8 +1510,12 @@ TEST(EmitterTest, AStarredSequenceOfUnknownLengthReachesOnlyArgs) {
       "    return total(*args)\n"
       "def count[T](*args: T) -> int:\n"
       "    return len(args)\n"
+      "class Bag:\n"
+      "    def count[T](self, *items: T) -> int:\n"
+      "        return len(items)\n"
       "xs = [1, 2]\n"
-      "print(total(*xs), total(0, *xs), relay(3, 4), count(*xs))\n",
+      "print(total(*xs), total(0, *xs), relay(3, 4), count(*xs),\n"
+      "      Bag().count(*xs), Bag().count(0, *xs))\n",
       context);
   EXPECT_TRUE(forwarded.ok());
 }
