@@ -3,8 +3,9 @@
 #   find the TestCase subclasses without module reflection.
 # KIND: 未対応 (unsupported)
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   static type !py.type<!py.contract<"Base">> does not provide manifest method '__subclasses__'
+# FIXED: 2026-10-20 -- answered from the program's classes, in creation order
+#   (cases/a_class_lists_its_subclasses).
+# CLASSIFICATION @ lang-gaps 18111c5c + the fix: 1 正しい
 # CPython 3.14 expects: ['A', 'B'] ['C']
 class Base:
     pass

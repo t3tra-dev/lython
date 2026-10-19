@@ -3,8 +3,10 @@
 #   builtins.function to runtime input 0"), not from the emitter.
 # KIND: 未対応 (unsupported) -- refused only in the lowering
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   cannot adapt builtins.function to runtime input 0 of builtins.function._ZN8__main__5applyE [values:, expected 'memref<8xi64>']
+# FIXED: 2026-10-20 -- a builtin passed where a callable value is expected becomes a
+#   forwarder typed by that callable
+#   (cases/a_builtin_function_passed_as_a_callable_value).
+# CLASSIFICATION @ lang-gaps 3fa9a5fb + the fix: 1 正しい
 # CPython 3.14 expects: hi
 from collections.abc import Callable
 

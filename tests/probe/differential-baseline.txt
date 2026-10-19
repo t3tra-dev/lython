@@ -378,8 +378,8 @@ ut_mod_inherited_method.py AGREE
 ut_mod_lib_error.py AGREE
 ut_mod_list_of_classes.py AGREE
 ut_mod_type_alias.py AGREE
-ut_unsupported_bound_builtin_method_as_callable.py GAP
-ut_unsupported_builtin_function_as_callable.py GAP
+ut_unsupported_bound_builtin_method_as_callable.py AGREE
+ut_unsupported_builtin_function_as_callable.py AGREE
 ut_unsupported_bytes_count_int.py GAP
 ut_unsupported_class_as_callable.py GAP
 ut_unsupported_class_attribute_overridden_read_through_base.py AGREE
@@ -408,10 +408,11 @@ ut_unsupported_paramspec_decorator.py GAP
 ut_unsupported_paramspec_forwarder_as_value.py GAP
 ut_unsupported_range_count.py GAP
 ut_unsupported_reversed_heterogeneous_tuple.py GAP
-ut_unsupported_subclasses.py GAP
+ut_unsupported_subclasses.py AGREE
 ut_unsupported_sys_modules.py GAP
 ut_unsupported_traceback_attribute.py GAP
-wb_a_bound_method_off_a_builtin_instance.py GAP
+wb_a_bound_method_off_a_builtin_instance.py AGREE
+wb_a_builtin_function_through_a_paramspec.py GAP
 wb_a_class_attribute_function_read_through_an_instance.py GAP
 wb_a_class_member_read_in_an_inferred_argument.py GAP
 wb_a_class_value_call_whose_argument_the_init_cannot_hold.py WRONG-DECLARED
@@ -428,6 +429,7 @@ wb_a_none_field_written_only_in_a_loop.py AGREE
 wb_a_record_written_as_a_dict.py GAP
 wb_a_return_a_rung_below_its_annotation.py AGREE
 wb_a_store_proof_outlives_what_changed_the_field.py GAP
+wb_a_str_joined_as_an_iterable_of_str.py GAP
 wb_a_try_in_a_generator_whose_name_outlives_it.py AGREE
 wb_a_watched_name_bound_in_a_loop_body.py WRONG-DECLARED
 wb_aggregate_slot_unfold_retain_leak.py SKIP

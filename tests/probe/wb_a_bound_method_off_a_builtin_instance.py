@@ -1,4 +1,11 @@
-# OPEN. A method read off an INSTANCE of a manifest class, without calling it:
+# FIXED 2026-10-20 (cases/a_method_of_a_builtin_value_read_without_calling_it):
+# the read is a forwarder `return __ly_recv.method(...)` over the receiver,
+# CAPTURED where it is read; the type is the shortest overload's required
+# parameters (TypeSystem::boundManifestMethodCallable). What the note below
+# said was missing -- a capture on the synthesized def -- is what
+# emitCallableFunction already does for a closure.
+#
+# WAS OPEN. A method read off an INSTANCE of a manifest class, without calling it:
 #
 #     s = "ab"
 #     m = s.upper          # inferred as the RESULT of s.upper(), i.e. str

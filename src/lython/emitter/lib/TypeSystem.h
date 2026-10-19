@@ -245,6 +245,12 @@ public:
   std::optional<py::CallableType>
   unboundManifestMethodCallable(mlir::Type typeObject,
                                 llvm::StringRef methodName) const;
+  // The callable a method read off an INSTANCE of a builtin class is, as the
+  // emitter's forwarder takes it (tryEmitBoundManifestMethodObject): the
+  // shortest overload, its required parameters, the receiver bound.
+  std::optional<py::CallableType>
+  boundManifestMethodCallable(mlir::Type receiver,
+                              llvm::StringRef methodName) const;
   // The instance contract behind a type object whose manifest class declares
   // `methodName` as an INSTANCE method -- the receiver an unbound call has to
   // shift its first argument into. Null for a source class, for a staticmethod

@@ -49,4 +49,4 @@ class FailingTests(unittest.TestCase):
         self.assertIn(3, [1, 2, 3])
 
 
-unittest.main(FailingTests)
+unittest.main()

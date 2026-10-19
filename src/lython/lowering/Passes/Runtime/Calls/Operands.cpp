@@ -255,7 +255,17 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
       // reaches a container slot. Its own storage is NOT that handle even
       // though the memref type matches: the boxed-payload entity word the
       // callee reads as the object's identity is only written by the box.
-      if (!RuntimeBundleLowerer::usesInheritedObjectDunder(symbol, boxInput))
+      // ⭐ A VALUE WHOSE HANDLE CANNOT BE MISTAKEN FOR A BOX IS BOXED HERE.
+      // The refusal below guards an instance, whose handle is a box's five
+      // words; a str's two lanes are not, and an indirect call that may reach
+      // a function taking `Iterable[str]` hands the str to that arm, whose
+      // parameter is the erased box: `cb("x")` over `list[Callable[[str],
+      // object]]` was refused once any such function existed.
+      bool unmistakable =
+          boxInput.physicalValues().size() != 1 ||
+          boxInput.physicalValues().front().getType() != expected;
+      if (!unmistakable &&
+          !RuntimeBundleLowerer::usesInheritedObjectDunder(symbol, boxInput))
         return op->emitError()
                << "cannot pass concrete object " << boxInput.contractName()
                << " as builtins.object runtime input " << inputIndex << " of "

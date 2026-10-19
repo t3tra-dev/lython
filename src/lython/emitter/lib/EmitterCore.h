@@ -1530,10 +1530,19 @@ private:
                                                mlir::Type type);
   // `str.lower` used as a value: the forwarder synthesized for it, memoized by
   // "<contract>.<method>" so one program builds one.
+  std::optional<Value> tryEmitBoundManifestMethodObject(
+      const parser::Node &anchor, Value object, llvm::StringRef methodName);
+  std::optional<Value> tryWrapBuiltinFunctionValue(Value value,
+                                                   py::CallableType target,
+                                                   const parser::Node &anchor);
   std::optional<Value> tryEmitManifestMethodObject(const parser::Node &anchor,
                                                    Value object,
                                                    llvm::StringRef methodName);
   llvm::StringMap<std::pair<std::string, mlir::Type>> manifestMethodObjects;
+  // Bound-method forwarders, keyed by receiver type and method.
+  llvm::StringMap<std::string> boundManifestMethodObjects;
+  // Builtin-function forwarders, keyed by builtin and the callable they are.
+  llvm::StringMap<std::pair<std::string, mlir::Type>> builtinFunctionObjects;
   Value emitFunctionObject(const parser::Node &anchor,
                            llvm::StringRef symbolName, mlir::Type type,
                            llvm::ArrayRef<Capture> captures);
@@ -1870,6 +1879,14 @@ private:
   // before any emission, so that "does a subclass override this" does not
   // depend on where in the file it is asked.
   llvm::StringMap<llvm::SmallVector<std::string, 4>> declaredClassBases;
+  // When each program class is created: an imported module's before the main
+  // module's, each in the order its module writes them.
+  llvm::StringMap<unsigned> declaredClassRank;
+  unsigned importedClassRanks = 0;
+  unsigned mainModuleClassRanks = 0;
+  // The program classes that name `cls` among their bases, in creation order.
+  llvm::SmallVector<std::string, 8> directSubclassesOf(llvm::StringRef cls);
+  std::optional<Value> tryEmitSubclassesCall(const parser::Node &expr);
   llvm::StringMap<llvm::StringSet<>> declaredClassMethods;
   llvm::StringMap<llvm::StringSet<>> declaredClassAttributes;
   // The names a class body makes readable WITHOUT an instance store: a plain

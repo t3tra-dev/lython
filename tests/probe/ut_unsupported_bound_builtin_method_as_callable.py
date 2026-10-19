@@ -3,8 +3,9 @@
 #   "attr.get object type has no class schema".
 # KIND: 未対応 (unsupported) -- refused with an internal message
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   attr.get object type has no class schema
+# FIXED: 2026-10-20 -- a method read off a builtin instance is a forwarder over the
+#   captured receiver (cases/a_method_of_a_builtin_value_read_without_calling_it).
+# CLASSIFICATION @ lang-gaps 3fa9a5fb + the fix: 1 正しい
 # CPython 3.14 expects: ['hi']
 from collections.abc import Callable
 

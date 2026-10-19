@@ -317,6 +317,8 @@ void ModuleEmitter::collectTopLevelBindings() {
       // Whether a hierarchy has an override is a property of the module, not
       // of where in it the question is asked.
       auto &bases = declaredClassBases[*name];
+      declaredClassRank.try_emplace(*name,
+                                    (1u << 30) + mainModuleClassRanks++);
       if (const auto *baseNodes = ast::nodeList(*statement, "bases"))
         for (const parser::NodePtr &base : *baseNodes)
           if (base && base->kind == "Name")
