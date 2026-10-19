@@ -3,8 +3,9 @@
 #   displays solve T. unittest's assertSetEqual is this method.
 # KIND: バグ (bug) -- loud: well-typed code refused
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   this call does not determine the type arguments of the generic method 'same'
+# FIXED: 2026-10-20 -- a set display ignores an expectation that still names a
+#   type parameter, as a list display does.
+# CLASSIFICATION @ lang-gaps e3a2bbfe + the fix: 1 正しい
 # CPython 3.14 expects: False True
 class Case:
     def same[T](self, a: set[T], b: set[T]) -> bool:

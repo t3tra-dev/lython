@@ -41,10 +41,7 @@ class ArithmeticTests(unittest.TestCase):
 
     def test_dicts_and_sets(self) -> None:
         self.assertDictEqual({"a": 1}, {"a": 1})
-        # WORKAROUND(ut_bug_set_display_solves_no_type_parameter): set displays do not solve a generic method's T.
-        a: set[int] = {1, 2}
-        b: set[int] = {2, 1}
-        self.assertSetEqual(a, b)
+        self.assertSetEqual({1, 2}, {2, 1})
 
     def test_none_and_identity(self) -> None:
         x: int | None = None
@@ -123,4 +120,4 @@ class DecoratedTests(unittest.TestCase):
             self.assertLess(i, 3)
 
 
-unittest.main([ArithmeticTests, FixtureTests, DecoratedTests])
+unittest.main(ArithmeticTests, FixtureTests, DecoratedTests)

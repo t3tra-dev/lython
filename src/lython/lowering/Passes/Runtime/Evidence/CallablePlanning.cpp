@@ -375,8 +375,11 @@ mlir::LogicalResult RuntimeBundleLowerer::collectFunctionCallSources(
     elementBundles.reserve(plan->varargActuals.size());
     elementSources.reserve(plan->varargActuals.size());
     for (unsigned actualIndex : plan->varargActuals) {
+      // A class value carrying its type object is an element like any object,
+      // as a list display's is (lowerPack): `names(A, B)` for `*classes:
+      // type[Base]` was refused here while `names([A, B])` ran.
       if (actualIndex >= actualSources.size() ||
-          actualSources[actualIndex]->kind != RuntimeBundle::Kind::Object)
+          !actualSources[actualIndex]->isObjectLike())
         return op.emitError()
                << "*args source for function target " << targetName
                << " must be a lowered object bundle";

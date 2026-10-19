@@ -4148,10 +4148,17 @@ Value ModuleEmitter::emitSetLiteral(const parser::Node &expr,
   }
 
   mlir::Type elementType;
+  // ⛔ Not an expectation that still names a type parameter: a generic's
+  // `set[T]` is what the call is about to SOLVE from this display, and a set
+  // built at `set[T]` left T with nothing to be solved from -- `same({1, 2},
+  // {2, 1})` was "this call does not determine the type arguments" while
+  // the list display beside it solved.
   if (auto expectedContract =
           mlir::dyn_cast_if_present<py::ContractType>(expected))
     if (expectedContract.getContractName() == "builtins.set" &&
-        expectedContract.getArguments().size() == 1)
+        expectedContract.getArguments().size() == 1 &&
+        unboundStaticParameterCount(expectedContract.getArguments().front()) ==
+            0)
       elementType = expectedContract.getArguments().front();
   // ⭐ An annotated `set[object]` is the program's own choice and is built by
   // the same `add` per element that `set()` then `add` already runs; only an
@@ -4674,7 +4681,8 @@ ModuleEmitter::tryEmitUnpackedLiteral(const parser::Node &expr,
     llvm::StringRef wanted = isDict          ? "builtins.dict"
                              : expr.kind == "Set" ? "builtins.set"
                                                   : "builtins.list";
-    if (expectedContract.getContractName() == wanted) {
+    if (expectedContract.getContractName() == wanted &&
+        unboundStaticParameterCount(expectedContract) == 0) {
       if (isDict && expectedContract.getArguments().size() == 2) {
         elementType = expectedContract.getArguments()[0];
         valueType = expectedContract.getArguments()[1];
@@ -4898,6 +4906,17 @@ Value ModuleEmitter::emitContainerLiteral(const parser::Node &expr,
       mlir::Type actual = types.widenLiteral(value.type);
       mlir::Type formal = types.widenLiteral(wanted);
       if (actual == formal)
+        continue;
+      // A subclass is a class value of its base: `[Mine]` for a
+      // `list[type[TestCase]]` formal, with TestCase in another module, kept
+      // `list[type[Mine]]` and the call was refused in the lowering.
+      auto actualClass = mlir::dyn_cast<py::TypeType>(actual);
+      auto formalClass = mlir::dyn_cast<py::TypeType>(formal);
+      if (actualClass && formalClass &&
+          (declaredSubclassOfType(actualClass.getInstanceType(),
+                                  formalClass.getInstanceType(), types) ||
+           pythonSubclassOf(actualClass.getInstanceType(),
+                            formalClass.getInstanceType(), types, module)))
         continue;
       if (!isAssignableWithStaticEvidence(actual, formal, module) &&
           !declaredSubclassOfType(actual, formal, types)) {

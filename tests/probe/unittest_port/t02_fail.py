@@ -45,6 +45,4 @@ class FailingTests(unittest.TestCase):
         self.assertIn(3, [1, 2, 3])
 
 
-# WORKAROUND(ut_bug_imported_function_list_of_one_subclass_value)
-classes: list[type[unittest.TestCase]] = [FailingTests]
-unittest.main(classes)
+unittest.main(FailingTests)

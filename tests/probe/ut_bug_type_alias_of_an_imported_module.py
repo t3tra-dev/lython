@@ -5,8 +5,9 @@
 #   shape.
 # KIND: バグ (bug) -- loud: well-typed code refused
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   static type !py.contract<"builtins.Info"> does not provide manifest method '__getitem__'
+# FIXED: 2026-10-20 -- an imported module's aliases are bound in its own scope;
+#   its `type X = ...` statements are declarations too.
+# CLASSIFICATION @ lang-gaps 699a549f + the fix: 1 正しい
 # CPython 3.14 expects: 1a / KeyError
 import sys
 import ut_mod_type_alias

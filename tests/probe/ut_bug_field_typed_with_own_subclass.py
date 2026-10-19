@@ -4,8 +4,9 @@
 #   current `_SubTest | None` this way.
 # KIND: バグ (bug) -- loud: well-typed code refused
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   class Sub has no field 'name'
+# FIXED: 2026-10-20 -- a subclass named in its base's body is no longer emitted
+#   ahead of the base.
+# CLASSIFICATION @ lang-gaps 699a549f + the fix: 1 正しい
 # CPython 3.14 expects: x s
 class Base:
     def __init__(self, name: str = "x") -> None:

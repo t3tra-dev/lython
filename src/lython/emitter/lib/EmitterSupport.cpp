@@ -1752,6 +1752,38 @@ std::optional<bool> optionalStaticBranchTruth(const parser::Node &test,
     return std::nullopt;
   }
 
+  // ⭐ `A and B` IS DECIDED BY ITS OPERANDS, left to right as CPython
+  // evaluates them: the first decided-false operand of an `and` (the first
+  // decided-true one of an `or`) is the answer, and the operands after it
+  // are never evaluated -- here or there. A generic method specialized at a
+  // V that no isinstance arm admits kept the arm compiled when its test was
+  // written `isinstance(a, list) and isinstance(b, list)`, and the dead arm
+  // was then refused for passing an int where it wants a list; the same test
+  // as two nested `if`s was pruned.
+  // ⛔ Only while every operand before the answer is decided too: an
+  // undecided one is evaluated at run time and its result may be the answer.
+  if (test.kind == "BoolOp") {
+    const parser::Node *op = ast::node(test, "op");
+    const auto *operands = ast::nodeList(test, "values");
+    bool isAnd = ast::isOperator(op, "And");
+    bool isOr = ast::isOperator(op, "Or");
+    if (operands && !operands->empty() && (isAnd || isOr)) {
+      for (const parser::NodePtr &operand : *operands) {
+        if (!operand)
+          return std::nullopt;
+        std::optional<bool> truth =
+            optionalStaticBranchTruth(*operand, types, from);
+        if (!truth)
+          return std::nullopt;
+        if (isAnd && !*truth)
+          return false;
+        if (isOr && *truth)
+          return true;
+      }
+      return isAnd;
+    }
+  }
+
   // `<string literal> == <string literal>` (and !=) folds statically: the
   // platform constants (sys.platform, os.name, platform.system()) type as
   // string literals, so this is the compile-time platform switch idiom --

@@ -29,7 +29,7 @@ Deviations from CPython that the static types themselves call for:
   context manager factory and a call forwarder here).
 - cleanups are stored as closures over their arguments, not as triples.
 - module fixtures (setUpModule) and the module loader are not provided; the
-  tests to run are named explicitly: main([TestA, TestB]).
+  tests to run are named explicitly: main(TestA, TestB).
 - failure messages carry no difflib/pprint diff.
 - frames of this module are dropped from a traceback by FILE NAME, not by a
   `__unittest` global in the frame.
@@ -42,8 +42,7 @@ import traceback
 import types
 from collections.abc import Callable, Iterator
 
-# WORKAROUND(ut_bug_type_alias_of_an_imported_module): a tuple alias defined here reaches annotations as a
-# fabricated class, so the sys.exc_info() triple is written out in full.
+_SysExcInfoType = tuple[type[BaseException], BaseException, types.TracebackType]
 
 _MAX_LENGTH: int = 80
 _PLACEHOLDER_LEN: int = 12
@@ -118,7 +117,7 @@ class _UnexpectedSuccess(Exception):
 class _ExpectedFailure(Exception):
     """The test failed as its decorator said it would."""
 
-    def __init__(self, exc_info: tuple[type[BaseException], BaseException, types.TracebackType]) -> None:
+    def __init__(self, exc_info: _SysExcInfoType) -> None:
         super().__init__()
         self.exc_info = exc_info
 
@@ -128,7 +127,7 @@ class _Outcome:
         self.expecting_failure = False
         self.result = result
         self.success = True
-        self.expectedFailure: tuple[type[BaseException], BaseException, types.TracebackType] | None = None
+        self.expectedFailure: _SysExcInfoType | None = None
         self.unexpectedSuccess = False
 
     @contextlib.contextmanager
@@ -266,12 +265,7 @@ class TestCase:
         if methodName != 'runTest' and not hasattr(self, methodName):
             raise ValueError("no such test method in %s: %s" % (type(self), methodName))
         self._cleanups: list[Callable[[], object]] = []
-        # WORKAROUND(ut_bug_field_typed_with_own_subclass): a field typed with a SUBCLASS of this class
-        # (`_SubTest | None`) makes that subclass lose the fields set here, so
-        # only the enclosing subtest's parameters are kept.
-        # WORKAROUND(ut_bug_optional_held_across_yield_in_with): an Optional held across a yield inside `with` stops
-        # the ownership verifier, so subtest parameters are a stack.
-        self._subtest_params: list[dict[str, object]] = []
+        self._subtest: _SubTest | None = None
 
     def addCleanup[**P](self, function: Callable[P, object], /, *args: P.args, **kwargs: P.kwargs) -> None:
         """Add a function, with arguments, to be called when the test is
@@ -417,9 +411,8 @@ class TestCase:
                                                 callable_obj: Callable[P, object],
                                                 *args: P.args, **kwargs: P.kwargs) -> None:
         """assertRaises' callable form: call callable_obj(*args, **kwargs)."""
-        # WORKAROUND(ut_bug_generic_method_local_of_generic_class): a generic class built from E and held in a local of
-        # a generic method is specialized at the unsolved E too.
-        with _AssertRaisesContext[E](expected_exception, self):
+        context = _AssertRaisesContext[E](expected_exception, self)
+        with context:
             callable_obj(*args, **kwargs)
 
     def _baseAssertEqual[T](self, first: T, second: T, msg: str | None = None) -> None:
@@ -431,12 +424,9 @@ class TestCase:
     def assertEqual[T](self, first: T, second: T, msg: str | None = None) -> None:
         """Fail if the two objects are unequal as determined by the '=='
         operator."""
-        # WORKAROUND(ut_bug_isinstance_and_keeps_dead_arm_in_generic_method): `isinstance(a, str) and isinstance(b, str)` keeps
-        # the unreachable arm type-checked; two nested tests do not.
-        if isinstance(first, str):
-            if isinstance(second, str):
-                self.assertMultiLineEqual(first, second, msg)
-                return
+        if isinstance(first, str) and isinstance(second, str):
+            self.assertMultiLineEqual(first, second, msg)
+            return
         self._baseAssertEqual(first, second, msg)
 
     def assertNotEqual[T](self, first: T, second: T, msg: str | None = None) -> None:
@@ -645,21 +635,21 @@ class TestResult:
         """Called once after all tests are executed."""
 
     def addError(self, test: TestCase,
-                 err: tuple[type[BaseException], BaseException, types.TracebackType]) -> None:
+                 err: _SysExcInfoType) -> None:
         """Called when an error has occurred."""
         self.errors.append((test, _exc_info_to_string(err, test)))
         if self.failfast:
             self.stop()
 
     def addFailure(self, test: TestCase,
-                   err: tuple[type[BaseException], BaseException, types.TracebackType]) -> None:
+                   err: _SysExcInfoType) -> None:
         """Called when a failure has occurred."""
         self.failures.append((test, _exc_info_to_string(err, test)))
         if self.failfast:
             self.stop()
 
     def addSubTest(self, test: TestCase, subtest: TestCase,
-                   err: tuple[type[BaseException], BaseException, types.TracebackType] | None) -> None:
+                   err: _SysExcInfoType | None) -> None:
         """Called at the end of a subtest."""
         if err is not None:
             if self.failfast:
@@ -678,7 +668,7 @@ class TestResult:
         self.skipped.append((test, reason))
 
     def addExpectedFailure(self, test: TestCase,
-                           err: tuple[type[BaseException], BaseException, types.TracebackType]) -> None:
+                           err: _SysExcInfoType) -> None:
         """Called when an expected failure/error occurred."""
         self.expectedFailures.append((test, _exc_info_to_string(err, test)))
 
@@ -710,7 +700,7 @@ def _is_unittest_entry(entry: str) -> bool:
     return 'unittest.py", line' in first
 
 
-def _exc_info_to_string(err: tuple[type[BaseException], BaseException, types.TracebackType],
+def _exc_info_to_string(err: _SysExcInfoType,
                         test: TestCase) -> str:
     """Converts a sys.exc_info()-style tuple of values into a string."""
     exctype, value, tb = err
@@ -812,7 +802,7 @@ def _tearDownPreviousClass(test: TestCase | None, result: TestResult) -> None:
 
 
 def _addClassLevelException(result: TestResult, exception: Exception, errorName: str,
-                            info: tuple[type[BaseException], BaseException, types.TracebackType]) -> None:
+                            info: _SysExcInfoType) -> None:
     error = _ErrorHolder(errorName)
     if isinstance(exception, SkipTest):
         result.addSkip(error, str(exception))
@@ -872,9 +862,8 @@ class TestLoader:
     def loadTestsFromTestCase(self, testCaseClass: type[TestCase]) -> TestSuite:
         """Return a suite of all test cases contained in testCaseClass."""
         testCaseNames = self.getTestCaseNames(testCaseClass)
-        # WORKAROUND(ut_bug_and_over_hasattr_of_a_class_value, ut_unsupported_hasattr_on_class_value): `not names and hasattr(cls, n)` is refused, and
-        # so is `hasattr(cls, 'runTest')` on a class value alone: the runTest
-        # fallback is dropped.
+        if not testCaseNames and hasattr(testCaseClass, 'runTest'):
+            testCaseNames = ['runTest']
         tests: list[TestCase | TestSuite] = []
         for name in testCaseNames:
             tests.append(testCaseClass(name))
@@ -951,7 +940,7 @@ class TextTestResult(TestResult):
         self._newline = True
 
     def addSubTest(self, test: TestCase, subtest: TestCase,
-                   err: tuple[type[BaseException], BaseException, types.TracebackType] | None) -> None:
+                   err: _SysExcInfoType | None) -> None:
         if err is not None:
             if self.showAll:
                 if issubclass(err[0], subtest.failureException):
@@ -975,7 +964,7 @@ class TextTestResult(TestResult):
             self.stream.flush()
 
     def addError(self, test: TestCase,
-                 err: tuple[type[BaseException], BaseException, types.TracebackType]) -> None:
+                 err: _SysExcInfoType) -> None:
         super().addError(test, err)
         if self.showAll:
             self._write_status(test, "ERROR")
@@ -984,7 +973,7 @@ class TextTestResult(TestResult):
             self.stream.flush()
 
     def addFailure(self, test: TestCase,
-                   err: tuple[type[BaseException], BaseException, types.TracebackType]) -> None:
+                   err: _SysExcInfoType) -> None:
         super().addFailure(test, err)
         if self.showAll:
             self._write_status(test, "FAIL")
@@ -1001,7 +990,7 @@ class TextTestResult(TestResult):
             self.stream.flush()
 
     def addExpectedFailure(self, test: TestCase,
-                           err: tuple[type[BaseException], BaseException, types.TracebackType]) -> None:
+                           err: _SysExcInfoType) -> None:
         super().addExpectedFailure(test, err)
         if self.showAll:
             self.stream.writeln("expected failure")
@@ -1098,9 +1087,7 @@ class TextTestRunner:
 _NO_TESTS_EXITCODE: int = 5
 
 
-# WORKAROUND(ut_bug_class_values_into_varargs): class values passed to `*classes: type[TestCase]` are
-# refused by the lowering, so the classes come as a list.
-def main(testCaseClasses: list[type[TestCase]]) -> None:
+def main(*testCaseClasses: type[TestCase]) -> None:
     """Run the test methods of the given classes; exit with the outcome."""
     verbosity = 1
     failfast = False

@@ -6,8 +6,9 @@
 #   compiles. unittest's assertRaises builds its context manager this way.
 # KIND: バグ (bug) -- loud, but only in the lowering
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   class value has no type object for builtins.E
+# FIXED: 2026-10-20 -- the field walk binds a generic method's type parameters,
+#   and no generic class is specialized at an unbound one.
+# CLASSIFICATION @ lang-gaps e3a2bbfe + the fix: 1 正しい
 # CPython 3.14 expects: False
 class Ctx[E: BaseException]:
     def __init__(self, expected: type[E]) -> None:
