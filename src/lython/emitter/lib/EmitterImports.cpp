@@ -61,9 +61,12 @@ bool isTopLevelClass(const parser::Node &statement) {
 // the earliest static boundary rather than answer as if the body were empty.
 bool isImportTimeDeclaration(const parser::Node &statement) {
   llvm::StringRef kind(statement.kind);
+  // A PEP 695 `type X = ...` declares a name for annotations, which the
+  // module's scope binds (bindSourceClassLocals); there is nothing to run.
   if (kind == "FunctionDef" || kind == "AsyncFunctionDef" ||
       kind == "ClassDef" || kind == "Import" || kind == "ImportFrom" ||
-      kind == "Assign" || kind == "AnnAssign" || kind == "Pass")
+      kind == "Assign" || kind == "AnnAssign" || kind == "Pass" ||
+      kind == "TypeAlias")
     return true;
   if (kind != "Expr")
     return false;
@@ -216,6 +219,43 @@ void bindSourceClassLocals(
       continue;
     types.bindClass(*name, types.contract(sourceModuleClassSymbol(moduleName,
                                                                   *name)));
+  }
+  // ⭐ AND THE MODULE'S TYPE ALIASES, which its annotations spell as the
+  // program's own spell theirs (predeclareTopLevel binds those). Unbound,
+  // `def f(info: Info)` for `Info = tuple[type[BaseException], ...]` read Info
+  // as a class of that name and fabricated it -- unittest's `_SysExcInfoType`.
+  // Bound in this module's scope only, in source order, so an alias may name
+  // the one before it.
+  // ⛔ Only a name the module binds once: one it rebinds is a value.
+  llvm::StringMap<unsigned> bindings;
+  auto singleTarget = [](const parser::Node &statement) -> const parser::Node * {
+    if (statement.kind == "AnnAssign")
+      return ast::node(statement, "target");
+    if (statement.kind != "Assign")
+      return nullptr;
+    const auto *targets = ast::nodeList(statement, "targets");
+    return targets && targets->size() == 1 ? targets->front().get() : nullptr;
+  };
+  for (const parser::NodePtr &statement : body)
+    if (statement)
+      if (const parser::Node *target = singleTarget(*statement);
+          target && target->kind == "Name")
+        ++bindings[ast::nameSpelling(*target)];
+  for (const parser::NodePtr &statement : body) {
+    if (!statement)
+      continue;
+    const parser::Node *target = statement->kind == "TypeAlias"
+                                     ? ast::node(*statement, "name")
+                                     : singleTarget(*statement);
+    const parser::Node *value = ast::node(*statement, "value");
+    if (!target || target->kind != "Name" || !value ||
+        !types.namesAType(value))
+      continue;
+    llvm::StringRef alias = ast::nameSpelling(*target);
+    if (statement->kind != "TypeAlias" && bindings.lookup(alias) != 1)
+      continue;
+    if (mlir::Type aliased = types.annotationType(value))
+      types.bindLocalTypeParameter(alias, aliased);
   }
 }
 
@@ -2277,12 +2317,23 @@ void ModuleEmitter::emitTopLevelDeclarations() {
       return ast::Walk::Continue;
     });
   };
+  // ⛔ NOT A SUBCLASS OF A CLASS STILL BEING EMITTED: its contract merges
+  // its bases' fields, which that class has not registered yet. `self.sub:
+  // Sub | None` in Base's `__init__` pulled `class Sub(Base)` ahead of Base,
+  // and Sub came out with no fields at all ("class Sub has no field
+  // 'name'"). It keeps its place in source order, after its base.
+  llvm::SmallVector<std::string, 4> classesInProgress;
   emitClassNow = [&](llvm::StringRef name) {
     auto found = deferred.find(name);
     if (found == deferred.end())
       return;
+    for (const std::string &active : classesInProgress)
+      if (programClassDerivesFrom(name, active))
+        return;
     const parser::Node *statement = found->second;
     deferred.erase(found);
+    classesInProgress.push_back(name.str());
+    auto done = llvm::scope_exit([&] { classesInProgress.pop_back(); });
     emitNamedClassesFirst(*statement);
     if (genericClasses.count(name)) {
       // ⛔ A SPECIALIZATION'S BODIES ARE NEVER DEFERRED. They are typed inside

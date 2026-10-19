@@ -3,8 +3,9 @@
 #   The instance form `hasattr(obj, name)` is answered at run time.
 # KIND: 未対応 (unsupported)
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   hasattr(x, 'runTest') on 'TestCase' cannot be answered: 'WithRunTest' derives from it and may define that attribute
+# FIXED: 2026-10-20 -- answered by the run-time class: does it derive from a class
+#   that declares the name.
+# CLASSIFICATION @ lang-gaps 699a549f + the fix: 1 正しい
 # CPython 3.14 expects: True False
 class TestCase:
     pass

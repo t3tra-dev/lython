@@ -4907,6 +4907,17 @@ Value ModuleEmitter::emitContainerLiteral(const parser::Node &expr,
       mlir::Type formal = types.widenLiteral(wanted);
       if (actual == formal)
         continue;
+      // A subclass is a class value of its base: `[Mine]` for a
+      // `list[type[TestCase]]` formal, with TestCase in another module, kept
+      // `list[type[Mine]]` and the call was refused in the lowering.
+      auto actualClass = mlir::dyn_cast<py::TypeType>(actual);
+      auto formalClass = mlir::dyn_cast<py::TypeType>(formal);
+      if (actualClass && formalClass &&
+          (declaredSubclassOfType(actualClass.getInstanceType(),
+                                  formalClass.getInstanceType(), types) ||
+           pythonSubclassOf(actualClass.getInstanceType(),
+                            formalClass.getInstanceType(), types, module)))
+        continue;
       if (!isAssignableWithStaticEvidence(actual, formal, module) &&
           !declaredSubclassOfType(actual, formal, types)) {
         allFit = false;

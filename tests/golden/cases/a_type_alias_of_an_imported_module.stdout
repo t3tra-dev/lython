@@ -1,0 +1,5 @@
+1a
+KeyError ['KeyError']
+ValueError ['KeyError', 'ValueError']
+KeyError ['KeyError', 'ValueError', 'KeyError']
+{'KeyError': 2, 'ValueError': 1}

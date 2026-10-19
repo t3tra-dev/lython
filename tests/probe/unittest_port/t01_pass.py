@@ -120,4 +120,4 @@ class DecoratedTests(unittest.TestCase):
             self.assertLess(i, 3)
 
 
-unittest.main([ArithmeticTests, FixtureTests, DecoratedTests])
+unittest.main(ArithmeticTests, FixtureTests, DecoratedTests)

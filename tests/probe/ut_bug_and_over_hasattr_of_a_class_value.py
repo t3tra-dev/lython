@@ -4,8 +4,8 @@
 #   ut_unsupported_hasattr_on_class_value.)
 # KIND: バグ (bug) -- loud: well-typed code refused
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   `and`/`or` over these operand types has no statically representable result type; wrap the operands in explicit comparisons or a conditional expression
+# FIXED: 2026-10-20 -- hasattr and callable are typed bool.
+# CLASSIFICATION @ lang-gaps 699a549f + the fix: 1 正しい
 # CPython 3.14 expects: ['runTest'] ['x']
 class TestCase:
     pass

@@ -4,8 +4,8 @@
 #   TestB)` needs this.
 # KIND: バグ (bug) -- loud, but only in the lowering
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   *args source for function target _ZN8__main__5namesE must be a lowered object bundle
+# FIXED: 2026-10-20 -- the variadic tuple takes a class value as a list display does.
+# CLASSIFICATION @ lang-gaps 699a549f + the fix: 1 正しい
 # CPython 3.14 expects: ['A', 'B']
 class Base:
     pass

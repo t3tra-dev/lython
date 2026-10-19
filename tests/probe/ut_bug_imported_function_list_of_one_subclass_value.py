@@ -6,8 +6,9 @@
 #   `unittest.main([MyTests])` is this call.
 # KIND: バグ (bug) -- loud, but only in the lowering
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   arguments do not match Callable contract for function target _ZN22ut_mod_list_of_classes4mainE
+# FIXED: 2026-10-20 -- a subclass's class value fits its base's class type in a
+#   container display's expectation.
+# CLASSIFICATION @ lang-gaps 699a549f + the fix: 1 正しい
 # CPython 3.14 expects: ['Mine']
 import ut_mod_list_of_classes
 

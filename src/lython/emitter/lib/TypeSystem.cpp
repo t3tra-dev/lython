@@ -4868,7 +4868,11 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           return inference.resultType;
         return fail(inference.failureReason);
       }
-      if (name == "isinstance" || name == "issubclass")
+      // `hasattr` and `callable` too: the emitter answers each with a bool or
+      // a literal one, and inferring nothing for them made `not names and
+      // hasattr(cls, 'runTest')` an `and` with no representable result.
+      if (name == "isinstance" || name == "issubclass" || name == "hasattr" ||
+          name == "callable")
         return boolType();
       // `type(v)` is v's class, as a class value: the emitter answers it from
       // the static class where that decides it and from the value's header

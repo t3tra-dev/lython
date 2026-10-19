@@ -3473,6 +3473,80 @@ ModuleEmitter::tryEmitHasattrCall(const parser::Node &expr,
   std::string undecidedBy;
   AttributePresence presence =
       attributePresence(subject, attribute, &undecidedBy);
+  // ⭐ A RECEIVER WHOSE CLASS LINE LACKS THE NAME, BUT WHOSE SUBCLASSES MAY
+  // DECLARE IT, is answered by which class it has at run time: the program's
+  // classes are all known, so the answer is whether that class derives from
+  // one that declares the name. unittest's loader asks `hasattr(cls,
+  // 'runTest')` of every test class, and the question was refused because a
+  // test class may define it.
+  // ⛔ An instance whose subclasses STORE the name on `self` is not answered
+  // this way: whether that instance has stored it is its own history.
+  if (presence == AttributePresence::Undecided && !undecidedBy.empty()) {
+    bool throughClass = mlir::isa<py::TypeType>(subject);
+    auto staticClass = mlir::dyn_cast<py::ContractType>(
+        throughClass ? mlir::cast<py::TypeType>(subject).getInstanceType()
+                     : subject);
+    llvm::SmallVector<std::string, 4> definers;
+    bool stored = false;
+    if (staticClass)
+      for (const std::string &candidate :
+           programSubclassesOf(staticClass.getContractName())) {
+        auto declares = [&](const llvm::StringMap<llvm::StringSet<>> &map) {
+          auto found = map.find(candidate);
+          return found != map.end() && found->second.contains(attribute);
+        };
+        if (declares(declaredClassStoredFields))
+          stored = true;
+        bool valued = false;
+        if (const parser::Node *classDef = declaredClassNodes.lookup(candidate))
+          if (const auto *classBody = ast::nodeList(*classDef, "body"))
+            for (const parser::NodePtr &member : *classBody) {
+              if (!member)
+                continue;
+              if ((member->kind == "FunctionDef" ||
+                   member->kind == "AsyncFunctionDef") &&
+                  llvm::StringRef(ast::string(*member, "name").value_or("")) ==
+                      attribute)
+                valued = true;
+              const parser::Node *target = nullptr;
+              if (member->kind == "AnnAssign" && ast::node(*member, "value"))
+                target = ast::node(*member, "target");
+              else if (member->kind == "Assign")
+                if (const auto *targets = ast::nodeList(*member, "targets");
+                    targets && targets->size() == 1)
+                  target = targets->front().get();
+              if (target && target->kind == "Name" &&
+                  llvm::StringRef(ast::nameSpelling(*target)) == attribute)
+                valued = true;
+            }
+        if (valued)
+          definers.push_back(candidate);
+      }
+    if (staticClass && !definers.empty() && (throughClass || !stored)) {
+      Value receiver = emitExpr(args->front().get());
+      mlir::Value classValue =
+          throughClass ? receiver.value
+                       : emitClassOfValue(expr, receiver,
+                                          types.typeObject(staticClass))
+                             .value;
+      mlir::Value test;
+      for (const std::string &definer : definers) {
+        mlir::Type definerType = types.contract(definer);
+        auto definerClass = py::TypeObjectOp::create(
+            builder, loc(expr), types.typeObject(definerType), definerType);
+        mlir::Value one =
+            py::TypeSubclassOp::create(builder, loc(expr), builder.getI1Type(),
+                                       classValue, definerClass.getResult())
+                .getResult();
+        test = test ? mlir::arith::OrIOp::create(builder, loc(expr), test, one)
+                          .getResult()
+                    : one;
+      }
+      auto pyBool = py::CastFromPrimOp::create(builder, loc(expr),
+                                               types.boolType(), test);
+      return Value{pyBool.getResult(), types.boolType()};
+    }
+  }
   switch (presence) {
   case AttributePresence::Undecided:
     if (undecidedBy.empty())
