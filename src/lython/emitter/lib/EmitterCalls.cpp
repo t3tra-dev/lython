@@ -7063,15 +7063,24 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
   // The arguments are evaluated first and the keywords after them in their
   // written order, which is when CPython evaluates a call's arguments; the
   // str() of each argument is taken between the writes, as there.
-  bool chosenSink = fileNode || flushNode;
+  // ⭐ AND SO IS A `sys.stdout` THE PROGRAM REPLACES: print writes to what
+  // the stream holds when it runs, piece by piece through its `write`, which
+  // is CPython's print -- the joined line above is a shortcut only the
+  // runtime's own stream can take (EmitterGlobals.cpp, replaced streams).
+  bool replacedStdout = llvm::is_contained(replacedStreams, "sys.stdout");
+  bool chosenSink = fileNode || flushNode || replacedStdout;
   if (chosenSink) {
     if (printArgs)
       for (const parser::NodePtr &argument : *printArgs)
         if (!argument || argument->kind == "Starred") {
           diagnostics.push_back(parser::Diagnostic{
               parser::Severity::Error, expr.range.start,
-              "print() to a file takes its arguments spelled out, not "
-              "unpacked"});
+              fileNode || flushNode
+                  ? "print() to a file takes its arguments spelled out, not "
+                    "unpacked"
+                  : "print() takes its arguments spelled out, not unpacked, "
+                    "in a program that replaces sys.stdout: each one is "
+                    "written to the stream sys.stdout holds"});
           return emitNone(expr);
         }
     mlir::Type strType = types.contract("builtins.str");

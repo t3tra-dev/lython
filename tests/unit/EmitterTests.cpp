@@ -1004,6 +1004,39 @@ TEST(EmitterTest, AMethodOnAUnionIsAnsweredByEveryMemberOrRefused) {
   }
 }
 
+// A program that replaces sys.stdout refuses what would read the stream it
+// replaced: an object of another kind assigned to it, a `from sys import
+// stdout` snapshot, and a print() whose arguments are unpacked.
+TEST(EmitterTest, AReplacedStreamRefusesWhatItCannotWriteThrough) {
+  struct Case {
+    const char *source;
+    const char *message;
+  };
+  for (const Case &item : {
+           Case{"import sys\n"
+                "sys.stdout = 'not a stream'\n",
+                "sys.stdout can be replaced here by an io.StringIO"},
+           Case{"import sys\n"
+                "from sys import stdout\n"
+                "sys.stdout = sys.__stdout__\n",
+                "would bind the stream as it is at the import"},
+           Case{"import sys\n"
+                "xs = [1, 2]\n"
+                "sys.stdout = sys.__stdout__\n"
+                "print(*xs)\n",
+                "in a program that replaces sys.stdout"},
+       }) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult emitted = emitSource(item.source, context);
+    EXPECT_FALSE(emitted.ok()) << item.source;
+    bool found = false;
+    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+      found = found ||
+              diagnostic.message.find(item.message) != std::string::npos;
+    EXPECT_TRUE(found) << item.source;
+  }
+}
+
 // The chain attributes read the words a raise left in the exception; an
 // assignment to one is refused at the store, naming the raise that writes it.
 TEST(EmitterTest, TheExceptionChainIsReadButWrittenOnlyByARaise) {

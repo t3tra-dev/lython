@@ -4932,6 +4932,15 @@ Value ModuleEmitter::emitBindingRef(const parser::Node &anchor,
   auto shadowed = shadowedBuiltinSymbols.find(binding);
   if (shadowed != shadowedBuiltinSymbols.end())
     binding = shadowed->second;
+  // A stream the program replaces is read from its cell, whatever type the
+  // caller expected of the runtime's own (EmitterGlobals.cpp).
+  if (llvm::is_contained(replacedStreams, binding)) {
+    mlir::Type cell = types.replacedStreamType();
+    auto read = py::GlobalGetOp::create(builder, loc(anchor), cell,
+                                        builder.getStringAttr(binding));
+    markBoxedModuleGlobal(read);
+    return {read.getResult(), cell};
+  }
   mlir::Type resultType = type;
   llvm::SmallVector<mlir::Value, 4> captureValues;
   for (Value capture : captures)

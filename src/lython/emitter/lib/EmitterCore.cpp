@@ -110,6 +110,9 @@ EmitResult ModuleEmitter::emit() {
     if (source.moduleNode && !source.isStub)
       recordPythonDefinitionNames(*source.moduleNode, source.moduleName);
   recordPythonDefinitionNames(moduleNode, moduleName);
+  // Before any import is bound: a replaced stream's binding is typed as the
+  // cell it becomes.
+  collectReplacedStreams();
   // Before any binder reads an imported module's top level: a container
   // constant there is a module GLOBAL, and the binders below hand out its
   // canonical name.
@@ -205,6 +208,7 @@ EmitResult ModuleEmitter::emit() {
   // the importer continues.
   // Module-level constants first: a class attribute initializer may read one,
   // and CPython runs the module body top to bottom.
+  emitReplacedStreamInitializers(moduleNode);
   emitImportedModuleGlobalInitializers();
   emitImportedClassAttrInitializers();
   emitStatements(ast::nodeList(moduleNode, "body"), /*skipDeclarations=*/true);

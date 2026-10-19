@@ -409,11 +409,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBindingRef(py::BindingRefOp op) {
 
   // sys.stdout/stderr resolve to the immortal _io.TextIOWrapper singletons
   // through their manifest accessors; the borrowed handle needs no refcount
-  // traffic.
-  if (op.getBinding() == "sys.stdout" || op.getBinding() == "sys.stderr") {
+  // traffic. `sys.__stdout__` / `sys.__stderr__` are the same singletons:
+  // they name the streams the program started with, which a replaced
+  // `sys.stdout` holds only until its first assignment.
+  llvm::StringRef binding = op.getBinding();
+  if (binding == "sys.stdout" || binding == "sys.stderr" ||
+      binding == "sys.__stdout__" || binding == "sys.__stderr__") {
+    bool out = binding == "sys.stdout" || binding == "sys.__stdout__";
     std::optional<RuntimeSymbol> accessor = manifest.primitive(
-        "_io.TextIOWrapper",
-        op.getBinding() == "sys.stdout" ? "sys_stdout" : "sys_stderr");
+        "_io.TextIOWrapper", out ? "sys_stdout" : "sys_stderr");
     if (!accessor)
       return op.emitError() << "runtime manifest has no _io.TextIOWrapper "
                             << "accessor for " << op.getBinding();

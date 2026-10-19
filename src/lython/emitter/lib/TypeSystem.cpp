@@ -1521,11 +1521,15 @@ constexpr NameStrListImport kNameStrListImports[] = {
 constexpr ModuleContractValueImport kModuleContractValueImports[] = {
     {"sys", "stdout", "sys.stdout", "_io.TextIOWrapper"},
     {"sys", "stderr", "sys.stderr", "_io.TextIOWrapper"},
+    {"sys", "__stdout__", "sys.__stdout__", "_io.TextIOWrapper"},
+    {"sys", "__stderr__", "sys.__stderr__", "_io.TextIOWrapper"},
 };
 
 constexpr NameContractValueImport kNameContractValueImports[] = {
     {"sys", "stdout", "sys.stdout", "_io.TextIOWrapper"},
     {"sys", "stderr", "sys.stderr", "_io.TextIOWrapper"},
+    {"sys", "__stdout__", "sys.__stdout__", "_io.TextIOWrapper"},
+    {"sys", "__stderr__", "sys.__stderr__", "_io.TextIOWrapper"},
 };
 
 std::string importedAttribute(llvm::StringRef localName, llvm::StringRef attr) {
@@ -2968,7 +2972,10 @@ bool TypeSystem::bindImportedModule(llvm::StringRef module,
       continue;
     bindModuleObject();
     bindCanonicalSymbol(importedAttribute(localName, entry.localAttr),
-                        entry.canonicalName, contract(entry.contract));
+                        entry.canonicalName,
+                        isReplacedStream(entry.canonicalName)
+                            ? replacedStreamType()
+                            : contract(entry.contract));
   }
 
   if (std::optional<AnnotationModuleStyle> style =
@@ -2994,6 +3001,26 @@ bool TypeSystem::bindImportedModule(llvm::StringRef module,
   if (handled)
     noteModuleNameInScope(localName);
   return handled;
+}
+
+void TypeSystem::setReplacedStreams(
+    llvm::ArrayRef<std::string> canonicalNames) {
+  replacedStreams.clear();
+  for (const std::string &name : canonicalNames)
+    replacedStreams.insert(name);
+}
+
+bool TypeSystem::isReplacedStream(llvm::StringRef canonicalName) const {
+  return replacedStreams.contains(canonicalName);
+}
+
+// ⛔ THE TWO TEXT STREAMS THE RUNTIME HAS, and no more. What a program stores
+// there is read back by tag (`print` writes through the stream's own
+// `write`), so every member must be a class the dispatch can name -- an
+// arbitrary object with a `write` method would need `object`, which is the
+// dynamic receiver this compiler does not have.
+mlir::Type TypeSystem::replacedStreamType() const {
+  return join({contract("_io.TextIOWrapper"), contract("_io.StringIO")});
 }
 
 bool TypeSystem::bindImportedName(llvm::StringRef module,
@@ -3066,7 +3093,9 @@ bool TypeSystem::bindImportedName(llvm::StringRef module,
     if (module != entry.module || exportedName != entry.exportedName)
       continue;
     bindCanonicalSymbol(localName, entry.canonicalName,
-                        contract(entry.contract));
+                        isReplacedStream(entry.canonicalName)
+                            ? replacedStreamType()
+                            : contract(entry.contract));
     return true;
   }
 

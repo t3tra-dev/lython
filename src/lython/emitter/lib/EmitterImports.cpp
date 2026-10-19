@@ -2135,6 +2135,22 @@ bool ModuleEmitter::bindImportStatement(const parser::Node &statement,
     std::optional<std::string_view> asname = ast::string(*alias, "asname");
     llvm::StringRef local =
         asname ? llvm::StringRef(*asname) : llvm::StringRef(*name);
+    // ⛔ A REPLACED STREAM IS NOT IMPORTED BY NAME. `from sys import stdout`
+    // binds the stream at the import, and a later `sys.stdout = buf` does not
+    // reach that name in CPython -- while here the name would read the cell,
+    // which is the replacement. Refused rather than answered differently.
+    if (diagnoseUnsupported &&
+        llvm::is_contained(replacedStreams,
+                           joinModuleName(*resolvedModule, *name))) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, alias->range.start,
+          "'from " + *resolvedModule + " import " + std::string(*name) +
+              "' would bind the stream as it is at the import, and this "
+              "program replaces " + joinModuleName(*resolvedModule, *name) +
+              ": read it as `" + joinModuleName(*resolvedModule, *name) +
+              "` where it is used"});
+      continue;
+    }
     if (bindSourceModuleName(*resolvedModule, llvm::StringRef(*name), local))
       continue;
     std::string submodule = joinModuleName(*resolvedModule, *name);

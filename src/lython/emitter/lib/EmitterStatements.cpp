@@ -2131,6 +2131,25 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
     return;
   }
   if (target.kind == "Attribute") {
+    // ⭐ `sys.stdout = buf` STORES INTO THE STREAM'S CELL, which every read of
+    // the stream -- print's included -- goes through (EmitterGlobals.cpp).
+    if (std::optional<std::string> stream = replacedStreamTarget(target)) {
+      mlir::Type cell = types.replacedStreamType();
+      if (!py::isAssignableTo(types.widenLiteral(value.type), cell, module)) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, target.range.start,
+            *stream + " can be replaced here by an io.StringIO or a "
+                      "TextIOWrapper (the stream it starts as), not by " +
+                pythonTypeSpelling(types.widenLiteral(value.type)) +
+                ": what it holds is written through by tag"});
+        return;
+      }
+      Value coerced = coerceValue(value, cell, target);
+      auto store = py::GlobalSetOp::create(
+          builder, loc(target), builder.getStringAttr(*stream), coerced.value);
+      markBoxedModuleGlobal(store);
+      return;
+    }
     const parser::Node *objectNode = ast::node(target, "value");
     Value object = emitExpr(objectNode);
     if (auto attr = ast::string(target, "attr")) {
