@@ -388,6 +388,116 @@ ModuleEmitter::bindParamSpecPacks(const parser::Node &callable,
   return held;
 }
 
+const parser::Node *
+ModuleEmitter::defaultExpressionForSlot(const parser::Node &def,
+                                        unsigned slot) {
+  const parser::Node *arguments = ast::node(def, "args");
+  if (!arguments)
+    return nullptr;
+  std::size_t positional = 0;
+  for (llvm::StringRef field : {"posonlyargs", "args"})
+    if (const auto *list = ast::nodeList(*arguments, field))
+      positional += list->size();
+  if (slot < positional) {
+    const auto *defaults = ast::nodeList(*arguments, "defaults");
+    if (!defaults || defaults->size() > positional)
+      return nullptr;
+    std::size_t firstDefault = positional - defaults->size();
+    if (slot < firstDefault)
+      return nullptr;
+    return (*defaults)[slot - firstDefault].get();
+  }
+  const auto *kwDefaults = ast::nodeList(*arguments, "kw_defaults");
+  std::size_t index = slot - positional;
+  if (!kwDefaults || index >= kwDefaults->size())
+    return nullptr;
+  return (*kwDefaults)[index].get();
+}
+
+std::optional<ModuleEmitter::GenericDefaultCell>
+ModuleEmitter::genericDefaultCell(const parser::Node &def, unsigned slot) {
+  const GenericFunctionInfo *generic = nullptr;
+  for (const auto &entry : genericFunctions)
+    if (entry.second.node == &def) {
+      generic = &entry.second;
+      break;
+    }
+  if (!generic)
+    return std::nullopt;
+  const parser::Node *expr = defaultExpressionForSlot(def, slot);
+  if (!expr)
+    return std::nullopt;
+  const FunctionSignature &sig = generic->signature;
+  unsigned positionalCount = static_cast<unsigned>(sig.positionalTypes.size());
+  mlir::Type type;
+  if (slot < positionalCount)
+    type = sig.positionalTypes[slot];
+  else if (slot - positionalCount < sig.kwOnlyTypes.size())
+    type = sig.kwOnlyTypes[slot - positionalCount];
+  type = type ? types.widenLiteral(type) : type;
+  if (!type || unboundStaticParameterCount(type) != 0) {
+    type = types.widenLiteral(types.inferExpr(expr));
+    if (!type || unboundStaticParameterCount(type) != 0)
+      return std::nullopt;
+  }
+  return GenericDefaultCell{(llvm::Twine("__ly.defaultcell.") +
+                             generic->symbolBase + "." + llvm::Twine(slot))
+                                .str(),
+                            type};
+}
+
+std::string ModuleEmitter::genericOmittedDefaultMismatch(
+    const parser::Node &def, py::CallableType specialized,
+    unsigned positionalGiven, llvm::ArrayRef<CallKeywordType> keywords) {
+  if (!specialized)
+    return "";
+  llvm::ArrayRef<mlir::Type> positionalTypes = specialized.getPositionalTypes();
+  llvm::ArrayRef<mlir::Type> kwOnlyTypes = specialized.getKwOnlyTypes();
+  const parser::Node *arguments = ast::node(def, "args");
+  if (!arguments)
+    return "";
+  llvm::SmallVector<std::string, 8> names;
+  for (llvm::StringRef field : {"posonlyargs", "args", "kwonlyargs"})
+    if (const auto *list = ast::nodeList(*arguments, field))
+      for (const parser::NodePtr &argument : *list)
+        names.push_back(argument ? std::string(ast::nameSpelling(*argument))
+                                 : std::string());
+  unsigned total =
+      static_cast<unsigned>(positionalTypes.size() + kwOnlyTypes.size());
+  for (unsigned slot = 0; slot < total && slot < names.size(); ++slot) {
+    if (slot < positionalTypes.size() && slot < positionalGiven)
+      continue;
+    if (llvm::any_of(keywords, [&](const CallKeywordType &keyword) {
+          return keyword.name == names[slot];
+        }))
+      continue;
+    const parser::Node *expr = defaultExpressionForSlot(def, slot);
+    if (!expr)
+      continue;
+    mlir::Attribute literal = defaultValueAttr(builder, expr);
+    auto dict = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(literal);
+    auto kind =
+        dict ? dict.getAs<mlir::StringAttr>("kind") : mlir::StringAttr();
+    if (!kind || kind.getValue() != "unsupported")
+      continue;
+    mlir::Type parameter = types.widenLiteral(
+        slot < positionalTypes.size()
+            ? positionalTypes[slot]
+            : kwOnlyTypes[slot - positionalTypes.size()]);
+    std::optional<GenericDefaultCell> cell = genericDefaultCell(def, slot);
+    if (cell && cell->type == parameter)
+      continue;
+    return "the default of '" + names[slot] +
+           "' is one value every call shares, as CPython evaluates it once "
+           "at the def" +
+           (cell ? ", and it is " + pythonTypeSpelling(cell->type)
+                 : std::string()) +
+           "; this call leaves it out where the parameter is " +
+           pythonTypeSpelling(parameter) + ": pass it";
+  }
+  return "";
+}
+
 void ModuleEmitter::emitImportedClassAttrInitializers() {
   llvm::SmallVector<PendingClassAttrInit, 4> pending =
       std::move(importedClassAttrInits);
@@ -1457,6 +1567,31 @@ mlir::ArrayAttr ModuleEmitter::emitCallableDefaultValues(
 
     if (isModuleLevelDef) {
       if (mlir::Type declared = declaredSlotType(slot)) {
+        // ⭐ A SPECIALIZATION READS ITS GENERIC'S CELL. Its own cell was
+        // registered when the specialization was emitted -- at the first
+        // call, which is usually after the module walk had passed the def
+        // -- so nothing ever wrote it and an omitted argument read a null
+        // object: `def g[T](x: T, xs: list[int] = [1])` then `g(1)` was a
+        // segfault. The generic's cell is written at the def statement
+        // (emitPendingDefaultCells), once, as CPython evaluates it.
+        // ⛔ A specialization whose parameter cannot hold that one value
+        // gets no default at all; a call that would read it is refused at
+        // the call (genericOmittedDefaultMismatch).
+        if (defaultCellOwner == &function && hasTypeParameters(function)) {
+          llvm::SmallVector<mlir::NamedAttribute, 2> attrs;
+          std::optional<GenericDefaultCell> cell =
+              genericDefaultCell(function, slot);
+          if (!cell || cell->type != declared) {
+            attrs.push_back(builder.getNamedAttr(
+                "kind", builder.getStringAttr("unshared")));
+            return builder.getDictionaryAttr(attrs);
+          }
+          attrs.push_back(
+              builder.getNamedAttr("kind", builder.getStringAttr("global")));
+          attrs.push_back(builder.getNamedAttr(
+              "value", builder.getStringAttr(cell->name)));
+          return builder.getDictionaryAttr(attrs);
+        }
         std::string cellName = (llvm::Twine("__ly.defaultcell.") + symbolName +
                                 "." + llvm::Twine(slot))
                                    .str();

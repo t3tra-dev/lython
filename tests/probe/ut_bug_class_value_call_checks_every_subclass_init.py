@@ -4,8 +4,9 @@
 #   passed.
 # KIND: バグ (bug) -- loud: well-typed code refused
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   missing required argument 'extra' for inlined class method
+# FIXED: 2026-10-20 -- an arm whose __init__ cannot take the call raises CPython's
+#   TypeError instead of refusing the call for every class.
+# CLASSIFICATION @ lang-gaps c8463f9d + the fix: 1 正しい
 # CPython 3.14 expects: ['test_a'] d
 class TestCase:
     def __init__(self, methodName: str = "runTest") -> None:

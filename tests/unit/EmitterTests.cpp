@@ -3463,6 +3463,43 @@ TEST(EmitterTest, AClassmethodThroughAnInstanceNeedsItsClassName) {
       << diagnostics;
 }
 
+// A generic function's non-literal default is one value every call shares --
+// CPython evaluates it once at the def -- so a call that leaves it out where
+// its specialization types the parameter otherwise has no value to pass.
+// Passing it, or a default whose type does not depend on the type parameter,
+// compiles.
+TEST(EmitterTest, AGenericDefaultIsOneValueForEveryCall) {
+  lython::driver::DriverOptions native;
+  native.targetTriple = llvm::sys::getDefaultTargetTriple();
+  {
+    mlir::MLIRContext context(testRegistry());
+    mlir::OwningOpRef<mlir::ModuleOp> module;
+    std::string diagnostics;
+    llvm::raw_string_ostream diag(diagnostics);
+    EXPECT_TRUE(mlir::succeeded(lython::driver::emitMLIRFromSource(
+        "def g[T](x: T, xs: list[int] = [1]) -> int:\n    return len(xs)\n"
+        "def h[T](x: T, ys: list[T] = []) -> int:\n    return len(ys)\n"
+        "print(g(1), g(\"a\"), h(1, [2]))\n",
+        "main.py", "<lython-no-import-dir>", native, context, module, diag)))
+        << diagnostics;
+  }
+  mlir::MLIRContext context(testRegistry());
+  mlir::OwningOpRef<mlir::ModuleOp> module;
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  EXPECT_TRUE(mlir::failed(lython::driver::emitMLIRFromSource(
+      "def h[T](x: T, ys: list[T] = []) -> int:\n    return len(ys)\n"
+      "print(h(1))\n",
+      "main.py", "<lython-no-import-dir>", native, context, module, diag)));
+  EXPECT_NE(diagnostics.find("the default of 'ys' is one value every call "
+                             "shares"),
+            std::string::npos)
+      << diagnostics;
+  EXPECT_NE(diagnostics.find("where the parameter is list[int]"),
+            std::string::npos)
+      << diagnostics;
+}
+
 TEST(EmitterTest, ABytearrayTakesWhatCPythonTakes) {
   lython::driver::DriverOptions native;
   native.targetTriple = llvm::sys::getDefaultTargetTriple();

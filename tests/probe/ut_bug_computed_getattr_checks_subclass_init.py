@@ -4,8 +4,9 @@
 #   CPython's TypeError if that name ever arrives.
 # KIND: バグ (bug) -- loud: well-typed code refused
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   missing required argument 'description' for inlined class method
+# FIXED: 2026-10-20 -- a dispatch arm whose override cannot take the call raises
+#   CPython's TypeError.
+# CLASSIFICATION @ lang-gaps c8463f9d + the fix: 1 正しい
 # CPython 3.14 expects: test_a ran / d
 class TestCase:
     def __init__(self, methodName: str = "runTest") -> None:

@@ -641,6 +641,48 @@ mlir::Type ModuleEmitter::storeProvedMember(py::UnionType declared,
 }
 
 void ModuleEmitter::emitPendingDefaultCells(const parser::Node &statement) {
+  // A generic function's cells (genericDefaultCell): written here whether or
+  // not a specialization exists yet, which is what its readers rely on.
+  // ⛔ Only a def of the module being compiled, which is where a
+  // specialization reads cells; an imported one evaluates its defaults per
+  // call (the provider path).
+  bool mainModuleDef = false;
+  if (const auto *moduleBody = ast::nodeList(moduleNode, "body"))
+    mainModuleDef = llvm::any_of(*moduleBody, [&](const parser::NodePtr &top) {
+      return top.get() == &statement;
+    });
+  if (mainModuleDef &&
+      (statement.kind == "FunctionDef" ||
+       statement.kind == "AsyncFunctionDef") &&
+      hasTypeParameters(statement))
+    for (unsigned slot = 0;; ++slot) {
+      const parser::Node *arguments = ast::node(statement, "args");
+      std::size_t slots = 0;
+      if (arguments)
+        for (llvm::StringRef field : {"posonlyargs", "args", "kwonlyargs"})
+          if (const auto *list = ast::nodeList(*arguments, field))
+            slots += list->size();
+      if (slot >= slots)
+        break;
+      const parser::Node *expr = defaultExpressionForSlot(statement, slot);
+      if (!expr)
+        continue;
+      mlir::Attribute literal = defaultValueAttr(builder, expr);
+      auto dict = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(literal);
+      auto kind =
+          dict ? dict.getAs<mlir::StringAttr>("kind") : mlir::StringAttr();
+      if (!kind || kind.getValue() != "unsupported")
+        continue;
+      std::optional<GenericDefaultCell> cell =
+          genericDefaultCell(statement, slot);
+      if (!cell)
+        continue;
+      Value value = emitExprExpected(expr, cell->type);
+      Value coerced = coerceValue(value, cell->type, statement);
+      py::GlobalSetOp::create(builder, loc(statement),
+                              builder.getStringAttr(cell->name),
+                              coerced.value);
+    }
   auto pending = pendingDefaultCells.find(&statement);
   if (pending == pendingDefaultCells.end())
     return;

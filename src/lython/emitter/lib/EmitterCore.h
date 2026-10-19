@@ -645,6 +645,28 @@ private:
                       bool skipDeclarations = false);
   void emitStatement(const parser::Node &statement);
   void emitPendingDefaultCells(const parser::Node &statement);
+  // ⭐ A GENERIC FUNCTION'S NON-LITERAL DEFAULT IS ONE VALUE FOR EVERY
+  // SPECIALIZATION, as CPython evaluates it once at the def: a module cell
+  // named by the generic, typed by the declared parameter where that is
+  // ground and by the default's own type where the parameter names a type
+  // parameter. Null when neither is ground. (EmitterFunctions.cpp)
+  struct GenericDefaultCell {
+    std::string name;
+    mlir::Type type;
+  };
+  std::optional<GenericDefaultCell> genericDefaultCell(const parser::Node &def,
+                                                       unsigned slot);
+  // The default expression of parameter `slot` (positionals first, then the
+  // keyword-only ones), or null.
+  static const parser::Node *defaultExpressionForSlot(const parser::Node &def,
+                                                      unsigned slot);
+  // Why a call that leaves out a generic function's default cannot read the
+  // shared cell at this specialization; empty when it can.
+  std::string genericOmittedDefaultMismatch(const parser::Node &def,
+                                            py::CallableType specialized,
+                                            unsigned positionalGiven,
+                                            llvm::ArrayRef<CallKeywordType>
+                                                keywords);
   void emitDelete(const parser::Node &statement);
   // py.keep_alive for `value` when the program keeps locals alive and the
   // value can hold an object that observes its release.
@@ -1107,11 +1129,21 @@ private:
   // One arm per candidate, chosen by identity with the class value; each arm's
   // value is coerced to `resultType`.
   // `capturedNames` are the caller's bindings the arms read.
+  // `armMismatch`, when given, is asked for each class as its arm is written
+  // -- which may be after every class is declared -- and a non-empty answer
+  // makes the arm raise that TypeError instead.
   std::optional<Value> emitClassValueDispatch(
       const parser::Node &anchor, Value classValue, py::ContractType bound,
       mlir::Type resultType,
       llvm::function_ref<parser::NodePtr(llvm::StringRef spelling)> armFor,
-      llvm::ArrayRef<std::string> capturedNames = {});
+      llvm::ArrayRef<std::string> capturedNames = {},
+      std::function<std::string(llvm::StringRef spelling)> armMismatch = {});
+  // A call to a function of its own that raises `exception(message)`, typed
+  // as `resultType`: a raise where an expression is wanted.
+  parser::NodePtr raisingCall(parser::SourceRange range,
+                              llvm::StringRef exception,
+                              const std::string &message,
+                              mlir::Type resultType);
   // `t(args)` and `t.m(args)` for a class value the static type does not
   // decide.
   std::optional<Value> emitClassValueCall(const parser::Node &expr,
@@ -1127,6 +1159,17 @@ private:
   // A def whose body spells its own `*args` or `**kwargs` into a call
   // (`f(*args, **kwargs)`): their arity and names are the call site's.
   static bool forwardsItsPacks(const parser::Node &def);
+  // Whether an argument of type `actual` may bind a parameter declared
+  // `expected` at an inlined method's call (EmitterClasses.cpp).
+  bool inlineArgumentFits(mlir::Type actual, mlir::Type expected);
+  // The defaults a call leaves out, as keyword arguments of their types, for
+  // the parameters whose declared type still names a type parameter
+  // (EmitterCalls.cpp).
+  llvm::SmallVector<CallKeywordType, 2>
+  omittedDefaultArgumentTypes(const parser::Node &def,
+                              const FunctionSignature &sig,
+                              unsigned positionalGiven,
+                              llvm::ArrayRef<CallKeywordType> keywords);
   // The defs whose body is typed only where a call is: a generic one, and
   // one that forwards its packs. Neither has a standalone body.
   static bool specializedAtEachCall(const parser::Node &def) {

@@ -5,8 +5,9 @@
 #   though the name never arrives.
 # KIND: バグ (bug) -- loud: well-typed code refused
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   this call does not determine the type arguments of the generic method 'pick'
+# FIXED: 2026-10-20 -- a type parameter is solved from an omitted default, the
+#   value the call passes.
+# CLASSIFICATION @ lang-gaps c8463f9d + the fix: 1 正しい
 # CPython 3.14 expects: test_a ran ValueError
 class Case:
     def __init__(self, name: str) -> None:
