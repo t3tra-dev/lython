@@ -6,9 +6,6 @@
 # `lyc jit` the stdout, the stderr (but for the time) and the exit status are
 # the same.
 import unittest
-# WORKAROUND(ut_bug_computed_getattr_classmethod_arm_in_importer): the
-# computed getattr's classmethod arms name TestCase in this module's scope.
-from unittest import TestCase
 
 
 def double(x: int) -> int:

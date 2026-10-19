@@ -7,9 +7,6 @@
 # no frame of the test is in the traceback, so only the exception line is
 # printed.
 import unittest
-# WORKAROUND(ut_bug_computed_getattr_classmethod_arm_in_importer): the
-# computed getattr's classmethod arms name TestCase in this module's scope.
-from unittest import TestCase
 
 
 def parse(text: str) -> int:

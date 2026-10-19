@@ -7,8 +7,10 @@
 #   ut_bug_inherited_method_loses_its_module_globals.
 # KIND: バグ (bug) -- loud, but only in the lowering
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   attribute value '!py.union<!py.contract<"builtins.E">, !py.literal<None>>' is not assignable to field '!py.union<!py.contract<"builtins.ValueError">, !py.literal<None>>'
+# FIXED: 2026-10-20 -- a generic class's queued bodies are compiled with its type
+#   parameters bound. The trigger was a function body, not the inheritance:
+#   the same call at module level always worked.
+# CLASSIFICATION @ lang-gaps 9bf68b55 + the fix: 1 正しい
 # CPython 3.14 expects: True False
 import ut_mod_generic_context
 

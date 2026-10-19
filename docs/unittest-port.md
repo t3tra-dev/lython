@@ -29,7 +29,7 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
 - **1 ファイルのコンパイルは約 5 秒かかる。** golden の 1 件は約 0.7 秒。
   内訳 (RelWithDebInfo) は lowering 3.3 秒、エミッタ 1.3 秒、JIT ビルド
   0.5 秒、実行 4 ミリ秒、最大メモリ約 0.5 GB。
-- **設計判断が要る未対応は 3 つ。**
+- **設計判断が要る未対応は 3 つあった。** 利用者が決めた (2026-10-20、下の「方針」)。
   1. テストクラスの見つけ方 (`__subclasses__` か登録か)
   2. docstring を実行時に残すか
   3. builtin とクラスを Callable の値として渡せるようにするか
@@ -37,6 +37,21 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
   - difflib と pprint (差分の表示)
   - re と fnmatch (assertRegex と -k)
   - warnings、logging、argparse
+
+## 方針と初段の目標 (利用者の判断、2026-10-20)
+
+- サブクラスは `__subclasses__` を静的に答える。テストクラスは
+  `unittest.main()` が `TestCase.__subclasses__()` から見つける (登録表は作らない)。
+- docstring は、読まれる場合は残す。読まれなければ DCE で消す。
+- ビルトイン関数は Callable の値として扱えるようにする。
+- **初段の目標は、この方針で回避なしの unittest を動かすこと。** 受け入れ条件は
+  次の課題 A のとおり。
+
+### 進捗
+
+| 日付 | 直したプローブ | 何を直したか |
+| --- | --- | --- |
+| 2026-10-20 | `ut_bug_inherited_method_loses_its_module_globals`、`ut_bug_computed_getattr_classmethod_arm_in_importer`、`ut_bug_inherited_generic_method_annotation_in_importer` | A1 (継承したメソッド本体のスコープ)。サブクラス向けに複製した継承メソッドの本体を、定義元のモジュールで解決する。プログラムのクラスの classmethod をインスタンス経由で呼ぶとき、クラスの裸の名前に書き換えない。ジェネリッククラスの特殊化の、後回しにしたメソッド本体で型パラメータを束縛する (3 件目の引き金は継承ではなく、関数本体の中からの呼び出しだった)。 |
 
 ## 計測の方法
 

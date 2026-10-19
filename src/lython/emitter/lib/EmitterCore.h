@@ -1800,6 +1800,8 @@ private:
     // The module the class was declared in, when it is not the one being
     // emitted: its body reads that module's names.
     const EmitOptions::SourceModule *source = nullptr;
+    // The class whose type parameters the body spells.
+    std::string definer;
   };
   std::vector<DeferredMethodBody> deferredMethodBodies;
   // The module `emitInDefiningModuleScope` is emitting in, if any.
