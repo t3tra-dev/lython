@@ -3699,3 +3699,40 @@ TEST(EmitterTest, AProtocolSaysWhyItIsRefused) {
         << diagnostics;
   }
 }
+
+// What: `__subclasses__()` is refused when a list it may answer would hold a
+// class written inside a function -- asked of the class itself, and of a class
+// value that may hold a class one level up from it -- and answered for the
+// function's own class, which has no subclass to list.
+TEST(EmitterTest, SubclassesThatMayHoldAFunctionLocalClassAreRefused) {
+  lython::driver::DriverOptions native;
+  native.targetTriple = llvm::sys::getDefaultTargetTriple();
+  auto emit = [&](const std::string &source, std::string &diagnostics) {
+    mlir::MLIRContext context(testRegistry());
+    mlir::OwningOpRef<mlir::ModuleOp> module;
+    llvm::raw_string_ostream diag(diagnostics);
+    return mlir::succeeded(lython::driver::emitMLIRFromSource(
+        source, "main.py", "<lython-no-import-dir>", native, context, module,
+        diag));
+  };
+  const std::string classes = "class Base:\n    pass\nclass Mid(Base):\n"
+                              "    pass\ndef make() -> type[Base]:\n"
+                              "    class Local(Mid):\n        pass\n"
+                              "    print(Local.__subclasses__())\n"
+                              "    return Local\n";
+  for (auto [tail, expected] :
+       std::initializer_list<std::pair<const char *, const char *>>{
+           {"print(Mid.__subclasses__())\n",
+            "'Mid.__subclasses__()' would list 'make.<locals>.Local'"},
+           {"k: type[Base] = Base\nprint(k.__subclasses__())\n",
+            "'Mid.__subclasses__()' would list 'make.<locals>.Local'"}}) {
+    std::string diagnostics;
+    std::string source = classes + tail;
+    EXPECT_FALSE(emit(source, diagnostics)) << source;
+    EXPECT_NE(diagnostics.find(expected), std::string::npos)
+        << source << diagnostics;
+  }
+  std::string diagnostics;
+  std::string source = classes + "print(Base.__subclasses__(), make())\n";
+  EXPECT_TRUE(emit(source, diagnostics)) << source << diagnostics;
+}

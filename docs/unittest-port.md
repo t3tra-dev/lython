@@ -60,7 +60,7 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
 | 2026-10-20 | `ut_bug_join_of_tuple_with_narrowed_optional`、`ut_bug_exc_info_after_calling_a_callable_from_a_list`、`ut_bug_optional_held_across_yield_in_with`、`ut_bug_class_body_field_object_into_inner_contextmanager`、`ut_bug_tuple_of_optional_class_results` | A3 (所有権)。union から取り出した値は、タプルの表示が参照を奪ってよい一時値ではない。`Tb \| None` を object に箱詰めするとき、非活性メンバーの置き場所を読むのは使用ではない。try や with の中の `yield` で、例外辺でしか生きていない値を出口の前で解放する。refcount 挿入が参照を貸した辺の先のブロックを、その後の正規化で併合しない。試作の `doCleanups` と `getDescription` の回避策を外した。 |
 | 2026-10-20 | `ut_unsupported_object_sentinel` | subTest のための `object()`。`object()` を作れるようにした (中身のないボックス形の実体で、`object` のボックスの解放関数がそのまま解放できる)。`is` と `==` は同一性、hash は同一性のもの、repr は `<object object at 0x...>`。あわせて、`object` と注釈したフィールドへの格納の拒否を外した (16 語のスロットだった頃の根拠が残っていた。読みは実体のヘッダからクラスを答える)。取り込まれるモジュールの `x = object()` をセルに置く。ジェネレータの `object` 引数に他のクラスの値を渡せる (フレームが自分の箱を持つ)。これで試作の `subTest` を CPython 3.14 の形 (センチネル、`_SubTest.shortDescription`、`" ".join(parts) or ...`) で戻した。 |
 | 2026-10-20 | `ut_unsupported_bound_builtin_method_as_callable`、`ut_unsupported_builtin_function_as_callable`、`wb_a_bound_method_off_a_builtin_instance` | 方針 3 (ビルトインを Callable の値に)。組み込みクラスのインスタンスから読んだメソッドは、読んだ時点の受け手をキャプチャしたフォワーダ (`return __ly_recv.method(...)`) になる。型は最短のオーバーロードの必須引数だけ (`xs.pop` は `Callable[[], int]`)。組み込み関数を Callable の値が期待される位置 (引数、注釈付き変数、辞書の値、戻り値) に渡すと、その期待型で型付けしたフォワーダになる (`print` の `*args` や `len` のオーバーロードは、受け取る側の型が決める)。途中で、`Iterable[str]` を取る関数が候補に入る間接呼び出しで、str を箱に入れずに渡して全体が拒否される既存の不具合を直した。これで試作の回避策はゼロになった。 |
-| 2026-10-20 | `ut_unsupported_subclasses` | 方針 1 (`__subclasses__` を静的に)。`C.__subclasses__()` を、C を基底に書いたプログラムのクラスの、作られる順 (取り込んだモジュールのものが先、各モジュールの中は書いた順) のリストで答える。受け手がクラスそのものならリストの表示、実行時にしか決まらないクラス値なら、C とその下のクラスのどれを持つかで選ぶ。関数の中で定義したクラスは、その関数が走るまでプログラムのクラスではないので入れない。`object.__subclasses__()` は CPython ではインタプリタ自身のクラスも並ぶので答えない。試作の `main()` は引数を取らず、`loadTestsFromModule` が `TestCase.__subclasses__()` を下までたどって、`__module__` がそのモジュールのものを名前順 (`dir(module)` の順) に集める。t01 は `unittest.main()` のまま CPython と完全に一致する。 |
+| 2026-10-20 | `ut_unsupported_subclasses` | 方針 1 (`__subclasses__` を静的に)。`C.__subclasses__()` を、C を基底に書いたプログラムのクラスの、作られる順 (取り込んだモジュールのものが先、各モジュールの中は書いた順) のリストで答える。受け手がクラスそのものならリストの表示、実行時にしか決まらないクラス値なら、C とその下のクラスのどれを持つかで選ぶ。関数の中で定義したクラスが並びうる問いは拒否する (関数が走ってから回収されるまでの間だけ部分クラスで、呼び出しごとに別のクラスになるので、静的には決まらない)。`object.__subclasses__()` は CPython ではインタプリタ自身のクラスも並ぶので答えない。試作の `main()` は引数を取らず、`loadTestsFromModule` が `TestCase.__subclasses__()` を下までたどって、`__module__` がそのモジュールのものを名前順 (`dir(module)` の順) に集める。t01 は `unittest.main()` のまま CPython と完全に一致する。 |
 
 進捗の途中で決めたこと・見つけたこと:
 
@@ -122,6 +122,11 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
     その中で `join` する形。
   - `d.setdefault` のように、必須引数より多い引数で呼ぶ組み込みメソッドを値として
     使う形は型が付かない (必須引数だけの規則のため)。
+- **`__subclasses__` をマージした後に、黙った誤りを 1 件見つけて直した。**
+  関数の中で定義したクラスは最初にモジュールのトップレベルへ持ち上げられるので、
+  その関数が走る前から部分クラスとして並んでいた (CPython は `make()` を呼ぶまで
+  並べない)。コメントには「入れない」と書いたのに、コードはそうしていなかった。
+  そのクラスが並びうる問いは拒否する。
 - **方針 3 の最初の形は、全件テストで 11 件落ちた。** 組み込み関数かどうかを
   束縛の綴り (`_ZN` で始まらない、`$` を含まない) で決めていたので、デコレート
   されたモジュールの関数や JS ホストのラッパーも組み込みと見て包み、自分自身を
