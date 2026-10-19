@@ -176,9 +176,17 @@ void ModuleEmitter::emitWith(const parser::Node &statement, bool async) {
       parser::NodePtr node = synth::assign(nameNode(flagName), std::move(constant), statement.range);
       return node;
     };
+    // ⭐ `__exit__` IS CALLED AT THE CONTEXT EXPRESSION, as CPython locates
+    // it: an exception it raises (assertRaises' "KeyError not raised") is
+    // reported under `self.assertRaises(KeyError)` with a call's carets, not
+    // from the start of the `with` statement.
+    const parser::Node *contextExpr =
+        (*items)[index] ? ast::node(*(*items)[index], "context_expr")
+                        : nullptr;
+    parser::SourceRange exitRange =
+        contextExpr ? contextExpr->range : statement.range;
     auto cleanupNode = [&](parser::NodePtr exception) {
-      parser::NodePtr node =
-          parser::makeNode("LyWithCleanup", statement.range);
+      parser::NodePtr node = parser::makeNode("LyWithCleanup", exitRange);
       parser::addField(*node, "slot",
                        static_cast<std::int64_t>(cleanupStart + index));
       if (exception)

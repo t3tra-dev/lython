@@ -3913,6 +3913,18 @@ RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
   mlir::Value throwOuterAddress = alignedPointerOf(throwOuterArea);
   mlir::func::CallOp::create(builder, loc, throwStashFn,
                              mlir::ValueRange{throwOuterAddress});
+  // The exception the caller is handling, thrown in by `__exit__`, keeps the
+  // frames it was raised through (LyEH_SeedStashedSelfFrames).
+  {
+    mlir::Type ptrType = mlir::LLVM::LLVMPointerType::get(builder.getContext());
+    mlir::func::FuncOp seedFn = getOrCreatePrivateFunction(
+        module, builder, "LyEH_SeedStashedSelfFrames",
+        builder.getFunctionType({ptrType, ptrType}, {}));
+    mlir::func::CallOp::create(
+        builder, loc, seedFn,
+        mlir::ValueRange{throwOuterAddress,
+                         alignedPointerOf(entry->getArgument(headerIndex))});
+  }
   auto throwException = getOrCreatePrivateFunction(
       module, builder, "LyEH_ThrowException",
       builder.getFunctionType({headerType, messageType, bytesType}, {}));

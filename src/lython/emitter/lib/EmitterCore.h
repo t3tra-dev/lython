@@ -1709,6 +1709,9 @@ private:
   mlir::MLIRContext &context;
   std::string moduleName;
   std::string sourceName;
+  // The main module's, which `sourceName` is swapped away from while an
+  // imported module's code is emitted.
+  std::string mainSourceName;
   std::string activePackageName;
   EmitOptions options;
   mlir::OpBuilder builder;

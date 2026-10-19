@@ -34,6 +34,7 @@ ModuleEmitter::ModuleEmitter(const parser::Node &moduleNode,
   types.setProtocolMisses(&protocolMisses);
   if (this->sourceName.empty())
     this->sourceName = this->moduleName;
+  mainSourceName = this->sourceName;
 }
 
 EmitResult ModuleEmitter::emit() {

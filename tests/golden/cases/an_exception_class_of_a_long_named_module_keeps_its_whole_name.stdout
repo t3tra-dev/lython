@@ -1,0 +1,2 @@
+LibError LibError('boom') LibError
+LibError() LibError('x')

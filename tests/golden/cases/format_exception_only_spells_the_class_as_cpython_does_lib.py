@@ -1,0 +1,2 @@
+class LibError(Exception):
+    pass

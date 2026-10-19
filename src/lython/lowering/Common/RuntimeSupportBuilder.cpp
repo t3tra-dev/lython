@@ -2949,6 +2949,96 @@ void buildUnstashException(SupportBuilder &b) {
   emitLLVMTrap(b);
 }
 
+// void LyEH_SeedStashedSelfFrames(ptr area, ptr thrown): when the exception
+// thrown into a generator IS the one its caller parked in `area`, copy the
+// parked frames back onto the stack before the throw raises it. That is the
+// exception a `with` handler hands to `__exit__`, which a context manager's
+// `__exit__` throws into its generator. In CPython the exception keeps its
+// `__traceback__` -- the `with` body's frames -- and the generator's frame
+// goes in front of them, so a handler in the generator sees both. The park
+// had moved them off the stack, and the throw raised the exception with
+// none: unittest's failure reports, written from such a handler, lost every
+// frame of the test.
+// ⛔ Copied, not moved: the node keeps its own, which the unstash after the
+// resume hands back to the caller's handler.
+// ⛔ Only for the same exception. A different one is a new raise, whose
+// traceback starts where it is raised, and the parked one becomes its
+// `__context__` (LyEH_AdoptStashedAsContext).
+void buildSeedStashedSelfFrames(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyEH_SeedStashedSelfFrames",
+                            b.builder.getFunctionType({b.ptr(), b.ptr()}, {}));
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *compare = b.builder.createBlock(&body);
+  mlir::Block *seed = b.builder.createBlock(&body);
+  mlir::Block *done = b.builder.createBlock(&body);
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value node = b.loadPtrVal(entry->getArgument(0));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc,
+                                 b.ptrNe(node, b.nullPtr()), compare,
+                                 mlir::ValueRange{}, done, mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(compare);
+  mlir::Value parked = b.loadPtrVal(
+      partsField(b, nodeMember(b, node, kNodePayload), 0, 1));
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc, b.ptrEq(parked, entry->getArgument(1)), seed,
+      mlir::ValueRange{}, done, mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(seed);
+  mlir::Value size = mlir::LLVM::LoadOp::create(
+      b.builder, b.loc, b.i64(), b.addrOf("g_traceback_size"),
+      /*alignment=*/8);
+  mlir::Value count = b.loadI64(nodeMember(b, node, kNodeFrameCount));
+  // The stack holds 1024 frames; a park came off it, so it fits unless the
+  // stack has grown since, and then the frames nearest the raise stay.
+  mlir::Value room =
+      mlir::arith::SubIOp::create(b.builder, b.loc, b.iconst(1024), size);
+  mlir::Value fits =
+      b.cmpi(mlir::arith::CmpIPredicate::sle, count, room);
+  mlir::Value copied = mlir::arith::SelectOp::create(b.builder, b.loc, fits,
+                                                     count, room);
+  mlir::Value framesPtr = b.loadPtrVal(nodeMember(b, node, kNodeFrames));
+  mlir::Value zeroIndex =
+      mlir::arith::ConstantIndexOp::create(b.builder, b.loc, 0);
+  mlir::Value oneIndex =
+      mlir::arith::ConstantIndexOp::create(b.builder, b.loc, 1);
+  mlir::Value countIndex = mlir::arith::IndexCastOp::create(
+      b.builder, b.loc, b.builder.getIndexType(), copied);
+  auto copyLoop = mlir::scf::ForOp::create(b.builder, b.loc, zeroIndex,
+                                           countIndex, oneIndex);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(copyLoop.getBody());
+    mlir::Value position = mlir::arith::IndexCastOp::create(
+        b.builder, b.loc, b.i64(), copyLoop.getInductionVar());
+    mlir::Value source = mlir::LLVM::GEPOp::create(
+        b.builder, b.loc, b.ptr(), tracebackFrameType(b), framesPtr,
+        mlir::ValueRange{position});
+    mlir::Value at =
+        mlir::arith::AddIOp::create(b.builder, b.loc, size, position);
+    mlir::Value target =
+        b.call("frame_at", b.ptr(), mlir::ValueRange{at}).front();
+    mlir::LLVM::MemcpyOp::create(b.builder, b.loc, target, source,
+                                 typeSizeBytes(b, tracebackFrameType(b)),
+                                 /*isVolatile=*/false);
+    mlir::Type frameType = tracebackFrameType(b);
+    for (std::int64_t nameField = 0; nameField < 2; ++nameField) {
+      mlir::Value slot = b.frameField(frameType, target, nameField);
+      mlir::Value name =
+          b.call("copy_cstr", b.ptr(), mlir::ValueRange{b.loadPtrVal(slot)})
+              .front();
+      mlir::LLVM::StoreOp::create(b.builder, b.loc, name, slot,
+                                  /*alignment=*/8);
+    }
+  }
+  mlir::Value grown =
+      mlir::arith::AddIOp::create(b.builder, b.loc, size, copied);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, grown,
+                              b.addrOf("g_traceback_size"), /*alignment=*/8);
+  mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(done);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
 // void LyEH_AdoptStashedAsContext(i64 area): hand a parked token to the
 // pending exception as the TAIL of its __context__ chain. This models
 // CPython's per-frame exc-state stack at the generator boundary: an
@@ -4323,6 +4413,7 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   buildTakeCurrentDescriptor(support);
   buildStashCurrentException(support);
   buildUnstashException(support);
+  buildSeedStashedSelfFrames(support);
   buildAdoptStashedAsContext(support);
   buildReleaseCurrentException(support);
   buildRunPythonMain(support);

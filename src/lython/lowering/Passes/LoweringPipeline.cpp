@@ -485,18 +485,78 @@ LogicalResult runLoweringPipeline(ModuleOp module,
   dumpMLIRForPass(irDump, "ownership-verifier", module);
 
   // Phase 6: generic cleanup while Python-level structure is still visible.
+  // ⛔ Without block merging, for the reason the EH-safe canonicalizer gives
+  // and one more: blocks that differ only in their locations are identical
+  // to the merge, and in Python a location is part of what an operation does
+  // -- two `raise` statements merged into one push one traceback frame.
   if (failed(runPhase("canonicalize", [&](PassManager &pm) {
-        pm.addPass(mlir::createCanonicalizerPass());
+        GreedyRewriteConfig config;
+        config.setRegionSimplificationLevel(GreedySimplifyRegionLevel::Normal);
+        pm.addPass(mlir::createCanonicalizerPass(config));
         pm.addPass(mlir::createCSEPass());
       })))
     return failure();
   dumpMLIRForPass(irDump, "canonicalize", module);
 
   // Phase 7: numeric kernel lowering before Python object lowering.
-  if (failed(runPhase("linalg-lowering", [&](PassManager &pm) {
-        pm.addPass(createLinalgLoweringPass(tensorTarget));
-      })))
-    return failure();
+  // ⛔ Only over the functions that have primitive tensors. The pipeline runs
+  // over every function it is given, and upstream passes in it apply their
+  // patterns with block merging on, which no option reaches: `raise
+  // cls("first")` and `raise cls("second")` in one function became one raise,
+  // which pushed the first one's frame for both, and the second exception
+  // lost its message on an edge rewired ahead of where it is lowered. A
+  // function with no tensor has nothing for the pipeline to do, so its body
+  // is held outside the module while the pipeline runs, and the function
+  // stays where it is as a declaration -- its place, its symbol and its
+  // attributes untouched.
+  auto hasPrimitiveTensors = [](Operation *root) {
+    auto isTensor = [](Type type) { return isa<TensorType>(type); };
+    return root
+        ->walk([&](Operation *op) {
+          if (Dialect *dialect = op->getDialect())
+            if (llvm::is_contained({llvm::StringRef("linalg"),
+                                    llvm::StringRef("tensor"),
+                                    llvm::StringRef("bufferization")},
+                                   dialect->getNamespace()))
+              return WalkResult::interrupt();
+          if (llvm::any_of(op->getOperandTypes(), isTensor) ||
+              llvm::any_of(op->getResultTypes(), isTensor))
+            return WalkResult::interrupt();
+          if (auto function = dyn_cast<func::FuncOp>(op))
+            if (llvm::any_of(function.getArgumentTypes(), isTensor) ||
+                llvm::any_of(function.getResultTypes(), isTensor))
+              return WalkResult::interrupt();
+          return WalkResult::advance();
+        })
+        .wasInterrupted();
+  };
+  if (hasPrimitiveTensors(module)) {
+    struct HeldBody {
+      func::FuncOp function;
+      OwningOpRef<ModuleOp> holder;
+      SymbolTable::Visibility visibility;
+    };
+    std::vector<HeldBody> held;
+    for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+      if (function.isDeclaration() || hasPrimitiveTensors(function))
+        continue;
+      HeldBody body{function, ModuleOp::create(function.getLoc()),
+                    function.getVisibility()};
+      body.holder->getBodyRegion().takeBody(function.getBody());
+      // A declaration is private; the visibility comes back with the body.
+      function.setPrivate();
+      held.push_back(std::move(body));
+    }
+    LogicalResult lowered = runPhase("linalg-lowering", [&](PassManager &pm) {
+      pm.addPass(createLinalgLoweringPass(tensorTarget));
+    });
+    for (HeldBody &body : held) {
+      body.function.getBody().takeBody(body.holder->getBodyRegion());
+      body.function.setVisibility(body.visibility);
+    }
+    if (failed(lowered))
+      return failure();
+  }
   dumpMLIRForPass(irDump, "linalg-lowering", module);
 
   // Phase 8: import runtime object definitions written in MLIR.
