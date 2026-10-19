@@ -5546,6 +5546,15 @@ bool ModuleEmitter::inlineArgumentFits(mlir::Type actual,
     return true;
   if (isAssignableWithStaticEvidence(actual, expected, module))
     return true;
+  // ⭐ A VALUE FITS A UNION WHEN IT FITS A MEMBER, by the rules below as much
+  // as by assignability: `run(result: TestResult | None)` reached by a
+  // TextTestResult was refused, though a TestResult parameter takes the
+  // subclass and a free function's `TestResult | None` did too.
+  if (auto expectedUnion = mlir::dyn_cast<py::UnionType>(expected))
+    if (!mlir::isa<py::UnionType>(actual))
+      for (mlir::Type member : expectedUnion.getMemberTypes())
+        if (member != expected && inlineArgumentFits(actual, member))
+          return true;
   // ⭐ THE EMITTER'S OWN MRO, because the module's may not exist yet. An
   // unbound base-method call inside a subclass method passes `self`:
   //

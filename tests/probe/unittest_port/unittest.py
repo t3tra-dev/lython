@@ -44,14 +44,13 @@ from collections.abc import Callable, Iterator
 
 _SysExcInfoType = tuple[type[BaseException], BaseException, types.TracebackType]
 
-_MAX_LENGTH: int = 80
-_PLACEHOLDER_LEN: int = 12
-_MIN_BEGIN_LEN: int = 5
-_MIN_END_LEN: int = 5
-_MIN_COMMON_LEN: int = 5
-# WORKAROUND(ut_unsupported_computed_constant_of_imported_module): a computed constant of an imported module needs an annotation.
-_MIN_DIFF_LEN: int = _MAX_LENGTH - (_MIN_BEGIN_LEN + _PLACEHOLDER_LEN + _MIN_COMMON_LEN
-                                    + _PLACEHOLDER_LEN + _MIN_END_LEN)
+_MAX_LENGTH = 80
+_PLACEHOLDER_LEN = 12
+_MIN_BEGIN_LEN = 5
+_MIN_END_LEN = 5
+_MIN_COMMON_LEN = 5
+_MIN_DIFF_LEN = _MAX_LENGTH - (_MIN_BEGIN_LEN + _PLACEHOLDER_LEN + _MIN_COMMON_LEN +
+                               _PLACEHOLDER_LEN + _MIN_END_LEN)
 
 
 # ---------------------------------------------------------------- util
@@ -175,28 +174,22 @@ def skip[T: TestCase](reason: str) -> Callable[[Callable[[T], None]], Callable[[
     return decorator
 
 
+def _id[T](obj: T) -> T:
+    return obj
+
+
 def skipIf[T: TestCase](condition: bool, reason: str) -> Callable[[Callable[[T], None]], Callable[[T], None]]:
     """Skip a test if the condition is true."""
-    def decorator(test_item: Callable[[T], None]) -> Callable[[T], None]:
-        if condition:
-            def skip_wrapper(self: T) -> None:
-                raise SkipTest(reason)
-            return skip_wrapper
-        return test_item
-    return decorator
+    if condition:
+        return skip(reason)
+    return _id
 
 
 def skipUnless[T: TestCase](condition: bool, reason: str) -> Callable[[Callable[[T], None]], Callable[[T], None]]:
     """Skip a test unless the condition is true."""
-    # WORKAROUND(ut_unsupported_generic_factory_result_returned): returning skipIf(not condition, reason) is refused
-    # (a generic factory's result handed on unapplied).
-    def decorator(test_item: Callable[[T], None]) -> Callable[[T], None]:
-        if not condition:
-            def skip_wrapper(self: T) -> None:
-                raise SkipTest(reason)
-            return skip_wrapper
-        return test_item
-    return decorator
+    if not condition:
+        return skip(reason)
+    return _id
 
 
 def expectedFailure[T: TestCase](test_item: Callable[[T], None]) -> Callable[[T], None]:
@@ -469,9 +462,8 @@ class TestCase:
             item1 = seq1[i]
             item2 = seq2[i]
             if item1 != item2:
-                # WORKAROUND(ut_unsupported_fixed_tuple_concatenation): `fmt % ((i,) + pair)` is refused.
-                e1, e2 = _common_shorten_repr(safe_repr(item1), safe_repr(item2))
-                differing += '\nFirst differing element %d:\n%s\n%s\n' % (i, e1, e2)
+                differing += ('\nFirst differing element %d:\n%s\n%s\n' %
+                              ((i,) + _common_shorten_repr(safe_repr(item1), safe_repr(item2))))
                 break
         if len1 > len2:
             differing += ('\nFirst %s contains %d additional '
@@ -616,6 +608,7 @@ class TestResult:
         self.collectedDurations: list[tuple[str, float]] = []
         self.shouldStop = False
         self._previousTestClass: type[TestCase] | None = None
+        self._testRunEntered = False
         self._classSetupFailed: dict[type[TestCase], bool] = {}
 
     def printErrors(self) -> None:
@@ -749,65 +742,73 @@ class TestSuite:
     def addTest(self, test: TestCase | TestSuite) -> None:
         self._tests.append(test)
 
+    def __call__(self, result: TestResult) -> TestResult:
+        return self.run(result)
+
     def run(self, result: TestResult) -> TestResult:
-        _run_suite(self, result, True)
+        topLevel = False
+        if not result._testRunEntered:
+            result._testRunEntered = topLevel = True
+        for test in self._tests:
+            if result.shouldStop:
+                break
+            if isinstance(test, TestCase):
+                self._tearDownPreviousClass(test, result)
+                self._handleClassSetUp(test, result)
+                result._previousTestClass = type(test)
+                if result._classSetupFailed.get(type(test), False):
+                    continue
+            test(result)
+        if topLevel:
+            self._tearDownPreviousClass(None, result)
+            result._testRunEntered = False
         return result
 
+    def _handleClassSetUp(self, test: TestCase, result: TestResult) -> None:
+        previousClass = result._previousTestClass
+        currentClass = type(test)
+        if currentClass is previousClass:
+            return
+        result._classSetupFailed[currentClass] = False
+        try:
+            currentClass.setUpClass()
+        except Exception as e:
+            result._classSetupFailed[currentClass] = True
+            className = strclass(currentClass)
+            self._createClassOrModuleLevelException(result, e, 'setUpClass', className)
 
-def _run_suite(suite: TestSuite, result: TestResult, topLevel: bool) -> None:
-    for test in suite._tests:
-        if result.shouldStop:
-            break
-        if isinstance(test, TestCase):
-            _tearDownPreviousClass(test, result)
-            _handleClassSetUp(test, result)
-            result._previousTestClass = type(test)
-            if result._classSetupFailed.get(type(test), False):
-                continue
-            test.run(result)
+    def _tearDownPreviousClass(self, test: TestCase | None, result: TestResult) -> None:
+        previousClass = result._previousTestClass
+        if previousClass is None:
+            return
+        if test is not None and type(test) is previousClass:
+            return
+        if result._classSetupFailed.get(previousClass, False):
+            return
+        try:
+            previousClass.tearDownClass()
+        except Exception as e:
+            className = strclass(previousClass)
+            self._createClassOrModuleLevelException(result, e, 'tearDownClass', className)
+
+    def _createClassOrModuleLevelException(self, result: TestResult, exc: Exception,
+                                           method_name: str, parent: str,
+                                           info: _SysExcInfoType | None = None) -> None:
+        errorName = f'{method_name} ({parent})'
+        self._addClassOrModuleLevelException(result, exc, errorName, info)
+
+    def _addClassOrModuleLevelException(self, result: TestResult, exception: Exception,
+                                        errorName: str,
+                                        info: _SysExcInfoType | None = None) -> None:
+        error = _ErrorHolder(errorName)
+        if isinstance(exception, SkipTest):
+            result.addSkip(error, str(exception))
+        elif info is not None:
+            result.addError(error, info)
         else:
-            _run_suite(test, result, False)
-    if topLevel:
-        _tearDownPreviousClass(None, result)
-
-
-def _handleClassSetUp(test: TestCase, result: TestResult) -> None:
-    currentClass = type(test)
-    if currentClass is result._previousTestClass:
-        return
-    result._classSetupFailed[currentClass] = False
-    try:
-        currentClass.setUpClass()
-    except Exception as e:
-        result._classSetupFailed[currentClass] = True
-        # WORKAROUND(ut_unsupported_exc_info_outside_handler): sys.exc_info() is answered only lexically
-        # inside an except block, so the handler passes it down.
-        _addClassLevelException(result, e, 'setUpClass (%s)' % strclass(currentClass),
-                                sys.exc_info())
-
-
-def _tearDownPreviousClass(test: TestCase | None, result: TestResult) -> None:
-    previousClass = result._previousTestClass
-    if previousClass is None:
-        return
-    if test is not None and type(test) is previousClass:
-        return
-    if result._classSetupFailed.get(previousClass, False):
-        return
-    try:
-        previousClass.tearDownClass()
-    except Exception as e:
-        _addClassLevelException(result, e, 'tearDownClass (%s)' % strclass(previousClass),
-                                sys.exc_info())
-
-
-def _addClassLevelException(result: TestResult, exception: Exception, errorName: str,
-                            info: _SysExcInfoType) -> None:
-    error = _ErrorHolder(errorName)
-    if isinstance(exception, SkipTest):
-        result.addSkip(error, str(exception))
-    else:
-        result.addError(error, info)
+            exc_type, exc_value, tb = sys.exc_info()
+            if exc_type is not None and exc_value is not None and tb is not None:
+                result.addError(error, (exc_type, exc_value, tb))
 
 
 class _ErrorHolder(TestCase):

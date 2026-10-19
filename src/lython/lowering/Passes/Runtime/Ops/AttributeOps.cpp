@@ -352,25 +352,31 @@ unsigned RuntimeBundleLowerer::classBoxedFieldCount(py::ClassOp classOp) const {
   return count;
 }
 
+// ⭐ EVERY FIELD HAS ONE BOX-SIZED CELL, AT ITS FIELD INDEX, so where a field
+// lives depends only on the fields before it -- and a subclass's fields come
+// after its bases' (the merged order emitClassContract registers). The body
+// used to put every box first and the bool and class-value words after them
+// all, so a subclass that added a boxed field moved its base's bool: a
+// base-typed method wrote `self.flag` into one word and the subclass instance
+// read it from another, silently -- unittest's suite saw `_testRunEntered`
+// unset on a TextTestResult and ran the class teardown twice.
+// ⛔ Not a dense packing of the words: a box must start at a multiple of its
+// size, because the release helpers take a SLOT index (word / kWordsPerBox).
+// A bool or class value uses the first word of its cell.
+//
+// The box slot of a box-fronted field: its field index.
 std::optional<unsigned>
 RuntimeBundleLowerer::classBoxedFieldOrdinal(py::ClassOp classOp,
                                              unsigned fieldIndex) const {
   llvm::SmallVector<mlir::Type, 8> fieldTypes =
       RuntimeBundleLowerer::classFieldContractTypes(classOp);
-  unsigned ordinal = 0;
-  for (unsigned index = 0; index < fieldTypes.size(); ++index) {
-    if (!RuntimeBundleLowerer::classFieldStoredBoxed(fieldTypes[index]))
-      continue;
-    if (index == fieldIndex)
-      return ordinal;
-    ++ordinal;
-  }
-  return std::nullopt;
+  if (fieldIndex >= fieldTypes.size() ||
+      !RuntimeBundleLowerer::classFieldStoredBoxed(fieldTypes[fieldIndex]))
+    return std::nullopt;
+  return fieldIndex;
 }
 
-// The word an int/bool field writes: past every box, then by field index. The
-// index is the FIELD's and not the primitive fields' own running count, so a
-// field's word does not move when a sibling changes type.
+// The word a bool or class-value field writes: the first of its cell.
 std::optional<unsigned>
 RuntimeBundleLowerer::classFieldBodyWord(py::ClassOp classOp,
                                          unsigned fieldIndex) const {
@@ -380,18 +386,15 @@ RuntimeBundleLowerer::classFieldBodyWord(py::ClassOp classOp,
     return std::nullopt;
   if (!isPrimitiveFieldContract(fieldTypes[fieldIndex]))
     return std::nullopt;
-  return RuntimeBundleLowerer::classBoxedFieldCount(classOp) *
-             static_cast<unsigned>(box_abi::kWordsPerBox) +
-         fieldIndex;
+  return fieldIndex * static_cast<unsigned>(box_abi::kWordsPerBox);
 }
 
 unsigned
 RuntimeBundleLowerer::classInstanceBodyWords(py::ClassOp classOp) const {
   llvm::SmallVector<mlir::Type, 8> fieldTypes =
       RuntimeBundleLowerer::classFieldContractTypes(classOp);
-  return RuntimeBundleLowerer::classBoxedFieldCount(classOp) *
-             static_cast<unsigned>(box_abi::kWordsPerBox) +
-         static_cast<unsigned>(fieldTypes.size());
+  return static_cast<unsigned>(fieldTypes.size()) *
+         static_cast<unsigned>(box_abi::kWordsPerBox);
 }
 
 mlir::FailureOr<std::pair<mlir::Value, unsigned>>

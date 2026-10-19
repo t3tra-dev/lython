@@ -431,6 +431,18 @@ def Py_StarFinishOp : Py_Op<"except_star.finish", []> {
   let assemblyFormat = "$frame `:` type($frame) attr-dict";
 }
 
+def Py_ExceptHandlingOp : Py_Op<"except.handling", []> {
+  let summary = "Whether an exception is being handled at run time";
+  let description = [{
+    True while the run is inside an `except` block's handling of an
+    exception -- the block's own, or one that called the code asking. What
+    `sys.exc_info()` asks outside an `except` block written around it.
+  }];
+
+  let results = (outs I1:$result);
+  let assemblyFormat = "attr-dict";
+}
+
 def Py_ExceptCurrentValueOp : Py_Op<"except.current_value", []> {
   let summary = "Borrow the current Python EH payload as a handler value";
   let description = [{

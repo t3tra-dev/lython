@@ -914,6 +914,28 @@ RuntimeBundleLowerer::lowerStarFinish(py::StarFinishOp op) {
   return mlir::success();
 }
 
+// LyEH_HandledException() is what a `try` takes on entry: the exception
+// being handled, or null.
+mlir::LogicalResult
+RuntimeBundleLowerer::lowerExceptHandling(py::ExceptHandlingOp op) {
+  builder.setInsertionPoint(op);
+  mlir::Location loc = op.getLoc();
+  mlir::Type ptrType = mlir::LLVM::LLVMPointerType::get(context);
+  mlir::Value handled =
+      mlir::func::CallOp::create(
+          builder, loc,
+          getOrCreatePrivateFunction(module, builder, "LyEH_HandledException",
+                                     builder.getFunctionType({}, {ptrType})),
+          mlir::ValueRange{})
+          .getResult(0);
+  mlir::Value none = mlir::LLVM::ZeroOp::create(builder, loc, ptrType);
+  mlir::Value handling = mlir::LLVM::ICmpOp::create(
+      builder, loc, mlir::LLVM::ICmpPredicate::ne, handled, none);
+  op.getResult().replaceAllUsesWith(handling);
+  erase.push_back(op);
+  return mlir::success();
+}
+
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerExceptCurrentValue(py::ExceptCurrentValueOp op) {
   mlir::FailureOr<std::string> handlerId =

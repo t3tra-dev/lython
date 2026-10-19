@@ -14,6 +14,7 @@
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/SaveAndRestore.h"
 
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -860,6 +861,165 @@ static mlir::Type floatLiteralType(TypeSystem &types, double value) {
   return types.literal(spelling);
 }
 
+// The one value a top-level name is assigned, when it is assigned once.
+static const parser::Node *
+singleModuleAssignment(const std::vector<parser::NodePtr> &body,
+                       llvm::StringRef name) {
+  const parser::Node *found = nullptr;
+  unsigned assignments = 0;
+  for (const parser::NodePtr &statement : body) {
+    if (!statement)
+      continue;
+    const parser::Node *target = nullptr;
+    const parser::Node *value = nullptr;
+    if (statement->kind == "AnnAssign" || statement->kind == "AugAssign") {
+      target = ast::node(*statement, "target");
+      value = statement->kind == "AugAssign" ? nullptr
+                                             : ast::node(*statement, "value");
+    } else if (statement->kind == "Assign") {
+      const auto *targets = ast::nodeList(*statement, "targets");
+      if (targets && targets->size() == 1)
+        target = targets->front().get();
+      value = ast::node(*statement, "value");
+    } else {
+      continue;
+    }
+    if (!target || target->kind != "Name" ||
+        llvm::StringRef(ast::nameSpelling(*target)) != name)
+      continue;
+    ++assignments;
+    found = value;
+  }
+  return assignments == 1 ? found : nullptr;
+}
+
+// ⭐ A CONSTANT COMPUTED FROM CONSTANTS IS A CONSTANT, and an imported
+// module's travels as a literal like the ones it is computed from:
+// `_DIFF = _MAX - (_PLACE + 5)` -- unittest's util -- was refused ("its type
+// is not one a module global can hold ... Annotate it") while `_MAX = 80`
+// beside it resolved. Folded here: int arithmetic as Python computes it,
+// with floor division and modulo taking the divisor's sign, and str
+// concatenation and repetition.
+// ⛔ Not a float: an operation's rounding is the runtime's to do, and a
+// folded spelling that differs in the last digit would be a silent change.
+// ⛔ Nothing that overflows 64 bits: the literal spelling would hold it, but
+// a value this large is not one a module constant needs, and the refusal
+// with its advice to annotate stays the answer.
+struct FoldedConstant {
+  bool isText = false;
+  std::int64_t number = 0;
+  std::string text;
+};
+
+static std::optional<FoldedConstant>
+foldModuleConstant(const std::vector<parser::NodePtr> &body,
+                   const parser::Node *node, unsigned depth) {
+  if (!node || depth > 16)
+    return std::nullopt;
+  if (node->kind == "Constant") {
+    if (ast::boolean(*node, "value"))
+      return std::nullopt;
+    if (auto number = ast::integer(*node, "value"))
+      return FoldedConstant{false, *number, {}};
+    if (auto text = ast::string(*node, "value"))
+      return FoldedConstant{true, 0, std::string(*text)};
+    return std::nullopt;
+  }
+  if (node->kind == "Name")
+    return foldModuleConstant(
+        body, singleModuleAssignment(body, ast::nameSpelling(*node)),
+        depth + 1);
+  if (node->kind == "UnaryOp") {
+    std::optional<FoldedConstant> operand =
+        foldModuleConstant(body, ast::node(*node, "operand"), depth + 1);
+    const parser::Node *op = ast::node(*node, "op");
+    if (!operand || operand->isText)
+      return std::nullopt;
+    if (ast::isOperator(op, "UAdd"))
+      return operand;
+    if (ast::isOperator(op, "USub") &&
+        operand->number != std::numeric_limits<std::int64_t>::min())
+      return FoldedConstant{false, -operand->number, {}};
+    if (ast::isOperator(op, "Invert"))
+      return FoldedConstant{false, ~operand->number, {}};
+    return std::nullopt;
+  }
+  if (node->kind != "BinOp")
+    return std::nullopt;
+  std::optional<FoldedConstant> left =
+      foldModuleConstant(body, ast::node(*node, "left"), depth + 1);
+  std::optional<FoldedConstant> right =
+      foldModuleConstant(body, ast::node(*node, "right"), depth + 1);
+  const parser::Node *op = ast::node(*node, "op");
+  if (!left || !right)
+    return std::nullopt;
+  if (left->isText || right->isText) {
+    if (left->isText && right->isText && ast::isOperator(op, "Add"))
+      return FoldedConstant{true, 0, left->text + right->text};
+    if (ast::isOperator(op, "Mult") && left->isText != right->isText) {
+      const FoldedConstant &text = left->isText ? *left : *right;
+      std::int64_t times = left->isText ? right->number : left->number;
+      if (times <= 0)
+        return FoldedConstant{true, 0, {}};
+      if (text.text.size() * static_cast<std::uint64_t>(times) > 4096)
+        return std::nullopt;
+      std::string out;
+      for (std::int64_t index = 0; index < times; ++index)
+        out += text.text;
+      return FoldedConstant{true, 0, out};
+    }
+    return std::nullopt;
+  }
+  std::int64_t a = left->number;
+  std::int64_t b = right->number;
+  std::int64_t out = 0;
+  if (ast::isOperator(op, "Add")) {
+    if (__builtin_add_overflow(a, b, &out))
+      return std::nullopt;
+  } else if (ast::isOperator(op, "Sub")) {
+    if (__builtin_sub_overflow(a, b, &out))
+      return std::nullopt;
+  } else if (ast::isOperator(op, "Mult")) {
+    if (__builtin_mul_overflow(a, b, &out))
+      return std::nullopt;
+  } else if (ast::isOperator(op, "FloorDiv") || ast::isOperator(op, "Mod")) {
+    if (b == 0 || (a == std::numeric_limits<std::int64_t>::min() && b == -1))
+      return std::nullopt;
+    std::int64_t quotient = a / b;
+    std::int64_t remainder = a % b;
+    if (remainder != 0 && ((remainder < 0) != (b < 0))) {
+      --quotient;
+      remainder += b;
+    }
+    out = ast::isOperator(op, "FloorDiv") ? quotient : remainder;
+  } else if (ast::isOperator(op, "Pow")) {
+    if (b < 0)
+      return std::nullopt;
+    out = 1;
+    for (std::int64_t index = 0; index < b; ++index)
+      if (__builtin_mul_overflow(out, a, &out))
+        return std::nullopt;
+  } else if (ast::isOperator(op, "LShift")) {
+    if (b < 0 || b >= 63 || (a != 0 && (a > (std::numeric_limits<std::int64_t>::max() >> b) ||
+                                        a < (std::numeric_limits<std::int64_t>::min() >> b))))
+      return std::nullopt;
+    out = a * (std::int64_t{1} << b);
+  } else if (ast::isOperator(op, "RShift")) {
+    if (b < 0)
+      return std::nullopt;
+    out = b >= 63 ? (a < 0 ? -1 : 0) : (a >> b);
+  } else if (ast::isOperator(op, "BitOr")) {
+    out = a | b;
+  } else if (ast::isOperator(op, "BitAnd")) {
+    out = a & b;
+  } else if (ast::isOperator(op, "BitXor")) {
+    out = a ^ b;
+  } else {
+    return std::nullopt;
+  }
+  return FoldedConstant{false, out, {}};
+}
+
 // A top-level `NAME: T = <literal>` / `NAME = <literal>` assigned exactly once
 // in a source module is a static literal constant: its literal type fully
 // determines the value, so importers materialize it without module state.
@@ -922,8 +1082,17 @@ sourceModuleLiteralConstant(TypeSystem &types,
     if (!constantNode)
       return std::nullopt;
   }
-  if (constantNode->kind != "Constant")
-    return std::nullopt;
+  if (constantNode->kind != "Constant") {
+    if (negated)
+      return std::nullopt;
+    std::optional<FoldedConstant> folded =
+        foldModuleConstant(body, constantNode, 0);
+    if (!folded)
+      return std::nullopt;
+    if (folded->isText)
+      return types.literal("\"" + folded->text + "\"");
+    return types.literal(std::to_string(folded->number));
+  }
   if (negated) {
     if (auto number = ast::integer(*constantNode, "value"))
       return types.literal(std::to_string(-*number));

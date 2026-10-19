@@ -56,6 +56,7 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
 | 2026-10-20 | `ut_bug_class_value_class_attribute_through_instance`、`ut_bug_class_value_class_attribute_shadowed`、`ut_unsupported_class_attribute_overridden_read_through_base`、`ut_unsupported_instance_shadows_class_attribute`、`ut_unsupported_object_with_class_value_union_field_held`、`ut_bug_class_value_call_checks_unrelated_subclasses` の残り | A5 の一部 (クラス属性)。クラス値を持つクラス属性をセルに置く。サブクラスが上書きしたクラス属性を基底の型から読むディスパッチで、注釈に書けない型 (`type[X]`、`int \| None`) を受ける。インスタンス経由の代入 (`self.maxDiff = None`) を、クラス属性の系統に未設定で始まるフィールドを足して受け、読みは「設定されていればフィールド、なければ `type(obj).attr`」にする (`py.attr.is_set`)。`type[X] \| None` のフィールドを箱に入れる。 |
 | 2026-10-20 | `ut_bug_set_display_solves_no_type_parameter`、`ut_bug_isinstance_and_keeps_dead_arm_in_generic_method`、`ut_bug_generic_method_local_of_generic_class` | A4 (ジェネリクス)。集合の表示が、型パラメータを含む期待型 (`set[T]`) で作られないようにする。`and`/`or` の分岐を、決まる被演算子で静的に決める (実行時に決まる被演算子の後に決まるものも、その腕を刈る)。フィールドの事前走査でジェネリックメソッドの型パラメータを束縛し、未束縛の型パラメータでジェネリッククラスを特殊化しない。途中で、フィールドに入ったサブクラスのないクラス値を `issubclass` が拒否していたのも直した。 |
 | 2026-10-20 | `ut_bug_type_alias_of_an_imported_module`、`ut_bug_field_typed_with_own_subclass`、`ut_bug_class_values_into_varargs`、`ut_bug_imported_function_list_of_one_subclass_value`、`ut_bug_and_over_hasattr_of_a_class_value`、`ut_unsupported_hasattr_on_class_value` | A5 の残り。取り込んだモジュールの型エイリアスをそのモジュールのスコープで束縛し、`type X = ...` 文も宣言として受ける。基底の本体が名指すサブクラスを、基底より先に生成しない。可変長引数のタプルにクラス値を入れる。コンテナ表示の期待型で、サブクラスのクラス値を基底のクラス型に合うと見る。`hasattr` を bool と型付けし、クラス値への `hasattr` を実行時のクラスで答える (その名前を宣言するクラスから派生しているか)。 |
+| 2026-10-20 | `ut_unsupported_computed_constant_of_imported_module`、`ut_unsupported_generic_factory_result_returned`、`ut_unsupported_fixed_tuple_concatenation`、`ut_unsupported_exc_info_outside_handler`、`ut_bug_subclass_into_optional_method_parameter` | 未対応 4 件と A5 の 1 件。取り込んだモジュールの、他の定数から計算した int と str の定数を畳み込む。結果だけが名指す型パラメータを、結果に期待される型から解く (`skipUnless` が `skipIf(...)` を返す形)。長さの決まったタプルを要素ごとに連結する。except ブロックの外の `sys.exc_info()` を、typeshed どおり省略可能な三つ組として実行時に答える (新しい `py.except.handling`)。union の引数に、どれかのメンバーに合う値を渡せる。途中で、呼び出し可能なインスタンスの union を呼ぶ形も通した (`test(result)`)。 |
 
 進捗の途中で決めたこと・見つけたこと:
 
@@ -72,6 +73,15 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
 - **既存の誤動作を 1 件直した。** クラス属性と同名のフィールドを `__init__` が
   条件付きでしか書かないとき、書かなかったインスタンスの読みが AttributeError を
   投げていた (CPython はクラス属性を返す)。上のインスタンス経由の代入と同じ読み方で直った。
+- **黙った誤動作を 1 件直した。** インスタンスの本体はボックスを先に、bool と
+  クラス値の語を後に置いていたので、ボックスのフィールドを足したサブクラスでは
+  基底の bool の語の位置がずれた。基底の型から書いた値をサブクラスの型で読むと
+  別の語を読み、クラス値のフィールドではクラッシュした (unittest では
+  `_testRunEntered` が見えず、クラスの後始末が 2 回走った)。フィールドごとに 1 つの
+  ボックス大のセルを、フィールドの番号の位置に置くように直した。
+- **コンパイル時間の退行を 1 件、入れる前に直した。** タプル連結の型付けが
+  `a + b + c ...` の連鎖で被演算子を二度ずつ推論し、traceback を取り込むだけの
+  プログラムが 25 秒かかった。
 
 ## 計測の方法
 

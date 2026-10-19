@@ -79,6 +79,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOpRule(mlir::Operation *op) {
           [&](auto match) { return lowerExceptMatch(match); })
       .Case<py::ExceptCurrentMatchOp>(
           [&](auto match) { return lowerExceptCurrentMatch(match); })
+      .Case<py::ExceptHandlingOp>(
+          [&](auto handling) { return lowerExceptHandling(handling); })
       .Case<py::ExceptCurrentValueOp>(
           [&](auto value) { return lowerExceptCurrentValue(value); })
       .Case<py::StarBeginOp>([&](auto begin) { return lowerStarBegin(begin); })

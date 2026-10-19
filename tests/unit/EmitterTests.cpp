@@ -762,13 +762,39 @@ TEST(EmitterTest, AGenericDecoratorFactoryIsSolvedWhereItIsApplied) {
 // What: `sys.exc_info()` outside an `except` block is refused, saying where
 // it is answered: which exception is being handled there is the handler
 // active at run time.
-TEST(EmitterTest, SysExcInfoIsAnsweredInsideAnExceptBlock) {
-  mlir::MLIRContext context(testRegistry());
-  lython::emitter::EmitResult refused =
-      emitSource("import sys\nprint(sys.exc_info())\n", context);
-  EXPECT_FALSE(refused.ok());
-  EXPECT_TRUE(reportsDiagnostic(
-      refused, "sys.exc_info() is answered inside an except block"));
+// What: written in an except block's body, `sys.exc_info()` is the triple
+// without None; anywhere else -- a function a handler calls -- it is
+// typeshed's optional triple, answered at run time, so a member is narrowed
+// before it is used.
+TEST(EmitterTest, SysExcInfoIsOptionalOutsideAnExceptBlock) {
+  lython::driver::DriverOptions native;
+  native.targetTriple = llvm::sys::getDefaultTargetTriple();
+  auto emits = [&](const char *source, std::string &diagnostics) {
+    mlir::MLIRContext context(testRegistry());
+    mlir::OwningOpRef<mlir::ModuleOp> module;
+    llvm::raw_string_ostream diag(diagnostics);
+    return mlir::succeeded(lython::driver::emitMLIRFromSource(
+        source, "main.py", "<lython-no-import-dir>", native, context, module,
+        diag));
+  };
+  std::string inside;
+  EXPECT_TRUE(emits("import sys\ntry:\n    raise KeyError('k')\n"
+                    "except KeyError:\n"
+                    "    print(sys.exc_info()[0].__name__)\n",
+                    inside))
+      << inside;
+  std::string narrowed;
+  EXPECT_TRUE(emits("import sys\ndef report() -> str:\n"
+                    "    etype, value, tb = sys.exc_info()\n"
+                    "    if etype is None:\n        return 'none'\n"
+                    "    return etype.__name__\nprint(report())\n",
+                    narrowed))
+      << narrowed;
+  std::string unnarrowed;
+  EXPECT_FALSE(emits("import sys\ndef report() -> str:\n"
+                     "    etype, value, tb = sys.exc_info()\n"
+                     "    return etype.__name__\nprint(report())\n",
+                     unnarrowed));
 }
 
 // What: `Container` is covariant, as typeshed declares it, so a method taking

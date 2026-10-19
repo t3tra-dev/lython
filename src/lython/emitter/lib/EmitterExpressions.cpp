@@ -14,6 +14,7 @@
 #include "Contracts.h"
 
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include "PyProtocols.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -1120,6 +1121,46 @@ Value ModuleEmitter::emitUnary(const parser::Node &expr) {
 }
 
 Value ModuleEmitter::emitBinary(const parser::Node &expr) {
+  // ⭐ TWO TUPLES OF KNOWN ARITY CONCATENATE MEMBER BY MEMBER: `(i,) +
+  // pair` is `(i, pair[0], pair[1])`, each member keeping its own type. The
+  // manifest's `tuple.__add__` joins the two element types into one, and
+  // `int` with `str` has no join but `object` -- `fmt % ((i,) + pair)`, how
+  // unittest formats a differing element, was refused for it. Each side is
+  // evaluated once, left first, as CPython does.
+  if (ast::isOperator(ast::node(expr, "op"), "Add")) {
+    const parser::Node *leftNode = ast::node(expr, "left");
+    const parser::Node *rightNode = ast::node(expr, "right");
+    if (std::optional<llvm::SmallVector<mlir::Type, 8>> lhs =
+            types.fixedTupleMembers(leftNode))
+      if (std::optional<llvm::SmallVector<mlir::Type, 8>> rhs =
+              types.fixedTupleMembers(rightNode)) {
+        parser::SourceRange range = expr.range;
+        std::vector<std::string> temps;
+        auto forget = llvm::scope_exit([&] {
+          for (const std::string &name : temps)
+            values.erase(name);
+        });
+        std::vector<parser::NodePtr> members;
+        std::pair<const parser::Node *, std::size_t> sides[] = {
+            {leftNode, lhs->size()}, {rightNode, rhs->size()}};
+        for (auto [side, count] : sides) {
+          std::string temp =
+              "__ly_tuplecat" + std::to_string(++syntheticFunctionCounter);
+          Value value = emitExpr(side);
+          values[temp] = value;
+          types.bindSymbol(temp, value.type);
+          temps.push_back(temp);
+          for (std::size_t index = 0; index < count; ++index)
+            members.push_back(synth::subscript(
+                synth::name(temp, range),
+                synth::intConstant(static_cast<std::int64_t>(index), range),
+                range));
+        }
+        parser::NodePtr display = synth::tuple(std::move(members), range);
+        synthesizedIteratorDefs.push_back(display);
+        return emitExpr(display.get());
+      }
+  }
   // str % args is printf-style formatting, not a manifest __mod__; it needs
   // the unevaluated right-hand AST (tuple literals supply the arguments), so
   // intercept before the operands are emitted.
@@ -4541,6 +4582,12 @@ Value ModuleEmitter::emitExprExpected(const parser::Node *expr,
       return emitNone(*expr);
     return emitBindingRef(*expr, specialization->first,
                           specialization->second);
+  }
+  if (expr->kind == "Call" && expected &&
+      unboundStaticParameterCount(expected) == 0) {
+    llvm::SaveAndRestore<const parser::Node *> call(expectedResultCall, expr);
+    llvm::SaveAndRestore<mlir::Type> wanted(expectedResultType, expected);
+    return emitExpr(expr);
   }
   return emitExpr(expr);
 }

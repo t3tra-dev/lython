@@ -1855,9 +1855,17 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
       if (body.getType() != storageType)
         body = mlir::memref::CastOp::create(builder, loc, storageType, body)
                    .getResult();
-      for (unsigned ordinal = 0; ordinal < boxedFields; ++ordinal) {
+      // Each box-fronted field's own cell (classBoxedFieldOrdinal).
+      unsigned fieldCount = static_cast<unsigned>(
+          RuntimeBundleLowerer::classFieldContractTypes(plan.classOp).size());
+      for (unsigned fieldIndex = 0; fieldIndex < fieldCount; ++fieldIndex) {
+        std::optional<unsigned> ordinal =
+            RuntimeBundleLowerer::classBoxedFieldOrdinal(plan.classOp,
+                                                         fieldIndex);
+        if (!ordinal)
+          continue;
         mlir::Value slot = mlir::arith::ConstantIntOp::create(
-                               builder, loc, static_cast<std::int64_t>(ordinal),
+                               builder, loc, static_cast<std::int64_t>(*ordinal),
                                64)
                                .getResult();
         mlir::func::CallOp::create(builder, loc, releaseSlot,
