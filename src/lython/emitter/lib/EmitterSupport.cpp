@@ -707,6 +707,23 @@ static bool isinstanceClassMatch(mlir::Type member, mlir::Type target,
          pythonSubclassOf(member, target, types, from);
 }
 
+// Whether a value whose static class is `source` may be a `target` at run
+// time: the target derives from it by one of the edges the type system
+// records -- assignability, a declared base, or a program class under a
+// manifest base.
+//
+// ⛔ ONE PREDICATE FOR A PLAIN VALUE AND A UNION MEMBER. The union arm asked
+// assignability alone, which cannot see a program class under a MANIFEST
+// base: `isinstance(e, AppError)` on a `BaseException | None` -- what an
+// exception's `__cause__` reads as, and a `list[Exception | None]` element --
+// folded to False while the same test on a plain `BaseException` answered.
+static bool mayBeInstanceAtRunTime(mlir::Type target, mlir::Type source,
+                                   TypeSystem &types, mlir::Operation *from) {
+  return isAssignableWithStaticEvidence(target, source, from) ||
+         declaredSubclassOfType(target, source, types) ||
+         sourceClassUnderManifestBase(target, source, types);
+}
+
 IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
                                      mlir::Type targetType, TypeSystem &types,
                                      mlir::Operation *from) {
@@ -771,8 +788,8 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
         analysis.unionMembers.push_back(rawMember);
       } else if (containsObjectTop(member, types)) {
         sawUnsupportedMember = true;
-      } else if (isAssignableWithStaticEvidence(analysis.targetType, member,
-                                                from)) {
+      } else if (mayBeInstanceAtRunTime(analysis.targetType, member, types,
+                                        from)) {
         runtimeClassTestMembers.push_back(rawMember);
       } else {
         remaining.push_back(rawMember);
@@ -901,12 +918,8 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
   }
 
   if (mlir::isa<py::ContractType>(analysis.sourceType) &&
-      (isAssignableWithStaticEvidence(analysis.targetType, analysis.sourceType,
-                                      from) ||
-       declaredSubclassOfType(analysis.targetType, analysis.sourceType,
-                              types) ||
-       sourceClassUnderManifestBase(analysis.targetType, analysis.sourceType,
-                                    types))) {
+      mayBeInstanceAtRunTime(analysis.targetType, analysis.sourceType, types,
+                             from)) {
     analysis.kind = IsInstanceAnalysis::Kind::ClassTest;
     analysis.trueType = analysis.targetType;
     return analysis;

@@ -23,12 +23,31 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <cstdint>
+
 namespace py::runtime_library {
 
 inline llvm::SmallVector<mlir::Type, 3> exceptionTripleTypes(mlir::Builder &b) {
   return {mlir::MemRefType::get({3}, b.getI64Type()),
           mlir::MemRefType::get({2}, b.getI64Type()),
           mlir::MemRefType::get({mlir::ShapedType::kDynamic}, b.getI8Type())};
+}
+
+// The exception object's chain words (objects/exceptions.mlir,
+// LyBaseException_New): `__cause__` and `__context__` are each one entity
+// word -- the exception it names, 0 for None -- owning a reference, and
+// `__suppress_context__` is 0 or 1. The EH runtime writes them at a raise and
+// the lowering reads them for the attributes, so both take the offsets from
+// here.
+inline constexpr std::int64_t kExceptionCauseWord = 7;
+inline constexpr std::int64_t kExceptionContextWord = 8;
+inline constexpr std::int64_t kExceptionSuppressContextWord = 9;
+
+// `LyEH_SetCause(raised, cause)` and `LyEH_SetCauseNone(raised)`: the object
+// half of `raise X from Y` / `raise X from None`, each exception by its
+// header.
+inline mlir::Type exceptionHeaderType(mlir::Builder &b) {
+  return mlir::MemRefType::get({3}, b.getI64Type());
 }
 
 } // namespace py::runtime_library

@@ -2342,6 +2342,11 @@ void buildRecordException(SupportBuilder &b) {
       b.builder, b.loc,
       mlir::arith::ConstantIntOp::create(b.builder, b.loc, 1, 1).getResult(),
       flagSlot, /*alignment=*/4);
+  // ⭐ THE OBJECT'S `__context__` IS WRITTEN HERE, the one place every raise
+  // passes -- whichever stash parked the interrupted exception, the raise's
+  // own above or the lowering's before a frame push, it is parked by now.
+  b.call("exc_chain_pending_context", mlir::TypeRange{},
+         mlir::ValueRange{explodeMemRef1D(b, entry->getArgument(0)).aligned});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
@@ -2473,7 +2478,8 @@ void buildCurrentExceptionMatches(SupportBuilder &b) {
 // void release_exception_extras(i64 header): drop the extended exception
 // words before the 3-word storage itself is freed — word 3 (ExceptionGroup
 // members / multi-value args) and word 4 (user-exception fields) each hold a
-// [count, count x box16] i64 block whose slots own one reference apiece.
+// [count, count x box16] i64 block whose slots own one reference apiece, and
+// words 7 and 8 (__cause__, __context__) each own the exception they name.
 // Lives here (not in objects/exceptions.mlir) because every raw free site —
 // the manifest deallocator, the discard path, and chain-node destruction —
 // must share one implementation.
@@ -2525,6 +2531,15 @@ void buildReleaseExceptionExtras(SupportBuilder &b) {
       mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0), slotPtr,
                                   /*alignment=*/8);
     }
+  }
+  // A chain word is a slot of its own -- one entity word, 0 for None -- so
+  // the slot release takes it, dying exception and all.
+  for (std::int64_t word : {kExceptionCauseWord, kExceptionContextWord}) {
+    mlir::Value slotPtr = b.gepI64(header, b.iconst(word));
+    b.call("release_payload_slot_ptr", mlir::TypeRange{},
+           mlir::ValueRange{slotPtr});
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0), slotPtr,
+                                /*alignment=*/8);
   }
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
@@ -2588,9 +2603,10 @@ void buildDiscardCurrentException(SupportBuilder &b) {
   b.call("LyTraceback_Clear", mlir::TypeRange{}, {});
   mlir::Value contextSlot = b.addrOf("g_exc_context_node");
   mlir::Value node = b.loadPtrVal(contextSlot);
-  // ⛔ RESTORE ONLY WHEN THIS HANDLER IS NESTED INSIDE ANOTHER. The pop
-  // returns to handling the outer exception, and there is one to return to
-  // exactly when the handler that is finishing sits inside it. A raise that
+  // ⛔ RESTORE ONLY WHEN THIS HANDLER IS NESTED INSIDE ANOTHER -- which the
+  // caller answers (LyEH_ContextIsHandled, or a generator clone's text). The
+  // pop returns to handling the outer exception, and there is one to return
+  // to exactly when the handler that is finishing sits inside it. A raise that
   // LEFT its handler and was caught further out has no such handler any more,
   // and restoring there left an already-handled exception pending: a later
   // uncaught raise printed the old one's chain, and every
@@ -2679,6 +2695,64 @@ void buildDiscardCurrentExceptionPlain(SupportBuilder &b) {
              mlir::arith::ConstantIntOp::create(b.builder, b.loc, 1, 1)
                  .getResult()});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// ptr LyEH_HandledException(): the exception being handled, by identity --
+// its header -- or null. A `try` takes it on entry, and it is what a handler
+// of that try returns to handling when it completes (LyEH_ContextIsHandled).
+void buildHandledException(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyEH_HandledException",
+                            b.builder.getFunctionType({}, {b.ptr()}));
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value pending = mlir::LLVM::LoadOp::create(
+      b.builder, b.loc, b.i1(), b.addrOf("g_current_exception"),
+      /*alignment=*/4);
+  mlir::Value header =
+      b.loadPtrVal(partsField(b, b.addrOf("g_current_parts"), 0, 1));
+  mlir::Value handled = mlir::LLVM::SelectOp::create(b.builder, b.loc, pending,
+                                                     header, b.nullPtr());
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{handled});
+}
+
+// i1 LyEH_ContextIsHandled(ptr handledAtTry): whether the pending exception's
+// __context__ is the exception that was being handled when its handler's
+// `try` began -- the one handler completion returns to handling, as CPython's
+// POP_EXCEPT restores what PUSH_EXC_INFO saved. A context the exception
+// picked up inside a handler it then LEFT has no handler to return to.
+//
+// ⛔ NOT WHERE THE `try` IS WRITTEN. Being inside a handler is a fact about
+// the run, not the text: a function that handles an exception, called from an
+// except block, is inside that block's handler, and a `try` in a `finally`
+// body is inside one exactly when the finally runs for an exception. Answered
+// from the text, the helper's handler dropped the caller's exception -- the
+// caller's `except ValueError as e` then read freed memory, and a bare
+// `raise` after the call aborted.
+void buildContextIsHandled(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyEH_ContextIsHandled",
+                            b.builder.getFunctionType({b.ptr()}, {b.i1()}));
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value handledAtTry = entry->getArgument(0);
+  mlir::Value node = b.loadPtrVal(b.addrOf("g_exc_context_node"));
+  mlir::Value haveBoth = mlir::arith::AndIOp::create(
+      b.builder, b.loc, b.ptrNe(node, b.nullPtr()),
+      b.ptrNe(handledAtTry, b.nullPtr()));
+  auto compare = mlir::scf::IfOp::create(b.builder, b.loc,
+                                         mlir::TypeRange{b.i1()}, haveBoth,
+                                         /*withElseRegion=*/true);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(&compare.getThenRegion().front());
+    mlir::Value context = b.loadPtrVal(nodePartsField(b, node, 0, 1));
+    mlir::scf::YieldOp::create(b.builder, b.loc,
+                               mlir::ValueRange{b.ptrEq(context, handledAtTry)});
+    b.builder.setInsertionPointToStart(&compare.getElseRegion().front());
+    mlir::scf::YieldOp::create(b.builder, b.loc,
+                               mlir::ValueRange{b.iconst1(false)});
+  }
+  mlir::func::ReturnOp::create(b.builder, b.loc,
+                               mlir::ValueRange{compare.getResult(0)});
 }
 
 // LyEH_RethrowCurrent(): rethrows the still-stored payload with a fresh C++
@@ -2929,6 +3003,12 @@ void buildAdoptStashedAsContext(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(attach);
   mlir::LLVM::StoreOp::create(b.builder, b.loc, node,
                               attach->getArgument(0), /*alignment=*/8);
+  // And on the objects: the parked exception is the `__context__` CPython
+  // gave the first exception in the chain that was raised with none.
+  b.call("exc_adopt_context_tail", mlir::TypeRange{},
+         mlir::ValueRange{
+             b.loadPtrVal(partsField(b, b.addrOf("g_current_parts"), 0, 1)),
+             b.loadPtrVal(nodePartsField(b, node, 0, 1))});
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(done);
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
@@ -4237,6 +4317,8 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   buildCurrentExceptionMatches(support);
   buildDiscardCurrentException(support);
   buildDiscardCurrentExceptionPlain(support);
+  buildHandledException(support);
+  buildContextIsHandled(support);
   buildRethrowCurrent(support);
   buildTakeCurrentDescriptor(support);
   buildStashCurrentException(support);

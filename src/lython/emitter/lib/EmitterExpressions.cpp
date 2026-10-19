@@ -3301,21 +3301,14 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
             "attributes"});
     return emitNone(expr);
   }
-  // ⛔ THE EXCEPTION CHAIN HAS NO VALUE SURFACE, and BaseException DECLARES the
-  // four attributes that would read it -- so `e.__cause__` type-checked and
-  // then failed in the lowering with "attr.get object type has no class
-  // schema", which names nothing the reader wrote. The chain itself is real:
-  // `raise X from e` records it and the traceback prints it. What is missing is
-  // a way to hand a chain NODE back as a value.
-  //
-  // ⛔ `__traceback__` is a separate question with its own answer, which is why
-  // it names one. Its type is representable now -- `types.TracebackType` is an
-  // ordinary class (runtime/lib/types.py) and a chain of them is built by
-  // `traceback._current_tb()` out of the frame stack the runtime records. What
-  // is missing is only the WIRING: this attribute would have to emit a call
-  // into a stdlib module, and a module reaches the emitter only when the
-  // program imports it, so an attribute cannot summon one. The message says
-  // what to write instead rather than what cannot be done.
+  // ⛔ `__traceback__` is the one attribute of the chain with no value here,
+  // and the message names what to write instead. Its type is representable
+  // now -- `types.TracebackType` is an ordinary class (runtime/lib/types.py)
+  // and a chain of them is built by `traceback._current_tb()` out of the frame
+  // stack the runtime records. What is missing is only the WIRING: this
+  // attribute would have to emit a call into a stdlib module, and a module
+  // reaches the emitter only when the program imports it, so an attribute
+  // cannot summon one.
   if (*attr == "__traceback__")
     if (!lookupClassField(object.type, *attr) &&
         py::isAssignableTo(object.type,
@@ -3379,19 +3372,6 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
         "time"});
     return emitNone(expr);
   }
-  if (*attr == "__cause__" || *attr == "__context__" ||
-      *attr == "__suppress_context__")
-    if (!lookupClassField(object.type, *attr) &&
-        py::isAssignableTo(object.type,
-                           types.contract("builtins.BaseException"), module)) {
-      diagnostics.push_back(parser::Diagnostic{
-          parser::Severity::Error, expr.range.start,
-          "'" + std::string(*attr) +
-              "' is declared by the standard-library contract but has no "
-              "runtime implementation: the exception chain is recorded for "
-              "the traceback and has no value representation here"});
-      return emitNone(expr);
-    }
   // ⭐ `P._fields` IS A COMPILE-TIME TUPLE, for the same reason `C.__name__` is
   // a compile-time string: a NamedTuple's field order is the class statement.
   // CPython builds it at class creation and never changes it, so the fold is

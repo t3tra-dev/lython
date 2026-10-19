@@ -1731,6 +1731,11 @@ private:
                            mlir::Operation *insertBefore = nullptr);
   mlir::LogicalResult emitSetCurrentCause(mlir::Operation *op,
                                           const RuntimeBundle &cause);
+  mlir::LogicalResult emitSetObjectCause(mlir::Operation *op,
+                                         const RuntimeBundle &raised,
+                                         const RuntimeBundle *cause);
+  mlir::LogicalResult lowerExceptionChainAttrGet(py::AttrGetOp op,
+                                                 const RuntimeBundle &object);
   mlir::LogicalResult lowerRaise(py::RaiseOp op);
   mlir::LogicalResult lowerRaiseCurrent(py::RaiseCurrentOp op);
   mlir::LogicalResult lowerExceptMatch(py::ExceptMatchOp op);
@@ -2115,6 +2120,9 @@ private:
       controlFlowDeferredExpansions;
   std::int64_t nextFunctionTargetId = 1;
   std::int64_t nextTryHandlerId = 1;
+  // Set while the generator state machine flattens a clone's tries
+  // (TryOps.cpp, HandlerReturn): their handlers answer from the text.
+  bool loweringGeneratorCloneTries = false;
   llvm::SmallVector<mlir::Operation *, 32> erase;
 };
 

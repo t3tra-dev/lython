@@ -1,3 +1,4 @@
+#include "Common/ExceptionABI.h"
 #include "Runtime/ABI/ConstantData.h"
 #include "PyProtocols.h"
 #include "PyTypeObject.h"
@@ -1537,6 +1538,33 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     erase.push_back(op);
     return mlir::success();
   };
+
+  // ⭐ THE CHAIN IS READ OFF THE OBJECT'S OWN WORDS (Common/ExceptionABI.h),
+  // which a raise writes the way CPython's sets the object's fields -- so a
+  // stored exception keeps its chain after its handler is gone, where the
+  // chain NODES the traceback prints do not.
+  if (object->kind == RuntimeBundle::Kind::Object &&
+      object->physicalValues().size() == 3 &&
+      (op.getName() == "__cause__" || op.getName() == "__context__" ||
+       op.getName() == "__suppress_context__")) {
+    std::string contract = runtimeContractName(op.getObject().getType());
+    llvm::StringRef leaf = llvm::StringRef(contract).rsplit('.').second;
+    if (leaf.empty())
+      leaf = contract;
+    if (py::exceptions::findByName(leaf) != nullptr ||
+        RuntimeBundleLowerer::exceptionAncestorContractFor(
+            op.getObject().getType())
+            .has_value()) {
+      if (op.getName() != "__suppress_context__")
+        return RuntimeBundleLowerer::lowerExceptionChainAttrGet(op, *object);
+      std::optional<RuntimeSymbol> primitive =
+          manifest.primitive("builtins.BaseException", "suppress_context");
+      if (!primitive)
+        return op.emitError() << "runtime manifest has no BaseException "
+                                 "suppress_context primitive";
+      return lowerExceptionAttributePrimitive(*primitive);
+    }
+  }
 
   // The codec errors' encoding / object / start / end / reason are the
   // arguments in their payload block, read by primitives named after them.
@@ -3564,6 +3592,75 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCellAttrSet(
     return mlir::failure();
   erase.push_back(op);
   return mlir::success();
+}
+
+// `e.__cause__` / `e.__context__`: the entity word a raise left in the object,
+// as `BaseException | None`. Read the way a union FIELD is -- the class the
+// entity names is the live member and 0 is None's -- with the reference taken
+// at the read and the tag from a second read after it, for the reason the
+// field read gives: the release planner puts the exception's own death after
+// its last use, and the words are the only use this read makes of it.
+mlir::LogicalResult
+RuntimeBundleLowerer::lowerExceptionChainAttrGet(py::AttrGetOp op,
+                                                 const RuntimeBundle &object) {
+  auto unionType = mlir::dyn_cast<py::UnionType>(op.getResult().getType());
+  if (!unionType)
+    return op.emitError() << "exception attribute '" << op.getName()
+                          << "' reads as BaseException | None, not "
+                          << op.getResult().getType();
+  std::optional<RuntimeSymbol> extGet =
+      manifest.primitive("builtins.BaseException", "ext_get");
+  if (!extGet)
+    return op.emitError()
+           << "runtime manifest has no BaseException ext_get primitive";
+  mlir::FailureOr<mlir::Value> header =
+      RuntimeBundleLowerer::objectPhysicalHeader(op, object.objectValue);
+  if (mlir::failed(header))
+    return mlir::failure();
+  mlir::Type expectedHeader = extGet->function.getFunctionType().getInput(0);
+  if (header->getType() != expectedHeader)
+    return op.emitError() << "exception attribute '" << op.getName()
+                          << "' needs a " << expectedHeader << " header, got "
+                          << header->getType();
+  std::int64_t word = op.getName() == "__cause__"
+                          ? py::runtime_library::kExceptionCauseWord
+                          : py::runtime_library::kExceptionContextWord;
+  mlir::Location loc = op.getLoc();
+  auto readEntity = [&]() -> mlir::Value {
+    builder.setInsertionPoint(op);
+    mlir::Value slot =
+        mlir::arith::ConstantIntOp::create(builder, loc, word, 64);
+    return RuntimeBundleLowerer::createRuntimeCall(
+               loc, *extGet, mlir::ValueRange{*header, slot})
+        .getResult(0);
+  };
+  mlir::Value entity = readEntity();
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> unionValues =
+      RuntimeBundleLowerer::unionValuesFromBoxWords(
+          op, unionType, box_abi::slotClassFromEntity(builder, loc, entity),
+          entity, /*branchless=*/true);
+  if (mlir::failed(unionValues))
+    return mlir::failure();
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> retained =
+      RuntimeBundleLowerer::retainUnionMemberValues(op, unionType,
+                                                    *unionValues);
+  if (mlir::failed(retained))
+    return mlir::failure();
+  llvm::SmallVector<mlir::Value, 8> values(retained->begin(), retained->end());
+  mlir::Value entityAgain = readEntity();
+  mlir::FailureOr<mlir::Value> liveTag =
+      RuntimeBundleLowerer::unionTagFromBoxWords(
+          op, unionType,
+          box_abi::slotClassFromEntity(builder, loc, entityAgain),
+          entityAgain);
+  if (mlir::failed(liveTag))
+    return mlir::failure();
+  values[0] = *liveTag;
+  return bindRetainedEvidenceBundle(
+      op, op.getResult(),
+      RuntimeBundle::objectWithOwnership(
+          unionType, values,
+          ownership::logicalOwnershipKind(unionType, /*ownsObject=*/false)));
 }
 
 // The field block of an exception-backed instance, allocated on first use.

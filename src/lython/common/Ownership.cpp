@@ -1959,6 +1959,8 @@ bool isNonRaisingRuntimeSymbol(llvm::StringRef name) {
          name == "LyEH_DiscardCurrentException" ||
          name == "LyEH_StashCurrentAsContext" ||
          name == "LyEH_SetCurrentCause" || name == "LyEH_SetCurrentSuppress" ||
+         name == "LyEH_SetCause" || name == "LyEH_SetCauseNone" ||
+         name == "LyEH_HandledException" || name == "LyEH_ContextIsHandled" ||
          name == "LyEH_TryCallSiteMarker" || name == "LyEH_TryCatchMarker" ||
          name == "LyEH_TryCatchAnchor" || name.starts_with("LyTraceback_") ||
          name == "LyObject_KeepAlive";

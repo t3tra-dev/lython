@@ -1524,6 +1524,217 @@ void buildSetCurrentCause(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
+// void exc_set_context(ptr value, ptr context): `value.__context__ =
+// context` the way a raise sets it (CPython's _PyErr_SetObject): nothing when
+// the two are one object, and when context's own chain leads back to value
+// that link is cut first, so the words stay acyclic.
+//
+// ⛔ THE WALK HAS NO CYCLE GUARD because nothing else writes a context word:
+// this function keeps the chain acyclic, and the emitter refuses an
+// assignment to `__context__`. A writer added later brings CPython's Floyd
+// walk with it.
+void buildExcSetContext(SupportBuilder &b) {
+  auto fn = b.beginFunction(
+      "exc_set_context", b.builder.getFunctionType({b.ptr(), b.ptr()}, {}),
+      /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *walk =
+      b.builder.createBlock(&body, body.end(), {b.ptr()}, {b.loc});
+  mlir::Block *step = b.builder.createBlock(&body, body.end(),
+                                            {b.ptr(), b.i64()}, {b.loc, b.loc});
+  mlir::Block *cut =
+      b.builder.createBlock(&body, body.end(), {b.ptr()}, {b.loc});
+  mlir::Block *link = b.builder.createBlock(&body);
+  mlir::Block *done = b.builder.createBlock(&body);
+  mlir::Value value = entry->getArgument(0);
+  mlir::Value context = entry->getArgument(1);
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, b.ptrEq(value, context),
+                                 done, mlir::ValueRange{}, walk,
+                                 mlir::ValueRange{context});
+
+  b.builder.setInsertionPointToEnd(walk);
+  mlir::Value node = walk->getArgument(0);
+  mlir::Value nextWord =
+      b.loadI64(b.gepI64(node, b.iconst(kExceptionContextWord)));
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::eq, nextWord, b.iconst(0)), link,
+      mlir::ValueRange{}, step, mlir::ValueRange{node, nextWord});
+
+  b.builder.setInsertionPointToEnd(step);
+  mlir::Value reachesValue =
+      b.cmpi(mlir::arith::CmpIPredicate::eq, step->getArgument(1),
+             b.ptrToInt(value));
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc, reachesValue, cut,
+      mlir::ValueRange{step->getArgument(0)}, walk,
+      mlir::ValueRange{b.intToPtr(step->getArgument(1))});
+
+  b.builder.setInsertionPointToEnd(cut);
+  mlir::Value cutSlot =
+      b.gepI64(cut->getArgument(0), b.iconst(kExceptionContextWord));
+  b.call("release_payload_slot_ptr", mlir::TypeRange{},
+         mlir::ValueRange{cutSlot});
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0), cutSlot,
+                              /*alignment=*/8);
+  mlir::cf::BranchOp::create(b.builder, b.loc, link, mlir::ValueRange{});
+
+  // Retained before the old word is released: the two may be one exception.
+  b.builder.setInsertionPointToEnd(link);
+  b.call("retain_storage_raw", mlir::TypeRange{}, mlir::ValueRange{context});
+  mlir::Value slot = b.gepI64(value, b.iconst(kExceptionContextWord));
+  b.call("release_payload_slot_ptr", mlir::TypeRange{}, mlir::ValueRange{slot});
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.ptrToInt(context), slot,
+                              /*alignment=*/8);
+  mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(done);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// void exc_chain_pending_context(ptr value): the exception a raise just
+// recorded takes the one it interrupted -- parked in g_exc_context_node by
+// the stash that preceded the record -- as its `__context__`. With nothing
+// parked the word keeps what it had, as CPython leaves an exception raised
+// outside any handler.
+void buildExcChainPendingContext(SupportBuilder &b) {
+  auto fn = b.beginFunction("exc_chain_pending_context",
+                            b.builder.getFunctionType({b.ptr()}, {}),
+                            /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *chain = b.builder.createBlock(&body);
+  mlir::Block *done = b.builder.createBlock(&body);
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value node = b.loadPtrVal(b.addrOf("g_exc_context_node"));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc,
+                                 b.ptrEq(node, b.nullPtr()), done,
+                                 mlir::ValueRange{}, chain, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(chain);
+  mlir::Value interrupted = b.loadPtrVal(nodePartsField(b, node, 0, 1));
+  auto haveInterrupted = mlir::scf::IfOp::create(
+      b.builder, b.loc, mlir::TypeRange{},
+      b.ptrNe(interrupted, b.nullPtr()), /*withElseRegion=*/false);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(&haveInterrupted.getThenRegion().front());
+    b.call("exc_set_context", mlir::TypeRange{},
+           mlir::ValueRange{entry->getArgument(0), interrupted});
+  }
+  mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(done);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// void exc_adopt_context_tail(ptr value, ptr context): `context` becomes
+// the `__context__` of the last exception in value's chain -- what
+// LyEH_AdoptStashedAsContext does to the chain NODES, on the objects. An
+// exception already in the chain is left where it is.
+void buildExcAdoptContextTail(SupportBuilder &b) {
+  auto fn = b.beginFunction(
+      "exc_adopt_context_tail",
+      b.builder.getFunctionType({b.ptr(), b.ptr()}, {}), /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *walk =
+      b.builder.createBlock(&body, body.end(), {b.ptr()}, {b.loc});
+  mlir::Block *step = b.builder.createBlock(&body, body.end(),
+                                            {b.ptr(), b.i64()}, {b.loc, b.loc});
+  mlir::Block *attach =
+      b.builder.createBlock(&body, body.end(), {b.ptr()}, {b.loc});
+  mlir::Block *done = b.builder.createBlock(&body);
+  mlir::Value context = entry->getArgument(1);
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value nothing = b.orBit(b.ptrEq(entry->getArgument(0), b.nullPtr()),
+                                b.ptrEq(context, b.nullPtr()));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, nothing, done,
+                                 mlir::ValueRange{}, walk,
+                                 mlir::ValueRange{entry->getArgument(0)});
+
+  b.builder.setInsertionPointToEnd(walk);
+  mlir::Value node = walk->getArgument(0);
+  mlir::Value nextWord =
+      b.loadI64(b.gepI64(node, b.iconst(kExceptionContextWord)));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, b.ptrEq(node, context),
+                                 done, mlir::ValueRange{}, step,
+                                 mlir::ValueRange{node, nextWord});
+
+  b.builder.setInsertionPointToEnd(step);
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::eq, step->getArgument(1),
+             b.iconst(0)),
+      attach, mlir::ValueRange{step->getArgument(0)}, walk,
+      mlir::ValueRange{b.intToPtr(step->getArgument(1))});
+
+  b.builder.setInsertionPointToEnd(attach);
+  b.call("exc_set_context", mlir::TypeRange{},
+         mlir::ValueRange{attach->getArgument(0), context});
+  mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(done);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// void exc_set_cause(ptr value, ptr cause): CPython's PyException_SetCause
+// -- the cause word takes a reference to `cause` (null is None, for `from
+// None`) and __suppress_context__ becomes 1 either way.
+void buildExcSetCause(SupportBuilder &b) {
+  auto fn = b.beginFunction(
+      "exc_set_cause", b.builder.getFunctionType({b.ptr(), b.ptr()}, {}),
+      /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value value = entry->getArgument(0);
+  mlir::Value cause = entry->getArgument(1);
+  // Retained before the old word is released: the two may be one exception.
+  b.call("retain_storage_raw", mlir::TypeRange{}, mlir::ValueRange{cause});
+  mlir::Value slot = b.gepI64(value, b.iconst(kExceptionCauseWord));
+  b.call("release_payload_slot_ptr", mlir::TypeRange{}, mlir::ValueRange{slot});
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.ptrToInt(cause), slot,
+                              /*alignment=*/8);
+  mlir::LLVM::StoreOp::create(
+      b.builder, b.loc, b.iconst(1),
+      b.gepI64(value, b.iconst(kExceptionSuppressContextWord)),
+      /*alignment=*/8);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// LyEH_SetCause(raised header, cause header) / LyEH_SetCauseNone(raised
+// header): the object half of `raise X from Y` and `raise X from None`.
+// LyEH_SetCurrentCause / LyEH_SetCurrentSuppress record the same cause for
+// the traceback, which prints the chain NODES of the raise.
+void buildSetCause(SupportBuilder &b) {
+  mlir::Type header = exceptionHeaderType(b.builder);
+  auto fn = b.beginFunction("LyEH_SetCause",
+                            b.builder.getFunctionType({header, header}, {}));
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  b.call("exc_set_cause", mlir::TypeRange{},
+         mlir::ValueRange{explodeMemRef1D(b, entry->getArgument(0)).aligned,
+                          explodeMemRef1D(b, entry->getArgument(1)).aligned});
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+void buildSetCauseNone(SupportBuilder &b) {
+  auto fn = b.beginFunction(
+      "LyEH_SetCauseNone",
+      b.builder.getFunctionType({exceptionHeaderType(b.builder)}, {}));
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  b.call("exc_set_cause", mlir::TypeRange{},
+         mlir::ValueRange{explodeMemRef1D(b, entry->getArgument(0)).aligned,
+                          b.nullPtr()});
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
 // ptr read_source_line(ptr path, i32 line): malloc'd copy of the line-th
 // source line ("" when unavailable), trailing newline characters stripped.
 void buildReadSourceLine(SupportBuilder &b) {
@@ -3804,6 +4015,12 @@ void buildTracebackSupport(SupportBuilder &b) {
   buildStashCurrentAsContext(b);
   buildSetCurrentSuppress(b);
   buildSetCurrentCause(b);
+  buildExcSetContext(b);
+  buildExcChainPendingContext(b);
+  buildExcAdoptContextTail(b);
+  buildExcSetCause(b);
+  buildSetCause(b);
+  buildSetCauseNone(b);
   buildReadSourceLine(b);
   buildExceptionClassName(b);
   buildLeadingWhitespace(b);
