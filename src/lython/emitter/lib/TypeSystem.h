@@ -518,6 +518,14 @@ public:
   mlir::Type unionArgumentOperatorResult(mlir::Type receiver,
                                          llvm::StringRef method,
                                          mlir::Type argument) const;
+  // The result of `u.method(...)` on a union receiver: the join of what each
+  // member's method returns, or null unless every member has one that takes
+  // these arguments. Read only where the emitter builds the matching tag
+  // dispatch (`tryEmitUnionMethodCall`) -- the inferred type of a method call
+  // and that call's emission.
+  mlir::Type unionMethodResult(mlir::Type receiver, llvm::StringRef method,
+                               mlir::ArrayRef<mlir::Type> positional,
+                               mlir::ArrayRef<CallKeywordType> keywords) const;
   // Same-shape callables collapse to one callable whose result is the join of
   // theirs, instead of a union nothing can call.
   mlir::Type commonCallableJoin(mlir::ArrayRef<mlir::Type> members) const;

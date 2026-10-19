@@ -945,6 +945,65 @@ TEST(EmitterTest, AUserDefinedSetattrStillWins) {
   EXPECT_TRUE(emitted.ok()) << emitted.diagnostics.size();
 }
 
+// A method called on a union is answered by every member or refused: the
+// refusal names the member that has no such method, and a method that can
+// reallocate its receiver is refused by that reason.
+TEST(EmitterTest, AMethodOnAUnionIsAnsweredByEveryMemberOrRefused) {
+  {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult emitted =
+        emitSource("class A:\n"
+                   "    def size(self, k: int) -> int:\n"
+                   "        return k\n"
+                   "class B:\n"
+                   "    def size(self, k: int) -> str:\n"
+                   "        return str(k)\n"
+                   "def pick(b: bool) -> A | B:\n"
+                   "    if b:\n"
+                   "        return A()\n"
+                   "    return B()\n"
+                   "print(pick(True).size(k=1))\n",
+                   context);
+    EXPECT_TRUE(emitted.ok()) << emitted.diagnostics.size();
+  }
+  {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult emitted =
+        emitSource("def maybe(b: bool) -> str | None:\n"
+                   "    if b:\n"
+                   "        return 'x'\n"
+                   "    return None\n"
+                   "print(maybe(True).upper())\n",
+                   context);
+    EXPECT_FALSE(emitted.ok());
+    bool found = false;
+    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+      found = found ||
+              (diagnostic.message.find("for the member !py.literal<None>") !=
+                   std::string::npos &&
+               diagnostic.message.find("narrow the value") !=
+                   std::string::npos);
+    EXPECT_TRUE(found);
+  }
+  {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult emitted =
+        emitSource("def seqs(b: bool) -> list[int] | bytearray:\n"
+                   "    if b:\n"
+                   "        return [1]\n"
+                   "    return bytearray(b'a')\n"
+                   "xs = seqs(True)\n"
+                   "xs.append(2)\n",
+                   context);
+    EXPECT_FALSE(emitted.ok());
+    bool found = false;
+    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+      found = found || diagnostic.message.find("can reallocate the object") !=
+                           std::string::npos;
+    EXPECT_TRUE(found);
+  }
+}
+
 // The chain attributes read the words a raise left in the exception; an
 // assignment to one is refused at the store, naming the raise that writes it.
 TEST(EmitterTest, TheExceptionChainIsReadButWrittenOnlyByARaise) {

@@ -234,6 +234,12 @@ private:
   tryEmitVirtualDispatchWithValues(const parser::Node &anchor, Value receiver,
                                    llvm::StringRef methodName,
                                    llvm::ArrayRef<Value> positional);
+  // `u.method(...)` on a union receiver, by tag (EmitterCalls.cpp). Nothing --
+  // and nothing emitted -- when a member cannot answer, and the caller then
+  // refuses as before.
+  std::optional<Value> tryEmitUnionMethodCall(const parser::Node &expr,
+                                              Value receiver,
+                                              llvm::StringRef methodName);
   struct VirtualDispatchHelper {
     std::string symbol;
     py::CallableType callable;

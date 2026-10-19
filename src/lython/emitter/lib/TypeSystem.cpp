@@ -107,6 +107,27 @@ CallInferenceResult unresolvedMethodCall(const TypeSystem &types,
                                              keywords) {
   std::string subject =
       "static type " + typeText(types.widenLiteral(receiverType));
+  // ⭐ A UNION IS ANSWERED BY ITS MEMBERS (TypeSystem::unionMethodResult), so
+  // the sentence names the member that does not answer. "The union does not
+  // provide 'upper'" sent the reader looking for a method on a type that is
+  // only a set of other types.
+  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(
+          types.widenLiteral(receiverType)))
+    for (mlir::Type member : unionType.getMemberTypes()) {
+      CallInferenceResult answered = types.inferMethodCallWithEvidence(
+          types.widenLiteral(member), methodName, positional, keywords);
+      if (answered)
+        continue;
+      return CallInferenceResult{
+          {},
+          {},
+          false,
+          subject + " is a union, and '" + methodName.str() +
+              "' runs on whichever member the value holds: for the member " +
+              typeText(types.widenLiteral(member)) + ", " +
+              answered.failureReason +
+              " -- narrow the value to the members that answer first"};
+    }
   if (!types.declaresManifestMethod(receiverType, methodName))
     return CallInferenceResult{
         {},
@@ -5222,6 +5243,9 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
               widenLiteral(receiver), *methodName, positional, keywords);
           if (inference)
             return inference.resultType;
+          if (mlir::Type joined =
+                  unionMethodResult(receiver, *methodName, positional, keywords))
+            return joined;
           // ⭐ AN ATTRIBUTE HOLDING A TYPE OBJECT IS A CONSTRUCTOR, not a
           // method. `self.cls(i)` where `self.cls: type[Widget]` looked for a
           // METHOD named `cls`, found none and answered `object` -- which only
@@ -5713,6 +5737,36 @@ TypeSystem::unionOperatorResult(mlir::Type receiver, llvm::StringRef method,
     if (!solved || !solved->result)
       return {};
     results.push_back(widenLiteral(solved->result));
+  }
+  if (results.empty())
+    return {};
+  return join(results);
+}
+
+// ⭐ A METHOD, ASKED OF EVERY MEMBER, by the rule the operators keep: the
+// result is the join of what the members answer, and one member that has no
+// such method -- `None` above all -- refuses the call, where CPython would
+// fail the executions that reach it.
+//
+// ⛔ NO NUMERIC PROMOTION HERE. The operator rule lifts an int receiver to
+// float for a float operand because CPython's `int.__add__` returns
+// NotImplemented and the float's reflected method answers; a named method has
+// no reflected twin, so each member answers with its own method or not at all.
+mlir::Type
+TypeSystem::unionMethodResult(mlir::Type receiver, llvm::StringRef method,
+                              mlir::ArrayRef<mlir::Type> positional,
+                              mlir::ArrayRef<CallKeywordType> keywords) const {
+  auto unionType =
+      mlir::dyn_cast_if_present<py::UnionType>(widenLiteral(receiver));
+  if (!unionType)
+    return {};
+  llvm::SmallVector<mlir::Type, 4> results;
+  for (mlir::Type member : unionType.getMemberTypes()) {
+    CallInferenceResult inference = inferMethodCallWithEvidence(
+        widenLiteral(member), method, positional, keywords);
+    if (!inference || !inference.resultType)
+      return {};
+    results.push_back(widenLiteral(inference.resultType));
   }
   if (results.empty())
     return {};
