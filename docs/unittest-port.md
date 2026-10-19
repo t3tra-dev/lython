@@ -58,6 +58,7 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
 | 2026-10-20 | `ut_bug_type_alias_of_an_imported_module`、`ut_bug_field_typed_with_own_subclass`、`ut_bug_class_values_into_varargs`、`ut_bug_imported_function_list_of_one_subclass_value`、`ut_bug_and_over_hasattr_of_a_class_value`、`ut_unsupported_hasattr_on_class_value` | A5 の残り。取り込んだモジュールの型エイリアスをそのモジュールのスコープで束縛し、`type X = ...` 文も宣言として受ける。基底の本体が名指すサブクラスを、基底より先に生成しない。可変長引数のタプルにクラス値を入れる。コンテナ表示の期待型で、サブクラスのクラス値を基底のクラス型に合うと見る。`hasattr` を bool と型付けし、クラス値への `hasattr` を実行時のクラスで答える (その名前を宣言するクラスから派生しているか)。 |
 | 2026-10-20 | `ut_unsupported_computed_constant_of_imported_module`、`ut_unsupported_generic_factory_result_returned`、`ut_unsupported_fixed_tuple_concatenation`、`ut_unsupported_exc_info_outside_handler`、`ut_bug_subclass_into_optional_method_parameter` | 未対応 4 件と A5 の 1 件。取り込んだモジュールの、他の定数から計算した int と str の定数を畳み込む。結果だけが名指す型パラメータを、結果に期待される型から解く (`skipUnless` が `skipIf(...)` を返す形)。長さの決まったタプルを要素ごとに連結する。except ブロックの外の `sys.exc_info()` を、typeshed どおり省略可能な三つ組として実行時に答える (新しい `py.except.handling`)。union の引数に、どれかのメンバーに合う値を渡せる。途中で、呼び出し可能なインスタンスの union を呼ぶ形も通した (`test(result)`)。 |
 | 2026-10-20 | `ut_bug_join_of_tuple_with_narrowed_optional`、`ut_bug_exc_info_after_calling_a_callable_from_a_list`、`ut_bug_optional_held_across_yield_in_with`、`ut_bug_class_body_field_object_into_inner_contextmanager`、`ut_bug_tuple_of_optional_class_results` | A3 (所有権)。union から取り出した値は、タプルの表示が参照を奪ってよい一時値ではない。`Tb \| None` を object に箱詰めするとき、非活性メンバーの置き場所を読むのは使用ではない。try や with の中の `yield` で、例外辺でしか生きていない値を出口の前で解放する。refcount 挿入が参照を貸した辺の先のブロックを、その後の正規化で併合しない。試作の `doCleanups` と `getDescription` の回避策を外した。 |
+| 2026-10-20 | `ut_unsupported_object_sentinel` | subTest のための `object()`。`object()` を作れるようにした (中身のないボックス形の実体で、`object` のボックスの解放関数がそのまま解放できる)。`is` と `==` は同一性、hash は同一性のもの、repr は `<object object at 0x...>`。あわせて、`object` と注釈したフィールドへの格納の拒否を外した (16 語のスロットだった頃の根拠が残っていた。読みは実体のヘッダからクラスを答える)。取り込まれるモジュールの `x = object()` をセルに置く。ジェネレータの `object` 引数に他のクラスの値を渡せる (フレームが自分の箱を持つ)。これで試作の `subTest` を CPython 3.14 の形 (センチネル、`_SubTest.shortDescription`、`" ".join(parts) or ...`) で戻した。 |
 
 進捗の途中で決めたこと・見つけたこと:
 
@@ -98,8 +99,19 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
     解放される。
   - `wb_an_unannotated_return_under_a_guard_whose_body_returns` (拒否)。注釈のない
     関数の戻り値を、本文を歩き終えた後の型表で読み直すので流れに沿わない。
-- **subTest はまだ戻せない。** CPython は「メッセージなし」と `msg=None` を
-  `object()` のセンチネルで区別し、`object()` はまだ作れない。
+- **subTest を戻した。** 残る回避策は t01 の 1 か所だけになった
+  (組み込みのバウンドメソッド `log.append` を Callable の値にする、方針 3)。
+  t01 は CPython と完全に一致する。t02 の差はトレースバックのフレームだけで、
+  `@contextmanager` のハンドラが見るトレースバックに `with` 本体のフレームが
+  入らない (A6)。残った 1 フレームが unittest のものとして除かれるので、
+  トレースバック全体が消えて見える。
+- **`object()` の作業で見つけて直した黙った誤り 1 件。** `object` フィールドの
+  読みが、キャッシュの覚えている最初の格納のクラスで中身を読んでいた。ループで
+  束縛するモジュール変数はスロットに置かれ、そこからの読みは毎回最初の格納の
+  事実を持ち込むので、`h.f = None` の後の `h.f` が解放済みのインスタンスを
+  読んで落ちた。`object` と宣言したフィールドでは、実体のヘッダでクラスを答える。
+- **新しく 1 件記録した。** `wb_a_generator_that_takes_keyword_arguments`
+  (拒否)。`**kwargs` を取る素のジェネレータ関数 (contextmanager のメソッドなら通る)。
 - **コンパイル時間の退行を 1 件、入れる前に直した。** タプル連結の型付けが
   `a + b + c ...` の連鎖で被演算子を二度ずつ推論し、traceback を取り込むだけの
   プログラムが 25 秒かかった。

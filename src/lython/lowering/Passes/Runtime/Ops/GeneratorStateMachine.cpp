@@ -737,7 +737,8 @@ mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorArgumentOperands(
   if (sources.size() != info.argumentCount)
     return op->emitError()
            << "generator frame source count does not match the resume clone";
-  for (auto [index, source] : llvm::enumerate(sources)) {
+  for (auto [index, argument] : llvm::enumerate(sources)) {
+    const RuntimeBundle *source = argument.get();
     if (!source)
       return op->emitError() << "generator frame source " << index
                              << " has no lowered bundle";
@@ -792,6 +793,20 @@ mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorArgumentOperands(
         return mlir::failure();
       operands.append(wrapped.begin(), wrapped.end());
       continue;
+    }
+    // ⭐ And a value of any class passed where the parameter is `object` is
+    // boxed, as the call would have boxed it: the lane is the box.
+    std::optional<RuntimeBundle> boxedSource;
+    if (!lane->unionType && lane->contract == "builtins.object" &&
+        !lane->ownsNothing() && source->isObjectLike() &&
+        !RuntimeBundleLowerer::isBuiltinsObjectContract(source->contract)) {
+      builder.setInsertionPoint(op);
+      mlir::FailureOr<RuntimeBundle> boxed =
+          RuntimeBundleLowerer::boxForObjectLane(op, *source);
+      if (mlir::failed(boxed))
+        return mlir::failure();
+      boxedSource = std::move(*boxed);
+      source = &*boxedSource;
     }
     unsigned expected = lane->unionType
                             ? static_cast<unsigned>(lane->passTypes.size())

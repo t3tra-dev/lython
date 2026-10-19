@@ -6536,22 +6536,6 @@ Value ModuleEmitter::emitInlineMethodBody(
 Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
                                             llvm::StringRef name,
                                             mlir::Type instanceType) {
-  // `object()` is refused at the earliest static boundary rather than lowered.
-  // ⛔ No longer for a representation conflict -- object has its own class
-  // type object and None is an object of its own (TypeObjects.h) -- but because a
-  // bare object has nothing to be: an `object` value is a box around an
-  // entity, and there is no manifest `__new__` that allocates a header-only
-  // entity nor a deallocator its release would dispatch to.
-  if (auto contract =
-          mlir::dyn_cast_if_present<py::ContractType>(instanceType);
-      contract && contract.getContractName() == "builtins.object") {
-    diagnostics.push_back(parser::Diagnostic{
-        parser::Severity::Error, expr.range.start,
-        "`object()` cannot be constructed yet: a bare object has no runtime "
-        "allocation of its own. Declare a class (`class Sentinel: pass`) and "
-        "instantiate that instead"});
-    return emitNone(expr);
-  }
   // ⭐ A CONSTRUCTOR ARGUMENT IS EMITTED AGAINST THE PARAMETER IT FILLS, the
   // same way a free function's is. Without the expectation an empty literal
   // came out `list[object]` and the declared-parameter check refused the call

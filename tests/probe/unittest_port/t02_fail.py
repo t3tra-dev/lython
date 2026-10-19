@@ -35,7 +35,11 @@ class FailingTests(unittest.TestCase):
 
     def test_subtests(self) -> None:
         for i in range(3):
-            self.assertLess(i, 2)
+            with self.subTest(i=i):
+                self.assertLess(i, 2)
+        with self.subTest("outer", n=1):
+            with self.subTest(None, m=2):
+                self.assertEqual("a", "b")
 
     @unittest.expectedFailure
     def test_unexpected_success(self) -> None:

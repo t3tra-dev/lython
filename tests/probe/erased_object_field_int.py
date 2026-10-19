@@ -9,9 +9,12 @@
 #   **記録の要点**: この 2 件を対にして初めて「silent 4 型の修正」と
 #   「正しい 3 形の喪失」が同じ変更の両面だと読める。片方だけでは、
 #   純粋な改善にも純粋な退行にも見えてしまう。
+# FIXED (2026-10-20, lang-gaps): 受理する。スロットは実体だけを持つ (オブジェクト ABI の
+#   移行後)。格納は箱のクラス語と実体を書き、読みは実体のヘッダからクラスを答えて
+#   箱を作り直す。str / float / list / dict / int のどれも関数境界越しに CPython と
+#   一致する (cases/an_object_field_holds_any_value)。
 # axes: width=object(erased, int payload) op=field flow=straight
-# CLASSIFICATION @ kernel/4b fa71a3c: 3 loud 拒否 (診断)
-#   a type-erased `object` value cannot be stored in field 'class.v'; annotate the field with the concrete type it holds
+# CLASSIFICATION @ lang-gaps a1f774b0 + the fix: 1 正しい
 # CPython 3.14 expects: 7
 
 

@@ -85,6 +85,41 @@ module attributes {
     func.return
   }
 
+  // `object()` (Objects/typeobject.c object_new): an `object` value is a box
+  // around an entity, and this entity is an object of class `object` with
+  // nothing in it -- itself box-shaped, a refcount, the class word and an
+  // empty slot. That shape is what lets LyObject_DecRef, the deallocator
+  // every `object` box already has, free it too: its slot holds no address,
+  // so there is nothing further to release.
+  // ⛔ Not a two-word header of its own: the release hook would then need a
+  // deallocator for `object` that is not the box's, and the contract has one.
+  func.func @LyObject_New() -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.object", ly.runtime.initializer = "__new__"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+    %c4 = arith.constant 4 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %class = arith.constant {ly.class_of = "builtins.object"} 0 : i64
+    %entity = memref.alloc() : memref<5xi64>
+    memref.store %one, %entity[%c0] : memref<5xi64>
+    memref.store %class, %entity[%c1] : memref<5xi64>
+    memref.store %zero, %entity[%c2] : memref<5xi64>
+    memref.store %zero, %entity[%c3] : memref<5xi64>
+    memref.store %zero, %entity[%c4] : memref<5xi64>
+    %index = memref.extract_aligned_pointer_as_index %entity : memref<5xi64> -> index
+    %address = arith.index_cast %index : index to i64
+    %word = func.call @__ly_slot_word_from_view_address(%address) : (i64) -> i64
+    %box = memref.alloc() : memref<5xi64>
+    memref.store %one, %box[%c0] : memref<5xi64>
+    memref.store %class, %box[%c1] : memref<5xi64>
+    memref.store %word, %box[%c2] : memref<5xi64>
+    memref.store %zero, %box[%c3] : memref<5xi64>
+    memref.store %zero, %box[%c4] : memref<5xi64>
+    func.return %box : memref<5xi64>
+  }
+
   func.func private @LyObject_ReleaseBoxedPayloadRaw(%box: memref<5xi64>)
 
   // Liveness pin: a no-op call whose operand keeps a box alive past calls

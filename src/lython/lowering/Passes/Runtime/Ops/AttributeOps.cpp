@@ -642,26 +642,15 @@ RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(mlir::Operation *op,
           op, value, /*slotWordOnly=*/true);
   if (mlir::failed(payload))
     return mlir::failure();
-  // The slot holds a canonical payload handle, so the value needs a concrete
-  // shape to describe. `objectPayloadHandleWords` refuses an erased `object`
-  // below, but its message is written for a container element; say it in terms
-  // of the field, which is what the author wrote.
-  //
-  // This REJECTS one shape that used to run. Before the store moved into the
-  // slot, an `object`-annotated field took the handle-store path, which wrote
-  // the erased handle into the instance's lane; that was silently wrong across a
-  // function boundary for a str/float/list/dict payload and happened to work for
-  // an int. Keeping the one accidental case would mean keeping a path whose
-  // correctness depends on the payload's width, and the project does not
-  // implement runtime operations on `object` at all, so the whole shape is
-  // refused at the earliest boundary instead.
-  if (const RuntimeBundle *concrete =
-          RuntimeBundleLowerer::concreteObjectForOwnership(*payload))
-    if (concrete->contractName() == "builtins.object")
-      return op->emitError()
-             << "a type-erased `object` value cannot be stored in field '"
-             << slotName
-             << "'; annotate the field with the concrete type it holds";
+  // ⭐ AN `object` VALUE STORES AS THE HANDLE ITS BOX HOLDS -- class word and
+  // entity (`objectPayloadClassEntityAtCurrentInsertion`), the entity retained
+  // (`retainAggregateSlot`) -- which is what a container slot of `object`
+  // already takes, and the field read rebuilds the box (`objectBoxFromFieldSlot`).
+  // ⛔ It was refused here, for a slot of sixteen words where the box's handle
+  // and its payload's were different words: an erased handle written into the
+  // lane read back wrong across a call for a str/float/list/dict payload. A
+  // slot is the entity alone since the object ABI moved, and the refusal had
+  // outlived its reason -- unittest's `_SubTest` keeps its `msg` in one.
   if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(op, *payload,
                                                              slotName)))
     return mlir::failure();
@@ -2326,6 +2315,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     // run, and the append wrote past the list's real length: `['a', None]`
     // where CPython prints `['a', 'a']`.
     if (cached && !lanesReachRead(*cached))
+      cached = nullptr;
+    // ⛔ NOT FOR A FIELD DECLARED `object`. The class is the one fact the
+    // cache keeps that a store can change, and the store that changed it may
+    // have gone through another name for the instance -- a module variable
+    // the loop binds lives in a slot, and every read of it is a fresh value
+    // carrying the first store's facts. `h.f = None` then `print(h.f)` read
+    // the None the slot held as the `Inner` the cache remembered, and
+    // dereferenced it. The entity's own header says what it is.
+    if (cached && RuntimeBundleLowerer::isBuiltinsObjectContract(fieldType))
       cached = nullptr;
   }
   mlir::Type loadedContract = cached ? cached->objectValue.contract : fieldType;

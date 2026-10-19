@@ -117,7 +117,11 @@ class DecoratedTests(unittest.TestCase):
 
     def test_subtests(self) -> None:
         for i in range(3):
-            self.assertLess(i, 3)
+            with self.subTest(i=i):
+                self.assertLess(i, 3)
+        with self.subTest("named", n=1):
+            with self.subTest(m=2):
+                self.assertTrue(True)
 
 
 unittest.main(ArithmeticTests, FixtureTests, DecoratedTests)
