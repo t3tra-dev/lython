@@ -61,6 +61,7 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
 | 2026-10-20 | `ut_unsupported_object_sentinel` | subTest のための `object()`。`object()` を作れるようにした (中身のないボックス形の実体で、`object` のボックスの解放関数がそのまま解放できる)。`is` と `==` は同一性、hash は同一性のもの、repr は `<object object at 0x...>`。あわせて、`object` と注釈したフィールドへの格納の拒否を外した (16 語のスロットだった頃の根拠が残っていた。読みは実体のヘッダからクラスを答える)。取り込まれるモジュールの `x = object()` をセルに置く。ジェネレータの `object` 引数に他のクラスの値を渡せる (フレームが自分の箱を持つ)。これで試作の `subTest` を CPython 3.14 の形 (センチネル、`_SubTest.shortDescription`、`" ".join(parts) or ...`) で戻した。 |
 | 2026-10-20 | `ut_unsupported_bound_builtin_method_as_callable`、`ut_unsupported_builtin_function_as_callable`、`wb_a_bound_method_off_a_builtin_instance` | 方針 3 (ビルトインを Callable の値に)。組み込みクラスのインスタンスから読んだメソッドは、読んだ時点の受け手をキャプチャしたフォワーダ (`return __ly_recv.method(...)`) になる。型は最短のオーバーロードの必須引数だけ (`xs.pop` は `Callable[[], int]`)。組み込み関数を Callable の値が期待される位置 (引数、注釈付き変数、辞書の値、戻り値) に渡すと、その期待型で型付けしたフォワーダになる (`print` の `*args` や `len` のオーバーロードは、受け取る側の型が決める)。途中で、`Iterable[str]` を取る関数が候補に入る間接呼び出しで、str を箱に入れずに渡して全体が拒否される既存の不具合を直した。これで試作の回避策はゼロになった。 |
 | 2026-10-20 | `ut_unsupported_subclasses` | 方針 1 (`__subclasses__` を静的に)。`C.__subclasses__()` を、C を基底に書いたプログラムのクラスの、作られる順 (取り込んだモジュールのものが先、各モジュールの中は書いた順) のリストで答える。受け手がクラスそのものならリストの表示、実行時にしか決まらないクラス値なら、C とその下のクラスのどれを持つかで選ぶ。関数の中で定義したクラスが並びうる問いは拒否する (関数が走ってから回収されるまでの間だけ部分クラスで、呼び出しごとに別のクラスになるので、静的には決まらない)。`object.__subclasses__()` は CPython ではインタプリタ自身のクラスも並ぶので答えない。試作の `main()` は引数を取らず、`loadTestsFromModule` が `TestCase.__subclasses__()` を下までたどって、`__module__` がそのモジュールのものを名前順 (`dir(module)` の順) に集める。t01 は `unittest.main()` のまま CPython と完全に一致する。 |
+| 2026-10-20 | `ut_unsupported_docstring` | 方針 2 (docstring は読まれる場合だけ残す)。docstring はどこにも格納しない。読む場所で答えが決まるなら定数に畳み、実行時に決まるなら答えうる相手の docstring だけを並べた関数で選ぶ。読まれない docstring は最初から出ない。CPython 3.14 のコンパイラと同じ整形をする (タブを 8 桁に展開、1 行目の先頭の空白を落とし、2 行目以降の共通の字下げを除く)。関数、クラス (継承しない)、メソッド、モジュール (`__doc__`、`lib.__doc__`) を畳む。クラス値、インスタンス、上書きのあるメソッドは実行時のクラスで選び、関数の値は関数オブジェクトの target id で選ぶ (新しい `py.target.is`)。デコレートされたメソッドは、デコレータが返したものの docstring。`getattr(x, name).__doc__` は名前ごとに答える。組み込みの docstring は持たないので、`len.__doc__` などは拒否する (computed name の腕では TypeError)。試作の `TestCase.__init__` と `shortDescription` を CPython の形で戻し、t01 は `-v` でも CPython と完全に一致する。 |
 
 進捗の途中で決めたこと・見つけたこと:
 
@@ -122,6 +123,22 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
     その中で `join` する形。
   - `d.setdefault` のように、必須引数より多い引数で呼ぶ組み込みメソッドを値として
     使う形は型が付かない (必須引数だけの規則のため)。
+- **docstring で決めたこと。**
+  - 読みの型は typeshed どおり `str | None`。答えが定数でも `.splitlines()` を
+    直接呼ぶ形は型が合わない (`ut_unsupported_docstring` を絞り込みの形に直した)。
+  - docstring は desugar より前の定義ノードで記録する。desugar が作った関数や
+    クラス (デコレートされたメソッドの呼び出し側、`@contextmanager` の
+    クラス) は CPython の答えが分からないので「不明」として拒否する
+    (`@contextmanager` の包みは CPython が `functools.wraps` で写すので、元の
+    docstring を引き継ぐ)。
+  - CPython が docstring を生成するクラス (`@dataclass` の `P(x: int)`、
+    NamedTuple の `N(x,)`) は拒否する。
+  - 振り分け関数の本体は、main の最後の文の後に main のスコープで書く。
+    取り込んだモジュールのコードを emit している最中に書くと、main のグローバル
+    (デコレートされたメソッドのセル) が見えず、実行時の束縛として残った。
+  - 試作の skip と expectedFailure は関数を包むので、docstring は包みのもの
+    (None) になる。CPython の skip は `functools.wraps` で写す。逸脱として
+    `unittest.py` の冒頭に書いた。
 - **`__subclasses__` をマージした後に、黙った誤りを 1 件見つけて直した。**
   関数の中で定義したクラスは最初にモジュールのトップレベルへ持ち上げられるので、
   その関数が走る前から部分クラスとして並んでいた (CPython は `make()` を呼ぶまで
@@ -416,10 +433,17 @@ CPython も自分のインタプリタでテストを動かしているので、
 4. **コンパイル時間**。1 ファイル約 5 秒のうち 3.3 秒が lowering。unittest
    本体の大半はテストファイルによらず同じなので、ファイルあたりの費用を
    `LYTHON_PERF=1` の内訳から詰める。
+   - 2026-10-20 に測り直した (Release、t01、回避策ゼロの試作): 13.6 秒。
+     内訳は emit 2.4 秒、lowering 10.1 秒、JIT ビルド 1.2 秒、最大 RSS 845 MB。
+   - lowering の中身は、refcount 挿入 2.3 秒 (うち例外辺の解放 1.5 秒)、
+     所有権の検証 2.1 秒、runtime lowering 1.9 秒、LLVM への変換 1.9 秒。
+   - 増えた分は、subTest、クリーンアップ、`TestCase.run` を戻したことと、
+     テストを増やしたことによる。docstring の読み (方針 2) の分は 0.25 秒
+     (同じバイナリで `hasattr` 版と比べた)。
 
 ### C. 失敗メッセージと便利機能を CPython に近づける
 
-1. docstring を残すかどうかの判断 (`-v` の 2 行目)。
+1. docstring を残すかどうかの判断 (`-v` の 2 行目) (済)。
 2. difflib と pprint (差分の表示)。
 3. re と fnmatch (assertRegex、assertRaisesRegex、`-k`)。
 4. builtin とクラスを Callable の値にする (`addCleanup(log.append, x)`、

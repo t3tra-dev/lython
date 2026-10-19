@@ -4125,6 +4125,24 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       if (auto found = lookupSymbol(qualified))
         return *found;
     }
+    // ⭐ `__doc__` IS `str | None`, typeshed's `object.__doc__`, for every
+    // subject the emitter answers it for (EmitterDocstrings.cpp) -- a
+    // computed `getattr(x, name)` included, which has no type of its own.
+    // A class that declares a `__doc__` field keeps the field's type.
+    if (auto attr = ast::string(*node, "attr"); attr && *attr == "__doc__") {
+      const parser::Node *subject = ast::node(*node, "value");
+      const parser::Node *callee =
+          subject && subject->kind == "Call" ? ast::node(*subject, "func")
+                                             : nullptr;
+      if (callee && callee->kind == "Name" &&
+          ast::nameSpelling(*callee) == "getattr")
+        return join({strType(), none()});
+      mlir::Type objectType = lenientRecurse(subject);
+      const py::protocols::Table &table = py::protocols::Table::get(context);
+      if (!objectType || !table.resolveFieldContractWithEvidence(
+                             widenLiteral(objectType), "__doc__"))
+        return join({strType(), none()});
+    }
     if (mlir::Type objectType = lenientRecurse(ast::node(*node, "value"))) {
       const py::protocols::Table &table = py::protocols::Table::get(context);
       if (auto attr = ast::string(*node, "attr")) {

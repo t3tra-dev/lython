@@ -1,0 +1,9 @@
+"The module's docstring.\n\n    Indented further.\nIndented once.\n"
+'Return a.\n\nArgs:\n    a: anything.\n' None
+None 'two parts'
+None "A coroutine's."
+'A shape.\n\nIts second line, indented less than the class body is.' None
+'The area, after a tab.\nA tab-indented line.\nA space-indented line.\n'
+'A unit.' 'The class name.' 'The number of sides.'
+'The area, after a tab.\nA tab-indented line.\nA space-indented line.\n' None
+Return a.

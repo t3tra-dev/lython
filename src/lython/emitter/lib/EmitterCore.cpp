@@ -61,6 +61,11 @@ EmitResult ModuleEmitter::emit() {
         diagnostics[index].filename =
             source.sourceName.empty() ? source.moduleName : source.sourceName;
   };
+  // Before every desugar: the docstrings of the definitions as written.
+  for (const EmitOptions::SourceModule &source : options.sourceModules)
+    if (source.moduleNode && !source.isStub)
+      recordDocstrings(*source.moduleNode, source.moduleName);
+  recordDocstrings(moduleNode, moduleName);
   // First of all: a class written in a function becomes a class of its
   // module's top level, which every desugar below then treats as one.
   for (const EmitOptions::SourceModule &source : options.sourceModules)
@@ -195,9 +200,8 @@ EmitResult ModuleEmitter::emit() {
   // `if __name__ == "__main__":` -- the most common line in Python -- folds
   // to a taken branch. It used to be refused: "unresolved name '__name__'".
   //
-  // `__file__` is the source this walk was handed. `__doc__` is not bound:
-  // it is the module's docstring, which this walk does not keep, and a wrong
-  // constant is worse than an unresolved name.
+  // `__file__` is the source this walk was handed, and `__doc__` the
+  // module's docstring.
   auto bindModuleDunder = [&](llvm::StringRef name, llvm::StringRef text) {
     mlir::Type literalType = types.literal(("\"" + text + "\"").str());
     auto constant = py::StrConstantOp::create(builder, loc(moduleNode),
@@ -209,6 +213,13 @@ EmitResult ModuleEmitter::emit() {
   };
   bindModuleDunder("__name__", "__main__");
   bindModuleDunder("__file__", sourceName);
+  if (std::optional<std::string> doc = moduleDocstrings.lookup(moduleName)) {
+    bindModuleDunder("__doc__", *doc);
+  } else {
+    auto none = py::NoneOp::create(builder, loc(moduleNode), types.none());
+    values["__doc__"] = Value{none.getResult(), types.none()};
+    types.bindSymbol("__doc__", types.none());
+  }
   // Before the main module's first statement, because that is where CPython
   // runs an imported module's class bodies: `import lib` executes lib before
   // the importer continues.
@@ -233,6 +244,11 @@ EmitResult ModuleEmitter::emit() {
       }
     mlir::func::ReturnOp::create(builder, loc(moduleNode));
   }
+
+  // After the last function: these bodies list every function there is.
+  for (std::size_t index = 0; index < lateDispatcherBodies.size(); ++index)
+    lateDispatcherBodies[index]();
+  lateDispatcherBodies.clear();
 
   manglePythonDefinitionSymbols();
   EmitResult result;

@@ -55,6 +55,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOpRule(mlir::Operation *op) {
       .Case<py::ClassUpcastOp, py::ClassRefineOp, py::ProtocolViewOp>(
           [&](auto view) { return lowerAliasViewOp(view); })
       .Case<py::ClassTestOp>([&](auto test) { return lowerClassTest(test); })
+      .Case<py::TargetIsOp>([&](auto test) { return lowerTargetIs(test); })
       .Case<py::UnionWrapOp>([&](auto wrap) { return lowerUnionWrap(wrap); })
       .Case<py::UnionTestOp>([&](auto test) { return lowerUnionTest(test); })
       .Case<py::UnionUnwrapOp>(

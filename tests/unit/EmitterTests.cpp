@@ -1667,8 +1667,8 @@ TEST(EmitterTest, TheImplicitClassHooksAreAccountedFor) {
 
 // What: three reads that used to reach the LOWERING and fail there with a
 // sentence about the compiler. `(3).real` is a fold and a class in `print()`
-// renders through its type object; `__doc__` cannot answer at all and says so
-// about the PROGRAM.
+// renders through its type object; `(1).__doc__` is a builtin's docstring,
+// which is not retained, and the refusal names the class.
 TEST(EmitterTest, TheReadsThatUsedToFailInTheLowering) {
   mlir::MLIRContext folded(testRegistry());
   lython::emitter::EmitResult numeric =
@@ -1683,7 +1683,8 @@ TEST(EmitterTest, TheReadsThatUsedToFailInTheLowering) {
   bool saidDoc = false;
   for (const lython::parser::Diagnostic &diagnostic : doc.diagnostics)
     saidDoc = saidDoc ||
-              diagnostic.message.find("docstrings are not retained") !=
+              diagnostic.message.find(
+                  "the docstring of 'int' is not retained") !=
                   std::string::npos;
   EXPECT_TRUE(saidDoc);
 
@@ -3735,4 +3736,49 @@ TEST(EmitterTest, SubclassesThatMayHoldAFunctionLocalClassAreRefused) {
   std::string diagnostics;
   std::string source = classes + "print(Base.__subclasses__(), make())\n";
   EXPECT_TRUE(emit(source, diagnostics)) << source << diagnostics;
+}
+
+// What: `__doc__` is refused where the docstring is not the program's -- a
+// builtin function, a builtin class or value, a class a decorator or
+// NamedTuple writes the docstring of -- and answered for the program's own
+// function, class, method and module.
+TEST(EmitterTest, ADocstringIsRefusedWhereItIsNotTheProgramsOwn) {
+  lython::driver::DriverOptions native;
+  native.targetTriple = llvm::sys::getDefaultTargetTriple();
+  auto emit = [&](const std::string &source, std::string &diagnostics) {
+    mlir::MLIRContext context(testRegistry());
+    mlir::OwningOpRef<mlir::ModuleOp> module;
+    llvm::raw_string_ostream diag(diagnostics);
+    return mlir::succeeded(lython::driver::emitMLIRFromSource(
+        source, "main.py", "<lython-no-import-dir>", native, context, module,
+        diag));
+  };
+  for (auto [source, expected] :
+       std::initializer_list<std::pair<const char *, const char *>>{
+           {"print(len.__doc__)\n",
+            "the docstring of builtin 'len' is not retained"},
+           {"import math\nprint(math.sqrt.__doc__)\n",
+            "the docstring of builtin 'math.sqrt' is not retained"},
+           {"print(int.__doc__)\n", "the docstring of 'int' is not retained"},
+           {"x = 'a'\nprint(x.__doc__)\n",
+            "the docstring of 'str' is not retained"},
+           {"from dataclasses import dataclass\n@dataclass\nclass P:\n"
+            "    x: int\nprint(P.__doc__)\n",
+            "'P' is decorated, and a decorator may write its docstring"},
+           {"from typing import NamedTuple\nclass N(NamedTuple):\n"
+            "    x: int\nprint(N.__doc__)\n",
+            "the docstring of NamedTuple 'N' is generated"}}) {
+    std::string diagnostics;
+    EXPECT_FALSE(emit(source, diagnostics)) << source;
+    EXPECT_NE(diagnostics.find(expected), std::string::npos)
+        << source << diagnostics;
+  }
+  std::string diagnostics;
+  EXPECT_TRUE(emit("\"\"\"Module.\"\"\"\nclass C:\n    \"\"\"C.\"\"\"\n"
+                   "    def m(self) -> None:\n        \"\"\"m.\"\"\"\n"
+                   "def f() -> None:\n    pass\n"
+                   "print(__doc__, C.__doc__, C.m.__doc__, C().__doc__, "
+                   "f.__doc__)\n",
+                   diagnostics))
+      << diagnostics;
 }

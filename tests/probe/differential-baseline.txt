@@ -386,7 +386,7 @@ ut_unsupported_class_attribute_overridden_read_through_base.py AGREE
 ut_unsupported_class_decorator.py GAP
 ut_unsupported_computed_constant_of_imported_module.py AGREE
 ut_unsupported_decorated_staticmethod.py GAP
-ut_unsupported_docstring.py GAP
+ut_unsupported_docstring.py AGREE
 ut_unsupported_dynamic_star_into_builtin.py GAP
 ut_unsupported_dynamic_star_into_positional_parameters.py GAP
 ut_unsupported_dynamic_unpack_into_paramspec_forwarder.py GAP
@@ -412,6 +412,7 @@ ut_unsupported_subclasses.py AGREE
 ut_unsupported_sys_modules.py GAP
 ut_unsupported_traceback_attribute.py GAP
 wb_a_bound_method_off_a_builtin_instance.py AGREE
+wb_a_builtin_docstring_read_by_a_computed_name.py GAP
 wb_a_builtin_function_through_a_paramspec.py GAP
 wb_a_class_attribute_function_read_through_an_instance.py GAP
 wb_a_class_member_read_in_an_inferred_argument.py GAP

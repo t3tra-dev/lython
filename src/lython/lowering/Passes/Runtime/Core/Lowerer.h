@@ -1619,6 +1619,7 @@ private:
   retainUnionMemberValues(mlir::Operation *op, py::UnionType unionType,
                           llvm::ArrayRef<mlir::Value> values);
   mlir::LogicalResult lowerClassTest(py::ClassTestOp op);
+  mlir::LogicalResult lowerTargetIs(py::TargetIsOp op);
   mlir::LogicalResult lowerTypeObject(py::TypeObjectOp op);
   // The JavaScript host's members (Runtime/Js/HostCalls.cpp).
   bool isJsProxyBundle(const RuntimeBundle &bundle) const;

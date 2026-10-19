@@ -2,7 +2,8 @@
 # expectedFailure, one passes -- run by the prototype unittest next to this
 # file. Under python3.14 and under `lyc jit` the progress line, the
 # FAIL/ERROR/UNEXPECTED SUCCESS headings, the summary and the exit status are
-# the same. The reports differ only in what
+# the same, the first line of a test's docstring under its heading included.
+# The reports differ only in what
 # ut_bug_contextmanager_handler_traceback_lacks_body_frames records: under lyc
 # no frame of the test is in the traceback, so only the exception line is
 # printed.
@@ -15,6 +16,10 @@ def parse(text: str) -> int:
 
 class FailingTests(unittest.TestCase):
     def test_equal_ints(self) -> None:
+        """One and one are not three.
+
+        Only the first line is printed under the heading.
+        """
         self.assertEqual(1 + 1, 3)
 
     def test_equal_strings(self) -> None:
@@ -24,6 +29,7 @@ class FailingTests(unittest.TestCase):
         self.assertListEqual([1, 2, 3], [1, 2, 4, 5])
 
     def test_error(self) -> None:
+        """   An error, described.   """
         parse("not a number")
 
     def test_not_raised(self) -> None:
@@ -34,6 +40,7 @@ class FailingTests(unittest.TestCase):
         self.assertTrue(len("") > 0)
 
     def test_subtests(self) -> None:
+        """Subtests are described by the test they are in."""
         for i in range(3):
             with self.subTest(i=i):
                 self.assertLess(i, 2)
@@ -43,6 +50,7 @@ class FailingTests(unittest.TestCase):
 
     @unittest.expectedFailure
     def test_unexpected_success(self) -> None:
+        """The wrapper expectedFailure returns has no docstring."""
         self.assertEqual(1, 1)
 
     def test_passes(self) -> None:

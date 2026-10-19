@@ -19,6 +19,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/ADT/APFloat.h"
@@ -343,6 +344,9 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
       }
   }
   if (expr->kind == "Attribute") {
+    // Before the module attributes below: `lib.__doc__` is the module's.
+    if (std::optional<Value> doc = tryEmitDocRead(*expr))
+      return *doc;
     std::string qualified = ast::qualifiedName(expr);
     if (!qualified.empty())
       if (auto cls = types.lookupClass(qualified)) {
@@ -3190,6 +3194,8 @@ ModuleEmitter::tryEmitDynamicClassName(const parser::Node &expr) {
 }
 
 Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
+  if (std::optional<Value> doc = tryEmitDocRead(expr))
+    return *doc;
   if (std::optional<std::string_view> dynamicName = ast::string(expr, "attr");
       dynamicName && *dynamicName == "__name__")
     if (std::optional<Value> answered = tryEmitDynamicClassName(expr))
@@ -3401,17 +3407,6 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
                                         object.value, *attr);
       return Value{read.getResult(), types.floatType()};
     }
-  }
-  // ⛔ `__doc__` IS NOT STORED. A docstring is dropped at emit time, so the
-  // attribute had nothing to read and reached the lowering's "attr.get object
-  // type has no class schema" -- an internal sentence for a read CPython
-  // answers with a string.
-  if (*attr == "__doc__" && !lookupClassField(object.type, *attr)) {
-    diagnostics.push_back(parser::Diagnostic{
-        parser::Severity::Error, expr.range.start,
-        "'__doc__' is not available: docstrings are not retained at run "
-        "time"});
-    return emitNone(expr);
   }
   // ⭐ `P._fields` IS A COMPILE-TIME TUPLE, for the same reason `C.__name__` is
   // a compile-time string: a NamedTuple's field order is the class statement.
@@ -5347,6 +5342,14 @@ ModuleEmitter::tryEmitBoundManifestMethodObject(const parser::Node &anchor,
       mlir::OpBuilder::InsertionGuard guard(builder);
       emitCallableFunction(*def, symbol, sig, captures, /*isLambda=*/false);
     }
+    // Its `__doc__` is the builtin method's (EmitterDocstrings.cpp).
+    if (auto made = module.lookupSymbol<mlir::func::FuncOp>(symbol))
+      if (auto contract = mlir::dyn_cast<py::ContractType>(receiverType))
+        made->setAttr("ly.function.doc_of",
+                      builder.getStringAttr(
+                          py::contracts::displayClassNameForContract(
+                              contract.getContractName()) +
+                          "." + methodName.str()));
     memo = boundManifestMethodObjects.try_emplace(key, symbol).first;
   }
   return emitFunctionObject(anchor, memo->second, *bound, captures);
@@ -5438,6 +5441,8 @@ ModuleEmitter::tryWrapBuiltinFunctionValue(Value value, py::CallableType target,
       mlir::OpBuilder::InsertionGuard guard(builder);
       emitCallableFunction(*def, symbol, sig, {}, /*isLambda=*/false);
     }
+    if (auto made = module.lookupSymbol<mlir::func::FuncOp>(symbol))
+      made->setAttr("ly.function.doc_of", builder.getStringAttr(binding));
     memo = builtinFunctionObjects
                .try_emplace(key, std::make_pair(symbol, sig.publicCallable))
                .first;
