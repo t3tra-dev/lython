@@ -471,6 +471,23 @@ public:
   // name to another SPELLING (what an import rename needs), this carries the
   // resolved type, so `Row = list[int]` works as well as `Name = str`.
   void bindAnnotationTypeAlias(llvm::StringRef name, mlir::Type type);
+  // The members of a tuple whose arity is known: a display's elements, or a
+  // tuple type of two or more positions (one position is the homogeneous
+  // `tuple[T]`, which says nothing of its length).
+  // `inferred`, when given, is the node's type already inferred by the caller.
+  std::optional<llvm::SmallVector<mlir::Type, 8>>
+  fixedTupleMembers(const parser::Node *node,
+                    mlir::Type inferred = mlir::Type()) const;
+  // The `sys.exc_info()` calls written in an `except` block's body: typed as
+  // the triple without None, where every other one is typeshed's optional
+  // triple (ModuleEmitter::markExcInfoCallsInsideHandlers).
+  void markExcInfoInsideHandler(const parser::Node *call) {
+    excInfoCallsInsideHandlers.insert(call);
+  }
+  bool excInfoInsideHandler(const parser::Node *call) const {
+    return excInfoCallsInsideHandlers.contains(call);
+  }
+  mlir::Type optionalExcInfoType() const;
   // Takes back an alias bound for one module's contracts only (a stub's
   // aliases name types inside the stub and are not the program's to spell).
   void unbindAnnotationTypeAlias(llvm::StringRef name);
@@ -674,6 +691,7 @@ private:
   llvm::StringMap<std::string> builtinCanonicalBindings;
   llvm::StringMap<std::string> annotationAliases;
   llvm::StringMap<mlir::Type> annotationTypeAliases;
+  llvm::DenseSet<const parser::Node *> excInfoCallsInsideHandlers;
   mutable llvm::SmallVector<llvm::StringMap<mlir::Type>, 8> scopes;
   mutable llvm::SmallVector<llvm::StringMap<std::string>, 8>
       scopedCanonicalBindings;

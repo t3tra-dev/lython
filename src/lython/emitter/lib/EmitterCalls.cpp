@@ -980,6 +980,34 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         return emitExcInfo(expr);
   if (std::optional<Value> dispatched = emitClassValueCall(expr, calleeNode))
     return *dispatched;
+  // ⭐ A UNION OF CALLABLE INSTANCES IS CALLED THROUGH ITS LIVE MEMBER'S
+  // `__call__`: `test(result)` for `test: TestCase | TestSuite` is how
+  // unittest's suite runs what it holds, and the union method path answers
+  // `test.__call__(result)` already. Re-spelled as that, the callee is still
+  // evaluated once -- it is the call's receiver.
+  // ⛔ Only when every member declares `__call__`: a member that does not is
+  // a TypeError CPython raises at run time, and the refusal says which.
+  if (calleeNode && calleeNode->kind != "Lambda")
+    if (auto unionCallee = mlir::dyn_cast_if_present<py::UnionType>(
+            types.widenLiteral(types.inferExpr(calleeNode)));
+        unionCallee &&
+        llvm::all_of(unionCallee.getMemberTypes(), [&](mlir::Type member) {
+          return mlir::isa<py::ContractType>(member) &&
+                 lookupClassMethod(member, "__call__").has_value();
+        })) {
+      parser::NodePtr callee;
+      if (const parser::Field *func = parser::findField(expr, "func"))
+        if (const auto *held = std::get_if<parser::NodePtr>(&func->value))
+          callee = *held;
+      parser::NodePtr rewritten = parser::makeNode("Call", expr.range);
+      parser::addField(*rewritten, "func",
+                       synth::attribute(callee, "__call__", calleeNode->range));
+      for (llvm::StringRef field : {"args", "keywords"})
+        if (const parser::Field *original = parser::findField(expr, field))
+          rewritten->fields.push_back(*original);
+      synthesizedIteratorDefs.push_back(rewritten);
+      return emitCall(*rewritten);
+    }
   std::string calleeQualified = ast::qualifiedName(calleeNode);
   // ⭐ A LOCAL WINS OVER AN IMPORTED NAMESPACE. `from os import path` binds the
   // canonical symbol `path`, and that binding is visible while the STDLIB module
@@ -3248,6 +3276,26 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
           withDefaults);
     }
   }
+  // ⭐ A TYPE PARAMETER ONLY THE RESULT NAMES IS SOLVED BY WHAT THE RESULT IS
+  // WANTED AS, where that is known: `return skipIf(not condition, reason)` in
+  // a `skipUnless` specialized at a test class wants the decorator of that
+  // class, which is what its return annotation says. A factory that hands on
+  // another factory's result was refused ("generic in a type parameter no
+  // argument names") although its own signature names the type.
+  if (!inference && expectedResultCall == &expr && expectedResultType)
+    if (auto declared = mlir::dyn_cast_if_present<py::CallableType>(
+            generic.signature.publicCallable);
+        declared && declared.getResultTypes().size() == 1) {
+      TypeBindingMap bindings;
+      if (bindExpectedType(types, declared.getResultTypes().front(),
+                           expectedResultType, bindings) &&
+          !bindings.empty()) {
+        mlir::Type solved = substituteType(types, declared, bindings);
+        if (solved && unboundStaticParameterCount(solved) == 0)
+          inference = types.inferCallWithEvidence(
+              solved, operands.positionalTypes, operands.keywordTypes);
+      }
+    }
   // A type parameter only the result names is solved by what the result is
   // applied to, which a held factory (`d = skip(r)`) has not been yet.
   if (!inference)

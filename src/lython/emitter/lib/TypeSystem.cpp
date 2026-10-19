@@ -2773,6 +2773,43 @@ TypeSystem::importedCallable(llvm::StringRef name) const {
   return std::nullopt;
 }
 
+std::optional<llvm::SmallVector<mlir::Type, 8>>
+TypeSystem::fixedTupleMembers(const parser::Node *node,
+                              mlir::Type inferred) const {
+  if (!node)
+    return std::nullopt;
+  // Only a tuple has members: anything else is answered from its type alone.
+  mlir::Type type = widenLiteral(inferred ? inferred : inferExpr(node));
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+  if (!contract || contract.getContractName() != "builtins.tuple")
+    return std::nullopt;
+  if (node->kind == "Tuple") {
+    llvm::SmallVector<mlir::Type, 8> members;
+    if (const auto *elements = ast::nodeList(*node, "elts"))
+      for (const parser::NodePtr &element : *elements) {
+        if (!element || element->kind == "Starred")
+          return std::nullopt;
+        mlir::Type member = widenLiteral(inferExpr(element.get()));
+        if (!member)
+          return std::nullopt;
+        members.push_back(member);
+      }
+    return members;
+  }
+  if (contract.getArguments().size() < 2)
+    return std::nullopt;
+  return llvm::SmallVector<mlir::Type, 8>(contract.getArguments().begin(),
+                                          contract.getArguments().end());
+}
+
+mlir::Type TypeSystem::optionalExcInfoType() const {
+  mlir::Type exception = contract("builtins.BaseException");
+  mlir::Type traceback = contract("types.TracebackType");
+  return contract("builtins.tuple",
+                  {join({typeObject(exception), none()}),
+                   join({exception, none()}), join({traceback, none()})});
+}
+
 std::optional<mlir::Type> TypeSystem::lookupClass(llvm::StringRef name) const {
   for (auto it = scopedClasses.rbegin(), e = scopedClasses.rend(); it != e;
        ++it) {
@@ -4546,6 +4583,20 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     // result is always str regardless of the right operand.
     if (ast::isOperator(op, "Mod") && left == strType())
       return strType();
+    // Two tuples of known arity concatenate member by member (the emitter
+    // builds the display, emitBinary).
+    // ⛔ With the operand types already inferred above: asking the operands
+    // again inferred each one twice per level, which a long `a + b + c ...`
+    // chain doubled at every `+` -- an import of traceback took 25 s.
+    if (ast::isOperator(op, "Add"))
+      if (std::optional<llvm::SmallVector<mlir::Type, 8>> lhs =
+              fixedTupleMembers(ast::node(*node, "left"), left))
+        if (std::optional<llvm::SmallVector<mlir::Type, 8>> rhs =
+                fixedTupleMembers(ast::node(*node, "right"), right)) {
+          llvm::SmallVector<mlir::Type, 8> members(*lhs);
+          members.append(rhs->begin(), rhs->end());
+          return tupleOfMembers(*this, members);
+        }
     llvm::StringRef method = "__add__";
     if (ast::isOperator(op, "Sub"))
       method = "__sub__";
@@ -4675,6 +4726,13 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     if (std::optional<PrimitiveTypeSpec> primitive =
             primitiveTypeSpecFromSubscript(callee, *this))
       return primitive->type;
+    if (callee && (callee->kind == "Name" || callee->kind == "Attribute") &&
+        !excInfoInsideHandler(node))
+      if (std::string spelled = ast::qualifiedName(callee); !spelled.empty())
+        if (std::optional<std::string> canonical =
+                lookupCanonicalBinding(spelled);
+            canonical && *canonical == "sys.exc_info")
+          return optionalExcInfoType();
 
     // ⭐ The reducers the EMITTER folds are typed here, by the same walk the
     // fold uses to find its element type. Without it the inference had
@@ -5736,6 +5794,17 @@ CallInferenceResult TypeSystem::inferCallWithEvidence(
                               result->receiverManifestClass},
         true,
         {}};
+  // A union of callables is called through each member's `__call__`
+  // (ModuleEmitter::emitCall re-spells the call that way).
+  if (mlir::isa_and_nonnull<py::UnionType>(calleeType))
+    if (mlir::Type joined =
+            unionMethodResult(calleeType, "__call__", positional, keywords))
+      return CallInferenceResult{
+          joined,
+          CallInferenceEvidence{protocol("Callable"), "__call__",
+                                std::nullopt},
+          true,
+          {}};
   return unresolvedCallable(calleeType, "no manifest __call__ contract");
 }
 

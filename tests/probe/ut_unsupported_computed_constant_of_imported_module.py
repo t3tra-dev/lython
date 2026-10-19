@@ -3,8 +3,9 @@
 #   a literal". unittest/util.py has five of these.
 # KIND: 未対応 (unsupported)
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   '_DIFF' is assigned at the top level of this imported module, but its type is not one a module global can hold: a scalar travels as a literal and a container gets a cell only when its element type is resolved. Annotate i
+# FIXED: 2026-10-20 -- int and str arithmetic over the module's constants folds to
+#   a literal, as the constants it is computed from travel.
+# CLASSIFICATION @ lang-gaps e3a74bc1 + the fix: 1 正しい
 # CPython 3.14 expects: 63
 import ut_mod_computed_constant
 

@@ -5,8 +5,8 @@
 #   TextTestResult.
 # KIND: バグ (bug) -- loud: well-typed code refused
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   argument 'result' of 'run' is declared !py.union<!py.contract<"Result">, !py.literal<None>> and this call gives it !py.contract<"TextResult">
+# FIXED: 2026-10-20 -- a value fits a union parameter when it fits a member.
+# CLASSIFICATION @ lang-gaps e3a74bc1 + the fix: 1 正しい
 # CPython 3.14 expects: 1 -1
 class Result:
     def __init__(self) -> None:

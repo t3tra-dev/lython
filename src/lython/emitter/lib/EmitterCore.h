@@ -1162,6 +1162,13 @@ private:
   // Whether an argument of type `actual` may bind a parameter declared
   // `expected` at an inlined method's call (EmitterClasses.cpp).
   bool inlineArgumentFits(mlir::Type actual, mlir::Type expected);
+  void markExcInfoCallsInsideHandlers(const parser::Node &node,
+                                      bool insideHandler);
+  // The call `emitExprExpected` is emitting under a ground expectation, and
+  // that expectation: what a generic call's result is wanted as, which solves
+  // a type parameter only the result names (emitGenericCall).
+  const parser::Node *expectedResultCall = nullptr;
+  mlir::Type expectedResultType;
   // `obj.attr` where a field shadows a class attribute: the field when it is
   // set, `type(obj).attr` otherwise (EmitterExpressions.cpp).
   Value emitFieldOrClassAttribute(const parser::Node &expr, Value object,

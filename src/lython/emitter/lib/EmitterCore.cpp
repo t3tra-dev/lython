@@ -102,6 +102,12 @@ EmitResult ModuleEmitter::emit() {
   desugarContextManagers(moduleNode);
   desugarMethodDecorators(moduleNode);
   scopeComprehensionTargets(moduleNode);
+  // Once the trees are rewritten: which `sys.exc_info()` calls are written in
+  // an `except` block's body (TypeSystem::excInfoInsideHandler).
+  for (const EmitOptions::SourceModule &source : options.sourceModules)
+    if (source.moduleNode && !source.isStub)
+      markExcInfoCallsInsideHandlers(*source.moduleNode, false);
+  markExcInfoCallsInsideHandlers(moduleNode, false);
   // After the generic desugar (a `Protocol[T]` base is what it leaves for a
   // generic protocol) and before any binder reads a base list.
   desugarProtocols();
@@ -466,6 +472,40 @@ bool ModuleEmitter::requireStaticEvidence(
 // overridden, and reading it through a base-typed reference is the same
 // unresolvable dispatch. One walk for both the main module's classes and an
 // imported module's (which name them qualified).
+// ⭐ `sys.exc_info()` IS TYPED BY WHERE IT IS WRITTEN. Inside an `except`
+// block's body there is always an exception being handled, and the triple is
+// typed without None; anywhere else -- a function that a handler calls,
+// unittest's `_addClassOrModuleLevelException` -- it is typeshed's optional
+// triple, answered at run time. One walk decides which calls are which, and
+// the type system and the emitter both read its answer, so the two cannot
+// disagree.
+// ⛔ A def, a lambda or a class's method inside a handler is not inside it:
+// its body runs when it is called.
+void ModuleEmitter::markExcInfoCallsInsideHandlers(const parser::Node &node,
+                                                   bool insideHandler) {
+  if (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
+      node.kind == "Lambda")
+    insideHandler = false;
+  if (insideHandler && node.kind == "Call")
+    if (const parser::Node *callee = ast::node(node, "func")) {
+      std::string spelled = ast::qualifiedName(callee);
+      if (llvm::StringRef(spelled).ends_with("exc_info"))
+        types.markExcInfoInsideHandler(&node);
+    }
+  for (const parser::Field &field : node.fields) {
+    bool handlerBody = node.kind == "ExceptHandler" && field.name == "body";
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child)
+        markExcInfoCallsInsideHandlers(**child, insideHandler || handlerBody);
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &each : *children)
+        if (each)
+          markExcInfoCallsInsideHandlers(*each, insideHandler || handlerBody);
+    }
+  }
+}
+
 void ModuleEmitter::recordClassBodyDeclarations(llvm::StringRef name,
                                                 const parser::Node &classDef) {
   auto &methods = declaredClassMethods[name];

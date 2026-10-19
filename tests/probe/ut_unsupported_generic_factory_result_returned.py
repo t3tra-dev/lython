@@ -3,8 +3,9 @@
 #   result is generic in a type parameter no argument names".
 # KIND: 未対応 (unsupported)
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   this call's result is generic in a type parameter no argument names: apply the result where it is made -- `skipIf(...)(f)`, as a decorator does -- which is what solves it
+# FIXED: 2026-10-20 -- a type parameter only the result names is solved from the
+#   type the result is wanted as (the factory's own return annotation).
+# CLASSIFICATION @ lang-gaps e3a74bc1 + the fix: 1 正しい
 # CPython 3.14 expects: skipped: why
 from collections.abc import Callable
 

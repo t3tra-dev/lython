@@ -2176,14 +2176,6 @@ Value ModuleEmitter::emitExcInfo(const parser::Node &expr) {
         "sys.exc_info() takes no arguments"});
     return emitNone(expr);
   }
-  if (exceptHandlerDepth == 0) {
-    diagnostics.push_back(parser::Diagnostic{
-        parser::Severity::Error, expr.range.start,
-        "sys.exc_info() is answered inside an except block, where the "
-        "exception it reports is the one that block handles: elsewhere it "
-        "is the handler active on the stack at run time"});
-    return emitNone(expr);
-  }
   if (!types.lookupSymbol(kTracebackModuleBinding)) {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, expr.range.start,
@@ -2191,31 +2183,56 @@ Value ModuleEmitter::emitExcInfo(const parser::Node &expr) {
         "which this program was not compiled with"});
     return emitNone(expr);
   }
-  mlir::Type exceptionType = types.contract("builtins.BaseException");
-  Value current{py::ExceptCurrentValueOp::create(
-                    builder, loc(expr), exceptionType,
-                    mlir::TypeAttr::get(types.typeObject(exceptionType)))
-                    .getResult(),
-                exceptionType};
-  std::string temp = "__ly_excinfo" + std::to_string(++syntheticFunctionCounter);
-  values[temp] = current;
-  types.bindSymbol(temp, exceptionType);
-  auto forget = llvm::scope_exit([&] { values.erase(temp); });
-  parser::SourceRange range = expr.range;
-  std::vector<parser::NodePtr> parts;
-  parts.push_back(synth::call(synth::name("type", range),
-                              {synth::name(temp, range)}, range));
-  parts.push_back(synth::name(temp, range));
-  parts.push_back(synth::call(
-      synth::attribute(synth::name(kTracebackModuleBinding, range),
-                       "_handled_tb", range),
-      {}, range));
-  parser::NodePtr tuple = synth::tuple(std::move(parts), range);
-  synthesizedIteratorDefs.push_back(tuple);
-  Value built = emitExpr(tuple.get());
-  mlir::Type declared = types.inferExpr(&expr);
-  return declared ? coerceValue(built, types.widenLiteral(declared), expr)
-                  : built;
+  mlir::Type declared = types.widenLiteral(types.inferExpr(&expr));
+  // The exception being handled: its class, itself and its traceback.
+  auto handled = [&]() -> Value {
+    mlir::Type exceptionType = types.contract("builtins.BaseException");
+    Value current{py::ExceptCurrentValueOp::create(
+                      builder, loc(expr), exceptionType,
+                      mlir::TypeAttr::get(types.typeObject(exceptionType)))
+                      .getResult(),
+                  exceptionType};
+    std::string temp =
+        "__ly_excinfo" + std::to_string(++syntheticFunctionCounter);
+    values[temp] = current;
+    types.bindSymbol(temp, exceptionType);
+    auto forget = llvm::scope_exit([&] { values.erase(temp); });
+    parser::SourceRange range = expr.range;
+    std::vector<parser::NodePtr> parts;
+    parts.push_back(synth::call(synth::name("type", range),
+                                {synth::name(temp, range)}, range));
+    parts.push_back(synth::name(temp, range));
+    parts.push_back(synth::call(
+        synth::attribute(synth::name(kTracebackModuleBinding, range),
+                         "_handled_tb", range),
+        {}, range));
+    parser::NodePtr tuple = synth::tuple(std::move(parts), range);
+    synthesizedIteratorDefs.push_back(tuple);
+    Value built = emitExpr(tuple.get());
+    return declared ? coerceValue(built, declared, expr) : built;
+  };
+  if (types.excInfoInsideHandler(&expr))
+    return handled();
+  // ⭐ OUTSIDE AN `except` BLOCK, the run says whether one is handling an
+  // exception -- a function an except block calls is inside it -- and the
+  // answer is that exception's triple or (None, None, None), as CPython's.
+  // It was refused, so unittest's helper that reads the triple of the
+  // exception its caller handles could not be written.
+  mlir::Value handling =
+      py::ExceptHandlingOp::create(builder, loc(expr), builder.getI1Type())
+          .getResult();
+  mlir::Value merged = emitValueDiamond(
+      loc(expr), handling, declared, [&] { return handled().value; },
+      [&] {
+        parser::SourceRange range = expr.range;
+        parser::NodePtr nothing = synth::tuple(
+            {synth::noneConstant(range), synth::noneConstant(range),
+             synth::noneConstant(range)},
+            range);
+        synthesizedIteratorDefs.push_back(nothing);
+        return coerceValue(emitExpr(nothing.get()), declared, expr).value;
+      });
+  return Value{merged, declared};
 }
 
 } // namespace lython::emitter
