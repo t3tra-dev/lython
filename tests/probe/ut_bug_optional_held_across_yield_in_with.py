@@ -5,8 +5,9 @@
 #   parent subtest's parameters this way.
 # KIND: バグ (bug) -- loud, from the ownership verifier
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   owned resource from @LyDict_FromLength result 0 reaches function exit without release, transfer, or owned return
+# FIXED: 2026-10-20 -- a returning block live only on its exception edges takes
+#   its release before the exit (cases/an_optional_held_across_a_yield_in_a_try).
+# CLASSIFICATION @ lang-gaps 326fa275 + the fix: 1 正しい
 # CPython 3.14 expects: x 1 / held {'a': 1}
 import contextlib
 

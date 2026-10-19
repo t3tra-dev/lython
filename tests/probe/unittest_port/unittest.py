@@ -13,11 +13,8 @@ tests/probe that records the refusal. When a probe agrees with CPython, its
 workaround can go.
 
 Not here yet, each for a recorded reason:
-- subTest: the generator does not compile
-  (ut_bug_class_body_field_object_into_inner_contextmanager), so _SubTest and
-  the subTest arms of testPartExecutor are unused.
-- cleanups are DISCARDED, not run, and there is no doCleanups
-  (ut_bug_exc_info_after_calling_a_callable_from_a_list).
+- subTest: CPython tells "no message" from `msg=None` by an `object()`
+  sentinel, and `object()` cannot be constructed yet.
 - TestCase.debug, which the runner does not use.
 
 Deviations from CPython that the static types themselves call for:
@@ -28,6 +25,8 @@ Deviations from CPython that the static types themselves call for:
 - assertRaises' callable form is assertRaisesCall (one name cannot be both a
   context manager factory and a call forwarder here).
 - cleanups are stored as closures over their arguments, not as triples.
+- a skip reported with no result (doCleanups outside run) is dropped; CPython
+  warns and then fails on the missing result.
 - module fixtures (setUpModule) and the module loader are not provided; the
   tests to run are named explicitly: main(TestA, TestB).
 - failure messages carry no difflib/pprint diff.
@@ -122,9 +121,10 @@ class _ExpectedFailure(Exception):
 
 
 class _Outcome:
-    def __init__(self, result: TestResult) -> None:
+    def __init__(self, result: TestResult | None = None) -> None:
         self.expecting_failure = False
         self.result = result
+        self.result_supports_subtests = result is not None
         self.success = True
         self.expectedFailure: _SysExcInfoType | None = None
         self.unexpectedSuccess = False
@@ -139,7 +139,7 @@ class _Outcome:
             raise
         except SkipTest as e:
             self.success = False
-            self.result.addSkip(test_case, str(e))
+            _addSkip(self.result, test_case, str(e))
         except _ShouldStop:
             pass
         except _ExpectedFailure as e:
@@ -152,17 +152,30 @@ class _Outcome:
                 self.expectedFailure = exc_info
             else:
                 self.success = False
-                if subTest and isinstance(test_case, _SubTest):
-                    self.result.addSubTest(test_case.test_case, test_case, exc_info)
-                elif issubclass(exc_info[0], test_case.failureException):
-                    self.result.addFailure(test_case, exc_info)
+                result = self.result
+                if subTest and result is not None and isinstance(test_case, _SubTest):
+                    result.addSubTest(test_case.test_case, test_case, exc_info)
                 else:
-                    self.result.addError(test_case, exc_info)
+                    _addError(self.result, test_case, exc_info)
         else:
-            if subTest and self.success and isinstance(test_case, _SubTest):
-                self.result.addSubTest(test_case.test_case, test_case, None)
+            result = self.result
+            if subTest and self.success and result is not None and isinstance(test_case, _SubTest):
+                result.addSubTest(test_case.test_case, test_case, None)
         finally:
             self.success = self.success and old_success
+
+
+def _addSkip(result: TestResult | None, test_case: TestCase, reason: str) -> None:
+    if result is not None:
+        result.addSkip(test_case, reason)
+
+
+def _addError(result: TestResult | None, test: TestCase, exc_info: _SysExcInfoType) -> None:
+    if result is not None:
+        if issubclass(exc_info[0], test.failureException):
+            result.addFailure(test, exc_info)
+        else:
+            result.addError(test, exc_info)
 
 
 def skip[T: TestCase](reason: str) -> Callable[[Callable[[T], None]], Callable[[T], None]]:
@@ -319,6 +332,9 @@ class TestCase:
     def _callTearDown(self) -> None:
         self.tearDown()
 
+    def _callCleanup(self, function: Callable[[], object]) -> None:
+        function()
+
     def run(self, result: TestResult | None = None) -> TestResult:
         stopTestRun = False
         if result is None:
@@ -338,11 +354,7 @@ class TestCase:
                         self._callTestMethod()
                     with outcome.testPartExecutor(self):
                         self._callTearDown()
-                # WORKAROUND(ut_bug_exc_info_after_calling_a_callable_from_a_list):
-                # cleanups are discarded. Calling one -- a callable taken off a
-                # list -- in a function whose handlers read the traceback stops
-                # the ownership verifier.
-                self._cleanups.clear()
+                self.doCleanups()
                 result.addDuration(self, time.perf_counter() - start_time)
                 if outcome.success:
                     expected = outcome.expectedFailure
@@ -360,6 +372,18 @@ class TestCase:
             result.stopTest(self)
             if stopTestRun:
                 result.stopTestRun()
+
+    def doCleanups(self) -> bool:
+        """Execute all cleanup functions. Normally called for you after
+        tearDown."""
+        outcome = self._outcome or _Outcome()
+        while self._cleanups:
+            function = self._cleanups.pop()
+            with outcome.testPartExecutor(self):
+                self._callCleanup(function)
+        # return this for backwards compatibility
+        # even though we no longer use it internally
+        return outcome.success
 
     def __call__(self, result: TestResult | None = None) -> TestResult:
         return self.run(result)
@@ -914,9 +938,7 @@ class TextTestResult(TestResult):
     def getDescription(self, test: TestCase) -> str:
         doc_first_line = test.shortDescription()
         if self.descriptions and doc_first_line:
-            # WORKAROUND(ut_bug_join_of_tuple_with_narrowed_optional): not
-            # '\n'.join((str(test), doc_first_line)).
-            return str(test) + '\n' + doc_first_line
+            return '\n'.join((str(test), doc_first_line))
         return str(test)
 
     def startTest(self, test: TestCase) -> None:

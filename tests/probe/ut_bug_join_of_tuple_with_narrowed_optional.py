@@ -6,8 +6,10 @@
 #   way.
 # KIND: バグ (bug) -- loud, from the ownership verifier
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   owned resource from @_ZN8__main__5shortE result 1 reaches function exit without release, transfer, or owned return
+# FIXED: 2026-10-20 -- a union's unwrapped member is a view of the union, not a
+#   temporary a tuple display may take the reference of
+#   (cases/a_narrowed_optional_in_a_tuple_display).
+# CLASSIFICATION @ lang-gaps 326fa275 + the fix: 1 正しい
 # CPython 3.14 expects: case case / described
 def short(flag: bool) -> str | None:
     if flag:

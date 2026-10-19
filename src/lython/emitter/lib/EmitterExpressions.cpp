@@ -5763,6 +5763,14 @@ mlir::Value ModuleEmitter::emitBoolValue(Value value,
   if (isNoneTypeLike(widened))
     return mlir::arith::ConstantIntOp::create(builder, loc(anchor), 0, 1)
         .getResult();
+  // ⭐ A CLASS OBJECT IS TRUE: its truth is its metaclass's, and `metaclass=`
+  // is refused, so every class has `type`'s, which defines neither `__bool__`
+  // nor `__len__`. ⛔ Not asked of the instance contract, which is what the
+  // evidence below does: `type[int]` found `int.__bool__`, a method of the
+  // instances, and `if t:` over `type[int] | None` was refused.
+  if (mlir::isa<py::TypeType>(widened))
+    return mlir::arith::ConstantIntOp::create(builder, loc(anchor), 1, 1)
+        .getResult();
   // R1: implicit numeric truthiness is rejected (deliberate deviation from
   // CPython — `if n:` over int/float hides the comparison); bool stays exempt
   // because its truth bit IS the value.
@@ -5811,7 +5819,8 @@ mlir::Value ModuleEmitter::emitBoolValue(Value value,
       mlir::Type widenedMember = types.widenLiteral(member);
       if (isNoneTypeLike(member) || widenedMember == types.intType() ||
           widenedMember == types.floatType() ||
-          widenedMember == types.boolType())
+          widenedMember == types.boolType() ||
+          mlir::isa<py::TypeType>(widenedMember))
         return true;
       // Asked of the MEMBER, not of the union: this is the question the code
       // below asks of a concrete type, and it is the one that has an answer.
@@ -5822,9 +5831,13 @@ mlir::Value ModuleEmitter::emitBoolValue(Value value,
     };
     if (!members.empty() && llvm::all_of(members, memberAnswersTruth)) {
       auto truthOfMember = [&](mlir::Type member) -> mlir::Value {
-        // None has no header to unwrap and its truth is a constant.
+        // None has no header to unwrap and its truth is a constant, and so
+        // is a class's (above).
         if (isNoneTypeLike(member))
           return mlir::arith::ConstantIntOp::create(builder, loc(anchor), 0, 1)
+              .getResult();
+        if (mlir::isa<py::TypeType>(types.widenLiteral(member)))
+          return mlir::arith::ConstantIntOp::create(builder, loc(anchor), 1, 1)
               .getResult();
         auto unwrap = py::UnionUnwrapOp::create(builder, loc(anchor), member,
                                                 value.value);

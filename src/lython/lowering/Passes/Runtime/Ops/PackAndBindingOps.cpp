@@ -225,6 +225,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
       // inserts below grow the count entry by entry, exactly like the
       // incremental path starting from `{}`.
       RuntimeBundle bundle;
+      builder.setInsertionPoint(op);
       if (mlir::failed(materializeArityObject(op, op.getResult().getType(),
                                               /*arity=*/0, bundle, {}, {})))
         return mlir::failure();
@@ -352,6 +353,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
   RuntimeBundle bundle;
   std::uint64_t arity =
       contractName == "builtins.dict" ? values.size() / 2 : values.size();
+  builder.setInsertionPoint(op);
   if (mlir::failed(materializeArityObject(op, op.getResult().getType(), arity,
                                           bundle, elements, keys)))
     return mlir::failure();

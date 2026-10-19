@@ -1,0 +1,10 @@
+x 1
+held aaaTrue
+x 1
+held None
+x 2
+finally {'a': 1}
+table {'a': 1}
+next 2
+finally None
+16500

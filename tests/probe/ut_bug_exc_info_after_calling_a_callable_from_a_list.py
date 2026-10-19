@@ -8,8 +8,10 @@
 #   list. unittest runs each cleanup this way.
 # KIND: バグ (bug) -- loud, from the ownership verifier
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   conditionally owned resource from @_ZN9traceback11_current_tbE result 1 is used before its union tag proves the payload active
+# FIXED: 2026-10-20 -- boxing `Tb | None` into object reads each member's class
+#   word before the tag picks; a load of the inactive member's placeholder is
+#   not a use (cases/an_optional_instance_boxed_into_object).
+# CLASSIFICATION @ lang-gaps 326fa275 + the fix: 1 正しい
 # CPython 3.14 expects: caught KeyError / done
 import sys
 from collections.abc import Callable

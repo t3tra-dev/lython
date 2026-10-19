@@ -3,8 +3,10 @@
 #   its union tag proves the payload active".
 # KIND: バグ (bug) -- loud, from the ownership verifier
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   conditionally owned resource from @_ZN8__main__5maybeE result 1 is used before its union tag proves the payload active
+# FIXED: 2026-10-20 -- storing a union member reads each member's class word before
+#   the tag picks, and that load is not a use of the inactive payload
+#   (cases/an_optional_instance_boxed_into_object takes the same path).
+# CLASSIFICATION @ lang-gaps 326fa275 + the fix: 1 正しい
 # CPython 3.14 expects: True True
 class Box:
     def __init__(self, v: int) -> None:
