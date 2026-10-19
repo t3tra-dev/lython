@@ -3109,12 +3109,19 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
       emitCallOperands(expr, {}, /*includeAstArguments=*/true,
                        generic.signature.publicCallable);
   bool paramSpec = forwardsParamSpec(generic.signature);
-  if (!operands.valid) {
+  // ⭐ A SEQUENCE OF UNKNOWN LENGTH OR A MAPPING OF UNKNOWN KEYS solves the
+  // type parameters like any argument -- `*xs` with xs a `list[int]` binds
+  // the T of `*args: T` -- and the specialization takes them into its *args
+  // and **kwargs the way any function this program defines does
+  // (emitCallableDispatch). They were refused here as passed to something
+  // that is not such a function.
+  bool onlyDynamic = !operands.valid && !operands.invalidBeyondDynamic &&
+                     (operands.dynamicTail || operands.dynamicMapping);
+  if (!operands.valid && (paramSpec || !onlyDynamic)) {
     // ⛔ A ParamSpec forwarder is specialized at the call's shape, which a
     // sequence or mapping whose members only the run knows does not have.
     std::string reason =
-        paramSpec && !operands.invalidBeyondDynamic &&
-                (operands.dynamicTail || operands.dynamicMapping)
+        paramSpec && onlyDynamic
             ? "a starred sequence of unknown length or a `**` mapping of "
               "unknown keys cannot fill `*args: P.args` or `**kwargs: "
               "P.kwargs`, whose members are parameters of their own in the "

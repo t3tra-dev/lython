@@ -201,6 +201,20 @@ ModuleEmitter::ensureGenericSpecialization(
       !bindExpectedType(types, generic.signature.publicCallable, target,
                         bindings))
     return fail("the use site does not determine its type arguments");
+  // ⭐ A TYPE PARAMETER ONLY `*args: T` OR `**kwargs: V` NAMES is solved by
+  // them. The callable view binds the fixed parameters and the result, so
+  // `def count[T](*args: T) -> int` left T unbound at every call, `count(1,
+  // 2)` included. Bound here rather than in that view, which also decides
+  // whether one callable may stand for another and there would refuse what
+  // it accepts today.
+  if (py::CallableType declared = generic.signature.publicCallable) {
+    if (declared.hasVararg() && target.hasVararg())
+      (void)bindExpectedType(types, declared.getVarargType(),
+                             target.getVarargType(), bindings);
+    if (declared.hasKwarg() && target.hasKwarg())
+      (void)bindExpectedType(types, declared.getKwargType(),
+                             target.getKwargType(), bindings);
+  }
 
   FunctionSignature specialized = generic.signature;
   auto substitute = [&](mlir::Type type) {
