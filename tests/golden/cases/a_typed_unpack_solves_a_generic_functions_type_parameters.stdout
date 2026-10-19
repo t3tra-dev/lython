@@ -1,0 +1,5 @@
+[1, 2, 3] [0, 1, 2, 3] ['a', 'b'] []
+['a=1.5', 'b=2.5'] ['z=0.5', 'a=1.5', 'b=2.5'] ['a=1.5', 'b=2.5', 'y=3.5']
+(9, 3) ('x', 2)
+2 1 3 1 3
+TypeError: __main__.keyed() got multiple values for keyword argument 'a'

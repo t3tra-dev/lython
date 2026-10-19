@@ -855,6 +855,9 @@ private:
     // scope, not the use site's.
     const EmitOptions::SourceModule *source = nullptr;
     llvm::DenseMap<mlir::Type, std::string> specializations;
+    // Specializations whose bodies are being emitted right now: a body
+    // reaching a NEW instantiation of its own function nests one more.
+    unsigned emittingSpecializations = 0;
   };
   // What one call gives a function's `*args: P.args` and `**kwargs:
   // P.kwargs`: the positional arguments beyond its parameters, and the

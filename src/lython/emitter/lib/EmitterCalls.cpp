@@ -3019,7 +3019,7 @@ Value ModuleEmitter::emitArgumentSpecializedCall(const parser::Node &expr,
   } else {
     // The same divergence backstop the generic specializer carries: a body
     // that calls itself one rung down would otherwise re-enter forever.
-    if (info.specializations.size() >= 32)
+    if (info.emittingSpecializations >= 32)
       return ordinary();
     symbol = (llvm::Twine(info.symbolBase) + "$arg" +
               llvm::Twine(static_cast<unsigned>(info.specializations.size())))
@@ -3027,6 +3027,8 @@ Value ModuleEmitter::emitArgumentSpecializedCall(const parser::Node &expr,
     // Memoize BEFORE the body, so a recursive call at the same ground
     // signature resolves to this symbol instead of specializing again.
     info.specializations[specialized.publicCallable] = symbol;
+    ++info.emittingSpecializations;
+    auto leave = llvm::scope_exit([&] { --info.emittingSpecializations; });
     auto emitBody = [&] {
       emitCallableFunction(*info.node, symbol, specialized, {},
                            /*isLambda=*/false);
@@ -3109,12 +3111,19 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
       emitCallOperands(expr, {}, /*includeAstArguments=*/true,
                        generic.signature.publicCallable);
   bool paramSpec = forwardsParamSpec(generic.signature);
-  if (!operands.valid) {
+  // ⭐ A SEQUENCE OF UNKNOWN LENGTH OR A MAPPING OF UNKNOWN KEYS solves the
+  // type parameters like any argument -- `*xs` with xs a `list[int]` binds
+  // the T of `*args: T` -- and the specialization takes them into its *args
+  // and **kwargs the way any function this program defines does
+  // (emitCallableDispatch). They were refused here as passed to something
+  // that is not such a function.
+  bool onlyDynamic = !operands.valid && !operands.invalidBeyondDynamic &&
+                     (operands.dynamicTail || operands.dynamicMapping);
+  if (!operands.valid && (paramSpec || !onlyDynamic)) {
     // ⛔ A ParamSpec forwarder is specialized at the call's shape, which a
     // sequence or mapping whose members only the run knows does not have.
     std::string reason =
-        paramSpec && !operands.invalidBeyondDynamic &&
-                (operands.dynamicTail || operands.dynamicMapping)
+        paramSpec && onlyDynamic
             ? "a starred sequence of unknown length or a `**` mapping of "
               "unknown keys cannot fill `*args: P.args` or `**kwargs: "
               "P.kwargs`, whose members are parameters of their own in the "

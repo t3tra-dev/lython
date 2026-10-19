@@ -201,6 +201,20 @@ ModuleEmitter::ensureGenericSpecialization(
       !bindExpectedType(types, generic.signature.publicCallable, target,
                         bindings))
     return fail("the use site does not determine its type arguments");
+  // ⭐ A TYPE PARAMETER ONLY `*args: T` OR `**kwargs: V` NAMES is solved by
+  // them. The callable view binds the fixed parameters and the result, so
+  // `def count[T](*args: T) -> int` left T unbound at every call, `count(1,
+  // 2)` included. Bound here rather than in that view, which also decides
+  // whether one callable may stand for another and there would refuse what
+  // it accepts today.
+  if (py::CallableType declared = generic.signature.publicCallable) {
+    if (declared.hasVararg() && target.hasVararg())
+      (void)bindExpectedType(types, declared.getVarargType(),
+                             target.getVarargType(), bindings);
+    if (declared.hasKwarg() && target.hasKwarg())
+      (void)bindExpectedType(types, declared.getKwargType(),
+                             target.getKwargType(), bindings);
+  }
 
   FunctionSignature specialized = generic.signature;
   auto substitute = [&](mlir::Type type) {
@@ -275,8 +289,12 @@ ModuleEmitter::ensureGenericSpecialization(
   // instantiation at a NEW ground type re-enters here before its body
   // finishes emitting, so an unbounded chain would otherwise recurse
   // forever.
-  if (generic.specializations.size() >= 32)
-    return fail("too many distinct instantiations (polymorphic recursion?)");
+  // ⛔ It counts the instantiations still being emitted -- how deep that
+  // re-entry goes -- and not every one there is: a program calling a generic
+  // at 33 types, or a ParamSpec forwarder at 33 call shapes, is not
+  // recursing, and was refused as if it were.
+  if (generic.emittingSpecializations >= 32)
+    return fail("too many nested instantiations (polymorphic recursion?)");
 
   llvm::StringRef symbolBase =
       generic.symbolBase.empty() ? llvm::StringRef(*name) : generic.symbolBase;
@@ -289,6 +307,9 @@ ModuleEmitter::ensureGenericSpecialization(
   // re-specializing.
   generic.specializations[specialized.publicCallable] = symbol;
 
+  ++generic.emittingSpecializations;
+  auto leave =
+      llvm::scope_exit([&] { --generic.emittingSpecializations; });
   auto emitSpecializedBody = [&] {
     // Body annotations spell the type parameters by name (x: T); bind each
     // solved parameter to its ground type for the emission scope, shadowing
