@@ -109,6 +109,38 @@ struct PrimitiveConstant {
   std::int64_t integerValue = 0;
 };
 
+// The keyword arguments a call gave a method that is inlined, in the order
+// it gave them -- which is the order its `**kwargs` dict holds them in.
+//
+// ⛔ NOT A StringMap, which is what this was: its iteration order is the
+// hash's, so `C().m(zeta=1, alpha=2)` handed `**kw` the keys as
+// ['alpha', 'zeta'] where CPython (and a call of a plain function here) gives
+// ['zeta', 'alpha'].
+class KeywordArguments {
+public:
+  struct Entry {
+    std::string name;
+    Value value;
+    llvm::StringRef getKey() const { return name; }
+    Value getValue() const { return value; }
+  };
+
+  Value &operator[](llvm::StringRef name) {
+    for (Entry &entry : entries)
+      if (entry.name == name)
+        return entry.value;
+    entries.push_back(Entry{name.str(), Value{}});
+    return entries.back().value;
+  }
+  bool empty() const { return entries.empty(); }
+  std::size_t size() const { return entries.size(); }
+  const Entry *begin() const { return entries.begin(); }
+  const Entry *end() const { return entries.end(); }
+
+private:
+  llvm::SmallVector<Entry, 4> entries;
+};
+
 struct CallOperands {
   bool valid = true;
   std::string failureReason;

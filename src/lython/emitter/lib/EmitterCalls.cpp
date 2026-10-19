@@ -8610,7 +8610,7 @@ ModuleEmitter::tryEmitReprCall(const parser::Node &expr,
                   ? "__str__"
                   : "__repr__"))
         return emitNone(expr);
-      llvm::StringMap<Value> emptyKeywords;
+      KeywordArguments emptyKeywords;
       Value descriptorReceiver =
           emitDescriptorReceiver(expr, argument, *sourceMethod);
       repr = emitInlineMethodBody(expr, descriptorReceiver,

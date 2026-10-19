@@ -4869,7 +4869,7 @@ Value ModuleEmitter::emitInlineOperatorCall(const parser::Node &anchor,
   bool bindReceiver = methodBindingBindsReceiver(method);
   if (method.kind == "instance" && mlir::isa<py::TypeType>(receiver.type))
     bindReceiver = false;
-  llvm::StringMap<Value> keywords;
+  KeywordArguments keywords;
   return emitInlineMethodBody(anchor, descriptorReceiver, bindReceiver, method,
                               positional, keywords);
 }
@@ -5002,7 +5002,7 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
     }
   }
 
-  llvm::StringMap<Value> keywords;
+  KeywordArguments keywords;
   if (const auto *keywordNodes = ast::nodeList(expr, "keywords")) {
     for (const parser::NodePtr &keyword : *keywordNodes) {
       if (auto name = ast::string(*keyword, "arg")) {
@@ -5284,7 +5284,7 @@ bool ModuleEmitter::forwardsItsPacks(const parser::Node &def) {
 Value ModuleEmitter::emitInlineMethodBody(
     const parser::Node &anchor, Value receiver, bool bindDescriptorReceiver,
     const MethodBinding &method, llvm::ArrayRef<Value> positional,
-    const llvm::StringMap<Value> &keywords) {
+    const KeywordArguments &keywords) {
   if (!method.method)
     return emitNone(anchor);
   const std::string callerSourceName = sourceName;
@@ -5930,7 +5930,7 @@ Value ModuleEmitter::emitInlineMethodBody(
                            "unexpected keyword argument '" + name.str() +
                                "' for inlined class method"});
   };
-  for (auto &entry : keywords)
+  for (const auto &entry : keywords)
     bindKeyword(entry.getKey(), entry.getValue());
   if (sig.kwargName) {
     // The dict the callee would have received: string keys, and values named
@@ -6302,7 +6302,7 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
     return emitNone(expr);
   }
 
-  llvm::StringMap<Value> keywords;
+  KeywordArguments keywords;
   for (auto [index, keyword] : llvm::enumerate(operands.keywordTypes)) {
     if (index < operands.keywordValues.size())
       keywords[keyword.name] = operands.keywordValues[index];

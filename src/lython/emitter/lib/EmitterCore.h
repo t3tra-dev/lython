@@ -1314,7 +1314,7 @@ private:
                              bool bindDescriptorReceiver,
                              const MethodBinding &method,
                              llvm::ArrayRef<Value> positional,
-                             const llvm::StringMap<Value> &keywords);
+                             const KeywordArguments &keywords);
   Value emitClassInstantiation(const parser::Node &expr, llvm::StringRef name,
                                mlir::Type instanceType);
   // `super().m(...)` / `super(C, obj).m(...)`: compile-time expansion to the
