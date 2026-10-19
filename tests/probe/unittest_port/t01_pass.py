@@ -85,6 +85,7 @@ class FixtureTests(unittest.TestCase):
         FixtureTests.log.append("tearDown " + self._testMethodName)
 
     def test_a(self) -> None:
+        "A one-line docstring."
         FixtureTests.log.append("a")
 
     def test_b(self) -> None:
@@ -94,6 +95,7 @@ class FixtureTests(unittest.TestCase):
 class DecoratedTests(unittest.TestCase):
     @unittest.skip("not today")
     def test_skipped(self) -> None:
+        """A skipped test keeps the docstring its wrapper has."""
         self.fail("should not run")
 
     @unittest.skipIf(True, "condition held")
@@ -102,6 +104,10 @@ class DecoratedTests(unittest.TestCase):
 
     @unittest.skipUnless(True, "condition held")
     def test_not_skipped(self) -> None:
+        """
+        A test kept by skipUnless keeps its own docstring.
+            Only the first line describes it.
+        """
         self.assertTrue(True)
 
     @unittest.expectedFailure
@@ -109,6 +115,7 @@ class DecoratedTests(unittest.TestCase):
         self.assertEqual(1, 2)
 
     def test_skip_inside(self) -> None:
+        """\tA tab before the first line.\t"""
         self.skipTest("skipped from the body")
 
     def test_subtests(self) -> None:

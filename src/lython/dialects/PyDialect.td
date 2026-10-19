@@ -1209,6 +1209,26 @@ def Py_ClassTestOp : Py_Op<"class.test", [Pure]> {
   let hasVerifier = 1;
 }
 
+def Py_TargetIsOp : Py_Op<"target.is", [Pure]> {
+  let summary = "Test whether a function value was made for a function";
+  let description = [{
+    Compares the function a function object was made for -- the one an
+    indirect call through it reaches -- with a function of the module, named
+    by its symbol. The result is a primitive i1 for structured control flow.
+    The emitter writes it only in the functions that answer a function
+    value's `__doc__`.
+
+    Example:
+      %same = py.target.is %f, "_ZN8__main__1fE" : !py.callable<[], returns = [!py.literal<None>]>
+  }];
+
+  let arguments = (ins Py_ContractType:$callable, StrAttr:$target);
+
+  let results = (outs I1:$result);
+
+  let assemblyFormat = "$callable `,` $target `:` type($callable) attr-dict";
+}
+
 //===----------------------------------------------------------------------===//
 // Attribute access operations
 //===----------------------------------------------------------------------===//

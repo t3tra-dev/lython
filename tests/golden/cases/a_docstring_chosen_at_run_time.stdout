@@ -1,0 +1,10 @@
+['Base.', None, 'Leaf.']
+['Base.describe.', 'Derived.describe.', 'Derived.describe.']
+['Base.', None, 'Leaf.'] ['Base.describe.', 'Derived.describe.', 'Derived.describe.']
+['First.', None, 'Made by make.', None, "The wrapper's."]
+Derived.describe.
+describe 'Derived.describe.'
+plain None
+test_skipped None
+test_kept 'Kept: keep returns the function itself.'
+AttributeError: 'Leaf' object has no attribute 'missing'

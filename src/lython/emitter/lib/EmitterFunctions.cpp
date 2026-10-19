@@ -811,6 +811,15 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
       mlir::func::FuncOp::create(builder, loc(callable), symbolName, funcType);
   func.setPrivate();
   func->setAttr("callable_type", mlir::TypeAttr::get(sig.callable));
+  // What a `__doc__` read through a value made for this function answers
+  // (EmitterDocstrings.cpp); a function the desugars wrote has neither.
+  if (auto doc = definitionDocstrings.find(&callable);
+      doc != definitionDocstrings.end()) {
+    if (doc->second)
+      func->setAttr("ly.function.doc", builder.getStringAttr(*doc->second));
+    else
+      func->setAttr("ly.function.undocumented", builder.getUnitAttr());
+  }
   if (auto definition = pythonDefinitionNames.find(&callable);
       definition != pythonDefinitionNames.end()) {
     func->setAttr(py::mangling::kFunctionNameAttr,

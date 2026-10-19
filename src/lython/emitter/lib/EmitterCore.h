@@ -1887,6 +1887,64 @@ private:
   // The program classes that name `cls` among their bases, in creation order.
   llvm::SmallVector<std::string, 8> directSubclassesOf(llvm::StringRef cls);
   std::optional<Value> tryEmitSubclassesCall(const parser::Node &expr);
+
+  // ---- `__doc__` (EmitterDocstrings.cpp)
+  // Each definition's docstring as CPython 3.14 keeps it, recorded before any
+  // desugar rewrites the trees: a def, class or lambda maps to its docstring,
+  // or to nullopt when it has none. A definition missing from the map was
+  // written by this compiler, and what CPython would answer for it is not
+  // known here.
+  llvm::DenseMap<const parser::Node *, std::optional<std::string>>
+      definitionDocstrings;
+  llvm::StringMap<std::optional<std::string>> moduleDocstrings;
+  void recordDocstrings(const parser::Node &moduleNode,
+                        llvm::StringRef moduleName);
+  // What a `__doc__` read answers for one class, method or function.
+  struct DocAnswer {
+    enum class Kind { Text, None, Unknown, Cell };
+    Kind kind = Kind::Unknown;
+    // Text: the docstring. Unknown: why it is not known. Cell: the module
+    // global holding what a decorated method's decorators returned.
+    std::string text;
+    bool operator==(const DocAnswer &other) const {
+      return kind == other.kind && text == other.text;
+    }
+  };
+  DocAnswer docOfDefinition(const parser::Node *definition,
+                            llvm::StringRef shown) const;
+  DocAnswer docOfClass(llvm::StringRef cls) const;
+  DocAnswer docOfMethod(llvm::StringRef cls, llvm::StringRef method);
+  // The answer every class of `cls`'s line gives for the method, when they
+  // all give one.
+  std::optional<DocAnswer> decidedMethodDoc(llvm::StringRef cls,
+                                            llvm::StringRef method);
+  bool docOfValueIsAnswered(mlir::Type type) const;
+  parser::NodePtr docAnswerStatement(const DocAnswer &answer,
+                                     parser::SourceRange range);
+  std::optional<Value> tryEmitDocRead(const parser::Node &expr);
+  Value emitDocConstant(const parser::Node &anchor, const DocAnswer &answer);
+  std::string docDispatcher(llvm::StringRef key, llvm::StringRef prefix,
+                            llvm::ArrayRef<std::pair<std::string, mlir::Type>>
+                                params,
+                            parser::SourceRange range,
+                            std::function<std::vector<parser::NodePtr>()> body);
+  std::string classDocDispatcher(llvm::StringRef cls,
+                                 parser::SourceRange range);
+  std::string methodDocDispatcher(llvm::StringRef cls, llvm::StringRef method,
+                                  parser::SourceRange range);
+  std::string functionDocDispatcher(mlir::Type callable,
+                                    parser::SourceRange range);
+  std::vector<parser::NodePtr>
+  functionDocBody(mlir::Type callable, parser::SourceRange range);
+  std::optional<Value> emitComputedDocRead(const parser::Node &expr,
+                                           const parser::NodePtr &receiverNode,
+                                           const parser::NodePtr &nameNode);
+  std::vector<parser::NodePtr>
+  computedDocBody(parser::SourceRange range, llvm::StringRef cls,
+                  llvm::ArrayRef<std::string> hierarchy);
+  // Bodies that walk every function the program has: emitted after the main
+  // module's statements, the last code to be written.
+  std::vector<std::function<void()>> lateDispatcherBodies;
   llvm::StringMap<llvm::StringSet<>> declaredClassMethods;
   llvm::StringMap<llvm::StringSet<>> declaredClassAttributes;
   // The names a class body makes readable WITHOUT an instance store: a plain

@@ -169,6 +169,12 @@ void ModuleEmitter::manglePythonDefinitionSymbols() {
         binding.setBindingAttr(attributes.getStringAttr(*symbol));
       return;
     }
+    // A function-docstring dispatcher's test names its candidate the same way.
+    if (auto test = mlir::dyn_cast<py::TargetIsOp>(op)) {
+      if (std::optional<std::string> symbol = renamedTo(test.getTarget()))
+        test.setTargetAttr(attributes.getStringAttr(*symbol));
+      return;
+    }
     if (auto classOp = mlir::dyn_cast<py::ClassOp>(op))
       if (auto symbols =
               classOp->getAttrOfType<mlir::ArrayAttr>("method_symbols")) {

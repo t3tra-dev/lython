@@ -622,6 +622,11 @@ void ModuleEmitter::desugarContextManagers(const parser::Node &moduleNode) {
               std::vector<parser::NodePtr>{std::move(generator)}, range);
 
           parser::NodePtr wrapper = parser::makeNode("FunctionDef", range);
+          // CPython's decorator returns its helper through functools.wraps,
+          // which gives it the generator function's docstring.
+          if (auto doc = definitionDocstrings.find(statement.get());
+              doc != definitionDocstrings.end())
+            definitionDocstrings[wrapper.get()] = doc->second;
           parser::addField(*wrapper, "name", name);
           parser::addField(*wrapper, "args", std::move(wrapperArguments));
           parser::addField(*wrapper, "body",

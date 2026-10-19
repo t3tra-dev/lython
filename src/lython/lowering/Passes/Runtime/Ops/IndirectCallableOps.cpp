@@ -339,6 +339,47 @@ RuntimeBundleLowerer::closureValuesFromFunctionObject(
   return values;
 }
 
+// ⭐ WHICH FUNCTION A FUNCTION VALUE WAS MADE FOR, read where an indirect
+// call reads it: word 2 of the object is the target id. A value whose
+// evidence names its target answers at compile time.
+mlir::LogicalResult RuntimeBundleLowerer::lowerTargetIs(py::TargetIsOp op) {
+  const RuntimeBundle *callable =
+      RuntimeBundleLowerer::bundleFor(op.getCallable());
+  if (!callable)
+    return op.emitError() << "target.is operand has no lowered runtime bundle";
+  builder.setInsertionPoint(op);
+  mlir::Location loc = op.getLoc();
+  mlir::Value result;
+  if (!callable->functionTarget.empty()) {
+    result = mlir::arith::ConstantIntOp::create(
+                 builder, loc, callable->functionTarget == op.getTarget(), 1)
+                 .getResult();
+  } else {
+    mlir::MemRefType storageType = mlir::MemRefType::get(
+        {mlir::ShapedType::kDynamic}, builder.getI64Type());
+    mlir::FailureOr<mlir::Value> storage =
+        RuntimeBundleLowerer::erasedObjectStorageView(op, callable->objectValue,
+                                                      storageType);
+    if (mlir::failed(storage))
+      return mlir::failure();
+    mlir::Value targetSlot =
+        mlir::arith::ConstantIndexOp::create(builder, loc, 2).getResult();
+    mlir::Value targetId =
+        mlir::memref::LoadOp::create(builder, loc, *storage, targetSlot)
+            .getResult();
+    mlir::Value expectedId =
+        mlir::arith::ConstantIntOp::create(
+            builder, loc,
+            RuntimeBundleLowerer::functionTargetId(op.getTarget()), 64)
+            .getResult();
+    result = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::eq, targetId, expectedId);
+  }
+  op.getResult().replaceAllUsesWith(result);
+  erase.push_back(op);
+  return mlir::success();
+}
+
 bool RuntimeBundleLowerer::isIndirectCallDispatcher(
     mlir::func::FuncOp function) const {
   return function && function->hasAttr(kIndirectCallDispatcherAttr);

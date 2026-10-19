@@ -18,11 +18,16 @@ Not here yet, each for a recorded reason:
 Deviations from CPython that the static types themselves call for:
 - a skipped / expected-failure test is a WRAPPED method, not a function with
   `__unittest_skip__` attributes on it; class-level @skip is not provided.
+  Its docstring is the wrapper's (None), where CPython's skip copies the
+  test's through functools.wraps and expectedFailure returns the test itself.
 - assertEqual dispatches on the static type of its arguments (a generic
   method), not on a `_type_equality_funcs` dict keyed by run-time class.
 - assertRaises' callable form is assertRaisesCall (one name cannot be both a
   context manager factory and a call forwarder here).
 - cleanups are stored as closures over their arguments, not as triples.
+- TestCase.__init__ reads the test method's docstring as
+  `getattr(self, methodName).__doc__` inside the try, not through a
+  `testMethod` local: the attribute a computed name finds has no one type.
 - a subtest's params are a dict holding its own keys first and then its
   parent's others, not an _OrderedChainMap over the parent's.
 - a skip reported with no result (doCleanups outside run) is dropped; CPython
@@ -271,10 +276,21 @@ class TestCase:
     _diffThreshold: int = 2 ** 16
 
     def __init__(self, methodName: str = 'runTest') -> None:
+        """Create an instance of the class that will use the named test
+           method when executed. Raises a ValueError if the instance does
+           not have a method with the specified name.
+        """
         self._testMethodName = methodName
         self._outcome: _Outcome | None = None
-        if methodName != 'runTest' and not hasattr(self, methodName):
-            raise ValueError("no such test method in %s: %s" % (type(self), methodName))
+        self._testMethodDoc: str | None = 'No test'
+        try:
+            self._testMethodDoc = getattr(self, methodName).__doc__
+        except AttributeError:
+            if methodName != 'runTest':
+                # we allow instantiation with no explicit method name
+                # but not an *incorrect* or missing method name
+                raise ValueError("no such test method in %s: %s" %
+                      (type(self), methodName))
         self._cleanups: list[Callable[[], object]] = []
         self._subtest: _SubTest | None = None
 
@@ -304,7 +320,14 @@ class TestCase:
         return 1
 
     def shortDescription(self) -> str | None:
-        return None
+        """Returns a one-line description of the test, or None if no
+        description has been provided.
+
+        The default implementation of this method returns the first line of
+        the specified test method's docstring.
+        """
+        doc = self._testMethodDoc
+        return doc.strip().split("\n")[0].strip() if doc else None
 
     def id(self) -> str:
         return "%s.%s" % (strclass(type(self)), self._testMethodName)
