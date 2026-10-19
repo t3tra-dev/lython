@@ -5236,6 +5236,37 @@ bool ModuleEmitter::hasTypeParameters(const parser::Node &def) {
   return params && !params->empty();
 }
 
+// The dict a `**kwargs` parameter receives: string keys, and values named
+// through `LyValueRef` because they are already emitted. An EMPTY one takes
+// the declared type from the expectation, the same way an empty vararg tuple
+// does.
+Value ModuleEmitter::emitKeywordPackDict(
+    const parser::Node &anchor,
+    llvm::ArrayRef<std::pair<std::string, Value>> members,
+    mlir::Type declared) {
+  std::size_t refStart = pendingValueRefs.size();
+  auto releaseRefs =
+      llvm::scope_exit([&] { pendingValueRefs.resize(refStart); });
+  std::vector<parser::NodePtr> keyNodes;
+  std::vector<parser::NodePtr> valueNodes;
+  for (const auto &[name, value] : members) {
+    keyNodes.push_back(synth::strConstant(name, anchor.range));
+    parser::NodePtr ref = parser::makeNode("LyValueRef", anchor.range);
+    parser::addField(*ref, "slot",
+                     static_cast<std::int64_t>(pendingValueRefs.size()));
+    pendingValueRefs.push_back(value);
+    valueNodes.push_back(std::move(ref));
+  }
+  parser::NodePtr dictNode = parser::makeNode("Dict", anchor.range);
+  parser::addField(*dictNode, "keys", std::move(keyNodes));
+  parser::addField(*dictNode, "values", std::move(valueNodes));
+  Value packed = declared ? emitExprExpected(dictNode.get(), declared)
+                          : emitExpr(dictNode.get());
+  if (declared && packed.type != declared)
+    packed = coerceValue(packed, declared, anchor);
+  return packed;
+}
+
 bool ModuleEmitter::keywordPackIsOnlyRead(const parser::Node &def,
                                           llvm::StringRef name) {
   auto isPack = [&](const parser::Node *node) {
@@ -5988,8 +6019,7 @@ Value ModuleEmitter::emitInlineMethodBody(
     bind(*sig.varargName, packed);
   }
 
-  llvm::SmallVector<std::string, 4> variadicKeywordNames;
-  llvm::SmallVector<Value, 4> variadicKeywordValues;
+  llvm::SmallVector<std::pair<std::string, Value>, 4> variadicKeywords;
   auto bindKeyword = [&](llvm::StringRef name, Value value) {
     for (auto [index, positionalName] : llvm::enumerate(sig.positionalNames)) {
       if (positionalName != name)
@@ -6032,8 +6062,7 @@ Value ModuleEmitter::emitInlineMethodBody(
     // the synthesized Dict names it by slot, which is the same machinery the
     // augmented-assignment rewrite uses to avoid evaluating a subexpression twice.
     if (sig.kwargName) {
-      variadicKeywordNames.push_back(name.str());
-      variadicKeywordValues.push_back(value);
+      variadicKeywords.push_back({name.str(), value});
       return;
     }
     diagnostics.push_back(
@@ -6048,40 +6077,13 @@ Value ModuleEmitter::emitInlineMethodBody(
     // (emitDynamicUnpack); every other keyword bound a named parameter.
     bind(*sig.kwargName, *collectedKwargs);
   } else if (sig.kwargName) {
-    // The dict the callee would have received: string keys, and values named
-    // through `LyValueRef` because they are already emitted. An EMPTY one takes
-    // the declared type from the expectation, the same way the empty vararg
-    // tuple above does.
-    std::size_t refStart = pendingValueRefs.size();
-    auto releaseRefs = llvm::scope_exit(
-        [&] { pendingValueRefs.resize(refStart); });
-    std::vector<parser::NodePtr> keyNodes;
-    std::vector<parser::NodePtr> valueNodes;
-    for (auto [index, name] : llvm::enumerate(variadicKeywordNames)) {
-      keyNodes.push_back(synth::strConstant(name, anchor.range));
-      parser::NodePtr ref = parser::makeNode("LyValueRef", anchor.range);
-      parser::addField(*ref, "slot",
-                       static_cast<std::int64_t>(pendingValueRefs.size()));
-      pendingValueRefs.push_back(variadicKeywordValues[index]);
-      valueNodes.push_back(std::move(ref));
-    }
-    parser::NodePtr dictNode = parser::makeNode("Dict", anchor.range);
-    parser::addField(*dictNode, "keys", std::move(keyNodes));
-    parser::addField(*dictNode, "values", std::move(valueNodes));
-    Value packedKeywords = sig.kwargType
-                               ? emitExprExpected(dictNode.get(), sig.kwargType)
-                               : emitExpr(dictNode.get());
-    if (sig.kwargType && packedKeywords.type != sig.kwargType)
-      packedKeywords = coerceValue(packedKeywords, sig.kwargType, anchor);
+    Value packedKeywords =
+        emitKeywordPackDict(anchor, variadicKeywords, sig.kwargType);
     if (packedKeywords.value &&
-        keywordPackIsOnlyRead(*method.method, *sig.kwargName)) {
-      llvm::SmallVector<std::pair<std::string, Value>, 4> named;
-      for (auto [index, name] : llvm::enumerate(variadicKeywordNames))
-        named.push_back({name, variadicKeywordValues[index]});
-      if (staticKeywordPacks.try_emplace(packedKeywords.value, std::move(named))
-              .second)
-        heldPacks.push_back(packedKeywords.value);
-    }
+        keywordPackIsOnlyRead(*method.method, *sig.kwargName) &&
+        staticKeywordPacks.try_emplace(packedKeywords.value, variadicKeywords)
+            .second)
+      heldPacks.push_back(packedKeywords.value);
     bind(*sig.kwargName, packedKeywords);
   }
 

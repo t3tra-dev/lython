@@ -1203,7 +1203,7 @@ bool isImportedAnnotationName(llvm::StringRef name) {
       name == "type" || name == "Callable" || name == "List" ||
       name == "Dict" || name == "Tuple" || name == "Set" ||
       name == "FrozenSet" || name == "ParamSpec" || name == "TypeVar" ||
-      name == "TypeVarTuple" || name == "Unpack")
+      name == "TypeVarTuple" || name == "Unpack" || name == "Concatenate")
     return true;
   return protocolAnnotationName(name) || contractAnnotationName(name);
 }
@@ -1242,6 +1242,7 @@ void bindAnnotationModuleAliases(
                                "TypeVar",
                                "TypeVarTuple",
                                "Unpack",
+                               "Concatenate",
                                "Awaitable",
                                "Coroutine",
                                "AsyncIterable",
@@ -3613,6 +3614,16 @@ mlir::Type TypeSystem::annotationType(const parser::Node *node) const {
       return typeObject(annotationType(slice));
     if (annotationNameIs(baseName, "Unpack"))
       return py::UnpackType::get(&context, annotationType(slice));
+    // `Concatenate[X, P]` is what a `Callable[...]` takes before P, and is
+    // erased with P there (below: any arguments). Anywhere else it is no type,
+    // and the fallback would fabricate a contract named after it.
+    if (annotationNameIs(baseName, "Concatenate")) {
+      annotationDiagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, node->range.start,
+          "`Concatenate[...]` is meaningful only as the first argument of "
+          "`Callable`"});
+      return object();
+    }
     if (annotationNameIs(baseName, "Callable")) {
       llvm::SmallVector<mlir::Type, 4> positional;
       mlir::Type vararg;
@@ -4765,17 +4776,35 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       }
     }
 
+    // ⭐ A SEQUENCE OF UNKNOWN LENGTH AND A MAPPING OF UNKNOWN KEYS are the
+    // `*tuple[T]` and the ""-named keyword the matcher reads, as the emitter
+    // keeps them (emitCallOperands): a callee's *args and **kwargs take them.
+    // Refusing them here refused the body of every function that forwards
+    // its own packs -- a generator's yield type is read from this walk.
     llvm::SmallVector<mlir::Type, 8> positional;
+    bool sawVariadicTail = false;
     if (const auto *args = ast::nodeList(*node, "args")) {
       for (const parser::NodePtr &arg : *args) {
+        if (sawVariadicTail)
+          return strict ? fail("a starred argument whose length is known "
+                               "only at run time must be the last "
+                               "positional argument")
+                        : object();
         if (arg && arg->kind == "Starred") {
           mlir::Type starredType = recurse(ast::node(*arg, "value"));
           if (strict && !starredType)
             return {};
-          if (!appendStarredArgumentTypes(*this, starredType, positional))
+          if (!appendStarredArgumentTypes(*this, starredType, positional)) {
+            if (std::optional<mlir::Type> element =
+                    py::dynamicStarElementType(widenLiteral(starredType))) {
+              positional.push_back(py::variadicTailType(*element));
+              sawVariadicTail = true;
+              continue;
+            }
             return strict ? fail("starred call arguments require a "
                                  "statically sized tuple")
                           : object();
+          }
           continue;
         }
         mlir::Type argType = recurse(arg.get());
@@ -4786,10 +4815,20 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     }
 
     llvm::SmallVector<CallKeywordType, 4> keywords;
+    bool sawMapping = false;
     if (const auto *keywordNodes = ast::nodeList(*node, "keywords")) {
       for (const parser::NodePtr &keyword : *keywordNodes) {
         auto name = ast::string(*keyword, "arg");
         if (!name) {
+          mlir::Type mappingType = recurse(ast::node(*keyword, "value"));
+          if (strict && !mappingType)
+            return {};
+          if (mappingType && !sawMapping &&
+              py::callableUnpackedKeywordValueType(widenLiteral(mappingType))) {
+            keywords.push_back(CallKeywordType{"", widenLiteral(mappingType)});
+            sawMapping = true;
+            continue;
+          }
           if (strict)
             return fail(
                 "keyword splat call arguments require static keyword names");
@@ -6318,9 +6357,27 @@ TypeSystem::functionSignature(const parser::Node &function,
         ++index;
       }
     }
+    // The ParamSpec `P.args` / `P.kwargs` spells, if it is one.
+    auto paramSpecComponent =
+        [&](const parser::Node *annotationNode,
+            llvm::StringRef component) -> std::optional<std::string> {
+      if (!annotationNode || annotationNode->kind != "Attribute")
+        return std::nullopt;
+      auto attr = ast::string(*annotationNode, "attr");
+      if (!attr || llvm::StringRef(*attr) != component)
+        return std::nullopt;
+      const parser::Node *owner = ast::node(*annotationNode, "value");
+      if (!owner || owner->kind != "Name")
+        return std::nullopt;
+      std::optional<mlir::Type> bound = lookupSymbol(ast::nameSpelling(*owner));
+      if (!bound || !mlir::isa<py::ParamSpecType>(*bound))
+        return std::nullopt;
+      return std::string(ast::nameSpelling(*owner));
+    };
     if (const parser::Node *vararg = ast::node(*arguments, "vararg")) {
       sig.varargName = std::string(ast::nameSpelling(*vararg));
       const parser::Node *annotationNode = ast::node(*vararg, "annotation");
+      sig.paramSpecArgs = paramSpecComponent(annotationNode, "args");
       recordAnnotationIssue(annotationNode, "*" + *sig.varargName);
       mlir::Type annotation = annotationType(annotationNode);
       sig.varargType = tupleOf(annotation);
@@ -6330,6 +6387,7 @@ TypeSystem::functionSignature(const parser::Node &function,
     if (const parser::Node *kwarg = ast::node(*arguments, "kwarg")) {
       sig.kwargName = std::string(ast::nameSpelling(*kwarg));
       const parser::Node *annotationNode = ast::node(*kwarg, "annotation");
+      sig.paramSpecKwargs = paramSpecComponent(annotationNode, "kwargs");
       recordAnnotationIssue(annotationNode, "**" + *sig.kwargName);
       sig.kwargType =
           dictOf(strType(), annotationType(annotationNode));
@@ -6620,10 +6678,12 @@ void TypeSystem::refreshCallable(FunctionSignature &sig) const {
     return py::CallableType::get(
         &context, sig.positionalTypes, sig.kwOnlyTypes, callableVararg,
         sig.kwargType, results, posNames, kwNames, posDefaults, kwDefaults,
-        sig.varargName ? mlir::StringAttr::get(&context, *sig.varargName)
-                       : mlir::StringAttr(),
-        sig.kwargName ? mlir::StringAttr::get(&context, *sig.kwargName)
-                      : mlir::StringAttr(),
+        sig.varargName && callableVararg
+            ? mlir::StringAttr::get(&context, *sig.varargName)
+            : mlir::StringAttr(),
+        sig.kwargName && sig.kwargType
+            ? mlir::StringAttr::get(&context, *sig.kwargName)
+            : mlir::StringAttr(),
         sig.positionalOnlyCount);
   };
 

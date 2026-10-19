@@ -1503,6 +1503,49 @@ TEST(EmitterTest, AStarredSequenceOfUnknownLengthReachesOnlyArgs) {
   EXPECT_TRUE(forwarded.ok());
 }
 
+// A function forwarding `*args: P.args` and `**kwargs: P.kwargs` is compiled
+// at each call's shape; a call whose shape only the run knows, and a use that
+// is not a call, are refused, as is `Concatenate` outside `Callable`.
+TEST(EmitterTest, AParamSpecForwarderIsSpecializedAtEachCall) {
+  const char *forwarder =
+      "from collections.abc import Callable\n"
+      "def call[**P, R](f: Callable[P, R], *args: P.args,\n"
+      "                 **kwargs: P.kwargs) -> R:\n"
+      "    return f(*args, **kwargs)\n"
+      "def add(a: int, b: int = 0) -> int:\n"
+      "    return a + b\n";
+  {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult called = emitSource(
+        std::string(forwarder) + "print(call(add, 1), call(add, 1, b=2))\n",
+        context);
+    EXPECT_TRUE(called.ok());
+  }
+  struct Case {
+    std::string source;
+    const char *message;
+  };
+  for (const Case &item : {
+           Case{std::string(forwarder) + "xs = [1, 2]\nprint(call(add, *xs))\n",
+                "cannot fill `*args: P.args` or `**kwargs: P.kwargs`"},
+           Case{std::string(forwarder) +
+                    "d = {\"b\": 2}\nprint(call(add, 1, **d))\n",
+                "cannot fill `*args: P.args` or `**kwargs: P.kwargs`"},
+           Case{std::string(forwarder) + "g: Callable[..., int] = call\n",
+                "specialized at a call and has no value of its own"},
+           Case{"from typing import Concatenate\n"
+                "def f(x: Concatenate[int, str]) -> None:\n"
+                "    pass\n",
+                "`Concatenate[...]` is meaningful only as the first argument "
+                "of `Callable`"},
+       }) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult result = emitSource(item.source, context);
+    EXPECT_FALSE(result.ok()) << item.source;
+    EXPECT_TRUE(reportsDiagnostic(result, item.message)) << item.source;
+  }
+}
+
 TEST(EmitterTest, RepeatedEmitIsStable) {
   for (int round = 0; round < 5; ++round) {
     mlir::MLIRContext context(testRegistry());

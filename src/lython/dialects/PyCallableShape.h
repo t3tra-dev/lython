@@ -226,6 +226,20 @@ inline std::optional<mlir::Type> variadicTailElement(mlir::Type actual) {
   return tuple.getArguments().front();
 }
 
+// The member type of a starred argument whose length only the run time
+// knows: a list's, or the arity-erased tuple's (`tuple[T, ...]`, spelled
+// `tuple[T]`). Nothing for a tuple whose type counts its members -- that one
+// is spread statically -- or for another iterable.
+inline std::optional<mlir::Type> dynamicStarElementType(mlir::Type type) {
+  auto contract = mlir::dyn_cast_if_present<ContractType>(type);
+  if (!contract || contract.getArguments().size() != 1)
+    return std::nullopt;
+  llvm::StringRef name = contract.getContractName();
+  if (name != "builtins.tuple" && name != "builtins.list")
+    return std::nullopt;
+  return contract.getArguments().front();
+}
+
 inline mlir::Type variadicTailType(mlir::Type element) {
   mlir::MLIRContext *context = element.getContext();
   return UnpackType::get(context,

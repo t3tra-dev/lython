@@ -856,10 +856,27 @@ private:
     const EmitOptions::SourceModule *source = nullptr;
     llvm::DenseMap<mlir::Type, std::string> specializations;
   };
+  // What one call gives a function's `*args: P.args` and `**kwargs:
+  // P.kwargs`: the positional arguments beyond its parameters, and the
+  // keywords none of them takes, each at the type it arrives as.
+  struct ParamSpecCallShape {
+    llvm::SmallVector<mlir::Type, 4> positional;
+    llvm::SmallVector<CallKeywordType, 4> keywords;
+  };
   std::optional<std::pair<std::string, py::CallableType>>
   ensureGenericSpecialization(const parser::Node &anchor,
                               GenericFunctionInfo &generic,
-                              py::CallableType target);
+                              py::CallableType target,
+                              const ParamSpecCallShape *paramSpecShape = nullptr);
+  ParamSpecCallShape paramSpecCallShape(const FunctionSignature &sig,
+                                        const CallOperands &operands) const;
+  // Binds the `*args` and `**kwargs` of a body specialized at one call's
+  // shape to packs of the parameters the call's arguments arrive in, which a
+  // call in the body forwards one by one; the returned packs are dropped from
+  // the forwarding maps once the body is emitted.
+  llvm::SmallVector<mlir::Value, 2>
+  bindParamSpecPacks(const parser::Node &callable, const FunctionSignature &sig,
+                     mlir::Block *entry);
   // Argument specialization, and the record is the same GenericFunctionInfo
   // because the mechanism is: one extra body per demanded ground signature,
   // memoized on it, emitted under the defining module's scope. What differs
@@ -1606,6 +1623,10 @@ private:
   // names wherever the body forwards it.
   static bool keywordPackIsOnlyRead(const parser::Node &def,
                                     llvm::StringRef name);
+  Value emitKeywordPackDict(
+      const parser::Node &anchor,
+      llvm::ArrayRef<std::pair<std::string, Value>> members,
+      mlir::Type declared);
   // A copy of `lambda` whose calls spell out the static packs they forward,
   // through names bound to the packed values; null when it forwards none.
   parser::NodePtr lambdaWithPacksSpelledOut(const parser::Node &lambda);

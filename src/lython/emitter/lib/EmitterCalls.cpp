@@ -120,20 +120,6 @@ std::optional<llvm::StringRef> contractName(mlir::Type type) {
   return contract.getContractName();
 }
 
-// The member type of a starred argument whose length only the run time
-// knows: a list's, or the arity-erased tuple's (`tuple[T, ...]`, spelled
-// `tuple[T]`). Nothing for a tuple whose type counts its members -- that one
-// is spread statically -- or for another iterable.
-std::optional<mlir::Type> dynamicStarElementType(mlir::Type type) {
-  auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
-  if (!contract || contract.getArguments().size() != 1)
-    return std::nullopt;
-  llvm::StringRef name = contract.getContractName();
-  if (name != "builtins.tuple" && name != "builtins.list")
-    return std::nullopt;
-  return contract.getArguments().front();
-}
-
 } // namespace
 
 CallOperands
@@ -258,7 +244,7 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
           // parameters the emitter knows can take it into its *args
           // (normalizeDynamicUnpacks).
           std::optional<mlir::Type> element =
-              dynamicStarElementType(value.type);
+              py::dynamicStarElementType(value.type);
           if (element && !operands.dynamicTail) {
             operands.dynamicTail =
                 static_cast<unsigned>(operands.positional.size() - 1);
@@ -3122,9 +3108,20 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
   CallOperands operands =
       emitCallOperands(expr, {}, /*includeAstArguments=*/true,
                        generic.signature.publicCallable);
+  bool paramSpec = forwardsParamSpec(generic.signature);
   if (!operands.valid) {
-    diagnostics.push_back(parser::Diagnostic{
-        parser::Severity::Error, expr.range.start, operands.failureReason});
+    // ⛔ A ParamSpec forwarder is specialized at the call's shape, which a
+    // sequence or mapping whose members only the run knows does not have.
+    std::string reason =
+        paramSpec && !operands.invalidBeyondDynamic &&
+                (operands.dynamicTail || operands.dynamicMapping)
+            ? "a starred sequence of unknown length or a `**` mapping of "
+              "unknown keys cannot fill `*args: P.args` or `**kwargs: "
+              "P.kwargs`, whose members are parameters of their own in the "
+              "body each call is compiled to: spell the arguments out"
+            : operands.failureReason;
+    diagnostics.push_back(
+        parser::Diagnostic{parser::Severity::Error, expr.range.start, reason});
     return emitNone(expr);
   }
   CallInferenceResult inference = types.inferCallWithEvidence(
@@ -3164,8 +3161,12 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
         "generic call did not resolve to a Callable contract"});
     return emitNone(expr);
   }
+  std::optional<ParamSpecCallShape> shape;
+  if (paramSpec)
+    shape = paramSpecCallShape(generic.signature, operands);
   std::optional<std::pair<std::string, py::CallableType>> specialization =
-      ensureGenericSpecialization(expr, generic, resolved);
+      ensureGenericSpecialization(expr, generic, resolved,
+                                  shape ? &*shape : nullptr);
   if (!specialization)
     return emitNone(expr);
   Value callee = emitBindingRef(calleeNode, specialization->first,
