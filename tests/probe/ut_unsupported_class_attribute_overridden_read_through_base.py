@@ -4,8 +4,8 @@
 #   unittest reads failureException, maxDiff and longMessage this way.
 # KIND: 未対応 (unsupported)
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   'failureException' is overridden by a subclass of 'Case', so this call cannot be resolved from the static type of the receiver
+# FIXED: 2026-10-20 -- the attribute dispatcher pins a result type it cannot spell.
+# CLASSIFICATION @ lang-gaps 51e1e5ed + the fix: 1 正しい
 # CPython 3.14 expects: AssertionError KeyError
 class Case:
     failureException: type[BaseException] = AssertionError

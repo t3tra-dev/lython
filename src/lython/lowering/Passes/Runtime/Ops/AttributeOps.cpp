@@ -245,7 +245,8 @@ bool RuntimeBundleLowerer::classFieldStoredBoxed(
   // that header does not have cannot be a payload -- which is why the header is
   // sized for the deepest such read and not for a header.
   if (auto unionType = mlir::dyn_cast<py::UnionType>(fieldContract)) {
-    if (unionType.isOptional()) {
+    if (unionType.isOptional() &&
+        !mlir::isa<py::TypeType>(unionType.getOptionalPayloadType())) {
       mlir::Type payload = unionType.getOptionalPayloadType();
       std::string payloadName = runtimeShapeContractName(payload);
       if (payloadName.empty() || payloadName == "types.NoneType")
@@ -261,6 +262,12 @@ bool RuntimeBundleLowerer::classFieldStoredBoxed(
       // None` field takes the same road as `int | str`.
       return manifest.primitive(payloadName, "box").has_value();
     }
+    // ⛔ `type[X] | None` IS NOT THAT FAST PATH: a class value has no shape
+    // contract of its own, and the optional arm answered "inline" for it, so
+    // an object holding such a field expanded past one address and could not
+    // be held by another object or a list -- unittest's `_previousTestClass`.
+    // It is a union of one class value and None, which the rule below
+    // boxes.
     // ⭐ AND SO IS EVERY OTHER UNION WHOSE MEMBERS EACH FIT A BOX. The slot
     // holds ONE payload handle and that handle's class word says which member
     // it is -- the reading a `list[int | str]` element has always had
@@ -1295,6 +1302,77 @@ RuntimeBundleLowerer::raiseIfFieldUnset(py::AttrGetOp op,
         loc, *raiser, mlir::ValueRange{*classWord, text, length});
   }
   builder.setInsertionPoint(op);
+  return mlir::success();
+}
+
+// The test `ly.field.maybe_unset` raises on, answered instead: a bool or
+// class-value field's body word is 2 until its first store, and a boxed
+// field's entity word is 0.
+mlir::LogicalResult
+RuntimeBundleLowerer::lowerAttrIsSet(py::AttrIsSetOp op) {
+  const RuntimeBundle *object = RuntimeBundleLowerer::bundleFor(op.getObject());
+  if (!object || object->kind != RuntimeBundle::Kind::Object)
+    return op.emitError() << "attr.is_set object has no lowered runtime bundle";
+  py::ClassOp classOp =
+      RuntimeBundleLowerer::classForContract(op.getObject().getType());
+  std::optional<unsigned> fieldIndex =
+      classOp ? RuntimeBundleLowerer::classFieldIndex(classOp, op.getName())
+              : std::nullopt;
+  if (!classOp || !fieldIndex)
+    return op.emitError() << "attr.is_set: " << op.getObject().getType()
+                          << " has no field '" << op.getName() << "'";
+  if (RuntimeBundleLowerer::isCellClassOp(classOp) ||
+      RuntimeBundleLowerer::exceptionAncestorContract(classOp))
+    return op.emitError() << "attr.is_set: field '" << op.getName() << "' of "
+                          << classOp.getSymName()
+                          << " is not kept in an instance body";
+  llvm::SmallVector<mlir::Type, 8> fieldTypes =
+      RuntimeBundleLowerer::classFieldContractTypes(classOp);
+  if (*fieldIndex >= fieldTypes.size())
+    return op.emitError() << "class field metadata is malformed for "
+                          << classOp.getSymName();
+  mlir::Type fieldType = fieldTypes[*fieldIndex];
+  mlir::Location loc = op.getLoc();
+  mlir::Value set;
+  if (std::optional<unsigned> word =
+          RuntimeBundleLowerer::classFieldBodyWord(classOp, *fieldIndex)) {
+    if (auto typeField = mlir::dyn_cast<py::TypeType>(fieldType);
+        typeField && !RuntimeBundleLowerer::classValueRuntimeClass(
+                         typeField.getInstanceType()))
+      return op.emitError() << "attr.is_set: field '" << op.getName()
+                            << "' holds a class value with no storage";
+    builder.setInsertionPoint(op);
+    mlir::FailureOr<mlir::Value> body =
+        RuntimeBundleLowerer::classInstanceBody(op, *object, classOp);
+    if (mlir::failed(body))
+      return mlir::failure();
+    mlir::Value slotIndex =
+        mlir::arith::ConstantIndexOp::create(builder, loc, *word);
+    mlir::Value raw = mlir::memref::LoadOp::create(builder, loc, *body,
+                                                   mlir::ValueRange{slotIndex});
+    set = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::ne, raw,
+        mlir::arith::ConstantIntOp::create(builder, loc, 2, 64));
+  } else if (RuntimeBundleLowerer::classFieldStoredBoxed(fieldType)) {
+    mlir::FailureOr<std::pair<mlir::Value, unsigned>> slot =
+        RuntimeBundleLowerer::classBoxedFieldSlot(op, *object, classOp,
+                                                  *fieldIndex, "set test");
+    if (mlir::failed(slot))
+      return mlir::failure();
+    builder.setInsertionPoint(op);
+    mlir::Value entityIndex = mlir::arith::ConstantIndexOp::create(
+        builder, loc, slot->second + box_abi::kEntityWord);
+    mlir::Value entity =
+        mlir::memref::LoadOp::create(builder, loc, slot->first, entityIndex);
+    set = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::ne, entity,
+        mlir::arith::ConstantIntOp::create(builder, loc, 0, 64));
+  } else {
+    return op.emitError() << "attr.is_set: field '" << op.getName() << "' of "
+                          << classOp.getSymName() << " has no unset state";
+  }
+  op.getResult().replaceAllUsesWith(set);
+  erase.push_back(op);
   return mlir::success();
 }
 

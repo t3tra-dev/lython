@@ -3452,6 +3452,24 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
         return emitNone(expr);
     }
 
+  // ⭐ A FIELD THAT SHADOWS A CLASS ATTRIBUTE IS READ THE WAY CPYTHON LOOKS
+  // IT UP: the instance's when it holds one, the class's otherwise. A read
+  // that cannot prove a store raised AttributeError for an instance that
+  // never stored one -- `C(0).x` for `x: int = 0` with `if v != 0: self.x =
+  // v` in `__init__` -- where CPython answers the class attribute.
+  // ⛔ The class attribute is `type(obj).attr`: the RUNTIME class's, which is
+  // what CPython reads, and a subclass that redeclares it is dispatched to by
+  // the class-value read.
+  if (field && !mlir::isa<py::TypeType>(object.type))
+    if (auto contract =
+            mlir::dyn_cast_if_present<py::ContractType>(object.type);
+        contract && declaredClassNodes.count(contract.getContractName()) &&
+        !isExceptionBackedClass(contract.getContractName()) &&
+        (resolveClassAttrSlot(contract.getContractName(), *attr) ||
+         lookupClassStaticAttr(object.type, *attr)) &&
+        !fieldAlwaysStoredBeforeRead(contract.getContractName(), *attr))
+      return emitFieldOrClassAttribute(expr, object, *attr, *field);
+
   // Mutable class attributes read from the defining class's global cell
   // (instance receivers too, unless an instance field shadows the name).
   if (!field) {
@@ -3568,6 +3586,47 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   if (isJsHostValueType(object.type))
     return adaptJsHostResult(expr, op, value);
   return value;
+}
+
+Value ModuleEmitter::emitFieldOrClassAttribute(const parser::Node &expr,
+                                                Value object,
+                                                llvm::StringRef attr,
+                                                mlir::Type fieldType) {
+  parser::SourceRange range = expr.range;
+  auto contract = mlir::cast<py::ContractType>(object.type);
+  std::string receiver =
+      "__ly_shadowed" + std::to_string(++syntheticFunctionCounter);
+  values[receiver] = object;
+  types.bindSymbol(receiver, object.type);
+  auto forget = llvm::scope_exit([&] { values.erase(receiver); });
+  parser::NodePtr classRead = synth::attribute(
+      synth::call(synth::name("type", range), {synth::name(receiver, range)},
+                  range),
+      attr, range);
+  synthesizedIteratorDefs.push_back(classRead);
+  mlir::Type classType = types.widenLiteral(types.inferExpr(classRead.get()));
+  mlir::Type resultType = fieldType;
+  if (classType && classType != fieldType && !py::isPyObjectType(classType))
+    resultType = types.join({fieldType, classType});
+  auto set = py::AttrIsSetOp::create(builder, loc(expr), builder.getI1Type(),
+                                     object.value, attr);
+  mlir::Value merged = emitValueDiamond(
+      loc(expr), set.getResult(), resultType,
+      [&] {
+        auto read = py::AttrGetOp::create(builder, loc(expr), fieldType,
+                                          object.value, attr);
+        read->setAttr("ly.attr.kind", builder.getStringAttr("field"));
+        read->setAttr("ly.attr.owner",
+                      builder.getStringAttr(contract.getContractName()));
+        return coerceValue(Value{read.getResult(), fieldType}, resultType,
+                           expr)
+            .value;
+      },
+      [&] {
+        Value value = emitExpr(classRead.get());
+        return coerceValue(value, resultType, expr).value;
+      });
+  return {merged, resultType};
 }
 
 Value ModuleEmitter::emitAwait(const parser::Node &expr) {

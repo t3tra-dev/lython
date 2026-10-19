@@ -4,8 +4,8 @@
 #   has `_previousTestClass: type | None`.
 # KIND: 未対応 (unsupported)
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   a '!py.contract<"Result">' value expands to 3 physical values and nothing can rebuild them from one address; it cannot be stored in a container slot or boxed field yet (a union with two `type[X]` members keeps every memb
+# FIXED: 2026-10-20 -- a `type[X] | None` field is boxed, by the general union rule.
+# CLASSIFICATION @ lang-gaps 51e1e5ed + the fix: 1 正しい
 # CPython 3.14 expects: True
 class Case:
     pass

@@ -2,8 +2,8 @@
 #   name: "would shadow the class attribute; initialize it in __init__".
 # KIND: 未対応 (unsupported)
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   assigning 'label' through an instance would shadow the class attribute; initialize it in __init__ to make it an instance field
+# FIXED: 2026-10-20 -- see ut_bug_class_value_class_attribute_shadowed.
+# CLASSIFICATION @ lang-gaps 51e1e5ed + the fix: 1 正しい
 # CPython 3.14 expects: case b
 class Case:
     label: str = "case"

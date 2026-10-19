@@ -1,0 +1,5 @@
+AssertionError AssertionError
+AssertionError 640 ['base'] | KeyError None ['mine'] | AssertionError 640 ['base']
+True False True
+AssertionError boom
+KeyError 'boom'
