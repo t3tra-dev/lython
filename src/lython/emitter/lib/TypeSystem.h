@@ -320,6 +320,13 @@ public:
   // to share a class's spelling?
   bool namesClassInScope(llvm::StringRef name) const;
   std::optional<std::string> lookupCanonicalBinding(llvm::StringRef name) const;
+  // `sys.stdout` / `sys.stderr` when the program assigns them
+  // (ModuleEmitter::collectReplacedStreams): the binding is then a cell that
+  // holds either text stream the runtime has, and its type is their union.
+  // Set before any import is bound.
+  void setReplacedStreams(llvm::ArrayRef<std::string> canonicalNames);
+  bool isReplacedStream(llvm::StringRef canonicalName) const;
+  mlir::Type replacedStreamType() const;
   // The callable a program IMPORTED under `name` (`from helpers import
   // range`), which outranks every builtin meaning of the spelling -- its class
   // and the inference's per-name rules alike. Not the builtins' own canonical
@@ -518,6 +525,14 @@ public:
   mlir::Type unionArgumentOperatorResult(mlir::Type receiver,
                                          llvm::StringRef method,
                                          mlir::Type argument) const;
+  // The result of `u.method(...)` on a union receiver: the join of what each
+  // member's method returns, or null unless every member has one that takes
+  // these arguments. Read only where the emitter builds the matching tag
+  // dispatch (`tryEmitUnionMethodCall`) -- the inferred type of a method call
+  // and that call's emission.
+  mlir::Type unionMethodResult(mlir::Type receiver, llvm::StringRef method,
+                               mlir::ArrayRef<mlir::Type> positional,
+                               mlir::ArrayRef<CallKeywordType> keywords) const;
   // Same-shape callables collapse to one callable whose result is the join of
   // theirs, instead of a union nothing can call.
   mlir::Type commonCallableJoin(mlir::ArrayRef<mlir::Type> members) const;
@@ -620,6 +635,7 @@ private:
   std::string targetTriple;
   bool jsHost = false;
   llvm::StringMap<mlir::Type> symbols;
+  llvm::StringSet<> replacedStreams;
   llvm::StringMap<mlir::Type> classes;
   llvm::StringMap<llvm::SmallVector<std::string, 4>> declaredBases;
   // Class static attributes, keyed "<class>.<attr>". The protocol table's

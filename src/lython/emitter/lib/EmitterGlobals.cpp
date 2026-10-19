@@ -60,6 +60,8 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/ADT/StringSet.h"
 
+#include <functional>
+
 namespace lython::emitter {
 
 // Every name spelled inside a function, a lambda or a class body, at any
@@ -481,6 +483,110 @@ ModuleEmitter::moduleGlobalDeclarations(const parser::Node &scope) const {
   };
   walk(scope, walk);
   return declared;
+}
+
+// ⭐ A STREAM THE PROGRAM REPLACES IS A CELL, and one that it never replaces
+// stays the runtime's own stream. `sys.stdout = buf` is how output is
+// captured -- unittest's buffered result, `contextlib.redirect_stdout` -- and
+// CPython's print writes to whatever `sys.stdout` holds when it runs, so a
+// program that assigns it needs every read to see the assignment. One that
+// never does keeps the direct write it has always had: the question is asked
+// of the whole program, syntactically, before anything is bound.
+//
+// ⛔ BY THE SPELLING `sys.stdout = ...` (any alias of `import sys`), in any
+// module the program compiles. A replacement the scan cannot see -- through
+// `setattr`, or a name it was handed -- reaches the assignment's ordinary
+// refusal, so it is loud rather than unseen.
+void ModuleEmitter::collectReplacedStreams() {
+  llvm::SmallVector<std::string, 2> found;
+  auto scan = [&](const parser::Node &moduleNode) {
+    llvm::StringSet<> sysNames;
+    ast::walk(&moduleNode, [&](const parser::Node &node) {
+      if (node.kind == "Import")
+        if (const auto *names = ast::nodeList(node, "names"))
+          for (const parser::NodePtr &alias : *names)
+            if (alias && ast::string(*alias, "name") == "sys")
+              sysNames.insert(
+                  std::string(ast::string(*alias, "asname").value_or("sys")));
+      return ast::Walk::Continue;
+    });
+    if (sysNames.empty())
+      return;
+    std::function<void(const parser::Node *)> target =
+        [&](const parser::Node *node) {
+          if (!node)
+            return;
+          if (node->kind == "Tuple" || node->kind == "List") {
+            if (const auto *elements = ast::nodeList(*node, "elts"))
+              for (const parser::NodePtr &element : *elements)
+                target(element.get());
+            return;
+          }
+          if (node->kind == "Starred") {
+            target(ast::node(*node, "value"));
+            return;
+          }
+          if (node->kind != "Attribute")
+            return;
+          const parser::Node *owner = ast::node(*node, "value");
+          std::optional<std::string_view> attr = ast::string(*node, "attr");
+          if (!owner || owner->kind != "Name" || !attr ||
+              (*attr != "stdout" && *attr != "stderr") ||
+              !sysNames.contains(ast::nameSpelling(*owner)))
+            return;
+          std::string canonical = "sys." + std::string(*attr);
+          if (!llvm::is_contained(found, canonical))
+            found.push_back(canonical);
+        };
+    ast::walk(&moduleNode, [&](const parser::Node &node) {
+      if (node.kind == "Assign") {
+        if (const auto *targets = ast::nodeList(node, "targets"))
+          for (const parser::NodePtr &assigned : *targets)
+            target(assigned.get());
+      } else if (node.kind == "AnnAssign" || node.kind == "AugAssign") {
+        target(ast::node(node, "target"));
+      }
+      return ast::Walk::Continue;
+    });
+  };
+  for (const EmitOptions::SourceModule &source : options.sourceModules)
+    if (source.moduleNode && !source.isStub)
+      scan(*source.moduleNode);
+  scan(moduleNode);
+  llvm::sort(found);
+  replacedStreams.assign(found.begin(), found.end());
+  types.setReplacedStreams(found);
+}
+
+// Each replaced stream starts as the runtime's own, before any module's code
+// can read it.
+void ModuleEmitter::emitReplacedStreamInitializers(
+    const parser::Node &anchor) {
+  mlir::Type wrapper = types.contract("_io.TextIOWrapper");
+  for (const std::string &stream : replacedStreams) {
+    // ⛔ The op itself and not `emitBindingRef`, which reads a replaced
+    // stream's CELL -- the one this fills.
+    auto own = py::BindingRefOp::create(builder, loc(anchor), wrapper,
+                                        builder.getStringAttr(stream),
+                                        mlir::ValueRange{});
+    Value initial = coerceValue(Value{own.getResult(), wrapper},
+                                types.replacedStreamType(), anchor);
+    auto store = py::GlobalSetOp::create(builder, loc(anchor),
+                                         builder.getStringAttr(stream),
+                                         initial.value);
+    markBoxedModuleGlobal(store);
+  }
+}
+
+std::optional<std::string>
+ModuleEmitter::replacedStreamTarget(const parser::Node &target) const {
+  if (target.kind != "Attribute" || replacedStreams.empty())
+    return std::nullopt;
+  std::optional<std::string> canonical =
+      types.lookupCanonicalBinding(ast::qualifiedName(&target));
+  if (!canonical || !llvm::is_contained(replacedStreams, *canonical))
+    return std::nullopt;
+  return canonical;
 }
 
 void ModuleEmitter::markBoxedModuleGlobal(mlir::Operation *op) const {

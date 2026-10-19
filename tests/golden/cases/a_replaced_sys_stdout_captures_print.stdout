@@ -1,0 +1,5 @@
+before
+captured: "one, 2, 3.5, None;\n\ndirect\n[1, 2] {'k': 1} (1,)\n|to err\n"
+second: 'again\n|to err\n'
+from the library: 'line 0\nline 1\nline 2\n'
+back on the stream the program started with

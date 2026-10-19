@@ -234,6 +234,12 @@ private:
   tryEmitVirtualDispatchWithValues(const parser::Node &anchor, Value receiver,
                                    llvm::StringRef methodName,
                                    llvm::ArrayRef<Value> positional);
+  // `u.method(...)` on a union receiver, by tag (EmitterCalls.cpp). Nothing --
+  // and nothing emitted -- when a member cannot answer, and the caller then
+  // refuses as before.
+  std::optional<Value> tryEmitUnionMethodCall(const parser::Node &expr,
+                                              Value receiver,
+                                              llvm::StringRef methodName);
   struct VirtualDispatchHelper {
     std::string symbol;
     py::CallableType callable;
@@ -378,6 +384,16 @@ private:
   llvm::SmallVector<PendingModuleGlobalInit, 4> importedModuleGlobalInits;
   void collectImportedModuleGlobals();
   void emitImportedModuleGlobalInitializers();
+  // `sys.stdout` / `sys.stderr` that some module the program compiles
+  // assigns: each becomes the module global of its name, holding either text
+  // stream the runtime has (EmitterGlobals.cpp). Found before anything is
+  // bound, filled at the start of `__main__`.
+  llvm::SmallVector<std::string, 2> replacedStreams;
+  void collectReplacedStreams();
+  void emitReplacedStreamInitializers(const parser::Node &anchor);
+  // The replaced stream an assignment target names, if it names one.
+  std::optional<std::string>
+  replacedStreamTarget(const parser::Node &target) const;
   // The `mod.NAME` global an imported module's constant lives in, or empty.
   std::string importedModuleGlobalFor(llvm::StringRef binding) const;
   // CPython calls a base's `__init_subclass__` when a subclass is DEFINED.

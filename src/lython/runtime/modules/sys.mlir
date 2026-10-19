@@ -35,7 +35,14 @@
 // - `stdout` / `stderr` are immortal _io.TextIOWrapper singletons exposing
 //   only write(str) -> int and flush() (CPython's wrapper adds buffering
 //   and reconfiguration, which the unbuffered fd write path does not
-//   need). `stdin` is not supported.
+//   need). `stdin` is not supported. `__stdout__` / `__stderr__` are the same
+//   singletons.
+// - A program that assigns `sys.stdout` or `sys.stderr` makes it a cell
+//   holding an io.StringIO or the singleton (the emitter's replaced streams),
+//   and print writes through it; another kind of object is refused at the
+//   assignment. What the runtime writes on its own -- the traceback of an
+//   uncaught exception, input()'s prompt -- still goes to file descriptors 2
+//   and 1, where CPython writes to the replacement.
 // - `version_info`, `implementation`, `float_info`, `int_info` (structseq
 //   attribute access), `stdin`, `path`, `modules`, and the
 //   frame/trace/audit introspection surface are not yet supported;

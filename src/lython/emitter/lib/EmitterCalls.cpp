@@ -400,6 +400,105 @@ Value ModuleEmitter::emitCallableDispatch(const parser::Node &anchor,
   return {op.getResults().front(), resultType};
 }
 
+// ⭐ A UNION RECEIVER CALLS ITS METHOD BY TAG, the way it adds, counts and
+// indexes: every member has the method or the call is refused
+// (TypeSystem::unionMethodResult), and the value is the join of the arms.
+// `s.write(t)` where `s` is a `StringIO | TextIOWrapper` -- a stream chosen at
+// run time -- was "static type ... does not provide manifest method 'write'"
+// for a call both members answer.
+//
+// The arguments are evaluated once, in order, before the tag is asked; each
+// arm is then an ordinary call on the member, so a program class's member
+// inlines its body or dispatches as a direct call on it would.
+//
+// ⛔ ASKED ON TYPES BEFORE ANYTHING IS EMITTED: a member that cannot answer
+// leaves the call to the refusal below with nothing evaluated twice.
+//
+// ⛔ NOT A STRUCTURAL MUTATOR, and that one is refused by name. Such a method
+// may reallocate its receiver and hands the new one back to rebind the NAME it
+// was called through; an arm's receiver is the member it unwrapped, so the
+// rebinding would land there and the union would keep the old storage.
+std::optional<Value>
+ModuleEmitter::tryEmitUnionMethodCall(const parser::Node &expr, Value receiver,
+                                      llvm::StringRef methodName) {
+  auto unionType =
+      mlir::dyn_cast_if_present<py::UnionType>(types.widenLiteral(receiver.type));
+  if (!unionType)
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  llvm::SmallVector<mlir::Type, 4> positionalTypes;
+  llvm::SmallVector<CallKeywordType, 2> keywordTypes;
+  if (args)
+    for (const parser::NodePtr &argument : *args) {
+      if (!argument || argument->kind == "Starred")
+        return std::nullopt;
+      positionalTypes.push_back(types.inferExpr(argument.get()));
+    }
+  if (keywords)
+    for (const parser::NodePtr &keyword : *keywords) {
+      std::optional<std::string_view> name =
+          keyword ? ast::string(*keyword, "arg") : std::nullopt;
+      if (!name)
+        return std::nullopt;
+      keywordTypes.push_back(CallKeywordType{
+          std::string(*name), types.inferExpr(ast::node(*keyword, "value"))});
+    }
+  mlir::Type joined = types.unionMethodResult(receiver.type, methodName,
+                                              positionalTypes, keywordTypes);
+  if (!joined)
+    return std::nullopt;
+  for (mlir::Type member : unionType.getMemberTypes())
+    if (types.isStructuralMutatorMethod(types.widenLiteral(member),
+                                        methodName)) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "'" + std::string(methodName) +
+              "' can reallocate the object it is called on, and here that "
+              "object is one member of a union: narrow the value to that "
+              "member first, so the call rebinds the name that holds it"});
+      return emitNone(expr);
+    }
+
+  llvm::SmallVector<Value, 4> positional;
+  if (args)
+    for (const parser::NodePtr &argument : *args)
+      positional.push_back(emitExpr(argument.get()));
+  llvm::SmallVector<std::pair<std::string, Value>, 2> named;
+  if (keywords)
+    for (const parser::NodePtr &keyword : *keywords)
+      named.emplace_back(std::string(*ast::string(*keyword, "arg")),
+                         emitExpr(ast::node(*keyword, "value")));
+
+  return emitUnionMemberDispatch(
+      expr, receiver, unionType, joined, [&](Value member) -> Value {
+        llvm::SmallVector<std::string, 4> bound;
+        auto bind = [&](Value value) {
+          std::string name =
+              "__lyunioncall" + std::to_string(++syntheticFunctionCounter);
+          values[name] = value;
+          types.bindSymbol(name, value.type);
+          bound.push_back(name);
+          return synth::name(name, expr.range);
+        };
+        parser::NodePtr memberNode = bind(member);
+        std::vector<parser::NodePtr> argumentNodes;
+        for (Value value : positional)
+          argumentNodes.push_back(bind(value));
+        std::vector<parser::NodePtr> keywordNodes;
+        for (const auto &[name, value] : named)
+          keywordNodes.push_back(synth::keyword(name, bind(value), expr.range));
+        parser::NodePtr call = synth::callWithKeywords(
+            synth::attribute(std::move(memberNode), methodName, expr.range),
+            std::move(argumentNodes), std::move(keywordNodes), expr.range);
+        Value result = emitExpr(call.get());
+        synthesizedIteratorDefs.push_back(std::move(call));
+        for (const std::string &name : bound)
+          values.erase(name);
+        return result;
+      });
+}
+
 Value ModuleEmitter::emitCall(const parser::Node &expr) {
   const parser::Node *calleeNode = ast::node(expr, "func");
   if (calleeNode && calleeNode->kind == "Call")
@@ -1608,6 +1707,9 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
               return emitCallableDispatch(expr, callee, operands);
             }
         Value receiver = emitExpr(receiverNode);
+        if (std::optional<Value> dispatched =
+                tryEmitUnionMethodCall(expr, receiver, *methodName))
+          return *dispatched;
         if (dispatchIsUnresolvable(receiver, *methodName, receiverNode,
                                    /*throughSuper=*/false)) {
           if (std::optional<Value> dispatched = tryEmitVirtualDispatch(
@@ -6961,15 +7063,24 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
   // The arguments are evaluated first and the keywords after them in their
   // written order, which is when CPython evaluates a call's arguments; the
   // str() of each argument is taken between the writes, as there.
-  bool chosenSink = fileNode || flushNode;
+  // ⭐ AND SO IS A `sys.stdout` THE PROGRAM REPLACES: print writes to what
+  // the stream holds when it runs, piece by piece through its `write`, which
+  // is CPython's print -- the joined line above is a shortcut only the
+  // runtime's own stream can take (EmitterGlobals.cpp, replaced streams).
+  bool replacedStdout = llvm::is_contained(replacedStreams, "sys.stdout");
+  bool chosenSink = fileNode || flushNode || replacedStdout;
   if (chosenSink) {
     if (printArgs)
       for (const parser::NodePtr &argument : *printArgs)
         if (!argument || argument->kind == "Starred") {
           diagnostics.push_back(parser::Diagnostic{
               parser::Severity::Error, expr.range.start,
-              "print() to a file takes its arguments spelled out, not "
-              "unpacked"});
+              fileNode || flushNode
+                  ? "print() to a file takes its arguments spelled out, not "
+                    "unpacked"
+                  : "print() takes its arguments spelled out, not unpacked, "
+                    "in a program that replaces sys.stdout: each one is "
+                    "written to the stream sys.stdout holds"});
           return emitNone(expr);
         }
     mlir::Type strType = types.contract("builtins.str");

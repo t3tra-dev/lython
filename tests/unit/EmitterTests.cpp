@@ -945,6 +945,98 @@ TEST(EmitterTest, AUserDefinedSetattrStillWins) {
   EXPECT_TRUE(emitted.ok()) << emitted.diagnostics.size();
 }
 
+// A method called on a union is answered by every member or refused: the
+// refusal names the member that has no such method, and a method that can
+// reallocate its receiver is refused by that reason.
+TEST(EmitterTest, AMethodOnAUnionIsAnsweredByEveryMemberOrRefused) {
+  {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult emitted =
+        emitSource("class A:\n"
+                   "    def size(self, k: int) -> int:\n"
+                   "        return k\n"
+                   "class B:\n"
+                   "    def size(self, k: int) -> str:\n"
+                   "        return str(k)\n"
+                   "def pick(b: bool) -> A | B:\n"
+                   "    if b:\n"
+                   "        return A()\n"
+                   "    return B()\n"
+                   "print(pick(True).size(k=1))\n",
+                   context);
+    EXPECT_TRUE(emitted.ok()) << emitted.diagnostics.size();
+  }
+  {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult emitted =
+        emitSource("def maybe(b: bool) -> str | None:\n"
+                   "    if b:\n"
+                   "        return 'x'\n"
+                   "    return None\n"
+                   "print(maybe(True).upper())\n",
+                   context);
+    EXPECT_FALSE(emitted.ok());
+    bool found = false;
+    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+      found = found ||
+              (diagnostic.message.find("for the member !py.literal<None>") !=
+                   std::string::npos &&
+               diagnostic.message.find("narrow the value") !=
+                   std::string::npos);
+    EXPECT_TRUE(found);
+  }
+  {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult emitted =
+        emitSource("def seqs(b: bool) -> list[int] | bytearray:\n"
+                   "    if b:\n"
+                   "        return [1]\n"
+                   "    return bytearray(b'a')\n"
+                   "xs = seqs(True)\n"
+                   "xs.append(2)\n",
+                   context);
+    EXPECT_FALSE(emitted.ok());
+    bool found = false;
+    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+      found = found || diagnostic.message.find("can reallocate the object") !=
+                           std::string::npos;
+    EXPECT_TRUE(found);
+  }
+}
+
+// A program that replaces sys.stdout refuses what would read the stream it
+// replaced: an object of another kind assigned to it, a `from sys import
+// stdout` snapshot, and a print() whose arguments are unpacked.
+TEST(EmitterTest, AReplacedStreamRefusesWhatItCannotWriteThrough) {
+  struct Case {
+    const char *source;
+    const char *message;
+  };
+  for (const Case &item : {
+           Case{"import sys\n"
+                "sys.stdout = 'not a stream'\n",
+                "sys.stdout can be replaced here by an io.StringIO"},
+           Case{"import sys\n"
+                "from sys import stdout\n"
+                "sys.stdout = sys.__stdout__\n",
+                "would bind the stream as it is at the import"},
+           Case{"import sys\n"
+                "xs = [1, 2]\n"
+                "sys.stdout = sys.__stdout__\n"
+                "print(*xs)\n",
+                "in a program that replaces sys.stdout"},
+       }) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult emitted = emitSource(item.source, context);
+    EXPECT_FALSE(emitted.ok()) << item.source;
+    bool found = false;
+    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+      found = found ||
+              diagnostic.message.find(item.message) != std::string::npos;
+    EXPECT_TRUE(found) << item.source;
+  }
+}
+
 // The chain attributes read the words a raise left in the exception; an
 // assignment to one is refused at the store, naming the raise that writes it.
 TEST(EmitterTest, TheExceptionChainIsReadButWrittenOnlyByARaise) {
