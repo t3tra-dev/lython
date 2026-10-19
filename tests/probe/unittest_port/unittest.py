@@ -27,8 +27,11 @@ Deviations from CPython that the static types themselves call for:
   parent's others, not an _OrderedChainMap over the parent's.
 - a skip reported with no result (doCleanups outside run) is dropped; CPython
   warns and then fails on the missing result.
-- module fixtures (setUpModule) and the module loader are not provided; the
-  tests to run are named explicitly: main(TestA, TestB).
+- module fixtures (setUpModule) are not provided, and loadTestsFromModule
+  takes the module's NAME: it finds the TestCase subclasses through
+  `TestCase.__subclasses__()` whose `__module__` it is, in the order of their
+  names -- `dir(module)`'s order -- rather than reading the module's
+  namespace, so a TestCase imported into the module is not one of its tests.
 - failure messages carry no difflib/pprint diff.
 - frames of this module are dropped from a traceback by FILE NAME, not by a
   `__unittest` global in the frame.
@@ -928,6 +931,14 @@ class TestLoader:
         names.sort()
         return names
 
+    def loadTestsFromModule(self, module: str) -> TestSuite:
+        """Return a suite of all test cases contained in the given module"""
+        tests: list[TestCase | TestSuite] = []
+        found = [cls for cls in _all_subclasses(TestCase) if cls.__module__ == module]
+        for obj in sorted(found, key=_class_name):
+            tests.append(self.loadTestsFromTestCase(obj))
+        return TestSuite(tests)
+
     def loadTestsFromTestCase(self, testCaseClass: type[TestCase]) -> TestSuite:
         """Return a suite of all test cases contained in testCaseClass."""
         testCaseNames = self.getTestCaseNames(testCaseClass)
@@ -937,6 +948,18 @@ class TestLoader:
         for name in testCaseNames:
             tests.append(testCaseClass(name))
         return TestSuite(tests)
+
+
+def _all_subclasses(cls: type[TestCase]) -> list[type[TestCase]]:
+    found: list[type[TestCase]] = []
+    for sub in cls.__subclasses__():
+        found.append(sub)
+        found.extend(_all_subclasses(sub))
+    return found
+
+
+def _class_name(cls: type[TestCase]) -> str:
+    return cls.__name__
 
 
 # ---------------------------------------------------------------- runner
@@ -1154,8 +1177,8 @@ class TextTestRunner:
 _NO_TESTS_EXITCODE: int = 5
 
 
-def main(*testCaseClasses: type[TestCase]) -> None:
-    """Run the test methods of the given classes; exit with the outcome."""
+def main(module: str = '__main__') -> None:
+    """Run the tests of the module; exit with the outcome."""
     verbosity = 1
     failfast = False
     patterns: list[str] = []
@@ -1176,9 +1199,7 @@ def main(*testCaseClasses: type[TestCase]) -> None:
     loader = TestLoader()
     if patterns:
         loader.testNamePatterns = patterns
-    suite = TestSuite()
-    for cls in testCaseClasses:
-        suite.addTest(loader.loadTestsFromTestCase(cls))
+    suite = loader.loadTestsFromModule(module)
     runner = TextTestRunner(verbosity=verbosity, failfast=failfast)
     result = runner.run(suite)
     if result.testsRun == 0 and len(result.skipped) == 0:

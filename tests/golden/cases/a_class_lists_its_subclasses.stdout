@@ -1,0 +1,6 @@
+['A', 'B'] ['C', 'D']
+['A', 'C', 'E', 'D', 'B']
+['C', 'E', 'D'] []
+['C', 'D'] True
+['Inner', 'Outer'] ['a_class_lists_its_subclasses_lib', '__main__']
+['Third']

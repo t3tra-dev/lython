@@ -1895,6 +1895,7 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
       std::string qualified =
           sourceModuleClassSymbol(source.moduleName, *name);
       auto &bases = declaredClassBases[qualified];
+      declaredClassRank.try_emplace(qualified, importedClassRanks++);
       if (const auto *baseNodes = ast::nodeList(*statement, "bases"))
         for (const parser::NodePtr &base : *baseNodes) {
           if (!base)

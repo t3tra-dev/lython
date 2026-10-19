@@ -965,8 +965,110 @@ ModuleEmitter::tryEmitUnionMethodCall(const parser::Node &expr, Value receiver,
       });
 }
 
+llvm::SmallVector<std::string, 8>
+ModuleEmitter::directSubclassesOf(llvm::StringRef cls) {
+  llvm::SmallVector<std::pair<unsigned, std::string>, 8> found;
+  for (const auto &entry : declaredClassBases) {
+    if (!llvm::is_contained(entry.second, cls))
+      continue;
+    auto rank = declaredClassRank.find(entry.getKey());
+    found.push_back({rank == declaredClassRank.end() ? ~0u : rank->second,
+                     entry.getKey().str()});
+  }
+  llvm::sort(found);
+  llvm::SmallVector<std::string, 8> names;
+  for (auto &[rank, name] : found)
+    names.push_back(std::move(name));
+  return names;
+}
+
+// ⭐ `C.__subclasses__()` IS ANSWERED FROM THE PROGRAM, which holds every
+// class there will ever be: the classes that name C as a base, in the order
+// they are created -- an imported module's before the main module's, each in
+// the order written. A receiver that is the class itself is a list display;
+// one that is a class VALUE asks which class it holds, among C and the classes
+// below it. unittest's `main()` finds the test classes this way.
+// ⛔ Program classes only: `object.__subclasses__()` in CPython also lists the
+// interpreter's own, which no program here can match, so it is not answered.
+// ⛔ A class defined inside a function is not one of the program's until the
+// function runs, and is left out.
+std::optional<Value>
+ModuleEmitter::tryEmitSubclassesCall(const parser::Node &expr) {
+  const parser::Node *callee = ast::node(expr, "func");
+  if (!callee || callee->kind != "Attribute" ||
+      ast::string(*callee, "attr").value_or("") != "__subclasses__")
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if ((args && !args->empty()) || (keywords && !keywords->empty()))
+    return std::nullopt;
+  const parser::Node *receiverNode = ast::node(*callee, "value");
+  auto receiverType = mlir::dyn_cast_if_present<py::TypeType>(
+      types.widenLiteral(types.inferExpr(receiverNode)));
+  auto cls = receiverType ? mlir::dyn_cast_if_present<py::ContractType>(
+                                receiverType.getInstanceType())
+                          : py::ContractType();
+  if (!cls || !types.lookupClass(cls.getContractName()) ||
+      !declaredClassBases.count(cls.getContractName()))
+    return std::nullopt;
+  Value receiver = emitExpr(receiverNode);
+  mlir::Type elementType = receiverType;
+  mlir::Type listType = types.contract("builtins.list", {elementType});
+  auto typeObjectOf = [&](llvm::StringRef name) -> std::optional<Value> {
+    std::optional<mlir::Type> instance = types.lookupClass(name);
+    if (!instance)
+      return std::nullopt;
+    mlir::Type classType = types.typeObject(*instance);
+    return Value{py::TypeObjectOp::create(builder, loc(expr), classType,
+                                          *instance)
+                     .getResult(),
+                 classType};
+  };
+  auto listOf = [&](llvm::StringRef name) -> mlir::Value {
+    llvm::SmallVector<mlir::Value, 8> operands;
+    for (const std::string &sub : directSubclassesOf(name))
+      if (std::optional<Value> object = typeObjectOf(sub))
+        operands.push_back(coerceValue(*object, elementType, expr).value);
+    return py::PackOp::create(builder, loc(expr), listType, operands)
+        .getResult();
+  };
+  // The classes a value of `type[C]` may hold, below C.
+  llvm::SmallVector<std::string, 8> below;
+  llvm::SmallVector<std::string, 8> pending{cls.getContractName().str()};
+  llvm::StringSet<> seen;
+  while (!pending.empty()) {
+    std::string next = pending.pop_back_val();
+    for (const std::string &sub : directSubclassesOf(next))
+      if (seen.insert(sub).second) {
+        below.push_back(sub);
+        pending.push_back(sub);
+      }
+  }
+  if (receiver.value.getDefiningOp<py::TypeObjectOp>() || below.empty())
+    return Value{listOf(cls.getContractName()), listType};
+  std::function<mlir::Value(std::size_t)> chain =
+      [&](std::size_t index) -> mlir::Value {
+    if (index == below.size())
+      return listOf(cls.getContractName());
+    std::optional<Value> candidate = typeObjectOf(below[index]);
+    if (!candidate)
+      return chain(index + 1);
+    mlir::Value same =
+        py::IsOp::create(builder, loc(expr), builder.getI1Type(),
+                         receiver.value, candidate->value)
+            .getResult();
+    return emitValueDiamond(
+        loc(expr), same, listType,
+        [&] { return listOf(below[index]); },
+        [&] { return chain(index + 1); });
+  };
+  return Value{chain(0), listType};
+}
+
 Value ModuleEmitter::emitCall(const parser::Node &expr) {
   const parser::Node *calleeNode = ast::node(expr, "func");
+  if (std::optional<Value> subclasses = tryEmitSubclassesCall(expr))
+    return *subclasses;
   if (calleeNode && calleeNode->kind == "Call")
     if (std::optional<Value> curried =
             tryEmitCurriedGenericCall(expr, *calleeNode))

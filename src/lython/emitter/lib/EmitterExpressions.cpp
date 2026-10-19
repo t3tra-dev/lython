@@ -3564,6 +3564,9 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   if (std::optional<Value> unbound =
           tryEmitManifestMethodObject(expr, object, *attr))
     return *unbound;
+  if (std::optional<Value> bound =
+          tryEmitBoundManifestMethodObject(expr, object, *attr))
+    return *bound;
 
   // ⭐ AN ATTRIBUTE A SOURCE CLASS DOES NOT HAVE IS REFUSED HERE. Nothing
   // resolved it -- not a field, not a class attribute, not a method, not a
@@ -4589,7 +4592,16 @@ Value ModuleEmitter::emitExprExpected(const parser::Node *expr,
     llvm::SaveAndRestore<mlir::Type> wanted(expectedResultType, expected);
     return emitExpr(expr);
   }
-  return emitExpr(expr);
+  Value value = emitExpr(expr);
+  // A builtin function named where a callable value is expected becomes one
+  // (tryWrapBuiltinFunctionValue); every other value is what it was.
+  if (auto expectedCallable =
+          mlir::dyn_cast_if_present<py::CallableType>(expected);
+      expectedCallable && (expr->kind == "Name" || expr->kind == "Attribute"))
+    if (std::optional<Value> wrapped =
+            tryWrapBuiltinFunctionValue(value, expectedCallable, *expr))
+      return *wrapped;
+  return value;
 }
 
 // ⭐ An EMPTY container literal inside another literal takes its element type
@@ -5261,6 +5273,179 @@ ModuleEmitter::tryEmitManifestMethodObject(const parser::Node &anchor,
   return emitFunctionObject(anchor, memo->second.first, memo->second.second, {});
 }
 
+// ⭐ A METHOD READ OFF A BUILTIN INSTANCE IS A BOUND METHOD, built as a
+// forwarder over its receiver: `return __ly_recv.method(a0, ...)`, with the
+// receiver CAPTURED where it was read -- which is when CPython binds it, so
+// a later rebinding of the name does not reach a callback already made.
+// `self.addCleanup(log.append, "x")` and `max(d, key=d.get)` are the shapes.
+//
+// ⛔ A capture and not a parameter: the forwarder is a value of the type the
+// method has once bound (TypeSystem::boundManifestMethodCallable says which),
+// and a parameter would be one more argument every caller had to pass.
+std::optional<Value>
+ModuleEmitter::tryEmitBoundManifestMethodObject(const parser::Node &anchor,
+                                                Value object,
+                                                llvm::StringRef methodName) {
+  std::optional<py::CallableType> bound =
+      types.boundManifestMethodCallable(object.type, methodName);
+  if (!bound)
+    return std::nullopt;
+  mlir::Type receiverType = types.widenLiteral(object.type);
+  Value receiver = coerceValue(object, receiverType, anchor);
+  llvm::SmallVector<Capture, 1> captures{Capture{"__ly_recv", receiver}};
+  std::string key = typeText(receiverType) + "." + methodName.str();
+  auto memo = boundManifestMethodObjects.find(key);
+  if (memo == boundManifestMethodObjects.end()) {
+    parser::SourceRange range = anchor.range;
+    llvm::ArrayRef<mlir::Type> parameterTypes = bound->getPositionalTypes();
+    llvm::SmallVector<synth::Param, 4> params;
+    std::vector<parser::NodePtr> arguments;
+    for (unsigned index = 0; index < parameterTypes.size(); ++index) {
+      std::string name = "__ly_a" + std::to_string(index);
+      params.push_back(synth::Param{name, nullptr});
+      arguments.push_back(synth::name(name, range));
+    }
+    std::vector<parser::NodePtr> body;
+    body.push_back(synth::returnStmt(
+        synth::methodCall(synth::name("__ly_recv", range), methodName,
+                          std::move(arguments), range),
+        range));
+    std::string symbol =
+        "__lybmeth$" + std::to_string(++syntheticFunctionCounter);
+    llvm::SmallVector<const parser::Node *, 4> paramNodes;
+    parser::NodePtr def = synth::functionDef(
+        symbol, params, {}, std::move(body), nullptr, {}, range, &paramNodes);
+    synthesizedIteratorDefs.push_back(def);
+    for (auto [index, type] : llvm::enumerate(parameterTypes))
+      types.overrideParameterType(paramNodes[index], type);
+    FunctionSignature sig;
+    {
+      // The body reads the receiver as a free name; the walk that types the
+      // result needs it bound, as a closure's enclosing scope binds it.
+      auto scope = types.pushScope();
+      types.bindLocalSymbol("__ly_recv", receiverType);
+      sig = types.functionSignature(*def);
+    }
+    {
+      auto savedLoops = std::move(loopControlContexts);
+      loopControlContexts.clear();
+      auto savedInlineReturns = std::move(inlineReturnContexts);
+      inlineReturnContexts.clear();
+      auto savedSupers = std::move(superContexts);
+      superContexts.clear();
+      auto savedInlining = std::move(methodsBeingInlined);
+      methodsBeingInlined.clear();
+      auto savedInlineFrames = std::move(inlineFrames);
+      inlineFrames.clear();
+      auto restoreContexts = llvm::scope_exit([&] {
+        loopControlContexts = std::move(savedLoops);
+        inlineReturnContexts = std::move(savedInlineReturns);
+        superContexts = std::move(savedSupers);
+        methodsBeingInlined = std::move(savedInlining);
+        inlineFrames = std::move(savedInlineFrames);
+      });
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      emitCallableFunction(*def, symbol, sig, captures, /*isLambda=*/false);
+    }
+    memo = boundManifestMethodObjects.try_emplace(key, symbol).first;
+  }
+  return emitFunctionObject(anchor, memo->second, *bound, captures);
+}
+
+// ⭐ A BUILTIN FUNCTION PASSED WHERE A CALLABLE VALUE IS EXPECTED becomes one:
+// a forwarder typed by the callable it is handed to, `return print(a0)`.
+// `apply(print, "hi")` reached the lowering with the builtin's NAME and no
+// object ("cannot adapt builtins.function to runtime input 0"), since a
+// builtin is a manifest entry the lowering calls directly and has no function
+// object of its own -- where a builtin call position (`sorted(key=len)`)
+// never needed one.
+//
+// ⛔ Typed by the TARGET, not by the builtin: `print` takes `*args` and `len`
+// is overloaded, and the callable it becomes is the one the receiving
+// parameter declares -- the call site lets it be derived, which is the rule
+// this port runs under.
+std::optional<Value>
+ModuleEmitter::tryWrapBuiltinFunctionValue(Value value, py::CallableType target,
+                                           const parser::Node &anchor) {
+  auto ref = value.value.getDefiningOp<py::BindingRefOp>();
+  if (!ref || !ref.getCaptures().empty() ||
+      !mlir::isa<py::CallableType, py::OverloadType>(value.type))
+    return std::nullopt;
+  llvm::StringRef binding = ref.getBinding();
+  // ⛔ Asked of the manifest, not read off the spelling: an unmangled name is
+  // not always a builtin -- a decorated module function and a host wrapper
+  // are bindings of their own -- and wrapping one of those called itself.
+  std::string qualified = binding.contains('.')
+                              ? binding.str()
+                              : ("builtins." + binding).str();
+  if (binding.empty() ||
+      !py::protocols::Table::get(context).freeFunctionContract(qualified))
+    return std::nullopt;
+  if (target.hasVararg() || target.hasKwarg() ||
+      !target.getKwOnlyTypes().empty() || target.getResultTypes().size() != 1)
+    return std::nullopt;
+  std::string key = binding.str() + "|" + typeText(target);
+  auto memo = builtinFunctionObjects.find(key);
+  if (memo == builtinFunctionObjects.end()) {
+    parser::SourceRange range = anchor.range;
+    llvm::ArrayRef<mlir::Type> parameterTypes = target.getPositionalTypes();
+    llvm::SmallVector<synth::Param, 4> params;
+    std::vector<parser::NodePtr> arguments;
+    for (unsigned index = 0; index < parameterTypes.size(); ++index) {
+      std::string name = "__ly_a" + std::to_string(index);
+      params.push_back(synth::Param{name, nullptr});
+      arguments.push_back(synth::name(name, range));
+    }
+    // A dotted binding (`math.sqrt`) is the attribute it was read as.
+    llvm::SmallVector<llvm::StringRef, 4> parts;
+    binding.split(parts, '.');
+    parser::NodePtr callee = synth::name(parts.front(), range);
+    for (llvm::StringRef part : llvm::drop_begin(parts))
+      callee = synth::attribute(std::move(callee), part, range);
+    std::vector<parser::NodePtr> body;
+    body.push_back(synth::returnStmt(
+        synth::call(std::move(callee), std::move(arguments), range), range));
+    std::string symbol =
+        "__lybfn$" + std::to_string(++syntheticFunctionCounter);
+    llvm::SmallVector<const parser::Node *, 4> paramNodes;
+    parser::NodePtr def = synth::functionDef(
+        symbol, params, {}, std::move(body), nullptr, {}, range, &paramNodes);
+    synthesizedIteratorDefs.push_back(def);
+    for (auto [index, type] : llvm::enumerate(parameterTypes))
+      types.overrideParameterType(paramNodes[index], type);
+    FunctionSignature sig = types.functionSignature(*def);
+    if (!sig.publicCallable)
+      return std::nullopt;
+    types.bindRootSymbol(symbol, sig.publicCallable);
+    {
+      auto savedLoops = std::move(loopControlContexts);
+      loopControlContexts.clear();
+      auto savedInlineReturns = std::move(inlineReturnContexts);
+      inlineReturnContexts.clear();
+      auto savedSupers = std::move(superContexts);
+      superContexts.clear();
+      auto savedInlining = std::move(methodsBeingInlined);
+      methodsBeingInlined.clear();
+      auto savedInlineFrames = std::move(inlineFrames);
+      inlineFrames.clear();
+      auto restoreContexts = llvm::scope_exit([&] {
+        loopControlContexts = std::move(savedLoops);
+        inlineReturnContexts = std::move(savedInlineReturns);
+        superContexts = std::move(savedSupers);
+        methodsBeingInlined = std::move(savedInlining);
+        inlineFrames = std::move(savedInlineFrames);
+      });
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      emitCallableFunction(*def, symbol, sig, {}, /*isLambda=*/false);
+    }
+    memo = builtinFunctionObjects
+               .try_emplace(key, std::make_pair(symbol, sig.publicCallable))
+               .first;
+  }
+  return emitFunctionObject(anchor, memo->second.first, memo->second.second,
+                            {});
+}
+
 Value ModuleEmitter::emitFunctionObject(const parser::Node &anchor,
                                         llvm::StringRef symbolName,
                                         mlir::Type type,
@@ -5564,6 +5749,10 @@ Value ModuleEmitter::coerceValue(Value value, mlir::Type targetType,
                                  const parser::Node &anchor) {
   if (!targetType || value.type == targetType)
     return value;
+  if (auto targetCallable = mlir::dyn_cast<py::CallableType>(targetType))
+    if (std::optional<Value> wrapped =
+            tryWrapBuiltinFunctionValue(value, targetCallable, anchor))
+      return *wrapped;
   if (auto unionType = mlir::dyn_cast<py::UnionType>(targetType)) {
     if (unionType.hasMember(value.type)) {
       auto op = py::UnionWrapOp::create(builder, loc(anchor), targetType,

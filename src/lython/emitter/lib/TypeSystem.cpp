@@ -1,4 +1,5 @@
 #include "TypeSystem.h"
+#include "RuntimeClasses.h"
 
 #include "TypeSystemSolver.h"
 
@@ -2117,6 +2118,62 @@ TypeSystem::unboundManifestMethodCallable(mlir::Type typeObject,
   mlir::Type receiver = contract;
   return py::CallableType::get(&context, {receiver}, {}, {}, {}, {result});
 }
+// ⭐ A METHOD READ OFF A BUILTIN INSTANCE IS ITS BOUND METHOD -- `log.append`
+// handed to a callback, `d.get` as a `key=`, `"-".join` kept for later. It
+// answered with the result of a zero-argument call, so `xs.append` was `None`
+// and `s.upper` a str, and the emitter had nothing to build either way.
+//
+// ⛔ THE SHORTEST OVERLOAD, AND ONLY ITS REQUIRED PARAMETERS: the forwarder
+// calls the method with what it is given and lets the running body fill the
+// rest, and a default the manifest only says EXISTS has no value to restate.
+// `xs.pop` is `Callable[[], int]`; `d.get` is the one-argument `get`.
+//
+// ⛔ Builtin classes only (RuntimeClasses.h): a source class has its own bound
+// method object (emitMethodObject), and a module is not an instance.
+std::optional<py::CallableType>
+TypeSystem::boundManifestMethodCallable(mlir::Type receiver,
+                                        llvm::StringRef methodName) const {
+  auto contract =
+      mlir::dyn_cast_if_present<py::ContractType>(widenLiteral(receiver));
+  if (!contract ||
+      !py::runtime_classes::isListed(contract.getContractName().str()) ||
+      lookupClass(contract.getContractName()))
+    return std::nullopt;
+  const py::protocols::Table &table = py::protocols::Table::get(context);
+  std::vector<py::protocols::ContractResolution> methods =
+      table.methodContractCandidatesWithEvidence(contract, methodName);
+  py::CallableType signature;
+  for (const py::protocols::ContractResolution &candidate : methods) {
+    py::CallableType option = candidate.method.signature;
+    if (!option || option.getPositionalTypes().empty() ||
+        mlir::isa<py::TypeType>(option.getPositionalTypes().front()))
+      continue;
+    if (!signature || option.getPositionalTypes().size() <
+                          signature.getPositionalTypes().size())
+      signature = option;
+  }
+  if (!signature || signature.hasVararg() || signature.hasKwarg() ||
+      !signature.getKwOnlyTypes().empty() ||
+      signature.getResultTypes().size() != 1)
+    return std::nullopt;
+  llvm::ArrayRef<mlir::Type> positional = signature.getPositionalTypes();
+  llvm::ArrayRef<mlir::BoolAttr> defaults = signature.getPositionalDefaults();
+  llvm::SmallVector<mlir::Type, 4> required;
+  for (unsigned index = 1; index < positional.size(); ++index) {
+    bool hasDefault = index < defaults.size() && defaults[index] &&
+                      defaults[index].getValue();
+    if (hasDefault)
+      break;
+    if (mlir::isa<py::SelfType>(positional[index]))
+      return std::nullopt;
+    required.push_back(positional[index]);
+  }
+  mlir::Type result = signature.getResultTypes().front();
+  if (mlir::isa<py::SelfType>(result))
+    result = contract;
+  return py::CallableType::get(&context, required, {}, {}, {}, {result});
+}
+
 mlir::Type TypeSystem::boolType() const { return contract("builtins.bool"); }
 mlir::Type TypeSystem::intType() const { return contract("builtins.int"); }
 mlir::Type TypeSystem::strType() const { return contract("builtins.str"); }
@@ -4195,6 +4252,9 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
             }
           }
         }
+        if (std::optional<py::CallableType> bound =
+                boundManifestMethodCallable(widenLiteral(objectType), *attr))
+          return *bound;
         if (std::optional<CallSolution> method =
                 tryManifestMethod(*this, widenLiteral(objectType), *attr, {}))
           return method->result;
@@ -4772,6 +4832,21 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
                 lookupCanonicalBinding(spelled);
             canonical && *canonical == "sys.exc_info")
           return optionalExcInfoType();
+    // ⭐ `C.__subclasses__()` OF A PROGRAM CLASS IS `list[type[C]]`, answered
+    // by the emitter from the program's classes (tryEmitSubclassesCall).
+    if (callee && callee->kind == "Attribute" &&
+        ast::string(*callee, "attr").value_or("") == "__subclasses__") {
+      const auto *callArgs = ast::nodeList(*node, "args");
+      const auto *callKeywords = ast::nodeList(*node, "keywords");
+      if ((!callArgs || callArgs->empty()) &&
+          (!callKeywords || callKeywords->empty()))
+        if (auto receiver = mlir::dyn_cast_if_present<py::TypeType>(
+                widenLiteral(inferExprImpl(ast::node(*callee, "value"), ctx))))
+          if (auto cls = mlir::dyn_cast_if_present<py::ContractType>(
+                  receiver.getInstanceType());
+              cls && lookupClass(cls.getContractName()))
+            return contract("builtins.list", {receiver});
+    }
 
     // ⭐ The reducers the EMITTER folds are typed here, by the same walk the
     // fold uses to find its element type. Without it the inference had

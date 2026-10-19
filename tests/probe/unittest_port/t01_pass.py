@@ -77,13 +77,9 @@ class FixtureTests(unittest.TestCase):
         FixtureTests.log.append("tearDownClass")
         print("fixture log:", FixtureTests.log)
 
-    def note(self, text: str) -> None:
-        FixtureTests.log.append(text)
-
     def setUp(self) -> None:
         FixtureTests.log.append("setUp " + self._testMethodName)
-        # WORKAROUND(ut_unsupported_bound_builtin_method_as_callable): a builtin's bound method (`log.append`) is not a callable value.
-        self.addCleanup(self.note, "cleanup " + self._testMethodName)
+        self.addCleanup(FixtureTests.log.append, "cleanup " + self._testMethodName)
 
     def tearDown(self) -> None:
         FixtureTests.log.append("tearDown " + self._testMethodName)
@@ -124,4 +120,4 @@ class DecoratedTests(unittest.TestCase):
                 self.assertTrue(True)
 
 
-unittest.main(ArithmeticTests, FixtureTests, DecoratedTests)
+unittest.main()
