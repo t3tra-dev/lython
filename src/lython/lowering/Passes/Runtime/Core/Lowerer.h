@@ -1731,6 +1731,11 @@ private:
                            mlir::Operation *insertBefore = nullptr);
   mlir::LogicalResult emitSetCurrentCause(mlir::Operation *op,
                                           const RuntimeBundle &cause);
+  mlir::LogicalResult emitSetObjectCause(mlir::Operation *op,
+                                         const RuntimeBundle &raised,
+                                         const RuntimeBundle *cause);
+  mlir::LogicalResult lowerExceptionChainAttrGet(py::AttrGetOp op,
+                                                 const RuntimeBundle &object);
   mlir::LogicalResult lowerRaise(py::RaiseOp op);
   mlir::LogicalResult lowerRaiseCurrent(py::RaiseCurrentOp op);
   mlir::LogicalResult lowerExceptMatch(py::ExceptMatchOp op);

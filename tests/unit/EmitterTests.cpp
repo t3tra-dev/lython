@@ -945,21 +945,33 @@ TEST(EmitterTest, AUserDefinedSetattrStillWins) {
   EXPECT_TRUE(emitted.ok()) << emitted.diagnostics.size();
 }
 
-TEST(EmitterTest, TheExceptionChainAttributesAreRefusedWhereTheyAreWritten) {
+// The chain attributes read the words a raise left in the exception; an
+// assignment to one is refused at the store, naming the raise that writes it.
+TEST(EmitterTest, TheExceptionChainIsReadButWrittenOnlyByARaise) {
   for (const char *attribute :
        {"__cause__", "__context__", "__suppress_context__"}) {
     mlir::MLIRContext context(testRegistry());
-    lython::emitter::EmitResult emitted =
+    lython::emitter::EmitResult read =
         emitSource(std::string("try:\n"
                                "    raise ValueError('v')\n"
                                "except ValueError as e:\n"
                                "    print(e.") +
                        attribute + ")\n",
                    context);
-    EXPECT_FALSE(emitted.ok()) << attribute;
+    EXPECT_TRUE(read.ok()) << attribute;
+  }
+  for (const char *attribute : {"__cause__", "__context__",
+                                "__suppress_context__", "__traceback__"}) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult written =
+        emitSource(std::string("e = ValueError('v')\n"
+                               "e.") +
+                       attribute + " = None\n",
+                   context);
+    EXPECT_FALSE(written.ok()) << attribute;
     bool found = false;
-    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
-      found = found || diagnostic.message.find("no runtime implementation") !=
+    for (const lython::parser::Diagnostic &diagnostic : written.diagnostics)
+      found = found || diagnostic.message.find("cannot be assigned") !=
                            std::string::npos;
     EXPECT_TRUE(found) << attribute;
   }

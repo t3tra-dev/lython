@@ -10,6 +10,10 @@
 //     `UnicodeDecodeError("message")` is refused at compile time where CPython
 //     raises TypeError when it runs, and a decode error's `object` is bytes
 //     rather than any buffer.
+//   - The chain is written only by a raise: `__cause__`, `__context__` and
+//     `__suppress_context__` read what `raise`, `raise ... from` and an
+//     except* split recorded, and an assignment to one is refused at compile
+//     time.
 
 module attributes {
   ly.typing.manifest,
@@ -298,6 +302,17 @@ module attributes {
     %byte_len = func.call @__ly_unicode_raw_bytes(%msg_ptr) : (i64) -> i64
     %msg_bytes = func.call @__ly_global_view_i8(%bytes_ptr, %byte_len) : (i64, i64) -> memref<?xi8>
     func.return %msg_header, %msg_bytes : memref<2xi64>, memref<?xi8>
+  }
+
+  // `__suppress_context__`: extended word 9, which `raise ... from` sets
+  // (LyEH_SetCause / LyEH_SetCauseNone). `__cause__` and `__context__` are
+  // read by the lowering itself, since a union is built there.
+  func.func @LyBaseException_SuppressContext(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> i1 attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "suppress_context", ly.runtime.result_contract = "builtins.bool"} {
+    %slot = arith.constant 9 : i64
+    %zero = arith.constant 0 : i64
+    %word = func.call @__ly_exc_ext_get(%header, %slot) : (memref<3xi64>, i64) -> i64
+    %set = arith.cmpi ne, %word, %zero : i64
+    func.return %set : i1
   }
 
   // Allocate a payload block for %count boxed entries: word 0 = count, then
@@ -1202,6 +1217,22 @@ module attributes {
     func.call @__ly_exc_set_message(%fresh#0, %retained#0) : (memref<3xi64>, memref<2xi64>) -> ()
     %block = func.call @__ly_exc_payload_alloc(%count) : (i64) -> i64
     func.call @__ly_exc_ext_set(%fresh#0, %payload_slot, %block) : (memref<3xi64>, i64, i64) -> ()
+    // ⭐ AND THE CHAIN, as CPython's split copies it (exceptiongroup_subset):
+    // __cause__ and __context__ name what the original's do, one more
+    // reference apiece, and __suppress_context__ is set because that copy
+    // goes through PyException_SetCause. The fresh words are 0, so nothing
+    // is released.
+    %cause_slot = arith.constant 7 : i64
+    %context_slot = arith.constant 8 : i64
+    %suppress_slot = arith.constant 9 : i64
+    %suppressed = arith.constant 1 : i64
+    %cause = func.call @__ly_exc_ext_get(%eh, %cause_slot) : (memref<3xi64>, i64) -> i64
+    %context = func.call @__ly_exc_ext_get(%eh, %context_slot) : (memref<3xi64>, i64) -> i64
+    func.call @__ly_handle_retain_raw(%cause) : (i64) -> ()
+    func.call @__ly_handle_retain_raw(%context) : (i64) -> ()
+    func.call @__ly_exc_ext_set(%fresh#0, %cause_slot, %cause) : (memref<3xi64>, i64, i64) -> ()
+    func.call @__ly_exc_ext_set(%fresh#0, %context_slot, %context) : (memref<3xi64>, i64, i64) -> ()
+    func.call @__ly_exc_ext_set(%fresh#0, %suppress_slot, %suppressed) : (memref<3xi64>, i64, i64) -> ()
     func.return %fresh#0, %retained#0, %retained#1, %block : memref<3xi64>, memref<2xi64>, memref<?xi8>, i64
   }
 
@@ -1649,13 +1680,14 @@ module attributes {
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
-  // The exception ALLOCATION is 5 words even though the header view (and
+  // The exception ALLOCATION is 10 words even though the header view (and
   // every signature) stays memref<3xi64>: words [3] (group/args payload
-  // block) and [4] (user-exception field block) ride inside the allocation
-  // so they survive the TLS throw path (g_current_parts stores only the
-  // three descriptors) without widening every exception signature in the
-  // manifests. The extended words are reached only through
-  // @__ly_exc_ext_get / @__ly_exc_ext_set, never through the 3-word view.
+  // block), [4] (user-exception field block), [5] (exit code), [6] (message)
+  // and [7]-[9] (the chain) ride inside the allocation so they survive the
+  // TLS throw path (g_current_parts stores only the three descriptors)
+  // without widening every exception signature in the manifests. The
+  // extended words are reached only through @__ly_exc_ext_get /
+  // @__ly_exc_ext_set, never through the 3-word view.
   // SystemExit's exit code, recorded on the object at construction because that
   // is where its static type is still known: a boxed value in the payload block
   // cannot be read back as an i64 without a per-class unboxer, and the top-level
@@ -1708,10 +1740,24 @@ module attributes {
     // produce one (New, Init, InitPayloadMessage) and released by the lane's
     // own owner -- LyBaseException_DecRef -- so it adds no reference.
     %message_slot = arith.constant 6 : index
-    %block_bytes = arith.constant 56 : index
+    // ⭐ WORDS 7-9 ARE THE CHAIN, as CPython keeps it on the object:
+    // __cause__ and __context__ are the entity word of the exception each
+    // names (0 for None) and own one reference apiece, __suppress_context__ is
+    // 0 or 1. The raise paths write them (LyEH_RecordException,
+    // LyEH_SetCurrentCause, LyEH_SetCurrentSuppress) and
+    // release_exception_extras drops the references.
+    //
+    // ⛔ NOT THE CHAIN NODES. Those are the traceback's record of one raise --
+    // they carry the frames each exception was raised through -- and a node
+    // is gone once its handler finishes, where the object's words stay as
+    // long as the exception does.
+    %cause_slot = arith.constant 7 : index
+    %context_slot = arith.constant 8 : index
+    %suppress_slot = arith.constant 9 : index
+    %block_bytes = arith.constant 80 : index
     %block = memref.alloc(%block_bytes) {alignment = 16 : i64} : memref<?xi8>
     %header = memref.view %block[%zero_index][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<3xi64>
-    %extended = memref.view %block[%zero_index][] : memref<?xi8> to memref<7xi64>
+    %extended = memref.view %block[%zero_index][] : memref<?xi8> to memref<10xi64>
     %empty_bytes = memref.alloca(%zero_index) : memref<?xi8>
     %message_header, %message_bytes = func.call @__ly_unicode_from_valid_utf8(%empty_bytes, %zero_index, %zero_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %message_ptr_index = memref.extract_aligned_pointer_as_index %message_header : memref<2xi64> -> index
@@ -1720,10 +1766,13 @@ module attributes {
     memref.store %one, %header[%refcount_slot] : memref<3xi64>
     memref.store %layout_exception, %header[%layout_slot] : memref<3xi64>
     memref.store %class_word, %header[%class_slot] : memref<3xi64>
-    memref.store %zero, %extended[%payload_slot] : memref<7xi64>
-    memref.store %zero, %extended[%fields_slot] : memref<7xi64>
-    memref.store %zero, %extended[%code_slot] : memref<7xi64>
-    memref.store %message_ptr, %extended[%message_slot] : memref<7xi64>
+    memref.store %zero, %extended[%payload_slot] : memref<10xi64>
+    memref.store %zero, %extended[%fields_slot] : memref<10xi64>
+    memref.store %zero, %extended[%code_slot] : memref<10xi64>
+    memref.store %message_ptr, %extended[%message_slot] : memref<10xi64>
+    memref.store %zero, %extended[%cause_slot] : memref<10xi64>
+    memref.store %zero, %extended[%context_slot] : memref<10xi64>
+    memref.store %zero, %extended[%suppress_slot] : memref<10xi64>
 
     func.return %header, %message_header, %message_bytes : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }

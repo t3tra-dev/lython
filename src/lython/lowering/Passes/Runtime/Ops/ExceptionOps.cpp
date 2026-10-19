@@ -357,9 +357,14 @@ RuntimeBundleLowerer::emitSetCurrentCause(mlir::Operation *op,
                         ? mlir::MemRefType()
                         : mlir::dyn_cast<mlir::MemRefType>(
                               values.front().getType());
+  // A program's exception class is a runtime exception by its ancestor: the
+  // object is the taxonomy's, with the source class's id in its header.
+  bool exceptionInstance =
+      manifest.runtimeClass(cause.contractName()) ||
+      RuntimeBundleLowerer::exceptionAncestorContractFor(cause.contract)
+          .has_value();
   if (values.size() != 3 || !headerType || headerType.getRank() != 1 ||
-      !headerType.getElementType().isInteger(64) ||
-      !manifest.runtimeClass(cause.contractName()))
+      !headerType.getElementType().isInteger(64) || !exceptionInstance)
     return op->emitError()
            << "raise ... from cause must be a runtime exception instance, got "
            << cause.contractName();
@@ -369,6 +374,47 @@ RuntimeBundleLowerer::emitSetCurrentCause(mlir::Operation *op,
                                values[2].getType()},
                               {}));
   mlir::func::CallOp::create(builder, op->getLoc(), setCause, values);
+  return mlir::success();
+}
+
+// LyEH_SetCause(raised, cause) / LyEH_SetCauseNone(raised): the object half
+// of the same annotation -- the raised exception's `__cause__` and
+// `__suppress_context__` words, which outlive the raise. Borrows both, like
+// LyEH_SetCurrentCause.
+mlir::LogicalResult
+RuntimeBundleLowerer::emitSetObjectCause(mlir::Operation *op,
+                                         const RuntimeBundle &raised,
+                                         const RuntimeBundle *cause) {
+  mlir::Type headerType = py::runtime_library::exceptionHeaderType(builder);
+  auto headerOf = [&](const RuntimeBundle &bundle) -> mlir::Value {
+    llvm::ArrayRef<mlir::Value> values = bundle.physicalValues();
+    if (values.size() != 3 || values.front().getType() != headerType)
+      return nullptr;
+    return values.front();
+  };
+  mlir::Value raisedHeader = headerOf(raised);
+  if (!raisedHeader)
+    return op->emitError() << "raise ... from needs the raised exception's "
+                           << headerType << " header, got "
+                           << raised.contractName();
+  if (!cause) {
+    mlir::func::CallOp::create(
+        builder, op->getLoc(),
+        getOrCreatePrivateFunction(module, builder, "LyEH_SetCauseNone",
+                                   builder.getFunctionType({headerType}, {})),
+        mlir::ValueRange{raisedHeader});
+    return mlir::success();
+  }
+  mlir::Value causeHeader = headerOf(*cause);
+  if (!causeHeader)
+    return op->emitError() << "raise ... from needs the cause's " << headerType
+                           << " header, got " << cause->contractName();
+  mlir::func::CallOp::create(
+      builder, op->getLoc(),
+      getOrCreatePrivateFunction(
+          module, builder, "LyEH_SetCause",
+          builder.getFunctionType({headerType, headerType}, {})),
+      mlir::ValueRange{raisedHeader, causeHeader});
   return mlir::success();
 }
 
@@ -390,12 +436,17 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRaise(py::RaiseOp op) {
     mlir::func::FuncOp rethrow = getOrCreateRethrowCurrent(module, builder);
     builder.setInsertionPoint(op);
     if (cause) {
-      if (mlir::failed(emitSetCurrentCause(op.getOperation(), *cause)))
+      if (mlir::failed(emitSetCurrentCause(op.getOperation(), *cause)) ||
+          mlir::failed(emitSetObjectCause(op.getOperation(), *exception,
+                                          cause)))
         return mlir::failure();
     } else if (op.getFromNone()) {
       mlir::func::CallOp::create(builder, op.getLoc(),
                                  getOrCreateSetCurrentSuppress(module, builder),
                                  mlir::ValueRange{});
+      if (mlir::failed(emitSetObjectCause(op.getOperation(), *exception,
+                                          /*cause=*/nullptr)))
+        return mlir::failure();
     }
     if (mlir::failed(emitTracebackFrame(op.getOperation(),
                                         /*stashCurrentException=*/false)))
@@ -467,6 +518,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRaise(py::RaiseOp op) {
       !mlir::isa_and_nonnull<py::UnionType>(
           exception->unionActiveMember->contract))
     raised = exception->unionActiveMember.get();
+  if (cause || op.getFromNone()) {
+    builder.setInsertionPoint(op);
+    if (mlir::failed(emitSetObjectCause(op.getOperation(), *raised, cause)))
+      return mlir::failure();
+  }
 
   if (mlir::failed(RuntimeBundleLowerer::emitRaiseExceptionBundle(
           op.getOperation(), *raised)))

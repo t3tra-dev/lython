@@ -2134,6 +2134,30 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
     const parser::Node *objectNode = ast::node(target, "value");
     Value object = emitExpr(objectNode);
     if (auto attr = ast::string(target, "attr")) {
+      // ⛔ AN EXCEPTION'S CHAIN IS WRITTEN BY A RAISE, NOT BY AN ASSIGNMENT.
+      // The words a raise writes are read back as attributes, and a store
+      // reached the lowering as "attr.set object type has no class schema".
+      // A context word the program wrote could also close a cycle, which the
+      // runtime's walk of the chain assumes cannot exist (exc_set_context).
+      if ((*attr == "__cause__" || *attr == "__context__" ||
+           *attr == "__suppress_context__" || *attr == "__traceback__") &&
+          !lookupClassField(object.type, *attr) &&
+          py::isAssignableTo(object.type,
+                             types.contract("builtins.BaseException"),
+                             module)) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, target.range.start,
+            *attr == "__traceback__"
+                ? std::string("'__traceback__' cannot be assigned: the "
+                              "traceback is the runtime's record of where the "
+                              "exception was raised, not a field of it")
+                : "'" + std::string(*attr) +
+                      "' cannot be assigned: a raise writes the exception "
+                      "chain -- `raise X from Y` sets __cause__ and "
+                      "__suppress_context__, and a raise inside an except "
+                      "block sets __context__"});
+        return;
+      }
       // ⭐ A FROZEN DATACLASS REFUSES THE STORE, which is the other half of what
       // `frozen=True` means -- CPython raises FrozenInstanceError, and the whole
       // reason to accept the argument is that it is the only spelling for a

@@ -1,0 +1,17 @@
+from: KeyError('k') KeyError('k') True KeyError
+implicit: None KeyError('a') False
+alone: None None False True True
+from None: None KeyError('hidden') True
+stored: KeyError('missing') KeyError('missing') True
+runtime raise: None ValueError('first') False
+re-raise: None KeyError('x') False
+bare raise: None None False
+program cause: 7 Detail('detail 7')
+cycle cut: ValueError('B') None
+called: None KeyError('h') False
+after a handled escape: None None False
+generator body: None ValueError('caller') False
+thrown in: None IndexError('held') False
+contextmanager: KeyError('inner') KeyError('inner') True
+split V: None KeyError('ctx') True
+split T: None KeyError('ctx') True

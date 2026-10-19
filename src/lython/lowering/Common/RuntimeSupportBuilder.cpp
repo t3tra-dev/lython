@@ -2342,6 +2342,11 @@ void buildRecordException(SupportBuilder &b) {
       b.builder, b.loc,
       mlir::arith::ConstantIntOp::create(b.builder, b.loc, 1, 1).getResult(),
       flagSlot, /*alignment=*/4);
+  // ⭐ THE OBJECT'S `__context__` IS WRITTEN HERE, the one place every raise
+  // passes -- whichever stash parked the interrupted exception, the raise's
+  // own above or the lowering's before a frame push, it is parked by now.
+  b.call("exc_chain_pending_context", mlir::TypeRange{},
+         mlir::ValueRange{explodeMemRef1D(b, entry->getArgument(0)).aligned});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
@@ -2473,7 +2478,8 @@ void buildCurrentExceptionMatches(SupportBuilder &b) {
 // void release_exception_extras(i64 header): drop the extended exception
 // words before the 3-word storage itself is freed — word 3 (ExceptionGroup
 // members / multi-value args) and word 4 (user-exception fields) each hold a
-// [count, count x box16] i64 block whose slots own one reference apiece.
+// [count, count x box16] i64 block whose slots own one reference apiece, and
+// words 7 and 8 (__cause__, __context__) each own the exception they name.
 // Lives here (not in objects/exceptions.mlir) because every raw free site —
 // the manifest deallocator, the discard path, and chain-node destruction —
 // must share one implementation.
@@ -2525,6 +2531,15 @@ void buildReleaseExceptionExtras(SupportBuilder &b) {
       mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0), slotPtr,
                                   /*alignment=*/8);
     }
+  }
+  // A chain word is a slot of its own -- one entity word, 0 for None -- so
+  // the slot release takes it, dying exception and all.
+  for (std::int64_t word : {kExceptionCauseWord, kExceptionContextWord}) {
+    mlir::Value slotPtr = b.gepI64(header, b.iconst(word));
+    b.call("release_payload_slot_ptr", mlir::TypeRange{},
+           mlir::ValueRange{slotPtr});
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0), slotPtr,
+                                /*alignment=*/8);
   }
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
@@ -2988,6 +3003,12 @@ void buildAdoptStashedAsContext(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(attach);
   mlir::LLVM::StoreOp::create(b.builder, b.loc, node,
                               attach->getArgument(0), /*alignment=*/8);
+  // And on the objects: the parked exception is the `__context__` CPython
+  // gave the first exception in the chain that was raised with none.
+  b.call("exc_adopt_context_tail", mlir::TypeRange{},
+         mlir::ValueRange{
+             b.loadPtrVal(partsField(b, b.addrOf("g_current_parts"), 0, 1)),
+             b.loadPtrVal(nodePartsField(b, node, 0, 1))});
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(done);
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
