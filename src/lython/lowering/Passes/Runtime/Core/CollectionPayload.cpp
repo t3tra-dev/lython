@@ -1028,9 +1028,19 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
       return mlir::failure();
     mlir::Value logicalSource =
         index < logicalSources.size() ? logicalSources[index] : mlir::Value{};
+    // ⛔ A UNION'S UNWRAPPED MEMBER IS NOT A TEMPORARY, however few uses it
+    // has: it is a view of the union, whose own claim is the token. `("case",
+    // doc)` for a narrowed `doc: str | None` moved that token into the tuple,
+    // and the union -- released nowhere after -- reached the function's exit
+    // still owned in the verifier's account ("owned resource ... reaches
+    // function exit without release"), while a list display of the same
+    // element compiled.
+    bool sourceIsView = logicalSource &&
+                        logicalSource.getDefiningOp<py::UnionUnwrapOp>();
     bool sourceIsTemporary =
         logicalSources.empty() || !logicalSource ||
-        RuntimeBundleLowerer::valueIsConsumedOnlyBy(logicalSource, op);
+        (!sourceIsView &&
+         RuntimeBundleLowerer::valueIsConsumedOnlyBy(logicalSource, op));
     // A LITERAL THAT CAN RUN MORE OFTEN THAN ITS SOURCE IS PRODUCED MAY NOT TAKE
     // THE SOURCE'S TOKEN. `valueIsConsumedOnlyBy` above answers a use-SET
     // question and the move needs an execution-FREQUENCY one; the CFG query here

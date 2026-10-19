@@ -7,8 +7,10 @@
 #   _SubTest to testPartExecutor this way.
 # KIND: バグ (bug) -- loud, from the ownership verifier
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   released owned resource from @_ZN8__main__8make_subE is used by function return
+# FIXED: 2026-10-20 -- the post-insertion canonicalizer no longer merges a
+#   block whose entry edge lends its arguments a reference of their own
+#   (cases/a_call_result_held_across_a_yield_in_a_contextmanager_method).
+# CLASSIFICATION @ lang-gaps 326fa275 + the fix: 1 正しい
 # CPython 3.14 expects: inside / True
 import contextlib
 from collections.abc import Iterator

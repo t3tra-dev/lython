@@ -12,6 +12,7 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
@@ -28,6 +29,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <optional>
 
@@ -2451,6 +2453,57 @@ bool releaseOwnedGroupByLiveness(
     return false;
   };
 
+  // ⭐ AN `scf.if` ARM THAT YIELDS THE VALUE LENDS IT TO THE IF'S RESULT,
+  // which is a borrow of whichever arm ran -- the reading the alias analysis
+  // gives a `select`. A tuple display iterated by `join` or `for` reads its
+  // elements back that way (one arm per static index), and the walk used to
+  // stop at the yield as a name it could not follow: no release at all, so a
+  // field read put in `"-".join((h.desc, "x"))` inside any loop reached the
+  // exit still owned. Outside a loop the fallback before the returns hid it.
+  // The reads of the result, followed out through enclosing arms, pin the
+  // token where they stand.
+  // ⛔ Only reads. A result handed on by a branch or a return, or given to a
+  // call that takes ownership, is a name whose life this walk cannot see the
+  // end of, and keeps the bail.
+  std::function<bool(mlir::Operation *, unsigned)> pinLentIfResult =
+      [&](mlir::Operation *yield, unsigned position) -> bool {
+    auto ifOp = mlir::dyn_cast_if_present<mlir::scf::IfOp>(
+        yield->getParentOp());
+    if (!ifOp || position >= ifOp->getNumResults())
+      return false;
+    mlir::Value lent = ifOp->getResult(position);
+    llvm::SmallVector<mlir::Value, 8> names;
+    aliases.namesOf(lent, names);
+    own::collectBoxWordDerivedViews(llvm::SmallVector<mlir::Value, 8>(names),
+                                    names, &contracts);
+    for (mlir::Value name : names)
+      for (mlir::OpOperand &read : name.getUses()) {
+        mlir::Operation *reader = read.getOwner();
+        if (mlir::isa<mlir::scf::YieldOp>(reader) &&
+            mlir::isa<mlir::scf::IfOp>(reader->getParentOp())) {
+          if (!pinLentIfResult(reader, read.getOperandNumber()))
+            return false;
+          continue;
+        }
+        if (reader->hasTrait<mlir::OpTrait::IsTerminator>() ||
+            ownershipConsumingUseInvalidatesGroup(contracts, read, {name},
+                                                  aliases))
+          return false;
+        mlir::Operation *blockReader = ancestorInRegion(reader, region);
+        if (!blockReader ||
+            blockReader->hasTrait<mlir::OpTrait::IsTerminator>())
+          return false;
+        lastUse[blockReader->getBlock()] =
+            latestUserInBlock(lastUse[blockReader->getBlock()], blockReader);
+      }
+    mlir::Operation *blockIf = ancestorInRegion(ifOp, region);
+    if (!blockIf || blockIf->hasTrait<mlir::OpTrait::IsTerminator>())
+      return false;
+    lastUse[blockIf->getBlock()] =
+        latestUserInBlock(lastUse[blockIf->getBlock()], blockIf);
+    return true;
+  };
+
   llvm::SmallVector<mlir::Value, 8> pinnedViews(group.views.begin(),
                                                 group.views.end());
   {
@@ -2619,6 +2672,14 @@ bool releaseOwnedGroupByLiveness(
             continue;
           }
           return false;
+        }
+        if (mlir::isa<mlir::scf::YieldOp>(user) &&
+            mlir::isa<mlir::scf::IfOp>(user->getParentOp())) {
+          if (pinsAnotherReference || useFollowsAConsume(user))
+            continue;
+          if (!pinLentIfResult(user, use.getOperandNumber()))
+            return false;
+          continue;
         }
         if (user->hasTrait<mlir::OpTrait::IsTerminator>())
           return false;
@@ -2969,6 +3030,18 @@ bool releaseOwnedGroupByLiveness(
       else if (block == defBlock)
         atStartReleases.push_back(block); // block-arg root, dies unused in defBlock
       else
+        beforeTermReleases.push_back(block);
+    } else if (mlir::isa<mlir::func::ReturnOp>(block->getTerminator())) {
+      // ⭐ LIVE-OUT OF A RETURNING BLOCK MEANS LIVE ON ITS EXCEPTION EDGES
+      // ONLY: a return has no successor to be live in. A generator's `yield`
+      // inside a `try` is that block -- it returns from the resume function
+      // with the handler still armed -- and the edge scan below found no edge
+      // to die on, so `held: str | None` kept across `yield` in a `try` or a
+      // `with` reached the exit still owned. The token stays alive through
+      // every call that can unwind into the handler and dies before the exit,
+      // unless this block already gave it away (an owned return, a
+      // transferring call).
+      if (!consumedBlocks.count(block))
         beforeTermReleases.push_back(block);
     } else {
       collectEdgeDeaths(block->getTerminator());

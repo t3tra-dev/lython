@@ -11,6 +11,7 @@
 
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dominance.h"
@@ -3231,8 +3232,20 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
         // the tag's `scf.if` and never reached this walk; with a union's
         // refcounting no longer guarded they sit in the block, and refusing
         // them would refuse every retain of a union.
+        // ⭐ NOR CAN A LOAD HAVE HURT: on the active arm the lanes name the
+        // owned object, and on the other they are the immortal dead
+        // placeholder every producer of a union gives an inactive member,
+        // whose header is sized for the deepest read a member's handle makes
+        // (`objectPayloadClassEntityAtCurrentInsertion` reads the class word
+        // of each member and lets the tag SELECT). A union of a program
+        // class and None boxed into `object` was refused here for that read
+        // -- `return maybe()` from a function returning object -- while the
+        // same union of a builtin, whose class word is a constant, passed.
+        // ⛔ A store or a call is still refused: either may write through
+        // the placeholder, which is a constant.
         if (!op->hasTrait<mlir::OpTrait::IsTerminator>() &&
             !mlir::isMemoryEffectFree(op) &&
+            !mlir::isa<mlir::memref::LoadOp>(op) &&
             groupContainsOperand(op, state.group, aliases))
           return op->emitError()
                  << "conditionally owned resource from "

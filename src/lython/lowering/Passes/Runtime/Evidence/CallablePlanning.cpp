@@ -680,10 +680,15 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeArityObject(
     return op->emitError() << "variadic callable aggregate has no concrete "
                               "runtime contract";
 
+  // ⛔ AT THE CALLER'S INSERTION POINT, not in front of `op`. The `*args`
+  // tuple of an indirect call is built inside the dispatch arm of each
+  // candidate, and moving to `op` put the tuple, the call and the arm's branch
+  // into the block of the call itself -- the arm for `main(*classes)` in a
+  // `Callable[[], object]` dispatch was left empty ("empty block: expect at
+  // least a terminator"). The pack lowering positions the builder itself.
   std::optional<RuntimeSymbol> initializer =
       manifest.initializer(contractName, "__new__");
   if (!initializer) {
-    builder.setInsertionPoint(op);
     mlir::FailureOr<RuntimeValue> value =
         RuntimeBundleLowerer::materializeDeadObjectValue(
             op, contract, "structural aggregate object ABI");
@@ -718,7 +723,6 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeArityObject(
     return initializer->function.emitError()
            << contractName << ".__new__ must take one i64 arity argument";
 
-  builder.setInsertionPoint(op);
   mlir::Value length =
       mlir::arith::ConstantIntOp::create(builder, op->getLoc(),
                                          static_cast<std::int64_t>(arity), 64)

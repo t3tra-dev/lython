@@ -958,10 +958,35 @@ void collectGeneratorFunctionAnalysis(
             analysis.localSymbols[name] = narrowed;
           },
           /*onFalseSide=*/true);
-    if (const auto *orelse = ast::nodeList(*node, "orelse"))
+    // ⭐ AND THE `else` ARM IS THE FALSE SIDE, where the guard proves the
+    // complement for as long as the arm runs. `if held is None: yield 0`
+    // `else: yield len(held)` asked the union for `__len__` here, while the
+    // emitter -- which narrows both arms -- compiled the body.
+    if (const auto *orelse = ast::nodeList(*node, "orelse");
+        orelse && !orelse->empty()) {
+      llvm::SmallVector<std::pair<std::string, std::optional<mlir::Type>>, 2>
+          savedElse;
+      applyGeneratorGuardNarrowing(
+          types, ast::node(*node, "test"), localCallables, analysis,
+          [&](llvm::StringRef name, mlir::Type narrowed) {
+            auto existing = analysis.localSymbols.find(name);
+            savedElse.emplace_back(
+                name.str(), existing == analysis.localSymbols.end()
+                                ? std::optional<mlir::Type>()
+                                : std::optional<mlir::Type>(existing->second));
+            analysis.localSymbols[name] = narrowed;
+          },
+          /*onFalseSide=*/true);
       for (const parser::NodePtr &statement : *orelse)
         collectGeneratorFunctionAnalysis(types, statement.get(), localCallables,
                                          generatorSendHint, analysis);
+      for (auto &entry : llvm::reverse(savedElse)) {
+        if (entry.second)
+          analysis.localSymbols[entry.first] = *entry.second;
+        else
+          analysis.localSymbols.erase(entry.first);
+      }
+    }
     return;
   }
   if (node->kind == "For" || node->kind == "AsyncFor") {
@@ -4442,7 +4467,21 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           named = right;
         if (named && (isIs || isIsNot)) {
           llvm::StringRef spelling = ast::nameSpelling(*named);
-          if (std::optional<mlir::Type> current = lookupSymbol(spelling))
+          // ⛔ The context's local symbols first, as the Name arm reads them:
+          // a pre-pass binds a function's locals there and not on the scope,
+          // so `0 if held is None else len(held)` over a local `held: str |
+          // None` found nothing to narrow and the generator it was yielded
+          // from typed its elements as `object`. A parameter is on the scope
+          // and was always narrowed.
+          std::optional<mlir::Type> current;
+          if (ctx && ctx->localSymbols) {
+            auto found = ctx->localSymbols->find(spelling);
+            if (found != ctx->localSymbols->end() && found->second)
+              current = found->second;
+          }
+          if (!current)
+            current = lookupSymbol(spelling);
+          if (current)
             if (auto unionType =
                     mlir::dyn_cast_if_present<py::UnionType>(*current)) {
               llvm::SmallVector<mlir::Type, 4> payload;

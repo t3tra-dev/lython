@@ -57,6 +57,7 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
 | 2026-10-20 | `ut_bug_set_display_solves_no_type_parameter`、`ut_bug_isinstance_and_keeps_dead_arm_in_generic_method`、`ut_bug_generic_method_local_of_generic_class` | A4 (ジェネリクス)。集合の表示が、型パラメータを含む期待型 (`set[T]`) で作られないようにする。`and`/`or` の分岐を、決まる被演算子で静的に決める (実行時に決まる被演算子の後に決まるものも、その腕を刈る)。フィールドの事前走査でジェネリックメソッドの型パラメータを束縛し、未束縛の型パラメータでジェネリッククラスを特殊化しない。途中で、フィールドに入ったサブクラスのないクラス値を `issubclass` が拒否していたのも直した。 |
 | 2026-10-20 | `ut_bug_type_alias_of_an_imported_module`、`ut_bug_field_typed_with_own_subclass`、`ut_bug_class_values_into_varargs`、`ut_bug_imported_function_list_of_one_subclass_value`、`ut_bug_and_over_hasattr_of_a_class_value`、`ut_unsupported_hasattr_on_class_value` | A5 の残り。取り込んだモジュールの型エイリアスをそのモジュールのスコープで束縛し、`type X = ...` 文も宣言として受ける。基底の本体が名指すサブクラスを、基底より先に生成しない。可変長引数のタプルにクラス値を入れる。コンテナ表示の期待型で、サブクラスのクラス値を基底のクラス型に合うと見る。`hasattr` を bool と型付けし、クラス値への `hasattr` を実行時のクラスで答える (その名前を宣言するクラスから派生しているか)。 |
 | 2026-10-20 | `ut_unsupported_computed_constant_of_imported_module`、`ut_unsupported_generic_factory_result_returned`、`ut_unsupported_fixed_tuple_concatenation`、`ut_unsupported_exc_info_outside_handler`、`ut_bug_subclass_into_optional_method_parameter` | 未対応 4 件と A5 の 1 件。取り込んだモジュールの、他の定数から計算した int と str の定数を畳み込む。結果だけが名指す型パラメータを、結果に期待される型から解く (`skipUnless` が `skipIf(...)` を返す形)。長さの決まったタプルを要素ごとに連結する。except ブロックの外の `sys.exc_info()` を、typeshed どおり省略可能な三つ組として実行時に答える (新しい `py.except.handling`)。union の引数に、どれかのメンバーに合う値を渡せる。途中で、呼び出し可能なインスタンスの union を呼ぶ形も通した (`test(result)`)。 |
+| 2026-10-20 | `ut_bug_join_of_tuple_with_narrowed_optional`、`ut_bug_exc_info_after_calling_a_callable_from_a_list`、`ut_bug_optional_held_across_yield_in_with`、`ut_bug_class_body_field_object_into_inner_contextmanager`、`ut_bug_tuple_of_optional_class_results` | A3 (所有権)。union から取り出した値は、タプルの表示が参照を奪ってよい一時値ではない。`Tb \| None` を object に箱詰めするとき、非活性メンバーの置き場所を読むのは使用ではない。try や with の中の `yield` で、例外辺でしか生きていない値を出口の前で解放する。refcount 挿入が参照を貸した辺の先のブロックを、その後の正規化で併合しない。試作の `doCleanups` と `getDescription` の回避策を外した。 |
 
 進捗の途中で決めたこと・見つけたこと:
 
@@ -79,6 +80,26 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
   別の語を読み、クラス値のフィールドではクラッシュした (unittest では
   `_testRunEntered` が見えず、クラスの後始末が 2 回走った)。フィールドごとに 1 つの
   ボックス大のセルを、フィールドの番号の位置に置くように直した。
+- **`doCleanups` を戻したら、既存の拒否が 2 件出た。どちらも直した。**
+  - `Callable[[], object]` の値を呼ぶとき、振り分けの候補に可変長引数の関数
+    (試作では `main(*classes)`) があると、その腕が空のまま残った
+    ("empty block")。`*args` のタプルを作る処理が、挿入位置を呼び出しの前へ
+    戻していた。
+  - フィールドの読みをタプルの表示に入れ、ループの中で `join` や `for` で回すと、
+    読みが持つ参照の解放が置かれなかった。要素を読み戻す `scf.if` の腕の
+    `yield` で、解放位置の計算が止まっていた。
+- **ついでに 2 件の拒否を直した。** `type[X] | None` の真偽 (`if t:`) を、クラス
+  オブジェクトは常に真として答える。注釈のないジェネレータが、ローカルを条件式や
+  `else` の腕で絞り込んだ値を yield するとき、要素型が `object` にならない。
+- **新しく 2 件を記録した。**
+  - `wb_a_watched_name_bound_in_a_loop_body` (黙った誤動作、expect-wrong)。
+    ループ本体で束縛した、解放が観測できる値 (`__del__` を持つオブジェクト、
+    try の中で止まったジェネレータ) が、名前の再束縛ではなく反復内の最後の使用で
+    解放される。
+  - `wb_an_unannotated_return_under_a_guard_whose_body_returns` (拒否)。注釈のない
+    関数の戻り値を、本文を歩き終えた後の型表で読み直すので流れに沿わない。
+- **subTest はまだ戻せない。** CPython は「メッセージなし」と `msg=None` を
+  `object()` のセンチネルで区別し、`object()` はまだ作れない。
 - **コンパイル時間の退行を 1 件、入れる前に直した。** タプル連結の型付けが
   `a + b + c ...` の連鎖で被演算子を二度ずつ推論し、traceback を取り込むだけの
   プログラムが 25 秒かかった。

@@ -9,6 +9,7 @@
 #include "Common/RuntimeLibrary.h"
 #include "Common/RuntimeSupport.h"
 #include "Common/TypeObjects.h"
+#include "Ownership.h"
 #include "Passes/Runtime/Arch/Arm/AppleAMX.h"
 #include "Passes/Runtime/Arch/Arm/ArmSME.h"
 #include "Passes/Runtime/Cleanup/Transforms.h"
@@ -212,13 +213,31 @@ LogicalResult collapsePassThrough(Block *&successor, ValueRange &operands,
   return success();
 }
 
+// Did refcount insertion lend this edge's destination arguments a token of
+// their own? Its retain for a `cf.br` edge sits in the branching block.
+bool edgeLendsArgumentsATokenOfTheirOwn(cf::BranchOp op) {
+  for (Operation &candidate : *op->getBlock())
+    if (auto call = dyn_cast<func::CallOp>(&candidate))
+      if (py::ownership::isBlockArgMergeBorrowRetain(call))
+        return true;
+  return false;
+}
+
 // `cf.br` merged into a single-predecessor destination, or short-circuited
 // past a pass-through block.
+//
+// ⛔ NOT MERGED WHEN THE EDGE LENDS A TOKEN: the merge renames the argument to
+// the value the edge passed, which is the uniform-argument fold above in
+// another spelling. A generator's `with` body reads the context manager's
+// argument under its outer name and enters through such an edge, so the lent
+// token and the outer one became two retains of one name, and the verifier
+// read the outer release as the death of a value the suspend still returned.
 LogicalResult canonicalizeBranch(cf::BranchOp op, PatternRewriter &rewriter) {
   Block *destination = op.getDest();
   Block *parent = op->getBlock();
   if (destination != parent &&
       llvm::hasSingleElement(destination->getPredecessors()) &&
+      !edgeLendsArgumentsATokenOfTheirOwn(op) &&
       llvm::none_of(op.getOperands(), [&](Value operand) {
         auto argument = dyn_cast<BlockArgument>(operand);
         return argument && argument.getOwner() == destination;
