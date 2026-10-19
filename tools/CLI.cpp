@@ -49,6 +49,8 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/BinaryFormat/Dwarf.h"
+#include "llvm/Bitcode/BitcodeReader.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/ExecutionEngine/JITSymbol.h"
 #include "llvm/ExecutionEngine/Orc/EHFrameRegistrationPlugin.h"
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
@@ -74,8 +76,11 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Signals.h"
+#include "llvm/Support/SmallVectorMemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/ThreadPool.h"
+#include "llvm/Support/Threading.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/AArch64TargetParser.h"
@@ -883,6 +888,174 @@ noopDeregisterEHFrameSectionAllocAction(const char *argData, size_t argSize) {
           .release();
 }
 
+// The threads one compile uses: the MLIR context's pool (per-function passes,
+// the ownership verifier) and the JIT's code generation.
+// ⛔ Not every hardware thread, MLIR's default: past four the measured wall
+// time stopped falling (5.92 s at four, 5.75 s at fourteen, for the largest
+// program in the tree) while the CPU spent waking threads kept rising (9.4 s
+// against 10.3 s; a small program paid 0.84 s against 1.37 s for the same
+// wall time) -- which a test suite that runs one compile per core pays in
+// full. LYTHON_COMPILE_THREADS=N sets it (1: everything on the calling thread).
+unsigned compileThreadCount() {
+  static const unsigned count = [] {
+    if (const char *value = std::getenv("LYTHON_COMPILE_THREADS"))
+      if (int requested = std::atoi(value); requested > 0)
+        return static_cast<unsigned>(requested);
+    return std::min(4u, std::max(
+        1u, llvm::hardware_concurrency().compute_thread_count()));
+  }();
+  return count;
+}
+
+// ⭐ THE JIT MODULE IS COMPILED AS SEVERAL OBJECTS AT ONCE. One module is one
+// object compiled on one thread, and the program's module holds every runtime
+// body it reaches; split by size, the objects compile side by side and the
+// linker joins them as it would the one.
+// ⛔ Not llvm::SplitModule: it clones the whole module once per part and
+// writes each clone out, which cost more than the parts saved. The module is
+// written once here, and each thread reads it lazily and materializes only
+// the bodies it owns.
+// ⛔ Not more parts than compile threads: each part reads the module's
+// globals again, and a part with no thread of its own only waits for one.
+// LYTHON_JIT_PARTITIONS=N forces N parts (1: one object, as before).
+unsigned jitPartitionCount(const llvm::Module &module) {
+  if (const char *value = std::getenv("LYTHON_JIT_PARTITIONS"))
+    return std::max(1, std::atoi(value));
+  std::size_t instructions = 0;
+  for (const llvm::Function &function : module)
+    instructions += function.getInstructionCount();
+  return static_cast<unsigned>(
+      std::clamp<std::size_t>(instructions / 4096, 1, compileThreadCount()));
+}
+
+// Can every definition go in an object of its own? Not a static initializer
+// table, nor an exit handler: the IR platform runs both from the IR, and an
+// object's handler would run after the JIT's memory is gone. Nor anything a
+// linker must keep together.
+bool definitionsCanBePartitioned(const llvm::Module &module) {
+  for (const char *name : {"atexit", "__cxa_atexit", "__dso_handle"})
+    if (module.getNamedValue(name))
+      return false;
+  for (const llvm::GlobalVariable &global : module.globals())
+    if (global.hasAppendingLinkage() || global.hasComdat())
+      return false;
+  for (const llvm::Function &function : module)
+    if (function.hasComdat())
+      return false;
+  return module.alias_empty() && module.ifunc_empty();
+}
+
+// A local symbol another part refers to becomes a hidden external of the same
+// name, as ORC's own partitioner promotes them (SymbolLinkagePromoter): one
+// module's names are already unique, and an assembler-local `\01L` label
+// cannot be named from another object.
+void promoteLocalSymbols(llvm::Module &module) {
+  for (llvm::GlobalValue &value : module.global_values()) {
+    if (value.isDeclaration())
+      continue;
+    if (!value.hasName())
+      value.setName("__ly_jit_unnamed");
+    else if (value.getName().starts_with("\01L"))
+      value.setName("__ly_jit" + value.getName().substr(1));
+    if (value.hasLocalLinkage()) {
+      value.setLinkage(llvm::GlobalValue::ExternalLinkage);
+      value.setVisibility(llvm::GlobalValue::HiddenVisibility);
+      value.setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::None);
+    }
+  }
+}
+
+llvm::Expected<std::vector<std::unique_ptr<llvm::MemoryBuffer>>>
+compileInPartitions(llvm::Module &module, unsigned partitions,
+                    const llvm::orc::JITTargetMachineBuilder &machineBuilder) {
+  llvm::StringMap<unsigned> owner;
+  llvm::SmallString<0> bitcode;
+  {
+    PerfScope perf("jit-build.partition");
+    promoteLocalSymbols(module);
+    // The largest first, each to the part with the least so far.
+    llvm::SmallVector<std::pair<std::size_t, llvm::GlobalValue *>, 0> sized;
+    const llvm::DataLayout &layout = module.getDataLayout();
+    for (llvm::Function &function : module)
+      if (!function.isDeclaration())
+        sized.push_back({function.getInstructionCount() + 1, &function});
+    for (llvm::GlobalVariable &global : module.globals())
+      if (!global.isDeclaration())
+        sized.push_back(
+            {1 + layout.getTypeAllocSize(global.getValueType()) / 64, &global});
+    llvm::stable_sort(sized, [](const auto &lhs, const auto &rhs) {
+      return lhs.first > rhs.first;
+    });
+    std::vector<std::size_t> load(partitions, 0);
+    for (auto &[size, value] : sized) {
+      unsigned least = static_cast<unsigned>(
+          std::min_element(load.begin(), load.end()) - load.begin());
+      load[least] += size;
+      owner[value->getName()] = least;
+    }
+    llvm::raw_svector_ostream stream(bitcode);
+    llvm::WriteBitcodeToFile(module, stream);
+  }
+  std::vector<std::unique_ptr<llvm::MemoryBuffer>> objects(partitions);
+  std::vector<std::string> errors(partitions);
+  PerfScope perf("jit-build.codegen");
+  llvm::DefaultThreadPool pool(llvm::hardware_concurrency(partitions));
+  for (unsigned index = 0; index < partitions; ++index)
+    pool.async([&, index] {
+      llvm::LLVMContext context;
+      auto part = llvm::getLazyBitcodeModule(
+          llvm::MemoryBufferRef(bitcode, "jit"), context);
+      if (!part) {
+        errors[index] = llvm::toString(part.takeError());
+        return;
+      }
+      auto owned = [&](const llvm::GlobalValue &value) {
+        auto found = owner.find(value.getName());
+        return found != owner.end() && found->second == index;
+      };
+      for (llvm::Function &function : **part)
+        if (!function.isDeclaration() && !owned(function))
+          function.deleteBody();
+      for (llvm::GlobalVariable &global : (*part)->globals())
+        if (!global.isDeclaration() && !owned(global)) {
+          global.setInitializer(nullptr);
+          global.setLinkage(llvm::GlobalValue::ExternalLinkage);
+        }
+      if (index != 0)
+        (*part)->removeModuleInlineAsm();
+      if (llvm::Error error = (*part)->materializeAll()) {
+        errors[index] = llvm::toString(std::move(error));
+        return;
+      }
+      llvm::orc::JITTargetMachineBuilder copy = machineBuilder;
+      auto machine = copy.createTargetMachine();
+      if (!machine) {
+        errors[index] = llvm::toString(machine.takeError());
+        return;
+      }
+      llvm::SmallVector<char, 0> object;
+      {
+        llvm::raw_svector_ostream stream(object);
+        llvm::legacy::PassManager passes;
+        llvm::MCContext *mc = nullptr;
+        if ((*machine)->addPassesToEmitMC(passes, mc, stream)) {
+          errors[index] = "the target cannot emit machine code";
+          return;
+        }
+        passes.run(**part);
+      }
+      objects[index] = std::make_unique<llvm::SmallVectorMemoryBuffer>(
+          std::move(object), ("partition" + llvm::Twine(index)).str(),
+          /*RequiresNullTerminator=*/false);
+    });
+  pool.wait();
+  for (std::string &error : errors)
+    if (!error.empty())
+      return llvm::make_error<llvm::StringError>(error,
+                                                 llvm::inconvertibleErrorCode());
+  return objects;
+}
+
 FailureOr<int> runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
                       py::TensorLoweringTarget tensorTarget,
                       llvm::ArrayRef<std::string> programArgs) {
@@ -942,6 +1115,7 @@ FailureOr<int> runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
     tmBuilder.setOptions(options);
 
     auto optimizationTMBuilder = tmBuilder;
+    auto partitionTMBuilder = tmBuilder;
     auto optimizationTargetMachineOrErr =
         optimizationTMBuilder.createTargetMachine();
     if (!optimizationTargetMachineOrErr) {
@@ -1077,9 +1251,26 @@ FailureOr<int> runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
         jd.addGenerator(std::move(*dlGen));
     }
 
-    auto tsm = llvm::orc::ThreadSafeModule(std::move(llvmModule),
-                                           std::move(llvmContext));
-    {
+    unsigned partitions = jitPartitionCount(*llvmModule);
+    if (partitions > 1 && definitionsCanBePartitioned(*llvmModule)) {
+      auto objects =
+          compileInPartitions(*llvmModule, partitions, partitionTMBuilder);
+      if (!objects) {
+        llvm::errs() << "JIT compile error: "
+                     << llvm::toString(objects.takeError()) << "\n";
+        return failure();
+      }
+      llvmModule.reset();
+      llvmContext.reset();
+      PerfScope perf("jit-build.add-objects");
+      for (std::unique_ptr<llvm::MemoryBuffer> &object : *objects)
+        if (auto err = jit->addObjectFile(jd, std::move(object))) {
+          llvm::errs() << "JIT add object error: " << err << "\n";
+          return failure();
+        }
+    } else {
+      auto tsm = llvm::orc::ThreadSafeModule(std::move(llvmModule),
+                                             std::move(llvmContext));
       PerfScope perf("jit-build.add-ir-module");
       if (auto err = jit->addIRModule(std::move(tsm))) {
         llvm::errs() << "JIT add module error: " << err << "\n";
@@ -1372,7 +1563,13 @@ int main(int argc, char **argv) {
   DialectRegistry registry;
   lython::driver::registerLythonDialects(registry);
 
-  MLIRContext context;
+  // Declared before the context, which holds a reference to it.
+  std::optional<llvm::DefaultThreadPool> compilePool;
+  MLIRContext context(MLIRContext::Threading::DISABLED);
+  if (compileThreadCount() > 1) {
+    compilePool.emplace(llvm::hardware_concurrency(compileThreadCount()));
+    context.setThreadPool(*compilePool);
+  }
   context.appendDialectRegistry(registry);
 
   std::string mlirSource;

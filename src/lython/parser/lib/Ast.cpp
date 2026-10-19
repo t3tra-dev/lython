@@ -192,7 +192,27 @@ void addField(Node &node, std::string name, FieldValue value) {
   node.fieldIndicesBySlot[slot] = fieldIndex;
 }
 
+// The field of that name. Only when two fields share it -- a rewrite copied
+// one in beside another -- does the slot this kind gives the name decide,
+// and failing that the first.
+// ⛔ Not the slot asked of the CPython spec table first, which is what this
+// did for every read: it hashes the node's kind and the field's name, and
+// the reads are the emitter's commonest operation -- 9% of compiling a
+// program that imports unittest. A node holds a handful of fields, and a
+// name held once is that field whatever the table would have said.
 const Field *findField(const Node &node, std::string_view name) {
+  const Field *first = nullptr;
+  bool repeated = false;
+  for (const Field &field : node.fields)
+    if (field.name == name) {
+      if (first) {
+        repeated = true;
+        break;
+      }
+      first = &field;
+    }
+  if (!repeated)
+    return first;
   if (std::optional<std::size_t> slot = cpythonAstFieldIndex(node.kind, name)) {
     if (*slot < node.fieldIndicesBySlot.size()) {
       std::size_t fieldIndex = node.fieldIndicesBySlot[*slot];
@@ -201,11 +221,7 @@ const Field *findField(const Node &node, std::string_view name) {
         return &node.fields[fieldIndex];
     }
   }
-
-  for (const Field &field : node.fields)
-    if (field.name == name)
-      return &field;
-  return nullptr;
+  return first;
 }
 
 Field *findField(Node &node, std::string_view name) {

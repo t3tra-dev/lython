@@ -83,7 +83,20 @@ private:
   // during the module fixpoint and changes what a body walk answers.
   llvm::DenseMap<std::pair<const parser::Node *, unsigned>, FunctionSignature>
       importedSignatures;
-  void forgetImportedSignatures() { importedSignatures.clear(); }
+  // The signatures `bindSourceModuleLocals` binds an imported module's defs
+  // under. Every method body inlined from the module binds its scope again,
+  // and reading every def's signature each time was half of the emitter on a
+  // program that imports unittest. The answer is the same each time: every
+  // caller isolates the scopes and binds the module's imports first, as the
+  // memo above does, and what a reading does besides answering is recorded
+  // once either way (annotation diagnostics are deduplicated, a generic class
+  // is specialized once). Dropped with the imported ones, for the same reason.
+  llvm::DenseMap<std::pair<const parser::Node *, unsigned>, FunctionSignature>
+      sourceLocalSignatures;
+  void forgetImportedSignatures() {
+    importedSignatures.clear();
+    sourceLocalSignatures.clear();
+  }
   // The host's global functions (Window's methods), and the spellings the
   // program imported them by.
   llvm::StringSet<> jsHostGlobalFunctions;

@@ -73,6 +73,16 @@ void dumpMLIRForPass(const IRDumpConfig &config, llvm::StringRef passName,
   llvm::errs() << "\n";
 }
 
+// ⭐ A PASS THAT REWRITES INSIDE ONE FUNCTION AT A TIME IS NESTED UNDER THE
+// MODULE'S ISOLATED CHILDREN (`pm.nestAny()`), and the pass manager then runs
+// it over every function at once on the context's threads -- and verifies each
+// function after it, instead of the whole module after every pass. Nothing it
+// does depends on that: a greedy rewrite and a conversion read and write one
+// function, a function is isolated from above, and a fixpoint reached by a
+// function alone is the one it reaches among the rest.
+// ⛔ Not a pass that declares a symbol in the module (a function a lowering
+// calls, a string it prints): that writes the module every other thread is
+// reading, so those stay `pm.addPass` and run over the module on one.
 template <typename Populate>
 LogicalResult runLoweringPhase(llvm::StringRef name, ModuleOp module,
                                bool enableVerifier, Populate populate) {
@@ -92,6 +102,12 @@ LogicalResult runLoweringPhase(llvm::StringRef name, ModuleOp module,
   PassManager pm(module.getContext());
   pm.enableVerifier(enableVerifier);
   populate(pm);
+  // LYTHON_PASS_TIMING=1: each pass of each phase, which LYTHON_PERF's one
+  // line per phase cannot split.
+  if (llvm::sys::Process::GetEnv("LYTHON_PASS_TIMING")) {
+    llvm::errs() << "=== [pass timing] lowering." << name << " ===\n";
+    pm.enableTiming();
+  }
   if (failed(pm.run(module))) {
     if (llvm::sys::Process::GetEnv("LYTHON_DUMP_ON_FAILURE")) {
       llvm::errs() << "\n=== [FAILED PHASE " << name << "] ===\n";
@@ -704,8 +720,9 @@ LogicalResult runLoweringPipeline(ModuleOp module,
 
   // Phase 11: fold what the lowering left foldable before symbol cleanup.
   if (failed(runPhase("post-lowering-canonicalize", [&](PassManager &pm) {
-        pm.addPass(createEHSafeCanonicalizerPass());
-        pm.addPass(mlir::createCSEPass());
+        OpPassManager &eachFunction = pm.nestAny();
+        eachFunction.addPass(createEHSafeCanonicalizerPass());
+        eachFunction.addPass(mlir::createCSEPass());
       })))
     return failure();
   dumpMLIRForPass(irDump, "post-lowering-canonicalize", module);
@@ -716,8 +733,9 @@ LogicalResult runLoweringPipeline(ModuleOp module,
   // DCE runs AFTER the ownership verifiers (phase 13): manifest contract
   // witnesses (e.g. ly.runtime.shape declarations) must outlive verification.
   if (failed(runPhase("post-lowering-cleanup", [&](PassManager &pm) {
-        pm.addPass(createEHSafeCanonicalizerPass());
-        pm.addPass(mlir::createCSEPass());
+        OpPassManager &eachFunction = pm.nestAny();
+        eachFunction.addPass(createEHSafeCanonicalizerPass());
+        eachFunction.addPass(mlir::createCSEPass());
       })))
     return failure();
   {
@@ -781,29 +799,34 @@ LogicalResult runLoweringPipeline(ModuleOp module,
           vectorOptions.x86 = tensorTarget.usesX86();
           mlir::VectorTransferToSCFOptions transferOptions;
           transferOptions.setTargetRank(1);
-          pm.addPass(mlir::createLowerAffinePass());
-          pm.addPass(mlir::memref::createExpandStridedMetadataPass());
-          pm.addPass(mlir::createLowerAffinePass());
+          OpPassManager &stridedForms = pm.nestAny();
+          stridedForms.addPass(mlir::createLowerAffinePass());
+          stridedForms.addPass(mlir::memref::createExpandStridedMetadataPass());
+          stridedForms.addPass(mlir::createLowerAffinePass());
           if (tensorTarget.usesArmSME())
             lowering::arch::arm::addSMEPreControlFlowLLVMPrepPipeline(pm);
           pm.addNestedPass<mlir::func::FuncOp>(
               mlir::vector::createLowerVectorMultiReductionPass(
                   mlir::vector::VectorMultiReductionLowering::InnerReduction));
-          pm.addPass(mlir::createConvertVectorToSCFPass(transferOptions));
-          pm.addPass(mlir::createLowerAffinePass());
-          pm.addPass(createEHSafeCanonicalizerPass());
+          OpPassManager &vectorLoops = pm.nestAny();
+          vectorLoops.addPass(mlir::createConvertVectorToSCFPass(transferOptions));
+          vectorLoops.addPass(mlir::createLowerAffinePass());
+          vectorLoops.addPass(createEHSafeCanonicalizerPass());
+          // ⛔ Module-wide: `vector.print` declares printf in the module.
           pm.addPass(mlir::createConvertVectorToLLVMPass(vectorOptions));
-          pm.addPass(mlir::createSCFToControlFlowPass());
+          pm.nestAny().addPass(mlir::createSCFToControlFlowPass());
           if (tensorTarget.usesArmSME())
             lowering::arch::arm::addSMEPostControlFlowLLVMPrepPipeline(pm);
-          pm.addPass(mlir::createArithToLLVMConversionPass());
-          pm.addPass(mlir::createUBToLLVMConversionPass());
+          OpPassManager &scalars = pm.nestAny();
+          scalars.addPass(mlir::createArithToLLVMConversionPass());
+          scalars.addPass(mlir::createUBToLLVMConversionPass());
+          // ⛔ Module-wide: `cf.assert` declares abort and its message.
           pm.addPass(mlir::createConvertControlFlowToLLVMPass());
           pm.addPass(std::make_unique<SymbolTableConvertToLLVM>());
           pm.addPass(mlir::createReconcileUnrealizedCastsPass());
           pm.addNestedPass<mlir::func::FuncOp>(
               mlir::createReconcileUnrealizedCastsPass());
-          pm.addPass(createEHSafeCanonicalizerPass());
+          pm.nestAny().addPass(createEHSafeCanonicalizerPass());
         })))
       return failure();
     if (options.enableVerifiers) {
