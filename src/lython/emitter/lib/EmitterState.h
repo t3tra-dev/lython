@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace lython::emitter {
@@ -150,6 +151,20 @@ struct CallOperands {
   llvm::SmallVector<Value, 4> keywordNames;
   llvm::SmallVector<Value, 4> keywordValues;
   llvm::SmallVector<CallKeywordType, 4> keywordTypes;
+  // A starred sequence whose length only the run time knows (`f(*xs)`, xs a
+  // list or a `tuple[T, ...]`) -- its index in `positional`, always the last
+  // -- and a `**mapping` whose keys only the run time knows -- its index in
+  // the keyword vectors, named "". Either leaves `valid` false: only a
+  // consumer that knows its callee's parameters can take them
+  // (ModuleEmitter::normalizeDynamicUnpacks), and every other one refuses
+  // with `failureReason` as before.
+  std::optional<unsigned> dynamicTail;
+  std::optional<unsigned> dynamicMapping;
+  // Invalid for a reason of its own, which normalizing cannot repair.
+  bool invalidBeyondDynamic = false;
+  // After normalizing: the last positional operand IS the callee's *args
+  // tuple, which the pack says with `ly.variadic_tail`.
+  bool variadicTail = false;
 };
 
 class ScopedEmitterScope {

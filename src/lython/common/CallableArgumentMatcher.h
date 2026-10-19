@@ -99,6 +99,7 @@ struct NoopMatchObserver {
   void onKeywordVariadicParameter() {}
   void onKeywordVariadic(llvm::StringRef) {}
   void onUnpackedKeywordVariadic() {}
+  void onUnpackedPositionalVariadic() {}
   void onDefaultedPositional(std::size_t) { onDefaultedParameter(); }
   void onDefaultedKeywordOnly(std::size_t) { onDefaultedParameter(); }
   void onDefaultedParameter() {}
@@ -115,6 +116,7 @@ struct InvocationSpecificityScore : NoopMatchObserver {
   void onKeywordVariadicParameter() { score -= 2; }
   void onKeywordVariadic(llvm::StringRef) { score -= 5; }
   void onUnpackedKeywordVariadic() { score -= 8; }
+  void onUnpackedPositionalVariadic() { score -= 8; }
   void onDefaultedParameter() { score -= 3; }
   void onDefaultedPositional(std::size_t) { onDefaultedParameter(); }
   void onDefaultedKeywordOnly(std::size_t) { onDefaultedParameter(); }
@@ -277,7 +279,8 @@ bool matchInvocationWithObserver(
     VarargShapeFn varargShape, KwargValue kwargValue,
     UnpackedKeywordValue unpackedKeywordValue, KeywordName keywordName,
     KeywordValue keywordValue, MatchObserver &observer,
-    bool requireSatisfiedDefaults = true) {
+    bool requireSatisfiedDefaults = true,
+    std::optional<T> variadicTail = std::nullopt) {
   if (!signature.valid())
     return false;
 
@@ -325,6 +328,25 @@ bool matchInvocationWithObserver(
     return false;
   }
 
+  // ⭐ A STARRED SEQUENCE OF UNKNOWN LENGTH, after the explicit positionals:
+  // `f(*xs)` where xs is a `tuple[T, ...]` or a list. Only the vararg can take
+  // it, since how many members it has is a run-time fact.
+  //
+  // ⛔ AND ONLY WHEN EVERY POSITIONAL PARAMETER IS ALREADY FILLED -- defaulted
+  // ones included. Python hands the sequence's first members to the
+  // parameters that remain, so `def f(a=0, *rest)` called as `f(*xs)` binds
+  // `a` from `xs`; sending all of xs to `rest` would answer with the default.
+  if (variadicTail) {
+    if (positionalArgs.size() < signature.positional.size() ||
+        !signature.vararg)
+      return false;
+    VarargShape<T> shape = varargShape(*signature.vararg);
+    if (shape.kind != VarargShape<T>::Kind::Repeated ||
+        !matchExpected(*shape.repeated, *variadicTail))
+      return false;
+    observer.onUnpackedPositionalVariadic();
+  }
+
   llvm::StringSet<> seenKeywords;
   llvm::StringMap<unsigned> positionalNameToIndex;
   for (auto [index, name] : llvm::enumerate(signature.positionalNames)) {
@@ -342,6 +364,7 @@ bool matchInvocationWithObserver(
   if (signature.kwarg)
     observer.onKeywordVariadicParameter();
 
+  bool sawUnpackedKeywords = false;
   for (const Keyword &keyword : keywords) {
     llvm::StringRef name = keywordName(keyword);
     auto actual = keywordValue(keyword);
@@ -353,6 +376,7 @@ bool matchInvocationWithObserver(
       if (!expected || !unpacked || !matchExpected(*expected, *unpacked))
         return false;
       observer.onUnpackedKeywordVariadic();
+      sawUnpackedKeywords = true;
       continue;
     }
     if (!seenKeywords.insert(name).second)
@@ -388,6 +412,23 @@ bool matchInvocationWithObserver(
     if (!value || !matchExpected(*value, actual))
       return false;
     observer.onKeywordVariadic(name);
+  }
+
+  // ⛔ A MAPPING OF UNKNOWN KEYS SHARES NO PARAMETER. Its keys bind named
+  // parameters before anything reaches **kwargs, so one the call leaves to its
+  // default could be filled by it at run time -- the default would then be a
+  // wrong value, not a refusal. Every parameter a keyword can name has to be
+  // given explicitly (positional-only ones cannot be named, so a key of their
+  // spelling goes to **kwargs, as in CPython).
+  if (sawUnpackedKeywords) {
+    for (std::size_t index = signature.positionalOnlyCount;
+         index < signature.positional.size(); ++index)
+      if (!positionalProvided[index] &&
+          !nameAt(signature.positionalNames, index).empty())
+        return false;
+    for (std::size_t index = 0; index < signature.kwonly.size(); ++index)
+      if (!kwonlyProvided[index])
+        return false;
   }
 
   if (!requireSatisfiedDefaults)

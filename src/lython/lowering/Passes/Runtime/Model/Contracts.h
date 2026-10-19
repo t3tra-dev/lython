@@ -53,6 +53,10 @@ inline constexpr llvm::StringLiteral kCallableKwargValueTypeAttr{
     "callable_kwarg_value_type"};
 inline constexpr llvm::StringLiteral kPackUnpackedOperandsAttr{
     "ly.unpack_operands"};
+// The emitter's mark on a call's positional pack: its last operand is the
+// callee's whole *args, a tuple collected from a starred argument whose length
+// only the run time knows.
+inline constexpr llvm::StringLiteral kPackVariadicTailAttr{"ly.variadic_tail"};
 
 std::string runtimeKey(llvm::StringRef contract, llvm::StringRef role,
                        llvm::StringRef name);

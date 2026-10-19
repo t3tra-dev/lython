@@ -247,11 +247,30 @@ mlir::LogicalResult RuntimeBundleLowerer::collectFunctionCallSources(
   positionalTypes.reserve(posargs->aggregateOperands.size());
   actualSources.reserve(posargs->aggregateOperands.size());
   actualSourceValues.reserve(posargs->aggregateOperands.size());
+  auto posargsPack = op.getPosargs().getDefiningOp<py::PackOp>();
+  bool variadicTail = posargsPack && posargsPack->hasAttr(kPackVariadicTailAttr);
+  std::optional<unsigned> tailActual;
   for (auto [index, operand] : llvm::enumerate(posargs->aggregateOperands)) {
     const RuntimeBundle *source = RuntimeBundleLowerer::bundleFor(operand);
     if (!source)
       return op.emitError()
              << "positional arg operand has no lowered runtime bundle";
+    // ⭐ THE CALLEE'S WHOLE *args, as the emitter collected it: a tuple whose
+    // length only the run time knows is passed as it is, never spread.
+    if (variadicTail && index + 1 == posargs->aggregateOperands.size()) {
+      lython::callable::VarargShape<mlir::Type> shape =
+          py::callableVarargShape(operand.getType());
+      if (!shape.valid() ||
+          shape.kind !=
+              lython::callable::VarargShape<mlir::Type>::Kind::Repeated)
+        return op.emitError() << "collected *args for function target "
+                              << targetName << " must be a tuple[T]";
+      tailActual = static_cast<unsigned>(actualSources.size());
+      positionalTypes.push_back(py::variadicTailType(*shape.repeated));
+      actualSources.push_back(source);
+      actualSourceValues.push_back(operand);
+      continue;
+    }
     if (aggregateOperandIsUnpacked(*posargs, static_cast<unsigned>(index))) {
       mlir::FailureOr<llvm::SmallVector<RuntimeValue, 4>> elements =
           RuntimeBundleLowerer::starredSequenceElements(
@@ -335,7 +354,14 @@ mlir::LogicalResult RuntimeBundleLowerer::collectFunctionCallSources(
     sources.push_back(source);
   }
 
-  if (callable.hasVararg()) {
+  if (callable.hasVararg() && tailActual) {
+    if (plan->varargActuals.size() != 1 ||
+        plan->varargActuals.front() != *tailActual)
+      return op.emitError() << "collected *args for function target "
+                            << targetName
+                            << " must be the only value *args receives";
+    sources.push_back(actualSources[*tailActual]);
+  } else if (callable.hasVararg()) {
     mlir::Type varargValueType =
         RuntimeBundleLowerer::callableVarargValueType(target, callable);
     if (!varargValueType)
@@ -365,7 +391,24 @@ mlir::LogicalResult RuntimeBundleLowerer::collectFunctionCallSources(
     materializedDefaults.push_back(std::move(bundle));
     sources.push_back(&materializedDefaults.back());
   }
-  if (callable.hasKwarg()) {
+  // ⭐ AND ITS WHOLE **kwargs: a fresh dict the emitter collected from a
+  // mapping whose keys only the run time knows, under the name "".
+  std::optional<unsigned> collectedKwargs;
+  for (unsigned actualIndex : plan->kwargActuals) {
+    auto keyword =
+        llvm::find_if(keywords, [&](const PlannedKeywordArgument &candidate) {
+          return candidate.actualIndex == actualIndex;
+        });
+    if (keyword != keywords.end() && keyword->name.empty())
+      collectedKwargs = actualIndex;
+  }
+  if (callable.hasKwarg() && collectedKwargs) {
+    if (plan->kwargActuals.size() != 1)
+      return op.emitError() << "collected **kwargs for function target "
+                            << targetName
+                            << " must be the only value **kwargs receives";
+    sources.push_back(actualSources[*collectedKwargs]);
+  } else if (callable.hasKwarg()) {
     mlir::Type kwargValueType =
         RuntimeBundleLowerer::callableKwargValueType(target, callable);
     if (!kwargValueType)
@@ -424,7 +467,23 @@ RuntimeBundleLowerer::collectStaticCallableInvocation(py::CallOp op) const {
                                  kwValues.getValues().size());
   invocation.actualValues.reserve(posargs.getValues().size() +
                                   kwValues.getValues().size());
+  bool variadicTail = posargs->hasAttr(kPackVariadicTailAttr);
   for (auto [index, value] : llvm::enumerate(posargs.getValues())) {
+    if (variadicTail && index + 1 == posargs.getValues().size()) {
+      lython::callable::VarargShape<mlir::Type> shape =
+          py::callableVarargShape(value.getType());
+      if (!shape.valid() ||
+          shape.kind !=
+              lython::callable::VarargShape<mlir::Type>::Kind::Repeated)
+        return std::nullopt;
+      invocation.variadicTailActual =
+          static_cast<unsigned>(invocation.actualTypes.size());
+      invocation.positionalTypes.push_back(
+          py::variadicTailType(*shape.repeated));
+      invocation.actualTypes.push_back(value.getType());
+      invocation.actualValues.push_back(value);
+      continue;
+    }
     if (callable_evidence::packOperandIsUnpacked(posargs, static_cast<unsigned>(index))) {
       std::size_t before = invocation.actualTypes.size();
       appendStaticUnpackedPositionalTypes(
@@ -480,6 +539,11 @@ RuntimeBundleLowerer::collectCallableAggregateEvidence(
       RuntimeBundleLowerer::collectCallableArgumentPlan(op, callable,
                                                         /*emitErrors=*/false);
   if (!plan)
+    return std::nullopt;
+
+  // ⛔ A COLLECTED *args HAS NO MEMBERS TO DESCRIBE: how many there are is a
+  // run-time fact, so this call offers the callee no per-member evidence.
+  if (invocation->variadicTailActual)
     return std::nullopt;
 
   CallableAggregateEvidenceCall evidence;

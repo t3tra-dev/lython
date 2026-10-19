@@ -940,6 +940,48 @@ private:
   Value emitCallableDispatch(const parser::Node &anchor, Value callee,
                              const CallOperands &operands,
                              mlir::Type resultOverride = {});
+  // A call that hands over a starred sequence whose length only the run time
+  // knows, or a `**mapping` whose keys only the run time knows (EmitterCalls.cpp,
+  // emitDynamicUnpack). The callee's parameters, and the two spellings of its
+  // name CPython's messages use.
+  struct DynamicUnpackTarget {
+    // The parameters a positional argument can fill, the receiver excluded.
+    llvm::SmallVector<std::string, 8> positionalNames;
+    unsigned positionalOnlyCount = 0;
+    llvm::SmallVector<std::string, 4> kwOnlyNames;
+    // `tuple[U]` and `dict[str, U]`, or null when there is none.
+    mlir::Type varargType;
+    mlir::Type kwargType;
+    std::string module;
+    std::string qualname;
+  };
+  struct DynamicUnpackCall {
+    // How many positional values the call gives before the starred one, and
+    // those of them beyond the parameters (what *args receives first).
+    unsigned explicitPositional = 0;
+    llvm::SmallVector<Value, 4> extras;
+    std::optional<Value> tail;
+    // In call order; the mapping is the one with the empty name.
+    llvm::SmallVector<std::pair<std::string, Value>, 4> keywords;
+  };
+  struct DynamicUnpackResult {
+    std::optional<Value> vararg;
+    std::optional<Value> kwargs;
+    // The keywords that bind named parameters, in call order.
+    llvm::SmallVector<std::pair<std::string, Value>, 4> named;
+  };
+  std::optional<DynamicUnpackResult>
+  emitDynamicUnpack(const parser::Node &anchor,
+                    const DynamicUnpackTarget &target,
+                    const DynamicUnpackCall &call);
+  // `operands` rewritten for a callee the emitter knows the parameters of: its
+  // *args is one tuple and its **kwargs one fresh dict.
+  bool normalizeDynamicUnpacks(const parser::Node &anchor,
+                               const DynamicUnpackTarget &target,
+                               CallOperands &operands);
+  std::optional<DynamicUnpackTarget> dynamicUnpackTargetFor(
+      const parser::Node &anchor, Value callee);
+  DynamicUnpackTarget dynamicUnpackTargetForMethod(const MethodBinding &method);
   // A manifest export is C behind its declared parameter, so an argument on a
   // lower numeric rung converts there (EmitterCalls.cpp). Null when nothing
   // needs widening; the returned node owns the rewritten arguments.
@@ -1314,7 +1356,9 @@ private:
                              bool bindDescriptorReceiver,
                              const MethodBinding &method,
                              llvm::ArrayRef<Value> positional,
-                             const KeywordArguments &keywords);
+                             const KeywordArguments &keywords,
+                             std::optional<Value> collectedVararg = std::nullopt,
+                             std::optional<Value> collectedKwargs = std::nullopt);
   Value emitClassInstantiation(const parser::Node &expr, llvm::StringRef name,
                                mlir::Type instanceType);
   // `super().m(...)` / `super(C, obj).m(...)`: compile-time expansion to the

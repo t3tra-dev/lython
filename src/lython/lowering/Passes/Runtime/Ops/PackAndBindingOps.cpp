@@ -1121,6 +1121,16 @@ mlir::LogicalResult RuntimeBundleLowerer::collectPackedObjectSources(
   const RuntimeBundle *pack = RuntimeBundleLowerer::bundleFor(packValue);
   if (!pack || pack->kind != RuntimeBundle::Kind::Aggregate)
     return op->emitError() << label << " must be a lowered aggregate bundle";
+  // ⛔ A COLLECTED *args IS FOR A FUNCTION'S PARAMETER LIST ONLY
+  // (collectFunctionCallSources). Read as an ordinary operand list it would be
+  // one argument holding the tuple -- `print(*xs)` printing the tuple -- so a
+  // consumer that gets here refuses rather than answering.
+  if (auto definingPack = packValue.getDefiningOp<py::PackOp>();
+      definingPack && definingPack->hasAttr(kPackVariadicTailAttr))
+    return op->emitError() << label
+                           << " collects a starred argument of unknown length "
+                              "into *args, which only a function this program "
+                              "defines takes";
   if (unpackedSources) {
     std::size_t reserve = unpackedSources->size();
     for (auto [index, operand] : llvm::enumerate(pack->aggregateOperands)) {

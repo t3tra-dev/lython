@@ -1,0 +1,13 @@
+6 9 6 0
+b=2,a=1 z=0,b=2,a=1 b=2,a=1,z=9
+6|b=2,a=1 0|
+2 1(2, 3) 1()
+['X', 'Y']
+2 {'k': 3}
+6 6 7
+s:b=2,a=1 t:w=0,b=2,a=1
+('a', 'b') {'k': 1}
+TypeError: __main__.show() got multiple values for keyword argument 'b'
+TypeError: named() got multiple values for argument 'a'
+TypeError: __main__.Fwd.show() got multiple values for keyword argument 'b'
+TypeError: __main__.show() got multiple values for keyword argument 'b'

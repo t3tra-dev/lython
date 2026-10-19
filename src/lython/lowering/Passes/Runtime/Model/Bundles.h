@@ -407,6 +407,9 @@ struct StaticCallableInvocation {
   llvm::SmallVector<mlir::Type, 8> actualTypes;
   llvm::SmallVector<mlir::Value, 8> actualValues;
   llvm::SmallVector<PlannedKeywordArgument, 8> keywords;
+  // The actual that IS the callee's *args -- a tuple the emitter collected
+  // from a starred argument of unknown length (`ly.variadic_tail`).
+  std::optional<unsigned> variadicTailActual;
 };
 
 struct CallableAggregateEvidenceCall {

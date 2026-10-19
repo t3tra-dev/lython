@@ -9,6 +9,7 @@
 #include "Contracts.h"
 #include "C3Linearization.h"
 #include "ExceptionTaxonomy.h"
+#include "PyCallableShape.h"
 #include "PyProtocols.h"
 #include "TypeSystemSolver.h"
 
@@ -4898,6 +4899,35 @@ Value ModuleEmitter::adoptDeclaredContainer(Value value, mlir::Type declared,
   return coerceValue(value, declared, anchor);
 }
 
+// The parameters an inlined method's call fills, its receiver's slot excluded,
+// for a call that collects a starred argument or a `**` mapping of unknown size.
+ModuleEmitter::DynamicUnpackTarget
+ModuleEmitter::dynamicUnpackTargetForMethod(const MethodBinding &method) {
+  const FunctionSignature &signature =
+      method.bodySignature.callable ? method.bodySignature : method.signature;
+  DynamicUnpackTarget target;
+  std::size_t firstSlot = methodBindingBindsReceiver(method) ? 1 : 0;
+  for (std::size_t slot = firstSlot; slot < signature.positionalNames.size();
+       ++slot)
+    target.positionalNames.push_back(signature.positionalNames[slot]);
+  target.positionalOnlyCount =
+      signature.positionalOnlyCount > firstSlot
+          ? signature.positionalOnlyCount - static_cast<unsigned>(firstSlot)
+          : 0;
+  target.kwOnlyNames.assign(signature.kwOnlyNames.begin(),
+                            signature.kwOnlyNames.end());
+  if (signature.varargName)
+    target.varargType = signature.varargType;
+  if (signature.kwargName)
+    target.kwargType = signature.kwargType;
+  if (auto definition = pythonDefinitionNames.find(method.method);
+      definition != pythonDefinitionNames.end()) {
+    target.module = definition->second.module;
+    target.qualname = definition->second.qualname;
+  }
+  return target;
+}
+
 Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
                                           Value receiver,
                                           const MethodBinding &method) {
@@ -4947,14 +4977,25 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
   };
 
   llvm::SmallVector<Value, 8> positional;
+  // A starred sequence, and a `**` mapping, whose size only the run time
+  // knows: collected into the method's *args and **kwargs below
+  // (emitDynamicUnpack), as a call of a function collects them.
+  std::optional<Value> dynamicTail;
+  bool dynamicMapping = false;
   if (const auto *args = ast::nodeList(expr, "args")) {
     for (const parser::NodePtr &arg : *args) {
+      if (dynamicTail) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, arg->range.start,
+            "a starred argument whose length is known only at run time must "
+            "be the last positional argument"});
+        continue;
+      }
       if (arg && arg->kind == "Starred") {
         // ⭐ A STARRED ARGUMENT WHOSE VALUES ARE KNOWN IS THOSE VALUES: an
         // inlined method's own `*args` (the values its call gave), or a tuple
-        // whose type says how many it holds, read by position. Anything else
-        // has an arity only the run time knows, and an inlined body binds
-        // its parameters here.
+        // whose type says how many it holds, read by position. One whose
+        // arity only the run time knows is the method's *args.
         Value starred = emitExpr(ast::node(*arg, "value"));
         if (auto pack = staticPositionalPacks.find(starred.value);
             pack != staticPositionalPacks.end()) {
@@ -4986,11 +5027,18 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
           }
           continue;
         }
+        if (auto sequence = mlir::dyn_cast_if_present<py::ContractType>(
+                types.widenLiteral(starred.type));
+            sequence && sequence.getArguments().size() == 1 &&
+            (sequence.getContractName() == "builtins.tuple" ||
+             sequence.getContractName() == "builtins.list")) {
+          dynamicTail = starred;
+          continue;
+        }
         diagnostics.push_back(parser::Diagnostic{
             parser::Severity::Error, arg->range.start,
             "starred arguments are not supported for inlined class methods "
-            "unless their length is known here (a tuple of two or more, or "
-            "the method's own *args)"});
+            "unless they are a tuple or a list"});
         continue;
       }
       mlir::Type expected = declaredPositional(positional.size());
@@ -5023,10 +5071,21 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
           keywords[packedName] = packedValue;
         continue;
       }
+      if (py::callableUnpackedKeywordValueType(
+              types.widenLiteral(mapping.type)) &&
+          !dynamicMapping) {
+        // Under the name "", in its place among the keywords.
+        keywords[""] = mapping;
+        dynamicMapping = true;
+        continue;
+      }
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, keyword->range.start,
-          "variadic keyword arguments are not supported for inlined class "
-          "methods unless they are the calling method's own **kwargs"});
+          dynamicMapping
+              ? "a call takes one `**` mapping whose keys are known only at "
+                "run time here; merge the mappings into one first"
+              : "variadic keyword arguments are not supported for inlined "
+                "class methods unless they are a dict with str keys"});
     }
   }
 
@@ -5034,8 +5093,36 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
   bool bindReceiver = methodBindingBindsReceiver(method);
   if (method.kind == "instance" && mlir::isa<py::TypeType>(receiver.type))
     bindReceiver = false;
+  std::optional<Value> collectedVararg;
+  std::optional<Value> collectedKwargs;
+  if (dynamicTail || dynamicMapping) {
+    DynamicUnpackTarget target = dynamicUnpackTargetForMethod(method);
+    DynamicUnpackCall call;
+    call.explicitPositional = static_cast<unsigned>(positional.size());
+    if (dynamicTail) {
+      for (std::size_t index = target.positionalNames.size();
+           index < positional.size(); ++index)
+        call.extras.push_back(positional[index]);
+      call.tail = *dynamicTail;
+    }
+    for (const auto &entry : keywords)
+      call.keywords.push_back({entry.name, entry.value});
+    std::optional<DynamicUnpackResult> collected =
+        emitDynamicUnpack(expr, target, call);
+    if (!collected)
+      return emitNone(expr);
+    if (dynamicTail && positional.size() > target.positionalNames.size())
+      positional.resize(target.positionalNames.size());
+    KeywordArguments named;
+    for (const auto &[name, value] : collected->named)
+      named[name] = value;
+    keywords = std::move(named);
+    collectedVararg = collected->vararg;
+    collectedKwargs = collected->kwargs;
+  }
   return emitInlineMethodBody(expr, descriptorReceiver, bindReceiver, method,
-                              positional, keywords);
+                              positional, keywords, collectedVararg,
+                              collectedKwargs);
 }
 
 // ⛔ THE MESSAGE NAMES THE DUNDER'S OWN OPERAND ORDER. CPython builds it from
@@ -5284,7 +5371,8 @@ bool ModuleEmitter::forwardsItsPacks(const parser::Node &def) {
 Value ModuleEmitter::emitInlineMethodBody(
     const parser::Node &anchor, Value receiver, bool bindDescriptorReceiver,
     const MethodBinding &method, llvm::ArrayRef<Value> positional,
-    const KeywordArguments &keywords) {
+    const KeywordArguments &keywords, std::optional<Value> collectedVararg,
+    std::optional<Value> collectedKwargs) {
   if (!method.method)
     return emitNone(anchor);
   const std::string callerSourceName = sourceName;
@@ -5337,6 +5425,17 @@ Value ModuleEmitter::emitInlineMethodBody(
             std::string(ast::string(*method.method, "name").value_or("")) +
             "' calls itself: its body is specialized at each call site, and a "
             "call cycle has no base case to stop the expansion"});
+    return emitNone(anchor);
+  }
+  if (llvm::is_contained(methodsBeingInlined, method.method) &&
+      (collectedVararg || collectedKwargs)) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, anchor.range.start,
+        "the method '" +
+            std::string(ast::string(*method.method, "name").value_or("")) +
+            "' calls itself with a starred argument or a `**` mapping whose "
+            "size is known only at run time, which its recursive call does "
+            "not pass"});
     return emitNone(anchor);
   }
   if (llvm::is_contained(methodsBeingInlined, method.method)) {
@@ -5441,10 +5540,18 @@ Value ModuleEmitter::emitInlineMethodBody(
     llvm::SmallVector<mlir::Type, 8> argumentTypes{receiver.type};
     for (const Value &argument : positional)
       argumentTypes.push_back(argument.type);
+    if (collectedVararg) {
+      lython::callable::VarargShape<mlir::Type> shape =
+          py::callableVarargShape(collectedVararg->type);
+      if (shape.valid() && shape.repeated)
+        argumentTypes.push_back(py::variadicTailType(*shape.repeated));
+    }
     llvm::SmallVector<CallKeywordType, 4> keywordTypes;
     for (const auto &entry : keywords)
       keywordTypes.push_back(
           CallKeywordType{entry.getKey().str(), entry.getValue().type});
+    if (collectedKwargs)
+      keywordTypes.push_back(CallKeywordType{"", collectedKwargs->type});
     CallInferenceResult solved =
         declared ? types.inferCallWithEvidence(declared, argumentTypes,
                                                keywordTypes)
@@ -5839,7 +5946,11 @@ Value ModuleEmitter::emitInlineMethodBody(
                                anchor);
     bind(sig.positionalNames[parameterIndex++], argument);
   }
-  if (sig.varargName) {
+  if (sig.varargName && collectedVararg) {
+    // The tuple the call collected from a starred argument of unknown length
+    // (emitDynamicUnpack): the whole of *args, with no static pack to forward.
+    bind(*sig.varargName, *collectedVararg);
+  } else if (sig.varargName) {
     // ⛔ An EMPTY pack has no element type to infer, so `emitPack({})` gives
     // `tuple[object]` and the body's `for n in rest` then reports "list
     // iteration evidence match/value count mismatch". An empty tuple LITERAL
@@ -5932,7 +6043,11 @@ Value ModuleEmitter::emitInlineMethodBody(
   };
   for (const auto &entry : keywords)
     bindKeyword(entry.getKey(), entry.getValue());
-  if (sig.kwargName) {
+  if (sig.kwargName && collectedKwargs) {
+    // The fresh dict the call collected from a mapping of unknown keys
+    // (emitDynamicUnpack); every other keyword bound a named parameter.
+    bind(*sig.kwargName, *collectedKwargs);
+  } else if (sig.kwargName) {
     // The dict the callee would have received: string keys, and values named
     // through `LyValueRef` because they are already emitted. An EMPTY one takes
     // the declared type from the expectation, the same way the empty vararg
@@ -6296,10 +6411,82 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
     }
   CallOperands operands = emitCallOperands(expr, {}, /*includeAstArguments=*/true,
                                            initExpectation);
+  // ⭐ A STARRED ARGUMENT OR A `**` MAPPING OF UNKNOWN SIZE reaches a program
+  // class's `__init__` the way it reaches a method's: collected into its *args
+  // and **kwargs (emitDynamicUnpack), which the inlined body binds.
+  std::optional<Value> collectedVararg;
+  std::optional<Value> collectedKwargs;
+  llvm::SmallVector<mlir::Type, 8> solvePositional;
+  llvm::SmallVector<CallKeywordType, 4> solveKeywords;
+  if (!operands.valid && !operands.invalidBeyondDynamic &&
+      (operands.dynamicTail || operands.dynamicMapping)) {
+    std::optional<MethodBinding> declaredInit =
+        lookupClassMethod(instanceType, "__init__");
+    unsigned plain = operands.dynamicTail
+                         ? *operands.dynamicTail
+                         : static_cast<unsigned>(operands.positional.size());
+    bool staticStar = false;
+    for (unsigned index = 0; index < plain; ++index)
+      staticStar = staticStar || operands.positionalUnpacked[index] != 0;
+    if (declaredInit && declaredInit->method && !staticStar) {
+      DynamicUnpackTarget target = dynamicUnpackTargetForMethod(*declaredInit);
+      DynamicUnpackCall call;
+      call.explicitPositional = plain;
+      for (unsigned index = static_cast<unsigned>(
+               target.positionalNames.size());
+           index < plain; ++index)
+        call.extras.push_back(operands.positional[index]);
+      if (operands.dynamicTail)
+        call.tail = operands.positional[*operands.dynamicTail];
+      for (auto [index, value] : llvm::enumerate(operands.keywordValues))
+        call.keywords.push_back({operands.keywordTypes[index].name, value});
+      std::optional<DynamicUnpackResult> collected =
+          emitDynamicUnpack(expr, target, call);
+      if (!collected)
+        return emitNone(expr);
+      unsigned kept = std::min<unsigned>(
+          plain, static_cast<unsigned>(target.positionalNames.size()));
+      CallOperands rebuilt;
+      for (unsigned index = 0; index < kept; ++index) {
+        rebuilt.positional.push_back(operands.positional[index]);
+        rebuilt.positionalUnpacked.push_back(0);
+        rebuilt.positionalTypes.push_back(operands.positional[index].type);
+      }
+      for (const auto &[name, value] : collected->named) {
+        mlir::Type literal = types.literal("\"" + name + "\"");
+        auto stringOp = py::StrConstantOp::create(
+            builder, loc(expr), literal, builder.getStringAttr(name));
+        rebuilt.keywordNames.push_back({stringOp.getResult(), literal});
+        rebuilt.keywordValues.push_back(value);
+        rebuilt.keywordTypes.push_back(CallKeywordType{name, value.type});
+      }
+      solvePositional.assign(rebuilt.positionalTypes.begin(),
+                             rebuilt.positionalTypes.end());
+      solveKeywords.assign(rebuilt.keywordTypes.begin(),
+                           rebuilt.keywordTypes.end());
+      if (collected->vararg) {
+        lython::callable::VarargShape<mlir::Type> shape =
+            py::callableVarargShape(collected->vararg->type);
+        if (shape.valid() && shape.repeated)
+          solvePositional.push_back(py::variadicTailType(*shape.repeated));
+      }
+      if (collected->kwargs)
+        solveKeywords.push_back(CallKeywordType{"", collected->kwargs->type});
+      operands = std::move(rebuilt);
+      collectedVararg = collected->vararg;
+      collectedKwargs = collected->kwargs;
+    }
+  }
   if (!operands.valid) {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, expr.range.start, operands.failureReason});
     return emitNone(expr);
+  }
+  if (!collectedVararg && !collectedKwargs) {
+    solvePositional.assign(operands.positionalTypes.begin(),
+                           operands.positionalTypes.end());
+    solveKeywords.assign(operands.keywordTypes.begin(),
+                         operands.keywordTypes.end());
   }
 
   KeywordArguments keywords;
@@ -6329,8 +6516,8 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
   bool hasUnpackedPositional = llvm::any_of(
       operands.positionalUnpacked, [](char value) { return value != 0; });
 
-  mlir::Type inferredInstanceType = types.inferClassInstantiation(
-      instanceType, operands.positionalTypes, operands.keywordTypes);
+  mlir::Type inferredInstanceType =
+      types.inferClassInstantiation(instanceType, solvePositional, solveKeywords);
   if (!inferredInstanceType) {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, expr.range.start,
@@ -6375,7 +6562,8 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
     Value descriptorReceiver = emitDescriptorReceiver(expr, receiver, *init);
     emitInlineMethodBody(expr, descriptorReceiver,
                          methodBindingBindsReceiver(*init), *init,
-                         operands.positional, keywords);
+                         operands.positional, keywords, collectedVararg,
+                         collectedKwargs);
   } else {
     bool noRuntimeInitArgs = operands.positional.empty() &&
                              operands.keywordValues.empty() &&

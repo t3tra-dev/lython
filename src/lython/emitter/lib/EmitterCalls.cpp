@@ -6,6 +6,7 @@
 #include "ArithBuilders.h"
 #include "ExceptionTaxonomy.h"
 #include "PlatformConstants.h"
+#include "PyCallableShape.h"
 #include "PyProtocols.h"
 #include "TypeSystemSolver.h"
 
@@ -18,6 +19,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -116,6 +118,20 @@ std::optional<llvm::StringRef> contractName(mlir::Type type) {
   if (!contract)
     return std::nullopt;
   return contract.getContractName();
+}
+
+// The member type of a starred argument whose length only the run time
+// knows: a list's, or the arity-erased tuple's (`tuple[T, ...]`, spelled
+// `tuple[T]`). Nothing for a tuple whose type counts its members -- that one
+// is spread statically -- or for another iterable.
+std::optional<mlir::Type> dynamicStarElementType(mlir::Type type) {
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+  if (!contract || contract.getArguments().size() != 1)
+    return std::nullopt;
+  llvm::StringRef name = contract.getContractName();
+  if (name != "builtins.tuple" && name != "builtins.list")
+    return std::nullopt;
+  return contract.getArguments().front();
 }
 
 } // namespace
@@ -222,14 +238,42 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
           }
           continue;
         }
+      // ⛔ Nothing positional after a starred sequence of unknown length:
+      // where its members end is a run-time fact, so a later argument has no
+      // static position.
+      if (operands.dynamicTail) {
+        operands.valid = false;
+        operands.invalidBeyondDynamic = true;
+        operands.failureReason =
+            "a starred argument whose length is known only at run time must "
+            "be the last positional argument";
+      }
       operands.positional.push_back(value);
       operands.positionalUnpacked.push_back(unpacked ? 1 : 0);
       if (unpacked) {
         if (!appendStarredArgumentTypes(types, value.type,
                                         operands.positionalTypes)) {
+          // ⭐ A SEQUENCE OF UNKNOWN LENGTH IS KEPT WHOLE, as the `*tuple[T]`
+          // the matcher reads (py::variadicTailElement): a callee whose
+          // parameters the emitter knows can take it into its *args
+          // (normalizeDynamicUnpacks).
+          std::optional<mlir::Type> element =
+              dynamicStarElementType(value.type);
+          if (element && !operands.dynamicTail) {
+            operands.dynamicTail =
+                static_cast<unsigned>(operands.positional.size() - 1);
+            operands.positionalTypes.push_back(py::variadicTailType(*element));
+            operands.failureReason =
+                "a starred argument whose length is known only at run time "
+                "can be passed here only to the *args of a function or "
+                "method this program defines";
+          } else {
+            operands.positionalTypes.push_back(value.type);
+            operands.invalidBeyondDynamic = true;
+            operands.failureReason =
+                "starred call arguments require a statically sized tuple";
+          }
           operands.valid = false;
-          operands.failureReason =
-              "starred call arguments require a statically sized tuple";
         }
       } else {
         operands.positionalTypes.push_back(value.type);
@@ -279,10 +323,34 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
         }
         continue;
       }
+      // ⭐ AND A MAPPING OF UNKNOWN KEYS, kept whole under the name "" -- the
+      // spelling the matcher reads as `**mapping` -- for a callee whose
+      // parameters the emitter knows (normalizeDynamicUnpacks).
       operands.valid = false;
+      if (py::callableUnpackedKeywordValueType(
+              types.widenLiteral(mapping.type)) &&
+          !operands.dynamicMapping) {
+        mlir::Type literal = types.literal("\"\"");
+        auto stringOp = py::StrConstantOp::create(
+            builder, loc(*keyword), literal, builder.getStringAttr(""));
+        operands.dynamicMapping =
+            static_cast<unsigned>(operands.keywordValues.size());
+        operands.keywordNames.push_back({stringOp.getResult(), literal});
+        operands.keywordValues.push_back(mapping);
+        operands.keywordTypes.push_back(CallKeywordType{"", mapping.type});
+        operands.failureReason =
+            "a `**` mapping whose keys are known only at run time can be "
+            "passed here only to the **kwargs of a function or method this "
+            "program defines";
+        continue;
+      }
+      operands.invalidBeyondDynamic = true;
       operands.failureReason =
-          "`**` call arguments require statically known keyword names; spell "
-          "the keywords out";
+          operands.dynamicMapping
+              ? "a call takes one `**` mapping whose keys are known only at "
+                "run time here; merge the mappings into one first"
+              : "`**` call arguments require statically known keyword "
+                "names; spell the keywords out";
     }
   }
 
@@ -352,10 +420,389 @@ parser::NodePtr ModuleEmitter::widenNumericArgumentsForManifestCall(
   return call;
 }
 
+// ⭐ A STARRED SEQUENCE OR A `**` MAPPING WHOSE SIZE ONLY THE RUN TIME KNOWS,
+// collected the way CPython collects them: what goes to *args is one tuple --
+// the positional values beyond the parameters, then the sequence's members --
+// and what goes to **kwargs is one FRESH dict, the keywords and the mapping's
+// items in call order, so a callee that writes to it does not write to the
+// caller's mapping. A key the call also gives as a keyword raises CPython's
+// TypeError, from the call site where CPython raises it.
+//
+// ⛔ ONLY WHEN THE SEQUENCE AND THE MAPPING CAN REACH NOTHING BUT *args AND
+// **kwargs. Python hands a sequence's first members to the positional
+// parameters the call leaves open, and binds a mapping's keys to the named
+// parameters before anything reaches **kwargs -- defaulted ones included, so
+// sending them all to *args or **kwargs would answer with the default where
+// CPython answers with the member. Those calls are refused, naming the
+// parameters to give explicitly.
+std::optional<ModuleEmitter::DynamicUnpackResult>
+ModuleEmitter::emitDynamicUnpack(const parser::Node &anchor,
+                                 const DynamicUnpackTarget &target,
+                                 const DynamicUnpackCall &call) {
+  auto refuse = [&](const std::string &message)
+      -> std::optional<DynamicUnpackResult> {
+    diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
+                                             anchor.range.start, message});
+    return std::nullopt;
+  };
+  auto quoted = [](llvm::ArrayRef<std::string> names) {
+    std::string text;
+    for (auto [index, name] : llvm::enumerate(names)) {
+      if (index != 0)
+        text += index + 1 == names.size() ? " and " : ", ";
+      text += "'" + name + "'";
+    }
+    return text;
+  };
+  std::string shown =
+      target.qualname.empty() ? std::string("the callee")
+                              : "'" + target.qualname + "'";
+  parser::SourceRange range = anchor.range;
+  llvm::SmallVector<std::string, 8> bound;
+  auto releaseNames = llvm::make_scope_exit([&] {
+    for (const std::string &name : bound)
+      values.erase(name);
+  });
+  auto bind = [&](Value value) {
+    std::string name =
+        "__lyunpack" + std::to_string(++syntheticFunctionCounter);
+    values[name] = value;
+    types.bindSymbol(name, value.type);
+    bound.push_back(name);
+    return name;
+  };
+  auto emitSynthesized = [&](parser::NodePtr statement) {
+    emitStatement(*statement);
+    synthesizedIteratorDefs.push_back(std::move(statement));
+  };
+  DynamicUnpackResult result;
+
+  if (call.tail) {
+    unsigned positionalCount =
+        static_cast<unsigned>(target.positionalNames.size());
+    if (call.explicitPositional < positionalCount) {
+      llvm::ArrayRef<std::string> open =
+          llvm::ArrayRef<std::string>(target.positionalNames)
+              .slice(call.explicitPositional);
+      return refuse(
+          "a starred argument whose length is known only at run time can fill "
+          "only *args here, and its first members would fill " +
+          quoted(open) + " of " + shown + ": give " +
+          (open.size() == 1 ? "it" : "them") + " explicitly before it");
+    }
+    if (!target.varargType)
+      return refuse(shown + " has no *args to take a starred argument whose "
+                            "length is known only at run time");
+    if (programBindsName("tuple"))
+      return refuse("a starred argument whose length is known only at run "
+                    "time is collected with tuple(), which this program "
+                    "rebinds");
+    std::vector<parser::NodePtr> extras;
+    for (Value extra : call.extras)
+      extras.push_back(synth::name(bind(extra), range));
+    parser::NodePtr collected = synth::call(
+        synth::name("tuple", range),
+        std::vector<parser::NodePtr>{synth::name(bind(*call.tail), range)},
+        range);
+    if (!extras.empty())
+      collected = synth::binOp(synth::tuple(std::move(extras), range), "Add",
+                               std::move(collected), range);
+    Value merged = emitExprExpected(collected.get(), target.varargType);
+    synthesizedIteratorDefs.push_back(std::move(collected));
+    result.vararg = coerceValue(merged, target.varargType, anchor);
+  }
+
+  auto mapping = llvm::find_if(call.keywords, [](const auto &entry) {
+    return entry.first.empty();
+  });
+  if (mapping == call.keywords.end()) {
+    result.named.assign(call.keywords.begin(), call.keywords.end());
+    return result;
+  }
+
+  // The parameters a keyword can name, and which of them the call fills by
+  // position.
+  llvm::SmallVector<std::string, 8> nameable;
+  llvm::SmallVector<std::string, 4> byPosition;
+  for (unsigned index = target.positionalOnlyCount;
+       index < target.positionalNames.size(); ++index) {
+    const std::string &name = target.positionalNames[index];
+    if (name.empty())
+      continue;
+    nameable.push_back(name);
+    if (index < call.explicitPositional)
+      byPosition.push_back(name);
+  }
+  nameable.append(target.kwOnlyNames.begin(), target.kwOnlyNames.end());
+  auto givenByKeyword = [&](llvm::StringRef name) {
+    return llvm::any_of(call.keywords, [&](const auto &entry) {
+      return entry.first == name;
+    });
+  };
+  llvm::SmallVector<std::string, 4> open;
+  for (const std::string &name : nameable)
+    if (!llvm::is_contained(byPosition, name) && !givenByKeyword(name))
+      open.push_back(name);
+  if (!open.empty())
+    return refuse(
+        "a `**` mapping whose keys are known only at run time can fill only "
+        "**kwargs here, and its keys could name " +
+        quoted(open) + " of " + shown +
+        ", which Python binds first: give " +
+        (open.size() == 1 ? "it" : "them") + " explicitly");
+  if (!target.kwargType)
+    return refuse(shown + " has no **kwargs to take a `**` mapping whose "
+                          "keys are known only at run time");
+  if (programBindsName("dict"))
+    return refuse("a `**` mapping whose keys are known only at run time is "
+                  "copied with dict(), which this program rebinds");
+
+  std::string qualified = target.module.empty()
+                              ? target.qualname
+                              : target.module + "." + target.qualname;
+  std::string source = bind(mapping->second);
+  auto raiseIfKey = [&](llvm::StringRef key, const std::string &message) {
+    emitSynthesized(synth::ifStmt(
+        synth::compareIn(synth::strConstant(key, range),
+                         synth::name(source, range), range),
+        {synth::raiseCall("TypeError", message, range)}, {}, range));
+  };
+  // CPython merges the keywords before it binds the parameters, so a key the
+  // call also spells as a keyword is reported first, and as a keyword.
+  for (const auto &[name, value] : call.keywords)
+    if (!name.empty())
+      raiseIfKey(name, qualified + "() got multiple values for keyword "
+                                   "argument '" + name + "'");
+  for (const std::string &name : byPosition)
+    raiseIfKey(name, target.qualname + "() got multiple values for argument '" +
+                         name + "'");
+
+  // The dict: the extra keywords before the mapping, its items, then the extra
+  // keywords after it.
+  std::vector<parser::NodePtr> keys;
+  std::vector<parser::NodePtr> initial;
+  llvm::SmallVector<std::pair<std::string, Value>, 4> after;
+  bool pastMapping = false;
+  for (const auto &entry : call.keywords) {
+    if (entry.first.empty()) {
+      pastMapping = true;
+      continue;
+    }
+    if (llvm::is_contained(nameable, entry.first)) {
+      result.named.push_back(entry);
+      continue;
+    }
+    if (pastMapping) {
+      after.push_back(entry);
+      continue;
+    }
+    keys.push_back(synth::strConstant(entry.first, range));
+    initial.push_back(synth::name(bind(entry.second), range));
+  }
+  bool seeded = !keys.empty();
+  parser::NodePtr start;
+  if (seeded) {
+    start = parser::makeNode("Dict", range);
+    parser::addField(*start, "keys", std::move(keys));
+    parser::addField(*start, "values", std::move(initial));
+  } else {
+    start = synth::call(
+        synth::name("dict", range),
+        std::vector<parser::NodePtr>{synth::name(source, range)}, range);
+  }
+  Value made = emitExprExpected(start.get(), target.kwargType);
+  synthesizedIteratorDefs.push_back(std::move(start));
+  std::string collected =
+      bind(coerceValue(made, target.kwargType, anchor));
+  if (seeded)
+    emitSynthesized(synth::exprStmt(
+        synth::methodCall(synth::name(collected, range), "update",
+                          {synth::name(source, range)}, range),
+        range));
+  for (const auto &[name, value] : after)
+    emitSynthesized(synth::assign(
+        synth::subscript(synth::name(collected, range),
+                         synth::strConstant(name, range), range),
+        synth::name(bind(value), range), range));
+  result.kwargs = values.lookup(collected);
+  return result;
+}
+
+bool ModuleEmitter::normalizeDynamicUnpacks(const parser::Node &anchor,
+                                            const DynamicUnpackTarget &target,
+                                            CallOperands &operands) {
+  if (operands.invalidBeyondDynamic ||
+      (!operands.dynamicTail && !operands.dynamicMapping))
+    return false;
+  DynamicUnpackCall call;
+  unsigned positionalCount =
+      static_cast<unsigned>(target.positionalNames.size());
+  // The operands that fill parameters, then the ones *args takes first. A
+  // statically sized starred tuple among them stays whole only where it does
+  // not straddle the two.
+  unsigned firstExtra = static_cast<unsigned>(operands.positional.size());
+  if (operands.dynamicTail) {
+    unsigned tail = *operands.dynamicTail;
+    firstExtra = tail;
+    unsigned covered = 0;
+    for (unsigned index = 0; index < tail; ++index) {
+      llvm::SmallVector<mlir::Type, 4> widths;
+      unsigned width = 1;
+      if (operands.positionalUnpacked[index] &&
+          appendStarredArgumentTypes(types, operands.positional[index].type,
+                                     widths))
+        width = static_cast<unsigned>(widths.size());
+      if (covered >= positionalCount) {
+        if (operands.positionalUnpacked[index]) {
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, anchor.range.start,
+              "a starred tuple after the parameters and before a starred "
+              "argument whose length is known only at run time is not "
+              "collected into *args here; give its members one by one"});
+          return false;
+        }
+        if (firstExtra == tail)
+          firstExtra = index;
+        call.extras.push_back(operands.positional[index]);
+      } else if (covered + width > positionalCount) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, anchor.range.start,
+            "a starred tuple that fills both parameters and *args is not "
+            "collected here; give its members one by one"});
+        return false;
+      }
+      covered += width;
+    }
+    call.explicitPositional = covered;
+    call.tail = operands.positional[tail];
+  } else {
+    call.explicitPositional =
+        static_cast<unsigned>(operands.positionalTypes.size());
+  }
+  for (auto [index, value] : llvm::enumerate(operands.keywordValues))
+    call.keywords.push_back({operands.keywordTypes[index].name, value});
+
+  std::optional<DynamicUnpackResult> result =
+      emitDynamicUnpack(anchor, target, call);
+  if (!result)
+    return false;
+
+  CallOperands rebuilt;
+  if (result->vararg) {
+    // The parameters' own operands stay; the extras went into the tuple, which
+    // is the last operand and the whole of *args (`ly.variadic_tail`).
+    rebuilt.positional.assign(operands.positional.begin(),
+                              operands.positional.begin() + firstExtra);
+    rebuilt.positionalUnpacked.assign(
+        operands.positionalUnpacked.begin(),
+        operands.positionalUnpacked.begin() + firstExtra);
+    rebuilt.positionalTypes.assign(operands.positionalTypes.begin(),
+                                   operands.positionalTypes.begin() +
+                                       positionalCount);
+    rebuilt.positional.push_back(*result->vararg);
+    rebuilt.positionalUnpacked.push_back(1);
+    lython::callable::VarargShape<mlir::Type> shape =
+        py::callableVarargShape(target.varargType);
+    rebuilt.positionalTypes.push_back(py::variadicTailType(
+        shape.repeated ? *shape.repeated : target.varargType));
+    rebuilt.variadicTail = true;
+  } else {
+    rebuilt.positional = operands.positional;
+    rebuilt.positionalUnpacked = operands.positionalUnpacked;
+    rebuilt.positionalTypes = operands.positionalTypes;
+  }
+  auto pushKeyword = [&](llvm::StringRef name, Value value) {
+    mlir::Type literal = types.literal("\"" + name.str() + "\"");
+    auto stringOp = py::StrConstantOp::create(builder, loc(anchor), literal,
+                                              builder.getStringAttr(name));
+    rebuilt.keywordNames.push_back({stringOp.getResult(), literal});
+    rebuilt.keywordValues.push_back(value);
+    rebuilt.keywordTypes.push_back(CallKeywordType{name.str(), value.type});
+  };
+  for (const auto &[name, value] : result->named)
+    pushKeyword(name, value);
+  if (result->kwargs)
+    pushKeyword("", *result->kwargs);
+  operands = std::move(rebuilt);
+  return true;
+}
+
+// The callee of a direct call the emitter knows the parameters of: a function
+// this program defines, called through its symbol. A manifest export lowers to
+// its own runtime call, which takes no collected *args or **kwargs.
+std::optional<ModuleEmitter::DynamicUnpackTarget>
+ModuleEmitter::dynamicUnpackTargetFor(const parser::Node &anchor,
+                                      Value callee) {
+  auto ref = callee.value ? callee.value.getDefiningOp<py::BindingRefOp>()
+                          : py::BindingRefOp();
+  auto callable = mlir::dyn_cast_if_present<py::CallableType>(callee.type);
+  if (!ref || !callable)
+    return std::nullopt;
+  // ⛔ ONLY A FUNCTION THIS PROGRAM DEFINES: one already emitted with its
+  // callable type, or a module-level def the call reaches before its body is
+  // emitted. Asked positively because the reverse question -- is this binding
+  // a builtin? -- missed `print`, and `print(*xs)` then printed the collected
+  // TUPLE: a builtin lowers to its own runtime call, which never reads the
+  // collected *args the way a function's parameter list does.
+  llvm::StringRef binding = ref.getBinding();
+  bool emitted = false;
+  if (auto function = module.lookupSymbol<mlir::func::FuncOp>(binding))
+    emitted = !function.isDeclaration() && function->hasAttr("callable_type");
+  bool pending = llvm::any_of(moduleFunctionNames, [&](const auto &entry) {
+    return topLevelFunctionSymbol(entry.getKey()) == binding;
+  });
+  if (!emitted && !pending)
+    return std::nullopt;
+  DynamicUnpackTarget target;
+  llvm::ArrayRef<mlir::StringAttr> names = callable.getPositionalNames();
+  for (std::size_t index = 0; index < callable.getPositionalTypes().size();
+       ++index)
+    target.positionalNames.push_back(
+        index < names.size() && names[index] ? names[index].getValue().str()
+                                             : std::string());
+  target.positionalOnlyCount = callable.getPositionalOnlyCount();
+  for (mlir::StringAttr name : callable.getKwOnlyNames())
+    target.kwOnlyNames.push_back(name ? name.getValue().str() : std::string());
+  if (callable.hasVararg())
+    target.varargType = callable.getVarargType();
+  if (callable.hasKwarg())
+    target.kwargType = callable.getKwargType();
+  for (const EmittedPythonDefinition &definition : emittedPythonDefinitions)
+    if (definition.symbol == ref.getBinding()) {
+      target.module = definition.module;
+      target.qualname = definition.qualname;
+      return target;
+    }
+  // Not emitted yet (a function written after the call): its name as the
+  // call spells it, in the module being emitted.
+  if (const parser::Node *function = ast::node(anchor, "func")) {
+    if (function->kind == "Name")
+      target.qualname = std::string(ast::nameSpelling(*function));
+    else if (std::optional<std::string_view> attr =
+                 ast::string(*function, "attr"))
+      target.qualname = std::string(*attr);
+  }
+  target.module =
+      activeSourceModule ? activeSourceModule->moduleName : moduleName;
+  return target;
+}
+
 Value ModuleEmitter::emitCallableDispatch(const parser::Node &anchor,
                                           Value callee,
-                                          const CallOperands &operands,
+                                          const CallOperands &givenOperands,
                                           mlir::Type resultOverride) {
+  CallOperands normalized;
+  const CallOperands *chosen = &givenOperands;
+  if (!givenOperands.valid && !givenOperands.invalidBeyondDynamic &&
+      (givenOperands.dynamicTail || givenOperands.dynamicMapping))
+    if (std::optional<DynamicUnpackTarget> target =
+            dynamicUnpackTargetFor(anchor, callee)) {
+      normalized = givenOperands;
+      if (!normalizeDynamicUnpacks(anchor, *target, normalized))
+        return emitNone(anchor);
+      chosen = &normalized;
+    }
+  const CallOperands &operands = *chosen;
   if (!operands.valid) {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, anchor.range.start, operands.failureReason});
@@ -386,6 +833,9 @@ Value ModuleEmitter::emitCallableDispatch(const parser::Node &anchor,
     callee.value = reemitted.getResult();
   }
   Value posPack = emitPack(operands.positional, operands.positionalUnpacked);
+  if (operands.variadicTail)
+    posPack.value.getDefiningOp()->setAttr(kPackVariadicTailAttr,
+                                           builder.getUnitAttr());
   Value namePack = emitPack(operands.keywordNames);
   Value valuePack = emitPack(operands.keywordValues);
   CallInferenceResult inference = types.inferCallWithEvidence(
