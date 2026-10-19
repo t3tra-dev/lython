@@ -1,0 +1,14 @@
+str 'text' False
+float 2.5 False
+int 7 False
+int 1180591620717411303424 False
+list [1, 2] False
+dict {'k': 3} False
+Inner Inner(4) False
+NoneType None True
+bool True False
+Marker <sentinel> False
+'other' True True
+Inner(9) False
+None True
+[3]

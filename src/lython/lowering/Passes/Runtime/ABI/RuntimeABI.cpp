@@ -2300,6 +2300,11 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
   // The object candidate is not dropped, it is moved to the end as None's
   // arm: it takes the BOX, so it is the arm that can answer for None.
   mlir::func::FuncOp objectFallback;
+  // Asked once: only a program that calls `object()` has such an object.
+  bool objectInstancesAreMade = false;
+  if (auto objectNew = module.lookupSymbol<mlir::func::FuncOp>("LyObject_New"))
+    objectInstancesAreMade =
+        !mlir::SymbolTable::symbolKnownUseEmpty(objectNew, module);
   auto conforms = [&](mlir::func::FuncOp function) {
     mlir::FunctionType type = function.getFunctionType();
     if (type.getNumResults() != calleeResultTypes.size() ||
@@ -2340,6 +2345,18 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
     if (contractAttr.getValue() == "builtins.object") {
       if (!objectFallback && function.getFunctionType().getNumInputs() == 1)
         objectFallback = function;
+      // ⭐ AND THE RELEASE OF AN OBJECT WHOSE CLASS IS `object` ITSELF, which
+      // only `object()` makes: its entity is box-shaped (LyObject_New), so the
+      // box's deallocator, handed the entity, frees it. ⛔ Release only: the
+      // other `object` methods would read the entity's empty slot as a box and
+      // ask the hook again; a miss there is the default answer CPython gives
+      // (repr by address, hash and == by identity, always true).
+      if (objectInstancesAreMade &&
+          function->hasAttr(contracts::kManifestDeallocatorAttr) &&
+          function.getFunctionType().getNumInputs() == 1 &&
+          seen.insert(*runtimeClass).second)
+        entries.push_back(HookEntry{*runtimeClass, function,
+                                    contractAttr.getValue().str()});
       return;
     }
     if (!seen.insert(*runtimeClass).second)
@@ -3206,6 +3223,13 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
       if (classOp)
         runtimeClass = RuntimeBundleLowerer::runtimeClassForClass(classOp);
     }
+    // ⛔ NOT `builtins.object`'s, for the reason the one-operand hooks give:
+    // its methods take BOXES, and an entity of class `object` -- what
+    // `object()` makes -- has an empty slot where a box's would be, so two of
+    // them compared equal as two Nones. Missing here, the comparison is the
+    // default CPython's object.__eq__ is: identity.
+    if (contractAttr.getValue() == "builtins.object")
+      return;
     if (!runtimeClass || !conforms(function) ||
         !seen.insert(*runtimeClass).second)
       return;

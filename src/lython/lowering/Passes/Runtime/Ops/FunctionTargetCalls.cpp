@@ -319,7 +319,16 @@ mlir::LogicalResult RuntimeBundleLowerer::emitGeneratorFunctionTargetCallResult(
       // object bundle", for a `TypeObject`).
       // ⭐ A union argument is kept boxed; the frame owns the box, and its
       // finalizer's release of it drops the payload with it.
-      if (lane && lane->unionType) {
+      // ⭐ AND SO IS AN `object` ARGUMENT, by the same box of the frame's own.
+      // What arrives may be a value of any class -- `subTest("named")` hands
+      // a str to `msg: object` -- whose lanes are not the box the lane holds
+      // ("has no matching physical span"); and a box that does arrive is the
+      // caller's, which the retaining store below would have kept by pointer
+      // while retaining only what it holds.
+      bool objectLane = lane && !lane->unionType &&
+                        lane->contract == "builtins.object" &&
+                        !lane->ownsNothing();
+      if (lane && (lane->unionType || objectLane)) {
         if (!source)
           return op->emitError() << "generator argument " << index
                                  << " has no union value to persist";

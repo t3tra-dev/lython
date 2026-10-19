@@ -13,8 +13,6 @@ tests/probe that records the refusal. When a probe agrees with CPython, its
 workaround can go.
 
 Not here yet, each for a recorded reason:
-- subTest: CPython tells "no message" from `msg=None` by an `object()`
-  sentinel, and `object()` cannot be constructed yet.
 - TestCase.debug, which the runner does not use.
 
 Deviations from CPython that the static types themselves call for:
@@ -25,6 +23,8 @@ Deviations from CPython that the static types themselves call for:
 - assertRaises' callable form is assertRaisesCall (one name cannot be both a
   context manager factory and a call forwarder here).
 - cleanups are stored as closures over their arguments, not as triples.
+- a subtest's params are a dict holding its own keys first and then its
+  parent's others, not an _OrderedChainMap over the parent's.
 - a skip reported with no result (doCleanups outside run) is dropped; CPython
   warns and then fails on the missing result.
 - module fixtures (setUpModule) and the module loader are not provided; the
@@ -42,6 +42,8 @@ import types
 from collections.abc import Callable, Iterator
 
 _SysExcInfoType = tuple[type[BaseException], BaseException, types.TracebackType]
+
+_subtest_msg_sentinel = object()
 
 _MAX_LENGTH = 80
 _PLACEHOLDER_LEN = 12
@@ -388,8 +390,36 @@ class TestCase:
     def __call__(self, result: TestResult | None = None) -> TestResult:
         return self.run(result)
 
-    # WORKAROUND(ut_bug_class_body_field_object_into_inner_contextmanager):
-    # subTest is not here -- its generator does not compile.
+    @contextlib.contextmanager
+    def subTest(self, msg: object = _subtest_msg_sentinel, **params: object) -> Iterator[None]:
+        """Return a context manager that will return the enclosed block
+        of code in a subtest identified by the optional message and
+        keyword parameters.  A failure in the subtest marks the test
+        case as failed but resumes execution at the end of the enclosed
+        block, allowing further test code to be executed.
+        """
+        if self._outcome is None or not self._outcome.result_supports_subtests:
+            yield
+            return
+        parent = self._subtest
+        if parent is None:
+            params_map = dict(params)
+        else:
+            params_map = _new_child(parent.params, params)
+        self._subtest = _SubTest(self, msg, params_map)
+        try:
+            with self._outcome.testPartExecutor(self._subtest, subTest=True):
+                yield
+            if not self._outcome.success:
+                result = self._outcome.result
+                if result is not None and result.failfast:
+                    raise _ShouldStop
+            elif self._outcome.expectedFailure:
+                # If the test is expecting a failure, we really want to
+                # stop now and register the expected failure.
+                raise _ShouldStop
+        finally:
+            self._subtest = parent
 
     def skipTest(self, reason: str) -> None:
         """Skip this test."""
@@ -584,9 +614,19 @@ class TestCase:
             self.fail(self._formatMessage(msg, standardMsg))
 
 
+def _new_child(parent: dict[str, object], params: dict[str, object]) -> dict[str, object]:
+    """_OrderedChainMap.new_child's view, flattened: the child's keys first,
+    then the parent's that the child does not shadow."""
+    merged = dict(params)
+    for key, value in parent.items():
+        if key not in merged:
+            merged[key] = value
+    return merged
+
+
 class _SubTest(TestCase):
 
-    def __init__(self, test_case: TestCase, message: str | None, params: dict[str, object]) -> None:
+    def __init__(self, test_case: TestCase, message: object, params: dict[str, object]) -> None:
         super().__init__()
         self._message = message
         self.test_case = test_case
@@ -598,19 +638,23 @@ class _SubTest(TestCase):
 
     def _subDescription(self) -> str:
         parts: list[str] = []
-        message = self._message
-        if message is not None:
-            parts.append("[{}]".format(message))
+        if self._message is not _subtest_msg_sentinel:
+            parts.append("[{}]".format(self._message))
         if self.params:
-            params_desc = ', '.join("{}={!r}".format(k, v) for (k, v) in self.params.items())
+            params_desc = ', '.join(
+                "{}={!r}".format(k, v)
+                for (k, v) in self.params.items())
             parts.append("({})".format(params_desc))
-        text = " ".join(parts)
-        if text == "":
-            return '(<subtest>)'
-        return text
+        return " ".join(parts) or '(<subtest>)'
 
     def id(self) -> str:
         return "{} {}".format(self.test_case.id(), self._subDescription())
+
+    def shortDescription(self) -> str | None:
+        """Returns a one-line description of the subtest, or None if no
+        description has been provided.
+        """
+        return self.test_case.shortDescription()
 
     def __str__(self) -> str:
         return "{} {}".format(self.test_case, self._subDescription())

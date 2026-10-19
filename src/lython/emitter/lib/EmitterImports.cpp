@@ -1488,6 +1488,8 @@ bool isStorableContainerType(mlir::Type type) {
   // ⛔ NOT the erased top, and not a bare generic: a cell whose contract has
   // no arguments to describe it accepts every write and refuses every read,
   // which is the rule `collectModuleGlobals` lives under for the main module.
+  // (`object()` itself is admitted by the caller, which can tell it from an
+  // inference that answered `object` because it could not answer.)
   if (name == "builtins.object")
     return false;
   return contract.getArguments().empty();
@@ -1554,7 +1556,19 @@ void ModuleEmitter::collectImportedModuleGlobals() {
         declared = types.annotationType(ast::node(*statement, "annotation"));
       if (!declared)
         declared = types.widenLiteral(types.inferExpr(value));
-      if (!isStorableContainerType(declared))
+      // ⭐ AN `object` THE PROGRAM MADE OR DECLARED is held like any constant,
+      // now that a field of `object` keeps what it is given and reads it back
+      // as a box (a cell is a class with one field): unittest's
+      // `_subtest_msg_sentinel = object()` is one.
+      // ⛔ Not an `object` the inference answered with: that is how it says
+      // it could not tell -- `_Alias = tuple[type[E], E]` -- and a cell would
+      // evaluate the alias as an expression.
+      bool madeObject =
+          declared && declared == types.object() &&
+          (statement->kind == "AnnAssign" ||
+           (value->kind == "Call" &&
+            ast::nameSpelling(*ast::node(*value, "func")) == "object"));
+      if (!madeObject && !isStorableContainerType(declared))
         continue;
       std::string globalName =
           (llvm::Twine(source.moduleName) + "." + name).str();

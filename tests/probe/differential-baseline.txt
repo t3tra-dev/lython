@@ -29,8 +29,8 @@ dictlit_cache_boundary_pair.py AGREE
 dictlit_dup_source_two_entries.py AGREE
 dictlit_nested_read_only_silent.py AGREE
 dictlit_static_key_gate.py AGREE
-erased_object_field_int.py GAP
-erased_object_field_str.py GAP
+erased_object_field_int.py AGREE
+erased_object_field_str.py AGREE
 flow_earlyreturn_w1obj.py AGREE
 flow_earlyreturn_w1str.py AGREE
 flow_earlyreturn_w3list.py AGREE
@@ -402,7 +402,7 @@ ut_unsupported_init_subclass_super.py GAP
 ut_unsupported_instance_shadows_class_attribute.py AGREE
 ut_unsupported_iter_of_non_indexable.py GAP
 ut_unsupported_mapping_into_named_parameters.py GAP
-ut_unsupported_object_sentinel.py GAP
+ut_unsupported_object_sentinel.py AGREE
 ut_unsupported_object_with_class_value_union_field_held.py AGREE
 ut_unsupported_paramspec_decorator.py GAP
 ut_unsupported_paramspec_forwarder_as_value.py GAP
@@ -422,6 +422,7 @@ wb_a_generator_frame_carrying_a_boxed_int.py AGREE
 wb_a_generator_int_wider_than_its_frame_word.py AGREE
 wb_a_generator_method_that_calls_itself.py AGREE
 wb_a_generator_that_crosses_a_call.py AGREE
+wb_a_generator_that_takes_keyword_arguments.py GAP
 wb_a_nested_generator_that_delegates_to_itself.py GAP
 wb_a_none_field_written_only_in_a_loop.py AGREE
 wb_a_record_written_as_a_dict.py GAP
