@@ -990,8 +990,13 @@ ModuleEmitter::directSubclassesOf(llvm::StringRef cls) {
 // below it. unittest's `main()` finds the test classes this way.
 // ⛔ Program classes only: `object.__subclasses__()` in CPython also lists the
 // interpreter's own, which no program here can match, so it is not answered.
-// ⛔ A class defined inside a function is not one of the program's until the
-// function runs, and is left out.
+// ⛔ Refused when a list would hold a class written inside a function. Such a
+// class is a subclass only from the call that runs its statement until the
+// class is collected (a class is in a reference cycle, so that is when the
+// cycle collector runs), and every call makes another one -- none of which the
+// program text decides. It is hoisted to the module's top level here, so
+// answering would list it before the function has run, and listing it last
+// would still be one class where CPython has one per call.
 std::optional<Value>
 ModuleEmitter::tryEmitSubclassesCall(const parser::Node &expr) {
   const parser::Node *callee = ast::node(expr, "func");
@@ -1044,7 +1049,24 @@ ModuleEmitter::tryEmitSubclassesCall(const parser::Node &expr) {
         pending.push_back(sub);
       }
   }
-  if (receiver.value.getDefiningOp<py::TypeObjectOp>() || below.empty())
+  bool staticReceiver = receiver.value.getDefiningOp<py::TypeObjectOp>();
+  llvm::SmallVector<std::string, 8> answered{cls.getContractName().str()};
+  if (!staticReceiver)
+    answered.append(below.begin(), below.end());
+  for (const std::string &asked : answered)
+    for (const std::string &sub : directSubclassesOf(asked))
+      if (llvm::StringRef(sub).contains(py::contracts::kLocalClassScopeMarker)) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "'" + py::contracts::pythonQualnameForContract(asked) +
+                ".__subclasses__()' would list '" +
+                py::contracts::pythonQualnameForContract(sub) +
+                "', a class written inside a function: it is a subclass only "
+                "while a call has made it and something holds it, which the "
+                "program does not decide statically"});
+        return emitNone(expr);
+      }
+  if (staticReceiver || below.empty())
     return Value{listOf(cls.getContractName()), listType};
   std::function<mlir::Value(std::size_t)> chain =
       [&](std::size_t index) -> mlir::Value {
