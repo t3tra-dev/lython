@@ -52,6 +52,20 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
 | 日付 | 直したプローブ | 何を直したか |
 | --- | --- | --- |
 | 2026-10-20 | `ut_bug_inherited_method_loses_its_module_globals`、`ut_bug_computed_getattr_classmethod_arm_in_importer`、`ut_bug_inherited_generic_method_annotation_in_importer` | A1 (継承したメソッド本体のスコープ)。サブクラス向けに複製した継承メソッドの本体を、定義元のモジュールで解決する。プログラムのクラスの classmethod をインスタンス経由で呼ぶとき、クラスの裸の名前に書き換えない。ジェネリッククラスの特殊化の、後回しにしたメソッド本体で型パラメータを束縛する (3 件目の引き金は継承ではなく、関数本体の中からの呼び出しだった)。 |
+| 2026-10-20 | `ut_bug_class_value_call_checks_every_subclass_init`、`ut_bug_computed_getattr_checks_subclass_init`、`ut_bug_computed_getattr_generic_method_with_defaults`、`ut_bug_class_value_call_checks_unrelated_subclasses` の半分 | A2 (振り分けの枝の静的検査)。クラス値の呼び出し、仮想ディスパッチ、計算された名前の呼び出しで、呼び出しを受けられない枝が CPython と同じ TypeError を実行時に投げる (`initialize_locals` の順序と文言、3.14 の "Did you mean" を含む)。ジェネリックの型パラメータを、省いた既定値から解く。 |
+
+進捗の途中で決めたこと・見つけたこと:
+
+- **型の合わない枝は Lython の TypeError を投げる (意図した逸脱)。** クラス値の
+  呼び出しで、引数の数は合うが型が `__init__` の宣言と合わないクラスに当たると、
+  CPython はそのままオブジェクトを作る。Lython ではそのフィールドを持つ
+  オブジェクトを作れないので、理由を書いた TypeError を投げる。プログラム全体を
+  拒否していた以前より狭い。`wb_a_class_value_call_whose_argument_the_init_cannot_hold`
+  に記録した (expect-wrong)。
+- **既存のクラッシュを 1 件直した。** ジェネリック関数の、リテラルでない既定値
+  (`xs: list[int] = [1]` など) を省いて呼ぶと、誰も書き込んでいないセルを読んで
+  segfault していた。既定値は特殊化ごとではなく関数ごとに 1 つのセルにし、`def`
+  文の位置で 1 回評価する (CPython と同じく、全呼び出しで同じオブジェクトを共有する)。
 
 ## 計測の方法
 

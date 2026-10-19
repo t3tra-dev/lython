@@ -1,0 +1,10 @@
+Base 2
+Base 3
+TypeError: Fewer.f() takes 1 positional argument but 2 were given
+TypeError: Fewer.f() got an unexpected keyword argument 'x'
+TypeError: More.f() missing 1 required positional argument: 'y'
+TypeError: More.f() missing 1 required positional argument: 'y'
+TypeError: KeywordOnly.f() takes 1 positional argument but 2 were given
+KeywordOnly 2
+Optional 11
+Optional 12

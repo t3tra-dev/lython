@@ -118,11 +118,9 @@ class _UnexpectedSuccess(Exception):
 class _ExpectedFailure(Exception):
     """The test failed as its decorator said it would."""
 
-
-# WORKAROUND(ut_bug_class_value_call_checks_unrelated_subclasses): an exception class with its own __init__ signature makes
-# every `self.failureException(msg)` refused, so what an expected failure
-# raised is parked here instead of travelling on the exception.
-_expected_failures: list[tuple[type[BaseException], BaseException, types.TracebackType]] = []
+    def __init__(self, exc_info: tuple[type[BaseException], BaseException, types.TracebackType]) -> None:
+        super().__init__()
+        self.exc_info = exc_info
 
 
 class _Outcome:
@@ -146,8 +144,8 @@ class _Outcome:
             self.result.addSkip(test_case, str(e))
         except _ShouldStop:
             pass
-        except _ExpectedFailure:
-            self.expectedFailure = _expected_failures.pop()
+        except _ExpectedFailure as e:
+            self.expectedFailure = e.exc_info
         except _UnexpectedSuccess:
             self.unexpectedSuccess = True
         except:
@@ -209,8 +207,7 @@ def expectedFailure[T: TestCase](test_item: Callable[[T], None]) -> Callable[[T]
         except SkipTest:
             raise
         except Exception:
-            _expected_failures.append(sys.exc_info())
-            raise _ExpectedFailure()
+            raise _ExpectedFailure(sys.exc_info())
         raise _UnexpectedSuccess()
     return wrapper
 
@@ -583,13 +580,15 @@ class TestCase:
             self.fail(self._formatMessage(msg, standardMsg))
 
 
-# WORKAROUND(ut_bug_class_value_call_checks_every_subclass_init, ut_bug_computed_getattr_checks_subclass_init): a TestCase subclass whose __init__ takes other
-# arguments makes `cls(name)` and `getattr(self, name)()` refused, so the two
-# framework subclasses keep TestCase's signature and are filled in afterwards.
 class _SubTest(TestCase):
-    test_case: TestCase
-    _message: str | None
-    params: dict[str, object]
+
+    def __init__(self, test_case: TestCase, message: str | None, params: dict[str, object]) -> None:
+        super().__init__()
+        self._message = message
+        self.test_case = test_case
+        self.params = params
+        # WORKAROUND(ut_bug_class_value_class_attribute_shadowed): the instance does not
+        # take `failureException = test_case.failureException`.
 
     def runTest(self) -> None:
         raise NotImplementedError("subtests cannot be run directly")
@@ -612,15 +611,6 @@ class _SubTest(TestCase):
 
     def __str__(self) -> str:
         return "{} {}".format(self.test_case, self._subDescription())
-
-
-def _make_subtest(test_case: TestCase, message: str | None, params: dict[str, object]) -> _SubTest:
-    subtest = _SubTest()
-    subtest.test_case = test_case
-    subtest._message = message
-    subtest.params = params
-    # WORKAROUND(ut_bug_class_value_class_attribute_shadowed): an instance cannot shadow the class attribute.
-    return subtest
 
 
 # ---------------------------------------------------------------- result
@@ -839,14 +829,18 @@ def _addClassLevelException(result: TestResult, exception: Exception, errorName:
 class _ErrorHolder(TestCase):
     """Placeholder for a TestCase inside a result."""
 
+    def __init__(self, description: str) -> None:
+        super().__init__()
+        self.description = description
+
     def runTest(self) -> None:
         pass
 
     def id(self) -> str:
-        return self._testMethodName
+        return self.description
 
     def __repr__(self) -> str:
-        return "<ErrorHolder description=%r>" % (self._testMethodName,)
+        return "<ErrorHolder description=%r>" % (self.description,)
 
     def __str__(self) -> str:
         return self.id()

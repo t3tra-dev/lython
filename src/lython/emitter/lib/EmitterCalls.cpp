@@ -3138,6 +3138,68 @@ ModuleEmitter::tryEmitCurriedGenericCall(const parser::Node &expr,
                        solved->applied));
 }
 
+// ⭐ AN OMITTED DEFAULT IS AN ARGUMENT TOO, and the only one that can solve a
+// type parameter nothing else names: `def pick[E](expected: type[E] =
+// BaseException)` called as `pick()` passes BaseException, so E is
+// BaseException -- what a type checker infers, and what the body receives.
+// Both the generic function and the generic method were refused ("this call
+// does not determine the type arguments"), and a computed-name call writes
+// such a zero-argument call for every method of the class.
+// ⛔ Asked only when the call alone does not solve, so a call that already
+// did is specialized exactly as before; and only for a parameter whose type
+// still names a type parameter. A default whose type cannot be read here --
+// a name of the defining module, seen from another -- adds nothing.
+llvm::SmallVector<CallKeywordType, 2> ModuleEmitter::omittedDefaultArgumentTypes(
+    const parser::Node &def, const FunctionSignature &sig,
+    unsigned positionalGiven, llvm::ArrayRef<CallKeywordType> keywords) {
+  llvm::SmallVector<CallKeywordType, 2> out;
+  const parser::Node *arguments = ast::node(def, "args");
+  if (!arguments)
+    return out;
+  auto given = [&](llvm::StringRef name) {
+    return llvm::any_of(keywords, [&](const CallKeywordType &keyword) {
+      return keyword.name == name;
+    });
+  };
+  auto add = [&](llvm::StringRef name, mlir::Type declared,
+                 const parser::Node *defaultNode) {
+    if (!defaultNode || !declared || given(name) ||
+        unboundStaticParameterCount(declared) == 0)
+      return;
+    mlir::Type defaultType = types.widenLiteral(types.inferExpr(defaultNode));
+    if (!defaultType || defaultType == types.object())
+      return;
+    out.push_back(CallKeywordType{name.str(), defaultType});
+  };
+  llvm::SmallVector<const parser::Node *, 8> positional;
+  for (llvm::StringRef field : {"posonlyargs", "args"})
+    if (const auto *list = ast::nodeList(*arguments, field))
+      for (const parser::NodePtr &argument : *list)
+        positional.push_back(argument.get());
+  const auto *defaults = ast::nodeList(*arguments, "defaults");
+  std::size_t firstDefault =
+      defaults && defaults->size() <= positional.size()
+          ? positional.size() - defaults->size()
+          : positional.size();
+  for (std::size_t index = std::max<std::size_t>(positionalGiven, firstDefault);
+       index < positional.size(); ++index) {
+    // A positional-only parameter cannot be named, and the solver takes the
+    // default as a keyword.
+    if (index < sig.positionalOnlyCount || index >= sig.positionalNames.size() ||
+        index >= sig.positionalTypes.size() || !positional[index])
+      continue;
+    add(sig.positionalNames[index], sig.positionalTypes[index],
+        (*defaults)[index - firstDefault].get());
+  }
+  const auto *kwDefaults = ast::nodeList(*arguments, "kw_defaults");
+  for (std::size_t index = 0; index < sig.kwOnlyNames.size(); ++index)
+    if (kwDefaults && index < kwDefaults->size() &&
+        index < sig.kwOnlyTypes.size())
+      add(sig.kwOnlyNames[index], sig.kwOnlyTypes[index],
+          (*kwDefaults)[index].get());
+  return out;
+}
+
 Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
                                      const parser::Node &calleeNode,
                                      GenericFunctionInfo &generic) {
@@ -3172,6 +3234,20 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
   CallInferenceResult inference = types.inferCallWithEvidence(
       generic.signature.publicCallable, operands.positionalTypes,
       operands.keywordTypes);
+  if (!inference && generic.node && !operands.dynamicTail) {
+    llvm::SmallVector<CallKeywordType, 2> defaults = omittedDefaultArgumentTypes(
+        *generic.node, generic.signature,
+        static_cast<unsigned>(operands.positionalTypes.size()),
+        operands.keywordTypes);
+    if (!defaults.empty()) {
+      llvm::SmallVector<CallKeywordType, 4> withDefaults(
+          operands.keywordTypes.begin(), operands.keywordTypes.end());
+      withDefaults.append(defaults.begin(), defaults.end());
+      inference = types.inferCallWithEvidence(
+          generic.signature.publicCallable, operands.positionalTypes,
+          withDefaults);
+    }
+  }
   // A type parameter only the result names is solved by what the result is
   // applied to, which a held factory (`d = skip(r)`) has not been yet.
   if (!inference)
@@ -3209,6 +3285,16 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
   std::optional<ParamSpecCallShape> shape;
   if (paramSpec)
     shape = paramSpecCallShape(generic.signature, operands);
+  if (generic.node && !operands.dynamicTail && !operands.dynamicMapping)
+    if (std::string mismatch = genericOmittedDefaultMismatch(
+            *generic.node, resolved,
+            static_cast<unsigned>(operands.positionalTypes.size()),
+            operands.keywordTypes);
+        !mismatch.empty()) {
+      diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
+                                               expr.range.start, mismatch});
+      return emitNone(expr);
+    }
   std::optional<std::pair<std::string, py::CallableType>> specialization =
       ensureGenericSpecialization(expr, generic, resolved,
                                   shape ? &*shape : nullptr);
@@ -3699,58 +3785,204 @@ std::string quotedNameList(llvm::ArrayRef<std::string> names) {
   return out;
 }
 
-// What CPython says when `qualname` is called with `given` positional
-// arguments its parameters cannot take (`bound`: the first parameter is the
-// receiver, which CPython counts); empty when the count fits.
-std::string arityMismatch(llvm::StringRef qualname, const parser::Node &def,
-                          bool bound, unsigned given) {
+// CPython's `_Py_CalculateSuggestions` (Python/suggestions.c): the candidate
+// within a third of the characters involved, by its Levenshtein distance where
+// a case flip costs half a move. Empty when none is close enough.
+std::string closestName(llvm::ArrayRef<std::string> candidates,
+                        llvm::StringRef name) {
+  constexpr std::size_t kMaxStringSize = 40;
+  constexpr std::size_t kMoveCost = 2;
+  constexpr std::size_t kCaseCost = 1;
+  if (candidates.size() >= 750)
+    return "";
+  auto substitutionCost = [&](char a, char b) -> std::size_t {
+    if ((a & 31) != (b & 31))
+      return kMoveCost;
+    if (a == b)
+      return 0;
+    if ('A' <= a && a <= 'Z')
+      a += 'a' - 'A';
+    if ('A' <= b && b <= 'Z')
+      b += 'a' - 'A';
+    return a == b ? kCaseCost : kMoveCost;
+  };
+  auto distance = [&](llvm::StringRef a, llvm::StringRef b,
+                      std::size_t maxCost) -> std::size_t {
+    while (!a.empty() && !b.empty() && a.front() == b.front()) {
+      a = a.drop_front();
+      b = b.drop_front();
+    }
+    while (!a.empty() && !b.empty() && a.back() == b.back()) {
+      a = a.drop_back();
+      b = b.drop_back();
+    }
+    if (a.empty() || b.empty())
+      return (a.size() + b.size()) * kMoveCost;
+    if (a.size() > kMaxStringSize || b.size() > kMaxStringSize)
+      return maxCost + 1;
+    if (b.size() < a.size())
+      std::swap(a, b);
+    if ((b.size() - a.size()) * kMoveCost > maxCost)
+      return maxCost + 1;
+    llvm::SmallVector<std::size_t, kMaxStringSize> buffer(a.size());
+    std::size_t tmp = kMoveCost;
+    for (std::size_t &cell : buffer) {
+      cell = tmp;
+      tmp += kMoveCost;
+    }
+    std::size_t result = 0;
+    for (std::size_t bIndex = 0; bIndex < b.size(); ++bIndex) {
+      char code = b[bIndex];
+      std::size_t previous = result = bIndex * kMoveCost;
+      std::size_t minimum = std::numeric_limits<std::size_t>::max();
+      for (std::size_t index = 0; index < a.size(); ++index) {
+        std::size_t substitute = previous + substitutionCost(code, a[index]);
+        previous = buffer[index];
+        std::size_t insertDelete = std::min(result, previous) + kMoveCost;
+        result = std::min(insertDelete, substitute);
+        buffer[index] = result;
+        minimum = std::min(minimum, result);
+      }
+      if (minimum > maxCost)
+        return maxCost + 1;
+    }
+    return result;
+  };
+  std::string suggestion;
+  std::size_t suggestionDistance = std::numeric_limits<std::size_t>::max();
+  for (const std::string &candidate : candidates) {
+    if (candidate == name)
+      continue;
+    std::size_t maxDistance =
+        (name.size() + candidate.size() + 3) * kMoveCost / 6;
+    maxDistance = std::min(maxDistance, suggestionDistance - 1);
+    std::size_t current = distance(name, candidate, maxDistance);
+    if (current > maxDistance)
+      continue;
+    if (suggestion.empty() || current < suggestionDistance) {
+      suggestion = candidate;
+      suggestionDistance = current;
+    }
+  }
+  return suggestion;
+}
+
+// What CPython raises when `qualname` is called with `given` positional
+// arguments and the keywords `keywordNames` -- the checks of
+// `initialize_locals` (Python/ceval.c) in its order: each keyword, then too
+// many positionals, then the missing positionals, then the missing keyword-only
+// ones. `bound`: the first parameter is the receiver, which CPython counts.
+// Empty when the call binds.
+std::string callBindingError(llvm::StringRef qualname, const parser::Node &def,
+                             bool bound, unsigned given,
+                             llvm::ArrayRef<std::string> keywordNames = {}) {
   const parser::Node *arguments = ast::node(def, "args");
   if (!arguments)
     return "";
-  llvm::SmallVector<std::string, 8> positional;
-  for (llvm::StringRef field : {"posonlyargs", "args"})
+  llvm::SmallVector<std::string, 8> names;
+  unsigned positionalOnly = 0;
+  for (llvm::StringRef field : {"posonlyargs", "args", "kwonlyargs"})
     if (const auto *list = ast::nodeList(*arguments, field))
       for (const parser::NodePtr &argument : *list)
-        if (argument)
-          positional.push_back(std::string(ast::nameSpelling(*argument)));
+        if (argument) {
+          names.push_back(std::string(ast::nameSpelling(*argument)));
+          if (field == "posonlyargs")
+            ++positionalOnly;
+        }
+  const auto *kwonly = ast::nodeList(*arguments, "kwonlyargs");
+  unsigned keywordOnlyCount = kwonly ? static_cast<unsigned>(kwonly->size()) : 0;
+  unsigned argcount = static_cast<unsigned>(names.size()) - keywordOnlyCount;
+  unsigned total = static_cast<unsigned>(names.size());
+  bool varargs = ast::node(*arguments, "vararg") != nullptr;
+  bool varkeywords = ast::node(*arguments, "kwarg") != nullptr;
   const auto *defaultList = ast::nodeList(*arguments, "defaults");
-  unsigned total = static_cast<unsigned>(positional.size());
   unsigned defaults = std::min<unsigned>(
-      defaultList ? static_cast<unsigned>(defaultList->size()) : 0, total);
-  unsigned required = total - defaults;
+      defaultList ? static_cast<unsigned>(defaultList->size()) : 0, argcount);
+  const auto *kwDefaults = ast::nodeList(*arguments, "kw_defaults");
   if (bound)
     ++given;
   std::string head = (qualname + "() ").str();
+  llvm::SmallVector<bool, 8> filled(total, false);
+  for (unsigned index = 0; index < std::min(given, argcount); ++index)
+    filled[index] = true;
+  for (const std::string &keyword : keywordNames) {
+    std::optional<unsigned> slot;
+    for (unsigned index = positionalOnly; index < total; ++index)
+      if (names[index] == keyword) {
+        slot = index;
+        break;
+      }
+    if (!slot) {
+      if (varkeywords)
+        continue;
+      llvm::SmallVector<std::string, 2> conflicts;
+      for (unsigned index = 0; index < positionalOnly; ++index)
+        for (const std::string &other : keywordNames)
+          if (other == names[index])
+            conflicts.push_back(other);
+      if (!conflicts.empty())
+        return head +
+               "got some positional-only arguments passed as keyword "
+               "arguments: '" +
+               llvm::join(conflicts, ", ") + "'";
+      std::string message =
+          head + "got an unexpected keyword argument '" + keyword + "'";
+      std::string suggestion = closestName(
+          llvm::ArrayRef<std::string>(names).drop_front(positionalOnly),
+          keyword);
+      if (!suggestion.empty())
+        message += ". Did you mean '" + suggestion + "'?";
+      return message;
+    }
+    if (filled[*slot])
+      return head + "got multiple values for argument '" + keyword + "'";
+    filled[*slot] = true;
+  }
   auto count = [](unsigned n, llvm::StringRef noun) {
     return std::to_string(n) + " " + noun.str() + (n == 1 ? "" : "s");
   };
-  if (!ast::node(*arguments, "vararg") && given > total) {
-    std::string tail = " but " + std::to_string(given) +
-                       (given == 1 ? " was given" : " were given");
-    if (required != total)
-      return head + "takes from " + std::to_string(required) + " to " +
-             std::to_string(total) + " positional arguments" + tail;
-    return head + "takes " + count(total, "positional argument") + tail;
+  if (given > argcount && !varargs) {
+    unsigned keywordOnlyGiven = static_cast<unsigned>(
+        llvm::count(llvm::ArrayRef<bool>(filled).drop_front(argcount), true));
+    std::string takes =
+        defaults ? "from " + std::to_string(argcount - defaults) + " to " +
+                       std::to_string(argcount) + " positional arguments"
+                 : count(argcount, "positional argument");
+    std::string givenText = std::to_string(given);
+    if (keywordOnlyGiven)
+      givenText += " positional argument" + std::string(given != 1 ? "s" : "") +
+                   " (and " + count(keywordOnlyGiven, "keyword-only argument") +
+                   ")";
+    return head + "takes " + takes + " but " + givenText +
+           (given == 1 && !keywordOnlyGiven ? " was given" : " were given");
   }
-  if (given < required)
+  llvm::SmallVector<std::string, 4> missing;
+  for (unsigned index = 0; index < argcount - defaults; ++index)
+    if (!filled[index])
+      missing.push_back(names[index]);
+  if (!missing.empty())
     return head + "missing " +
-           count(required - given, "required positional argument") + ": " +
-           quotedNameList(llvm::ArrayRef<std::string>(positional)
-                              .slice(given, required - given));
-  llvm::SmallVector<std::string, 4> keywordOnly;
-  const auto *kwonly = ast::nodeList(*arguments, "kwonlyargs");
-  const auto *kwDefaults = ast::nodeList(*arguments, "kw_defaults");
-  if (kwonly)
-    for (auto [index, argument] : llvm::enumerate(*kwonly))
-      if (argument && (!kwDefaults || index >= kwDefaults->size() ||
-                       !(*kwDefaults)[index]))
-        keywordOnly.push_back(std::string(ast::nameSpelling(*argument)));
-  if (!keywordOnly.empty())
+           count(static_cast<unsigned>(missing.size()),
+                 "required positional argument") +
+           ": " + quotedNameList(missing);
+  for (unsigned index = argcount; index < total; ++index) {
+    unsigned keywordIndex = index - argcount;
+    bool hasDefault = kwDefaults && keywordIndex < kwDefaults->size() &&
+                      (*kwDefaults)[keywordIndex];
+    if (!filled[index] && !hasDefault)
+      missing.push_back(names[index]);
+  }
+  if (!missing.empty())
     return head + "missing " +
-           count(static_cast<unsigned>(keywordOnly.size()),
+           count(static_cast<unsigned>(missing.size()),
                  "required keyword-only argument") +
-           ": " + quotedNameList(keywordOnly);
+           ": " + quotedNameList(missing);
   return "";
+}
+
+std::string arityMismatch(llvm::StringRef qualname, const parser::Node &def,
+                          bool bound, unsigned given) {
+  return callBindingError(qualname, def, bound, given);
 }
 } // namespace
 
@@ -4002,7 +4234,7 @@ std::vector<parser::NodePtr> ModuleEmitter::computedGetattrBody(
         range);
   };
   auto qualname = [&](llvm::StringRef definingClass, llvm::StringRef name) {
-    return py::contracts::displayClassNameForContract(definingClass) + "." +
+    return py::contracts::pythonQualnameForContract(definingClass) + "." +
            name.str();
   };
   auto notCallable = [&](llvm::StringRef className) {
@@ -4919,11 +5151,29 @@ ModuleEmitter::classValueCandidates(llvm::StringRef contract) const {
 // The arms are the program's own spelling of each class, chosen by identity
 // (`t is D`), so each arm is the static construction or attribute read that
 // class already compiles to. The bound itself is last, the fallback.
+parser::NodePtr ModuleEmitter::raisingCall(parser::SourceRange range,
+                                           llvm::StringRef exception,
+                                           const std::string &message,
+                                           mlir::Type resultType) {
+  std::string symbol =
+      "__lyraise$" + std::to_string(++syntheticFunctionCounter);
+  parser::NodePtr def = synth::functionDef(
+      symbol, {}, {}, {synth::raiseCall(exception, message, range)}, nullptr,
+      {}, range);
+  synthesizedIteratorDefs.push_back(def);
+  types.pinResultType(def.get(), resultType);
+  FunctionSignature sig = types.functionSignature(*def);
+  types.bindRootSymbol(symbol, sig.publicCallable);
+  emitDispatcherBody(*def, symbol, sig, /*suppressGate=*/false);
+  return synth::call(synth::name(symbol, range), {}, range);
+}
+
 std::optional<Value> ModuleEmitter::emitClassValueDispatch(
     const parser::Node &anchor, Value classValue, py::ContractType bound,
     mlir::Type resultType,
     llvm::function_ref<parser::NodePtr(llvm::StringRef spelling)> armFor,
-    llvm::ArrayRef<std::string> capturedNames) {
+    llvm::ArrayRef<std::string> capturedNames,
+    std::function<std::string(llvm::StringRef spelling)> armMismatch) {
   llvm::SmallVector<std::string, 8> candidates =
       classValueCandidates(bound.getContractName());
   // ⛔ An instantiation of a generic subclass has no spelling of its own to
@@ -4981,10 +5231,15 @@ std::optional<Value> ModuleEmitter::emitClassValueDispatch(
     FunctionSignature sig = types.functionSignature(*def);
     types.bindRootSymbol(symbol, sig.publicCallable);
     deferredDispatcherBodies.push_back(
-        [this, def, symbol, sig, range, arms = std::move(arms)] {
+        [this, def, symbol, sig, range, arms = std::move(arms),
+         armMismatch = std::move(armMismatch)] {
           std::vector<parser::NodePtr> body;
           for (auto [index, arm] : llvm::enumerate(arms)) {
-            parser::NodePtr answer = synth::returnStmt(arm.second, range);
+            std::string mismatch = armMismatch ? armMismatch(arm.first) : "";
+            parser::NodePtr answer =
+                mismatch.empty()
+                    ? synth::returnStmt(arm.second, range)
+                    : synth::raiseCall("TypeError", mismatch, range);
             if (index + 1 == arms.size()) {
               body.push_back(std::move(answer));
               continue;
@@ -5012,7 +5267,12 @@ std::optional<Value> ModuleEmitter::emitClassValueDispatch(
   std::function<mlir::Value(std::size_t)> chain =
       [&](std::size_t index) -> mlir::Value {
     auto arm = [&]() -> mlir::Value {
-      parser::NodePtr node = armFor(spell(candidates[index]));
+      std::string mismatch =
+          armMismatch ? armMismatch(spell(candidates[index])) : "";
+      parser::NodePtr node =
+          mismatch.empty()
+              ? armFor(spell(candidates[index]))
+              : raisingCall(anchor.range, "TypeError", mismatch, resultType);
       synthesizedIteratorDefs.push_back(node);
       Value armValue = emitExpr(node.get());
       pendingConstructionClass.reset();
@@ -5111,6 +5371,89 @@ ModuleEmitter::emitClassValueCall(const parser::Node &expr,
   // can even spell.
   bool builtinExceptionBound =
       !method && py::exceptions::findByContract(bound.getContractName());
+  // ⭐ A CLASS WHOSE `__init__` CANNOT TAKE THE CALL IS AN ARM THAT RAISES.
+  // `cls(name)` over `type[TestCase]` names every subclass, and a subclass's
+  // `__init__` may take anything -- a constructor is not an override a type
+  // checker holds to its base's signature. Each arm was compiled as that
+  // class's own construction, so one subclass with another `__init__`
+  // refused the call for every class: unittest's loader, and
+  // `self.failureException(msg)` over every exception class of the program.
+  // CPython raises only if that class is the one called, and so does the
+  // arm: its binding error word for word.
+  // ⛔ An argument of a TYPE the `__init__` does not declare raises too, with
+  // Lython's reason: CPython would build the object, and an object whose
+  // field holds a value of another type is not one this compiler can lay
+  // out. Refusing the program instead is what stood here.
+  // ⛔ Asked as each arm is WRITTEN, with the argument types copied: a
+  // candidate declared after this call (a test class, for unittest's loader)
+  // has no `__init__` to ask yet.
+  std::function<std::string(llvm::StringRef)> constructionMismatch;
+  if (!method) {
+    llvm::SmallVector<mlir::Type, 4> positionalTypes;
+    for (const std::string &temp : positional)
+      positionalTypes.push_back(values.lookup(temp).type);
+    llvm::SmallVector<std::pair<std::string, mlir::Type>, 2> keywordTypes;
+    for (const auto &[keyword, temp] : named)
+      keywordTypes.push_back({keyword, values.lookup(temp).type});
+    constructionMismatch = [this, positionalTypes, keywordTypes](
+                               llvm::StringRef spelling) -> std::string {
+      std::optional<mlir::Type> classType = types.lookupClass(spelling);
+      if (!classType || !*classType)
+        return "";
+      std::optional<MethodBinding> init =
+          lookupClassMethod(*classType, "__init__");
+      if (!init || !init->method || init->definingClass.empty() ||
+          init->kind != "instance")
+        return "";
+      std::string qualname =
+          py::contracts::pythonQualnameForContract(init->definingClass) +
+          ".__init__";
+      llvm::SmallVector<std::string, 2> keywordNames;
+      for (const auto &entry : keywordTypes)
+        keywordNames.push_back(entry.first);
+      std::string binding = callBindingError(
+          qualname, *init->method, /*bound=*/true,
+          static_cast<unsigned>(positionalTypes.size()), keywordNames);
+      if (!binding.empty())
+        return binding;
+      const FunctionSignature &sig = init->bodySignature;
+      auto check = [&](llvm::StringRef parameter, mlir::Type declared,
+                       mlir::Type actual) -> std::string {
+        if (!declared || !actual ||
+            inlineArgumentFits(types.widenLiteral(actual),
+                               types.widenLiteral(declared)))
+          return "";
+        return qualname + "() is not supported here: argument '" +
+               parameter.str() + "' is declared " +
+               pythonTypeSpelling(types.widenLiteral(declared)) +
+               " and this call gives it " +
+               pythonTypeSpelling(types.widenLiteral(actual));
+      };
+      for (auto [index, actual] : llvm::enumerate(positionalTypes)) {
+        std::size_t slot = index + 1;
+        if (slot >= sig.positionalTypes.size() ||
+            slot >= sig.positionalNames.size())
+          break;
+        std::string message = check(sig.positionalNames[slot],
+                                    sig.positionalTypes[slot], actual);
+        if (!message.empty())
+          return message;
+      }
+      for (const auto &[keyword, actual] : keywordTypes) {
+        mlir::Type declared;
+        for (auto [index, name] : llvm::enumerate(sig.positionalNames))
+          if (name == keyword && index < sig.positionalTypes.size())
+            declared = sig.positionalTypes[index];
+        for (auto [index, name] : llvm::enumerate(sig.kwOnlyNames))
+          if (name == keyword && index < sig.kwOnlyTypes.size())
+            declared = sig.kwOnlyTypes[index];
+        std::string message = check(keyword, declared, actual);
+        if (!message.empty())
+          return message;
+      }
+      return "";
+    };
+  }
   auto armFor = [&](llvm::StringRef spelling) {
     parser::NodePtr callee = synth::name(spelling, range);
     if (builtinExceptionBound &&
@@ -5140,7 +5483,7 @@ ModuleEmitter::emitClassValueCall(const parser::Node &expr,
     resultType = types.widenLiteral(types.inferExpr(probe.get()));
   }
   return emitClassValueDispatch(expr, classValue, bound, resultType, armFor,
-                                temps);
+                                temps, std::move(constructionMismatch));
 }
 
 std::optional<Value>
@@ -5983,6 +6326,30 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
           synth::attribute(std::move(receiverNode), methodName, range),
           synth::name(parameterNames.front(), range), range);
     };
+    // ⭐ AN OVERRIDE THAT CANNOT TAKE THE CALL RAISES WHAT CPYTHON RAISES.
+    // The arms forward the base's parameters, and a subclass may declare
+    // others -- every `__init__` does, and a computed-name call reaches
+    // `__init__` with whatever the call passed. An arm that cannot bind was
+    // refused for the whole program ("missing required argument
+    // 'description' for inlined class method") although CPython calls it
+    // only if that class arrives, and then raises a TypeError; the arm now
+    // raises it, word for word.
+    // ⛔ Only the binding. An argument the override declares another TYPE for
+    // stays refused: that is an incompatible override, which a type checker
+    // reports too, and CPython would run the body with it anyway.
+    auto callMismatch = [&](llvm::StringRef candidate) -> std::string {
+      if (readsWithoutCall || asSetter)
+        return "";
+      std::optional<MethodBinding> running =
+          resolveMroMethod(candidate, methodName);
+      if (!running || !running->method || running->definingClass.empty())
+        return "";
+      return callBindingError(
+          py::contracts::pythonQualnameForContract(running->definingClass) +
+              "." + methodName.str(),
+          *running->method, /*bound=*/running->kind != "static",
+          argumentCount, keywordParameters);
+    };
     std::vector<parser::NodePtr> body;
     for (const auto &candidate : candidates) {
       // ⭐ AN ATTRIBUTE ARM READS THROUGH THE CLASS, not through the narrowed
@@ -6037,6 +6404,9 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
                 py::contracts::displayClassNameForContract(candidate.second) +
                 "' object has no setter",
             range));
+      else if (std::string mismatch = callMismatch(candidate.second);
+               !mismatch.empty())
+        armBody.push_back(synth::raiseCall("TypeError", mismatch, range));
       else if (asSetter) {
         armBody.push_back(write(std::move(subject)));
         // ⛔ The arm has to RETURN. A read arm ends in one because it produces

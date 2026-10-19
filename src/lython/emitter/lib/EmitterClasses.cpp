@@ -5444,6 +5444,113 @@ bool ModuleEmitter::forwardsItsPacks(const parser::Node &def) {
   return forwards;
 }
 
+// Whether an argument of type `actual` may bind a parameter declared `expected`
+// at an inlined method's call -- the rule `checkArgument` reports, and the
+// one a dispatch arm asks before it is written.
+bool ModuleEmitter::inlineArgumentFits(mlir::Type actual,
+                                       mlir::Type expected) {
+  if (!expected || !actual || unboundStaticParameterCount(expected) != 0 ||
+      unboundStaticParameterCount(actual) != 0)
+    return true;
+  if (isAssignableWithStaticEvidence(actual, expected, module))
+    return true;
+  // ⭐ THE EMITTER'S OWN MRO, because the module's may not exist yet. An
+  // unbound base-method call inside a subclass method passes `self`:
+  //
+  //     class Child(Base):
+  //         def __init__(self, n: int) -> None:
+  //             Base.__init__(self, "c")
+  //     # argument 'self' of '__init__' is declared Base and this call gives
+  //     # it Child
+  //
+  // `Base.__init__(c, "z")` at module scope works, and so does
+  // `Base.greet(c, "x")`, because by then `py.class @Child` carries its
+  // `mro_names` and `isAssignableTo` can walk it. Inside Child's own method
+  // the class op is not in the module yet, so the walk finds no bases and
+  // answers "not a subtype" for a subtype. `classMros` is populated before any
+  // body is emitted -- it is what `resolveMroMethod` already reads.
+  //
+  // ⛔ Only for source-defined contracts on both sides. A manifest contract's
+  // assignability is the manifest's business, and `isAssignableTo` is the one
+  // that knows the protocol and subtype relations there.
+  // ⛔ NO DOT TEST. It read "a name with a dot is a manifest contract", and
+  // an IMPORTED class's name is dotted too (`shapes2.Right`), so passing an
+  // imported subclass where the imported base is declared was refused --
+  // "argument 'inner' of '__init__' is declared shapes2.Base and this call
+  // gives it shapes2.Right" -- while the same hierarchy in ONE file was
+  // accepted. The MRO map is the answer on its own: it holds exactly the
+  // classes this compiler declared, and a manifest contract is never in it.
+  if (auto expectedContract = mlir::dyn_cast<py::ContractType>(expected))
+    if (auto actualContract = mlir::dyn_cast<py::ContractType>(actual))
+      if (llvm::is_contained(classMro(actualContract.getContractName()),
+                             expectedContract.getContractName()))
+        return true;
+  // ⭐ A SUBCLASS IS A CLASS VALUE OF ITS BASE: `type[Sq]` passed where
+  // `type[Shape]` is declared is the class value naming Sq, which is what
+  // the parameter holds at run time.
+  // (Not along the numeric tower, which `isAssignableWithStaticEvidence`
+  // states for class values.)
+  if (auto expectedClass = mlir::dyn_cast<py::TypeType>(expected))
+    if (auto actualClass = mlir::dyn_cast<py::TypeType>(actual)) {
+      auto numeric = [](mlir::Type type) {
+        auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+        return contract && (contract.getContractName() == "builtins.bool" ||
+                            contract.getContractName() == "builtins.int" ||
+                            contract.getContractName() == "builtins.float" ||
+                            contract.getContractName() == "builtins.complex");
+      };
+      mlir::Type actualInstance = actualClass.getInstanceType();
+      mlir::Type expectedInstance = expectedClass.getInstanceType();
+      if (!(numeric(actualInstance) && numeric(expectedInstance)) &&
+          (isAssignableWithStaticEvidence(actual, expected, module) ||
+           pythonSubclassOf(actualInstance, expectedInstance, types,
+                            module)))
+        return true;
+    }
+  // ⭐ A BARE generic contract accepts any instantiation of itself. A generic
+  // class's own methods spell the receiver without its arguments --
+  // `def __add__(self, other: "Counter") -> "Counter"` -- and the argument
+  // arrives as `Counter[str]`, which `isAssignableTo` answers false for
+  // because the argument lists differ. `c + c` on a `Counter[str]` was
+  // therefore refused by this very check: "argument 'other' of '__add__' is
+  // declared Counter and this call gives it Counter[str]".
+  //
+  // ⛔ One direction only. Declared WITH arguments and supplied without is a
+  // real mismatch -- the parameter promises an instantiation the argument
+  // does not name -- and stays refused.
+  if (auto expectedContract = mlir::dyn_cast<py::ContractType>(expected))
+    if (auto actualContract = mlir::dyn_cast<py::ContractType>(actual))
+      if (expectedContract.getArguments().empty() &&
+          !actualContract.getArguments().empty() &&
+          expectedContract.getContractName() ==
+              actualContract.getContractName())
+        return true;
+  // ⭐ The numeric tower is admitted HERE and not by `isAssignableTo`, which
+  // answers false for int against float. A free function refuses the same
+  // call and `emitArgumentSpecializedCall` then emits a SECOND BODY at the
+  // argument's rung; an inlined method re-emits its body at every call site
+  // already, so the specialization it would need is the emission that is
+  // about to happen. Refusing here would take away a shape that works.
+  auto rung = [&](mlir::Type type) {
+    if (type == types.boolType())
+      return 0;
+    if (type == types.intType())
+      return 1;
+    if (type == types.floatType())
+      return 2;
+    auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+    if (contract && contract.getArguments().empty() &&
+        contract.getContractName() == "builtins.complex")
+      return 3;
+    return -1;
+  };
+  int actualRung = rung(actual);
+  int expectedRung = rung(expected);
+  if (actualRung >= 0 && expectedRung >= 0 && actualRung <= expectedRung)
+    return true;
+  return false;
+}
+
 Value ModuleEmitter::emitInlineMethodBody(
     const parser::Node &anchor, Value receiver, bool bindDescriptorReceiver,
     const MethodBinding &method, llvm::ArrayRef<Value> positional,
@@ -5635,6 +5742,24 @@ Value ModuleEmitter::emitInlineMethodBody(
     auto resolved = solved ? mlir::dyn_cast_if_present<py::CallableType>(
                                  solved.evidence.callableContract)
                            : py::CallableType();
+    // What a call that leaves a default out passes (see
+    // `omittedDefaultArgumentTypes`).
+    if (declared && !collectedVararg &&
+        !bindSolvedInstantiation(types, declared, resolved, typeArguments)) {
+      typeArguments.clear();
+      llvm::SmallVector<CallKeywordType, 2> defaults =
+          omittedDefaultArgumentTypes(
+              *method.method, declaredSig,
+              static_cast<unsigned>(argumentTypes.size()), keywordTypes);
+      if (!defaults.empty()) {
+        keywordTypes.append(defaults.begin(), defaults.end());
+        solved = types.inferCallWithEvidence(declared, argumentTypes,
+                                             keywordTypes);
+        resolved = solved ? mlir::dyn_cast_if_present<py::CallableType>(
+                                solved.evidence.callableContract)
+                          : py::CallableType();
+      }
+    }
     if (!bindSolvedInstantiation(types, declared, resolved, typeArguments)) {
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, anchor.range.start,
@@ -5850,104 +5975,7 @@ Value ModuleEmitter::emitInlineMethodBody(
       return;
     mlir::Type expected = types.widenLiteral(declared);
     mlir::Type actual = types.widenLiteral(argument.type);
-    if (!expected || !actual || unboundStaticParameterCount(expected) != 0 ||
-        unboundStaticParameterCount(actual) != 0)
-      return;
-    if (isAssignableWithStaticEvidence(actual, expected, module))
-      return;
-    // ⭐ THE EMITTER'S OWN MRO, because the module's may not exist yet. An
-    // unbound base-method call inside a subclass method passes `self`:
-    //
-    //     class Child(Base):
-    //         def __init__(self, n: int) -> None:
-    //             Base.__init__(self, "c")
-    //     # argument 'self' of '__init__' is declared Base and this call gives
-    //     # it Child
-    //
-    // `Base.__init__(c, "z")` at module scope works, and so does
-    // `Base.greet(c, "x")`, because by then `py.class @Child` carries its
-    // `mro_names` and `isAssignableTo` can walk it. Inside Child's own method
-    // the class op is not in the module yet, so the walk finds no bases and
-    // answers "not a subtype" for a subtype. `classMros` is populated before any
-    // body is emitted -- it is what `resolveMroMethod` already reads.
-    //
-    // ⛔ Only for source-defined contracts on both sides. A manifest contract's
-    // assignability is the manifest's business, and `isAssignableTo` is the one
-    // that knows the protocol and subtype relations there.
-    // ⛔ NO DOT TEST. It read "a name with a dot is a manifest contract", and
-    // an IMPORTED class's name is dotted too (`shapes2.Right`), so passing an
-    // imported subclass where the imported base is declared was refused --
-    // "argument 'inner' of '__init__' is declared shapes2.Base and this call
-    // gives it shapes2.Right" -- while the same hierarchy in ONE file was
-    // accepted. The MRO map is the answer on its own: it holds exactly the
-    // classes this compiler declared, and a manifest contract is never in it.
-    if (auto expectedContract = mlir::dyn_cast<py::ContractType>(expected))
-      if (auto actualContract = mlir::dyn_cast<py::ContractType>(actual))
-        if (llvm::is_contained(classMro(actualContract.getContractName()),
-                               expectedContract.getContractName()))
-          return;
-    // ⭐ A SUBCLASS IS A CLASS VALUE OF ITS BASE: `type[Sq]` passed where
-    // `type[Shape]` is declared is the class value naming Sq, which is what
-    // the parameter holds at run time.
-    // (Not along the numeric tower, which `isAssignableWithStaticEvidence`
-    // states for class values.)
-    if (auto expectedClass = mlir::dyn_cast<py::TypeType>(expected))
-      if (auto actualClass = mlir::dyn_cast<py::TypeType>(actual)) {
-        auto numeric = [](mlir::Type type) {
-          auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
-          return contract && (contract.getContractName() == "builtins.bool" ||
-                              contract.getContractName() == "builtins.int" ||
-                              contract.getContractName() == "builtins.float" ||
-                              contract.getContractName() == "builtins.complex");
-        };
-        mlir::Type actualInstance = actualClass.getInstanceType();
-        mlir::Type expectedInstance = expectedClass.getInstanceType();
-        if (!(numeric(actualInstance) && numeric(expectedInstance)) &&
-            (isAssignableWithStaticEvidence(actual, expected, module) ||
-             pythonSubclassOf(actualInstance, expectedInstance, types,
-                              module)))
-          return;
-      }
-    // ⭐ A BARE generic contract accepts any instantiation of itself. A generic
-    // class's own methods spell the receiver without its arguments --
-    // `def __add__(self, other: "Counter") -> "Counter"` -- and the argument
-    // arrives as `Counter[str]`, which `isAssignableTo` answers false for
-    // because the argument lists differ. `c + c` on a `Counter[str]` was
-    // therefore refused by this very check: "argument 'other' of '__add__' is
-    // declared Counter and this call gives it Counter[str]".
-    //
-    // ⛔ One direction only. Declared WITH arguments and supplied without is a
-    // real mismatch -- the parameter promises an instantiation the argument
-    // does not name -- and stays refused.
-    if (auto expectedContract = mlir::dyn_cast<py::ContractType>(expected))
-      if (auto actualContract = mlir::dyn_cast<py::ContractType>(actual))
-        if (expectedContract.getArguments().empty() &&
-            !actualContract.getArguments().empty() &&
-            expectedContract.getContractName() ==
-                actualContract.getContractName())
-          return;
-    // ⭐ The numeric tower is admitted HERE and not by `isAssignableTo`, which
-    // answers false for int against float. A free function refuses the same
-    // call and `emitArgumentSpecializedCall` then emits a SECOND BODY at the
-    // argument's rung; an inlined method re-emits its body at every call site
-    // already, so the specialization it would need is the emission that is
-    // about to happen. Refusing here would take away a shape that works.
-    auto rung = [&](mlir::Type type) {
-      if (type == types.boolType())
-        return 0;
-      if (type == types.intType())
-        return 1;
-      if (type == types.floatType())
-        return 2;
-      auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
-      if (contract && contract.getArguments().empty() &&
-          contract.getContractName() == "builtins.complex")
-        return 3;
-      return -1;
-    };
-    int actualRung = rung(actual);
-    int expectedRung = rung(expected);
-    if (actualRung >= 0 && expectedRung >= 0 && actualRung <= expectedRung)
+    if (inlineArgumentFits(actual, expected))
       return;
     auto spell = [](mlir::Type type) {
       std::string text;

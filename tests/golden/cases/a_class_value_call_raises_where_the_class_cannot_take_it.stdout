@@ -1,0 +1,9 @@
+['test_a', 'test_b']
+d k xy
+TypeError: Holder.__init__() missing 1 required positional argument: 'extra'
+TypeError: Holder.__init__() got an unexpected keyword argument 'methodName'
+TypeError: Keyed.__init__() takes 1 positional argument but 2 were given
+TypeError: Keyed.__init__() got an unexpected keyword argument 'methodName'
+['xy']
+TypeError: Spelled.__init__() got an unexpected keyword argument 'methodName'. Did you mean 'methodname'?
+x
