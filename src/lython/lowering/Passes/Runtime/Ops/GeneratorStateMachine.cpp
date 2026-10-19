@@ -6,6 +6,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
 #include "Runtime/ABI/BoxLayout.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/xxhash.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -1732,6 +1733,9 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
     {
       llvm::SmallVector<py::TryOp, 4> tries;
       clone.walk([&](py::TryOp tryOp) { tries.push_back(tryOp); });
+      loweringGeneratorCloneTries = true;
+      auto restore =
+          llvm::make_scope_exit([&] { loweringGeneratorCloneTries = false; });
       for (py::TryOp tryOp : llvm::reverse(tries))
         if (mlir::failed(lowerTry(tryOp)))
           return mlir::failure();

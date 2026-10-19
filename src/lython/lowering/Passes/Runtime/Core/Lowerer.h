@@ -2115,6 +2115,9 @@ private:
       controlFlowDeferredExpansions;
   std::int64_t nextFunctionTargetId = 1;
   std::int64_t nextTryHandlerId = 1;
+  // Set while the generator state machine flattens a clone's tries
+  // (TryOps.cpp, HandlerReturn): their handlers answer from the text.
+  bool loweringGeneratorCloneTries = false;
   llvm::SmallVector<mlir::Operation *, 32> erase;
 };
 

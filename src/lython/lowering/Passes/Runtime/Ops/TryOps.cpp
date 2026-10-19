@@ -41,18 +41,39 @@ void replaceYields(mlir::OpBuilder &builder, mlir::Region &region,
   }
 }
 
+// Whether a completing handler returns to handling the exception its `try`
+// began inside: asked of the runtime, with what LyEH_HandledException said at
+// the try's entry -- or, in a generator clone, answered from the text.
+//
+// ⛔ THE CLONE KEEPS THE TEXT'S ANSWER because the entry value would have to
+// cross a suspend: a `try` around a `yield` completes in a later activation,
+// and a pointer live across the split has no frame lane to ride in, which
+// would decline the whole generator.
+struct HandlerReturn {
+  mlir::func::FuncOp contextIsHandled;
+  mlir::Value handledAtTry;
+  bool staticNested = false;
+
+  mlir::Value build(mlir::OpBuilder &builder, mlir::Location loc) const {
+    if (!contextIsHandled)
+      return constantBool(builder, loc, staticNested);
+    return mlir::func::CallOp::create(builder, loc, contextIsHandled,
+                                      mlir::ValueRange{handledAtTry})
+        .getResult(0);
+  }
+};
+
 void replaceExceptYields(mlir::OpBuilder &builder, mlir::Region &region,
                          mlir::Block *continuation,
                          mlir::func::FuncOp discardCurrentException,
-                         bool nestedInHandler) {
+                         const HandlerReturn &handlerReturn) {
   llvm::SmallVector<py::ExceptYieldOp, 8> yields;
   collectOwnedOps(region, yields);
   for (py::ExceptYieldOp yield : yields) {
     builder.setInsertionPoint(yield);
     mlir::func::CallOp::create(
         builder, yield.getLoc(), discardCurrentException,
-        mlir::ValueRange{
-            constantBool(builder, yield.getLoc(), nestedInHandler)});
+        mlir::ValueRange{handlerReturn.build(builder, yield.getLoc())});
     mlir::cf::BranchOp::create(builder, yield.getLoc(), continuation,
                                yield.getOperands());
     yield.erase();
@@ -204,15 +225,15 @@ void replaceYieldsWithFinallyEntry(mlir::OpBuilder &builder,
 
 void replaceExceptYieldsWithFinallyEntry(
     mlir::OpBuilder &builder, mlir::Region &region, mlir::Block *finallyEntry,
-    mlir::func::FuncOp discardCurrentException, bool nestedInHandler) {
+    mlir::func::FuncOp discardCurrentException,
+    const HandlerReturn &handlerReturn) {
   llvm::SmallVector<py::ExceptYieldOp, 8> yields;
   collectOwnedOps(region, yields);
   for (py::ExceptYieldOp yield : yields) {
     builder.setInsertionPoint(yield);
     mlir::func::CallOp::create(
         builder, yield.getLoc(), discardCurrentException,
-        mlir::ValueRange{
-            constantBool(builder, yield.getLoc(), nestedInHandler)});
+        mlir::ValueRange{handlerReturn.build(builder, yield.getLoc())});
     llvm::SmallVector<mlir::Value, 4> operands;
     mlir::Value mode = constantBool(builder, yield.getLoc(), false);
     operands.push_back(mode);
@@ -356,9 +377,28 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerTry(py::TryOp op) {
   if (finalHandlerId)
     tryInlineDepths[*finalHandlerId] = tryDepth;
   mlir::func::FuncOp discardCurrentException;
-  if (hasExcept)
+  HandlerReturn handlerReturn;
+  handlerReturn.staticNested = op->hasAttr("ly.try.inside_handler");
+  if (hasExcept) {
     discardCurrentException =
         getOrCreateDiscardCurrentExceptionEx(module, builder);
+    if (!loweringGeneratorCloneTries) {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPoint(tryOperation);
+      mlir::Type ptrType = mlir::LLVM::LLVMPointerType::get(context);
+      handlerReturn.handledAtTry =
+          mlir::func::CallOp::create(
+              builder, loc,
+              getOrCreatePrivateFunction(
+                  module, builder, "LyEH_HandledException",
+                  builder.getFunctionType({}, {ptrType})),
+              mlir::ValueRange{})
+              .getResult(0);
+      handlerReturn.contextIsHandled = getOrCreatePrivateFunction(
+          module, builder, "LyEH_ContextIsHandled",
+          builder.getFunctionType({ptrType}, {builder.getI1Type()}));
+    }
+  }
 
   for (mlir::Block &block : op.getTryRegion())
     tryHandlerIds.try_emplace(&block, handlerId);
@@ -418,9 +458,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerTry(py::TryOp op) {
     replaceYieldsWithFinallyEntry<py::TryYieldOp>(
         builder, op.getTryRegion(), finallyEntry, /*exceptional=*/false);
     if (hasExcept)
-      replaceExceptYieldsWithFinallyEntry(
-          builder, op.getExceptRegion(), finallyEntry, discardCurrentException,
-          op->hasAttr("ly.try.inside_handler"));
+      replaceExceptYieldsWithFinallyEntry(builder, op.getExceptRegion(),
+                                          finallyEntry,
+                                          discardCurrentException,
+                                          handlerReturn);
     if (mlir::failed(replaceRaiseCurrentWithFinallyEntry(
             builder, op.getExceptRegion(), finallyEntry, op)))
       return mlir::failure();
@@ -465,8 +506,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerTry(py::TryOp op) {
   } else {
     replaceYields<py::TryYieldOp>(builder, op.getTryRegion(), continuation);
     replaceExceptYields(builder, op.getExceptRegion(), continuation,
-                        discardCurrentException,
-                        op->hasAttr("ly.try.inside_handler"));
+                        discardCurrentException, handlerReturn);
   }
 
   auto continuationIt = continuation->getIterator();
