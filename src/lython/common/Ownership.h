@@ -510,7 +510,8 @@ public:
   ~DeallocCensusContext();
 
 private:
-  const char *previousOrigin;
+  bool active;
+  const char *previousOrigin = nullptr;
   std::string previousSubject;
 };
 

@@ -177,6 +177,53 @@ How it was checked:
 - ASan fuzz regression (`ctest --test-dir build-fuzz`) 3/3: the checked-in
   corpora plus the golden cases, replayed unmutated.
 
+## Verified in parallel (2026-10-20)
+
+After the work above the walk was linear, and on a program that imports
+unittest it was still the single largest verifier: the pre-cleanup run took
+1.64 s and the phase-13 run 0.57 s of a 9.4 s compile (`t00`: the unittest
+prototype plus one test, Release, Apple M-series). Each function is verified
+on its own, so the functions are now verified at once on the context's
+threads (`verifyFunctionsInParallel`, `verifier/runtime/AffineOwnership.cpp`).
+
+| run | sequential | parallel |
+| --- | --- | --- |
+| pre-cleanup `llvm-call-verifier` | 1.64 | 0.77 |
+| phase-13 `llvm-call-verifier` | 0.57 | 0.31 |
+
+The parallel column is now one function long: `unittest.TestSuite.run` alone
+takes 0.68 s of the 0.77 s. Shortening it again means making one function's
+walk cheaper, not adding threads.
+
+Why the verdict is the same:
+
+- **What the walk reads per function is that function.** Resources, paths and
+  alias classes are built from one function's SSA values, which cannot cross a
+  function; a callee is read through its contract attributes only. The shared
+  memos of the sequential walk (contracts read so far, the module-wide alias
+  union-find, the reference map) answer the same per function as per module, so
+  each thread builds its own: one `AliasAnalysis` and `ReferenceMap` per
+  function, one `FuncContractCache` per thread, copied from a table that has
+  read nothing.
+- **The diagnostic is the sequential one.** The sequential walk stops at the
+  first function that fails, in module order. The threads report a verdict per
+  function with diagnostics silenced, and the first failing function in module
+  order is then verified again alone, which emits exactly what the sequential
+  walk would have.
+- **Checked by comparison, not argued alone.** Emitted LLVM IR, exit code and
+  `stderr` byte-identical over the 1,135 corpus programs (`tests/golden/cases`,
+  `tests/golden/errors`, `examples`) against the binary before the change, and
+  against the same binary with `LYTHON_COMPILE_THREADS=1`.
+  `LYTHON_ABLATE_PARALLEL_OWNERSHIP_VERIFIER=1` (and every trace switch, which
+  prints as it walks) restores the sequential walk.
+
+One shared state was found the hard way: the dealloc census
+(`LYTHON_DEALLOC_CENSUS`) kept the current lookup's subject in a global
+`std::string` that every lookup wrote, census on or off. Two threads writing it
+corrupted the heap in the build-time pre-lowering of `stackguard_support.py`.
+The subject and origin are now `thread_local`, the counters are taken under a
+lock, and with the census off nothing is written at all.
+
 ## Still open
 
 `lowering.post-cleanup-unwind-insertion` is now the dominant phase — most of

@@ -114,6 +114,10 @@ ASAN_OPTIONS=detect_leaks=0:detect_container_overflow=0:allow_user_poisoning=0 \
 - `LYTHON_DUMP_ON_FAILURE=1` — lowering フェーズが失敗したとき、そのフェーズ終了時点のモジュールを stderr にダンプする (`LYTHON_IR_DUMP` は成功したフェーズの後にしか出力しないので、壊れた IR を作ったフェーズ自身の出力はこれでしか見えない)
 - `LYTHON_DUMP_LOCS=1` — `LYTHON_DUMP_ON_FAILURE` のダンプに各 op の source location を付ける (location しか持たない診断が、どの op を指しているかを探すため)
 - `LYTHON_PERF=1` — フェーズごとの wall time を出力
+- `LYTHON_PASS_TIMING=1` — lowering の各フェーズの中を、パスごとの時間 (MLIR の pass timing) に分けて出す。`LYTHON_PERF` の 1 フェーズ 1 行では分からない内訳
+- `LYTHON_COMPILE_THREADS=N` — 1 回のコンパイルが使うスレッド数。関数単位のパス、所有権検証、JIT のコード生成がこれを使う。既定はハードウェアスレッド数と 4 の小さいほう、1 にすると全部を呼び出しスレッドで行う。4 より多くしても壁時間はほとんど縮まず、CPU だけが増える (ctest のように 1 コアに 1 コンパイルを割り当てる使い方では、その増分がそのまま効く)。出力はスレッド数によらない (IR 同一を全コーパスで確認済み)
+- `LYTHON_JIT_PARTITIONS=N` — JIT のモジュールを N 個のオブジェクトに分けて並列にコード生成する。既定は命令数とスレッド数から決まり、1 なら従来どおり 1 モジュールのまま
+- `LYTHON_ABLATE_PARALLEL_OWNERSHIP_VERIFIER=1` — 所有権検証を関数ごとに並列で走らせず、逐次で回す。同じバイナリで両者を比べるためのスイッチ
 - `LYTHON_ABLATE_PRECOMPILED_RUNTIME=1` — ビルド時にホスト向けに事前コンパイルして lyc に埋め込んだネイティブランタイム (`LythonNativeRuntimeBitcode`) を使わず、コンパイルのたびに下げる。両者が同じモジュールであることを `lyc.precompiled_runtime_is_the_lowered_runtime` が検査する
 - `LYTHON_TRACE_REPR_CLOSURE=1` — 箱詰めの値のフック (repr / str / eq / hash / lt / release) の分岐を絞る根拠 (プログラムが持ち得るクラスの閉包) を stderr に出す。開いた (全分岐を残した) ときはその型と op の位置を出す。`LYTHON_ABLATE_REPR_CLOSURE=1` で常に全分岐を残す (release は例外の系統を常に残す)
 - `LYTHON_NUM_THREADS=N` — 実行時: 大きい行列積の fork-join ワーカー数 (デフォルト 4、1 で逐次)

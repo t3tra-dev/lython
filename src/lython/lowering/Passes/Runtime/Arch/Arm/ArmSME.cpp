@@ -32,7 +32,8 @@ void registerSMEDialects(mlir::DialectRegistry &registry) {
 // Both entry points below run exactly this, and a pass added to one of them
 // but not the other would make the two ArmSME paths disagree.
 void addSMEVectorClaim(mlir::OpPassManager &pipeline) {
-  pipeline.addPass(mlir::createConvertVectorToArmSMEPass());
+  pipeline.nestAny().addPass(mlir::createConvertVectorToArmSMEPass());
+  // ⛔ Module-wide: it rewrites function signatures and their calls.
   pipeline.addPass(mlir::arm_sme::createVectorLegalizationPass());
   pipeline.addNestedPass<mlir::func::FuncOp>(
       mlir::arm_sme::createOuterProductFusionPass());
@@ -58,11 +59,12 @@ void addSMEPreControlFlowLLVMPrepPipeline(mlir::OpPassManager &pipeline) {
   // still intact. Tile stores are then expanded to SCF slice loops; ArmSME
   // tile allocation expects control-flow lowering before the final
   // ArmSME-to-LLVM conversion.
-  pipeline.addPass(mlir::createArithToArmSMEConversionPass());
+  pipeline.nestAny().addPass(mlir::createArithToArmSMEConversionPass());
   addSMEVectorClaim(pipeline);
-  pipeline.addPass(mlir::createConvertArmSMEToSCFPass());
-  pipeline.addPass(mlir::createCanonicalizerPass());
-  pipeline.addPass(mlir::createCSEPass());
+  mlir::OpPassManager &eachFunction = pipeline.nestAny();
+  eachFunction.addPass(mlir::createConvertArmSMEToSCFPass());
+  eachFunction.addPass(mlir::createCanonicalizerPass());
+  eachFunction.addPass(mlir::createCSEPass());
 }
 
 namespace {
@@ -130,8 +132,9 @@ private:
 void addSMEPostControlFlowLLVMPrepPipeline(mlir::OpPassManager &pipeline) {
   pipeline.addNestedPass<mlir::func::FuncOp>(
       std::make_unique<ConvertArmSMEToLLVMWhereUsed>());
-  pipeline.addPass(mlir::createCanonicalizerPass());
-  pipeline.addPass(mlir::createCSEPass());
+  mlir::OpPassManager &eachFunction = pipeline.nestAny();
+  eachFunction.addPass(mlir::createCanonicalizerPass());
+  eachFunction.addPass(mlir::createCSEPass());
 }
 
 } // namespace py::lowering::arch::arm

@@ -14,8 +14,10 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/Threading.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
@@ -32,9 +34,12 @@
 #include <cstdint>
 #include <cstdlib>
 #include <initializer_list>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace py::lowering {
@@ -3897,6 +3902,95 @@ mlir::LogicalResult verifyFunctionAffineOwnership(
   return mlir::success();
 }
 
+// LYTHON_ABLATE_PARALLEL_OWNERSHIP_VERIFIER=1 verifies the functions one
+// after another on one thread, for comparing the two with one binary.
+bool parallelOwnershipVerifierDisabled() {
+  static const bool disabled =
+      std::getenv("LYTHON_ABLATE_PARALLEL_OWNERSHIP_VERIFIER") != nullptr;
+  return disabled;
+}
+
+// ⭐ EVERY FUNCTION IS VERIFIED ON ITS OWN, so they are verified at once. A
+// function's resources, paths and aliases are its own: SSA values do not cross
+// a function, and a callee is known by its contract, which this walk only
+// reads. What the sequential walk shares between functions are memos -- the
+// contracts read so far, the alias classes, the references -- and memos give
+// the same answers per function as per module.
+// ⛔ Not one contract cache for every thread: a lookup that misses fills it.
+// Each thread keeps its own. Nor every contract read up front: reading a
+// malformed one emits an error, and the walk reads only what is called.
+// ⛔ Not the parallel walk's diagnostics: the sequential walk stops at the
+// first function that fails, and the threads do not. They report a verdict
+// per function and say nothing; the first failure in module order is then
+// verified again alone, which says what the sequential walk would have said.
+// ⛔ Not under the trace switches, which print as they walk.
+mlir::LogicalResult verifyFunctionsInParallel(
+    mlir::ModuleOp module, llvm::ArrayRef<own::RuntimeDeallocator> deallocators) {
+  mlir::MLIRContext *context = module.getContext();
+  llvm::SmallVector<mlir::func::FuncOp, 0> functions;
+  module.walk([&](mlir::func::FuncOp function) {
+    if (!own::isRuntimeManifestFunction(function))
+      functions.push_back(function);
+  });
+  mlir::SymbolTable symbols(module);
+  auto verifyOne = [&](mlir::func::FuncOp function,
+                       FuncContractCache &contracts) {
+    own::AliasAnalysis aliases;
+    aliases.build(function, &symbols);
+    const own::ReferenceMap references(contracts, aliases);
+    return verifyFunctionAffineOwnership(module, symbols, function,
+                                         deallocators, aliases, contracts,
+                                         references);
+  };
+  // The largest first, so no thread is left with a big one at the end.
+  llvm::SmallVector<std::size_t, 0> order(functions.size());
+  llvm::SmallVector<std::size_t, 0> weight(functions.size());
+  for (std::size_t index = 0; index < functions.size(); ++index) {
+    order[index] = index;
+    std::size_t ops = 0;
+    functions[index].walk([&](mlir::Operation *) { ++ops; });
+    weight[index] = ops;
+  }
+  llvm::stable_sort(order, [&](std::size_t lhs, std::size_t rhs) {
+    return weight[lhs] > weight[rhs];
+  });
+  // Each thread's cache starts as a copy of one that has read nothing yet:
+  // the name table is what costs a walk of the module, and it is shared.
+  const FuncContractCache unread(module);
+  std::mutex cachesMutex;
+  std::map<std::thread::id, std::unique_ptr<FuncContractCache>> caches;
+  auto threadCache = [&]() -> FuncContractCache & {
+    std::lock_guard<std::mutex> lock(cachesMutex);
+    std::unique_ptr<FuncContractCache> &cache =
+        caches[std::this_thread::get_id()];
+    if (!cache)
+      cache = std::make_unique<FuncContractCache>(unread);
+    return *cache;
+  };
+  std::vector<char> failed(functions.size(), 0);
+  {
+    mlir::ScopedDiagnosticHandler silence(
+        context, [](mlir::Diagnostic &) { return mlir::success(); });
+    mlir::parallelFor(context, 0, order.size(), [&](std::size_t position) {
+      std::size_t index = order[position];
+      if (mlir::failed(verifyOne(functions[index], threadCache())))
+        failed[index] = 1;
+    });
+  }
+  auto first = llvm::find(failed, 1);
+  if (first == failed.end())
+    return mlir::success();
+  FuncContractCache contracts(unread);
+  return verifyOne(functions[first - failed.begin()], contracts);
+}
+
+bool verifyFunctionsOneAtATime(mlir::ModuleOp module) {
+  return parallelOwnershipVerifierDisabled() || ownershipStaleTraceEnabled() ||
+         ownershipPathTraceEnabled() ||
+         std::getenv("LYTHON_TRACE_AFFINE_RETAIN") ||
+         !module.getContext()->isMultithreadingEnabled();
+}
+
 mlir::LogicalResult verifyPathSensitiveAffineOwnership(
     mlir::ModuleOp module, llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
     own::AliasAnalysis &aliases) {
@@ -4066,11 +4160,6 @@ verifyFuncCallOwnershipContractsImpl(mlir::ModuleOp module) {
     if (mlir::failed(verifyGeneratorResumeFrames(module)))
       return mlir::failure();
   }
-  own::AliasAnalysis aliases;
-  {
-    py::PerfScope perf("func-call-ownership.alias-analysis");
-    aliases.build(module);
-  }
   llvm::SmallVector<own::RuntimeDeallocator, 8> deallocators;
   {
     py::PerfScope perf("func-call-ownership.collect-deallocators");
@@ -4078,6 +4167,15 @@ verifyFuncCallOwnershipContractsImpl(mlir::ModuleOp module) {
   }
   if (deallocators.empty())
     return mlir::success();
+  if (!verifyFunctionsOneAtATime(module)) {
+    py::PerfScope perf("func-call-ownership.path-sensitive");
+    return verifyFunctionsInParallel(module, deallocators);
+  }
+  own::AliasAnalysis aliases;
+  {
+    py::PerfScope perf("func-call-ownership.alias-analysis");
+    aliases.build(module);
+  }
   py::PerfScope perf("func-call-ownership.path-sensitive");
   return verifyPathSensitiveAffineOwnership(module, deallocators, aliases);
 }

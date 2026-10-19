@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iterator>
+#include <mutex>
 #include <optional>
 
 namespace py::ownership {
@@ -84,42 +85,80 @@ DeallocCensus &census() {
   return instance;
 }
 
+// ⛔ Not counted without a lock: the ownership verifier walks functions on
+// several threads, and every one of them looks deallocators up. One lock for
+// every call site, so not a static of the template below.
+std::mutex &censusMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+template <typename Count> void countInCensus(Count &&count) {
+  if (!DeallocCensus::enabled())
+    return;
+  std::lock_guard<std::mutex> lock(censusMutex());
+  count(census());
+}
+
 // Which collector asked: a miss is only actionable by declaring a contract
 // name if the asking collector has a callee to read the name from.
-const char *g_origin = "other";
+// ⛔ Not one per process: the lookup a thread is in is that thread's.
+thread_local const char *g_origin = "other";
 // The callee (or function) whose values the current lookup is about.
-std::string g_subject = "?";
+thread_local std::string g_subject = "?";
 
 } // namespace
 
+// ⛔ Nothing is recorded with the census off: copying a callee's name on every
+// lookup only to restore it after cost every compile for a switch that is off.
 DeallocCensusContext::DeallocCensusContext(const char *origin,
                                            llvm::StringRef subject)
-    : previousOrigin(g_origin), previousSubject(g_subject) {
+    : active(DeallocCensus::enabled()) {
+  if (!active)
+    return;
+  previousOrigin = g_origin;
+  previousSubject = g_subject;
   g_origin = origin;
   g_subject = subject.str();
 }
 
 DeallocCensusContext::~DeallocCensusContext() {
+  if (!active)
+    return;
   g_origin = previousOrigin;
-  g_subject = previousSubject;
+  g_subject = std::move(previousSubject);
 }
 
 namespace {
 
 struct SubjectScope {
+  bool active = DeallocCensus::enabled();
   std::string previous;
-  explicit SubjectScope(llvm::StringRef name) : previous(g_subject) {
+  explicit SubjectScope(llvm::StringRef name) {
+    if (!active)
+      return;
+    previous = g_subject;
     g_subject = name.str();
   }
-  ~SubjectScope() { g_subject = previous; }
+  ~SubjectScope() {
+    if (active)
+      g_subject = std::move(previous);
+  }
 };
 
 struct OriginScope {
-  const char *previous;
-  explicit OriginScope(const char *name) : previous(g_origin) {
+  bool active = DeallocCensus::enabled();
+  const char *previous = nullptr;
+  explicit OriginScope(const char *name) {
+    if (!active)
+      return;
+    previous = g_origin;
     g_origin = name;
   }
-  ~OriginScope() { g_origin = previous; }
+  ~OriginScope() {
+    if (active)
+      g_origin = previous;
+  }
 };
 
 std::string typeListKey(llvm::ArrayRef<mlir::Type> types) {
@@ -572,8 +611,7 @@ findDeallocatorForValueGroup(mlir::ValueRange values, unsigned offset,
   // 5-word box), so a shape match either ties -- and answered nothing -- or
   // picks among contracts that merely look alike.
   if (contractName.empty()) {
-    if (DeallocCensus::enabled())
-      ++census().emptyName;
+    countInCensus([](DeallocCensus &census) { ++census.emptyName; });
     return nullptr;
   }
 
@@ -594,12 +632,12 @@ findDeallocatorForValueGroup(mlir::ValueRange values, unsigned offset,
       ambiguous = true;
   }
   if (matched) {
-    if (DeallocCensus::enabled()) {
+    countInCensus([&](DeallocCensus &census) {
       if (ambiguous)
-        ++census().namedTie;
+        ++census.namedTie;
       else
-        ++census().resolved[contractName];
-    }
+        ++census.resolved[contractName];
+    });
     return ambiguous ? nullptr : matched;
   }
 
@@ -612,9 +650,10 @@ findDeallocatorForValueGroup(mlir::ValueRange values, unsigned offset,
     if (offset < values.size())
       got = typeListKey(llvm::SmallVector<mlir::Type, 2>{
           values[offset].getType()});
-    ++census().misses[contractName.str() + " have=" +
-                      (have.empty() ? "none" : have) + " got=" + got + " in " +
-                      g_origin + " " + g_subject];
+    std::string miss = contractName.str() + " have=" +
+                       (have.empty() ? "none" : have) + " got=" + got + " in " +
+                       g_origin + " " + g_subject;
+    countInCensus([&](DeallocCensus &census) { ++census.misses[miss]; });
   }
   return nullptr;
 }
@@ -1477,16 +1516,18 @@ collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
       llvm::StringRef contractName = ownedResultContractName(
           callee, *functionContract, static_cast<unsigned>(contractIndex));
       OriginScope originScope("sibling/callResultGroups");
-      if (DeallocCensus::enabled() && contractName.empty())
-        ++census().declaredNameAbsent;
+      if (contractName.empty())
+        countInCensus(
+            [](DeallocCensus &census) { ++census.declaredNameAbsent; });
       const RuntimeDeallocator *deallocator = findDeallocatorForValueGroup(
           call.getResults(), offset, deallocators, contractName);
       if (!deallocator) {
         // Name the callees whose owned result no lookup can resolve, as a SET.
         // A count says how many groups went missing; only the names say which
         // declaration would close them.
-        if (DeallocCensus::enabled())
-          ++census().unresolved[(callee ? callee.getName() : "<indirect>")];
+        countInCensus([&](DeallocCensus &census) {
+          ++census.unresolved[(callee ? callee.getName() : "<indirect>")];
+        });
         continue;
       }
       ResourceGroup group;
