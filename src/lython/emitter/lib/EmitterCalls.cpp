@@ -3019,7 +3019,7 @@ Value ModuleEmitter::emitArgumentSpecializedCall(const parser::Node &expr,
   } else {
     // The same divergence backstop the generic specializer carries: a body
     // that calls itself one rung down would otherwise re-enter forever.
-    if (info.specializations.size() >= 32)
+    if (info.emittingSpecializations >= 32)
       return ordinary();
     symbol = (llvm::Twine(info.symbolBase) + "$arg" +
               llvm::Twine(static_cast<unsigned>(info.specializations.size())))
@@ -3027,6 +3027,8 @@ Value ModuleEmitter::emitArgumentSpecializedCall(const parser::Node &expr,
     // Memoize BEFORE the body, so a recursive call at the same ground
     // signature resolves to this symbol instead of specializing again.
     info.specializations[specialized.publicCallable] = symbol;
+    ++info.emittingSpecializations;
+    auto leave = llvm::scope_exit([&] { --info.emittingSpecializations; });
     auto emitBody = [&] {
       emitCallableFunction(*info.node, symbol, specialized, {},
                            /*isLambda=*/false);

@@ -289,8 +289,12 @@ ModuleEmitter::ensureGenericSpecialization(
   // instantiation at a NEW ground type re-enters here before its body
   // finishes emitting, so an unbounded chain would otherwise recurse
   // forever.
-  if (generic.specializations.size() >= 32)
-    return fail("too many distinct instantiations (polymorphic recursion?)");
+  // ⛔ It counts the instantiations still being emitted -- how deep that
+  // re-entry goes -- and not every one there is: a program calling a generic
+  // at 33 types, or a ParamSpec forwarder at 33 call shapes, is not
+  // recursing, and was refused as if it were.
+  if (generic.emittingSpecializations >= 32)
+    return fail("too many nested instantiations (polymorphic recursion?)");
 
   llvm::StringRef symbolBase =
       generic.symbolBase.empty() ? llvm::StringRef(*name) : generic.symbolBase;
@@ -303,6 +307,9 @@ ModuleEmitter::ensureGenericSpecialization(
   // re-specializing.
   generic.specializations[specialized.publicCallable] = symbol;
 
+  ++generic.emittingSpecializations;
+  auto leave =
+      llvm::scope_exit([&] { --generic.emittingSpecializations; });
   auto emitSpecializedBody = [&] {
     // Body annotations spell the type parameters by name (x: T); bind each
     // solved parameter to its ground type for the emission scope, shadowing

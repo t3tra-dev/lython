@@ -1554,6 +1554,40 @@ TEST(EmitterTest, AParamSpecForwarderIsSpecializedAtEachCall) {
   }
 }
 
+// A generic function is specialized at every type it is called with, however
+// many there are; what is refused is an instantiation that keeps nesting
+// inside the one being emitted -- polymorphic recursion.
+TEST(EmitterTest, AGenericIsSpecializedAtEveryTypeButNotWithoutEnd) {
+  std::string many = "def ident[T](x: T) -> T:\n"
+                     "    return x\n";
+  for (int arity = 1; arity <= 40; ++arity) {
+    std::string tuple = "(";
+    for (int index = 0; index < arity; ++index)
+      tuple += "1, ";
+    many += "print(len(ident(" + tuple + "))))\n";
+  }
+  {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult result = emitSource(many, context);
+    EXPECT_TRUE(result.ok());
+  }
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult mutual = emitSource(
+      "def f[T](x: T, n: int) -> int:\n"
+      "    if n == 0:\n"
+      "        return 0\n"
+      "    return g([x], n - 1)\n"
+      "def g[T](x: T, n: int) -> int:\n"
+      "    if n == 0:\n"
+      "        return 0\n"
+      "    return f([x], n - 1)\n"
+      "print(f(1, 3))\n",
+      context);
+  EXPECT_FALSE(mutual.ok());
+  EXPECT_TRUE(reportsDiagnostic(
+      mutual, "too many nested instantiations (polymorphic recursion?)"));
+}
+
 TEST(EmitterTest, RepeatedEmitIsStable) {
   for (int round = 0; round < 5; ++round) {
     mlir::MLIRContext context(testRegistry());
