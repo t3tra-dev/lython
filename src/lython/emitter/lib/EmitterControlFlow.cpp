@@ -657,6 +657,54 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
 
   std::optional<bool> staticTruth =
       test ? optionalStaticBranchTruth(*test, types, module) : std::nullopt;
+  // ⭐ AN `and` DECIDED FALSE BY A LATER OPERAND IS STILL FALSE: whatever
+  // the operands before it answer, the test is falsy -- `note() and
+  // isinstance(a, str)` for an int `a`. The arm was compiled as reachable,
+  // with `a` narrowed to str, and refused for what it did with one. The
+  // operands before the deciding one still run, with their short-circuit,
+  // for what they do; the deciding one and those after it would not run in
+  // CPython either, or would not change the answer. An `or` decided true
+  // the same way takes the body.
+  if (!staticTruth && test && test->kind == "BoolOp") {
+    const parser::Node *op = ast::node(*test, "op");
+    const auto *operands = ast::nodeList(*test, "values");
+    bool isAnd = ast::isOperator(op, "And");
+    bool isOr = ast::isOperator(op, "Or");
+    std::optional<std::size_t> deciding;
+    if (operands && (isAnd || isOr))
+      for (auto [index, operand] : llvm::enumerate(*operands)) {
+        if (!operand)
+          break;
+        std::optional<bool> truth =
+            optionalStaticBranchTruth(*operand, types, module);
+        if (truth && *truth == isOr) {
+          deciding = index;
+          break;
+        }
+      }
+    if (deciding) {
+      if (*deciding > 0) {
+        parser::NodePtr prefix;
+        if (*deciding == 1) {
+          prefix = (*operands)[0];
+        } else {
+          prefix = parser::makeNode("BoolOp", test->range);
+          parser::addField(*prefix, "op", parser::makeNode(isAnd ? "And" : "Or", test->range));
+          parser::addField(*prefix, "values",
+                           std::vector<parser::NodePtr>(
+                               operands->begin(),
+                               operands->begin() + *deciding));
+          synthesizedIteratorDefs.push_back(prefix);
+        }
+        (void)emitExpr(prefix.get());
+      }
+      const auto *selected = isOr ? ast::nodeList(statement, "body")
+                                  : ast::nodeList(statement, "orelse");
+      if (selected && !selected->empty())
+        emitStatements(selected);
+      return;
+    }
+  }
   if (staticTruth) {
     // A statically taken branch is inline code, not a scope (CPython `if`
     // does not scope): its bindings — assignments, imports, narrowing —

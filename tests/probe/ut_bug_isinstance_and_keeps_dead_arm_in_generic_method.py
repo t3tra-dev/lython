@@ -5,8 +5,9 @@
 #   assertEqual dispatches on both arguments' types this way.
 # KIND: バグ (bug) -- loud: well-typed code refused
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   argument 'a' of 'listy' is declared !py.contract<"builtins.list", [!py.contract<"builtins.int">]> and this call gives it !py.contract<"builtins.int">
+# FIXED: 2026-10-20 -- an `and`/`or` decided by its operands decides the branch;
+#   a later decided operand after run-time ones prunes the dead arm too.
+# CLASSIFICATION @ lang-gaps e3a2bbfe + the fix: 1 正しい
 # CPython 3.14 expects: other 1 list True
 class T:
     def listy(self, a: list[int], b: list[int]) -> str:

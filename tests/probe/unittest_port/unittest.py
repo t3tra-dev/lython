@@ -417,9 +417,8 @@ class TestCase:
                                                 callable_obj: Callable[P, object],
                                                 *args: P.args, **kwargs: P.kwargs) -> None:
         """assertRaises' callable form: call callable_obj(*args, **kwargs)."""
-        # WORKAROUND(ut_bug_generic_method_local_of_generic_class): a generic class built from E and held in a local of
-        # a generic method is specialized at the unsolved E too.
-        with _AssertRaisesContext[E](expected_exception, self):
+        context = _AssertRaisesContext[E](expected_exception, self)
+        with context:
             callable_obj(*args, **kwargs)
 
     def _baseAssertEqual[T](self, first: T, second: T, msg: str | None = None) -> None:
@@ -431,12 +430,9 @@ class TestCase:
     def assertEqual[T](self, first: T, second: T, msg: str | None = None) -> None:
         """Fail if the two objects are unequal as determined by the '=='
         operator."""
-        # WORKAROUND(ut_bug_isinstance_and_keeps_dead_arm_in_generic_method): `isinstance(a, str) and isinstance(b, str)` keeps
-        # the unreachable arm type-checked; two nested tests do not.
-        if isinstance(first, str):
-            if isinstance(second, str):
-                self.assertMultiLineEqual(first, second, msg)
-                return
+        if isinstance(first, str) and isinstance(second, str):
+            self.assertMultiLineEqual(first, second, msg)
+            return
         self._baseAssertEqual(first, second, msg)
 
     def assertNotEqual[T](self, first: T, second: T, msg: str | None = None) -> None:

@@ -2094,6 +2094,14 @@ mlir::Type ModuleEmitter::ensureGenericClassSpecialization(
   if (generic->hasPackParameter ||
       arguments.size() != generic->params.size())
     return {};
+  // ⛔ Nor at an argument that still names a type parameter: `Ctx[E]` in a
+  // generic method's body is typed before the method is specialized, and a
+  // class emitted at the unsolved E was refused ("class value has no type
+  // object for builtins.E") by programs that never called the method.
+  if (llvm::any_of(arguments, [](mlir::Type argument) {
+        return unboundStaticParameterCount(argument) != 0;
+      }))
+    return {};
 
   mlir::Type key = types.contract(baseName, arguments);
   auto memoized = generic->specializations.find(key);
@@ -4400,6 +4408,28 @@ void ModuleEmitter::collectClassFields(
       llvm::StringMap<mlir::Type> initArgTypes;
       collectInitArgTypes(method, initArgTypes);
       TypeSystem::Scope initScope = types.pushScope();
+      // ⭐ A GENERIC METHOD'S TYPE PARAMETERS ARE TYPE VARIABLES HERE TOO, as
+      // its signature reads them. Unbound, `E` in `Ctx[E](expected)` read as a
+      // class named E, and the walk specialized Ctx at that fabrication --
+      // a class the lowering then refused ("class value has no type object for
+      // builtins.E") in a program that never called the method.
+      if (const auto *typeParams = ast::nodeList(method, "type_params"))
+        for (const parser::NodePtr &param : *typeParams) {
+          std::optional<std::string_view> paramName =
+              param ? ast::string(*param, "name") : std::nullopt;
+          if (!paramName)
+            continue;
+          llvm::StringRef spelling(*paramName);
+          if (param->kind == "ParamSpec")
+            types.bindLocalSymbol(spelling,
+                                  py::ParamSpecType::get(&context, spelling));
+          else if (param->kind == "TypeVarTuple")
+            types.bindLocalSymbol(
+                spelling, py::TypeVarTupleType::get(&context, spelling));
+          else
+            types.bindLocalSymbol(spelling,
+                                  py::TypeVarType::get(&context, spelling));
+        }
       // ⭐ `self` IS THE CLASS, and this scope did not say so: it is the one
       // parameter `collectInitArgTypes` skips (it has no annotation to read),
       // so `other.nxt = self` -- how a linked structure links -- typed as

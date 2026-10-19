@@ -7520,6 +7520,21 @@ ModuleEmitter::tryEmitIssubclassCall(const parser::Node &expr,
   };
   std::optional<mlir::Type> subClass = classOf((*args)[0].get());
   std::optional<mlir::Type> superClass = classOf((*args)[1].get());
+  // ⭐ A CLASS VALUE THAT IS NOT SPELLED AS A CLASS NAME -- a field
+  // (`self.expected`), a call's result -- is a value like any other, even
+  // when its type alone says which class it is: the run-time test reads it.
+  // Only a name could be folded here, so `issubclass(t, self.expected)` in
+  // `Ctx[KeyError]` was refused while `Ctx[ValueError]`, whose class has
+  // subclasses, ran.
+  auto isClassValue = [&](const parser::Node *node) {
+    return node && (node->kind == "Tuple" ||
+                    mlir::isa_and_nonnull<py::TypeType>(
+                        types.widenLiteral(types.inferExpr(node))));
+  };
+  if ((!subClass || !superClass) && isClassValue((*args)[0].get()) &&
+      isClassValue((*args)[1].get()))
+    return emitClassValueSubclassTest(expr, (*args)[0].get(), (*args)[1].get(),
+                                      /*subjectIsInstance=*/false);
   if (!subClass || !superClass)
     return rejectIssubclass(
         "issubclass() requires statically resolvable class names");
