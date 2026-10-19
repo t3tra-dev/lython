@@ -493,9 +493,23 @@ ModuleEmitter::emitDynamicUnpack(const parser::Node &anchor,
     if (!extras.empty())
       collected = synth::binOp(synth::tuple(std::move(extras), range), "Add",
                                std::move(collected), range);
-    Value merged = emitExprExpected(collected.get(), target.varargType);
+    // ⛔ Not at a declared type that still names a type parameter: a generic
+    // method's `*args: T` is solved FROM what is collected here, and a tuple
+    // made at `tuple[T]` solved T as itself. It is made at the join of what
+    // it holds instead.
+    mlir::Type collectedType = target.varargType;
+    if (unboundStaticParameterCount(collectedType) != 0) {
+      llvm::SmallVector<mlir::Type, 4> members;
+      for (Value extra : call.extras)
+        members.push_back(types.widenLiteral(extra.type));
+      if (std::optional<mlir::Type> element = py::dynamicStarElementType(
+              types.widenLiteral(call.tail->type)))
+        members.push_back(*element);
+      collectedType = types.tupleOf(types.join(members));
+    }
+    Value merged = emitExprExpected(collected.get(), collectedType);
     synthesizedIteratorDefs.push_back(std::move(collected));
-    result.vararg = coerceValue(merged, target.varargType, anchor);
+    result.vararg = coerceValue(merged, collectedType, anchor);
   }
 
   auto mapping = llvm::find_if(call.keywords, [](const auto &entry) {
@@ -596,10 +610,26 @@ ModuleEmitter::emitDynamicUnpack(const parser::Node &anchor,
         synth::name("dict", range),
         std::vector<parser::NodePtr>{synth::name(source, range)}, range);
   }
-  Value made = emitExprExpected(start.get(), target.kwargType);
+  // ⛔ Not at a declared type that still names a type parameter, as for the
+  // tuple above: at the join of the values the dict holds.
+  mlir::Type collectedType = target.kwargType;
+  if (unboundStaticParameterCount(collectedType) != 0) {
+    llvm::SmallVector<mlir::Type, 4> members;
+    for (const auto &[name, value] : call.keywords) {
+      if (name.empty()) {
+        if (std::optional<mlir::Type> member =
+                py::callableUnpackedKeywordValueType(
+                    types.widenLiteral(value.type)))
+          members.push_back(*member);
+      } else if (!llvm::is_contained(nameable, name)) {
+        members.push_back(types.widenLiteral(value.type));
+      }
+    }
+    collectedType = types.dictOf(types.strType(), types.join(members));
+  }
+  Value made = emitExprExpected(start.get(), collectedType);
   synthesizedIteratorDefs.push_back(std::move(start));
-  std::string collected =
-      bind(coerceValue(made, target.kwargType, anchor));
+  std::string collected = bind(coerceValue(made, collectedType, anchor));
   if (seeded)
     emitSynthesized(synth::exprStmt(
         synth::methodCall(synth::name(collected, range), "update",

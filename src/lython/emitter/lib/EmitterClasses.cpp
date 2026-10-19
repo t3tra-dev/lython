@@ -5590,8 +5590,7 @@ Value ModuleEmitter::emitInlineMethodBody(
     auto resolved = solved ? mlir::dyn_cast_if_present<py::CallableType>(
                                  solved.evidence.callableContract)
                            : py::CallableType();
-    if (!resolved ||
-        !bindExpectedType(types, declared, resolved, typeArguments)) {
+    if (!bindSolvedInstantiation(types, declared, resolved, typeArguments)) {
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, anchor.range.start,
           "this call does not determine the type arguments of the generic "
