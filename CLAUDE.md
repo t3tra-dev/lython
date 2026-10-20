@@ -117,7 +117,7 @@ ASAN_OPTIONS=detect_leaks=0:detect_container_overflow=0:allow_user_poisoning=0 \
 - `LYTHON_PASS_TIMING=1` — lowering の各フェーズの中を、パスごとの時間 (MLIR の pass timing) に分けて出す。`LYTHON_PERF` の 1 フェーズ 1 行では分からない内訳
 - `LYTHON_COMPILE_THREADS=N` — 1 回のコンパイルが使うスレッド数。関数単位のパス、所有権検証、JIT のコード生成がこれを使う。既定はハードウェアスレッド数と 4 の小さいほう、1 にすると全部を呼び出しスレッドで行う。4 より多くしても壁時間はほとんど縮まず、CPU だけが増える (ctest のように 1 コアに 1 コンパイルを割り当てる使い方では、その増分がそのまま効く)。出力はスレッド数によらない (IR 同一を全コーパスで確認済み)
 - `LYTHON_JIT_PARTITIONS=N` — JIT のモジュールを N 個のオブジェクトに分けて並列にコード生成する。既定は命令数とスレッド数から決まり、1 なら従来どおり 1 モジュールのまま
-- `LYTHON_ABLATE_PARALLEL_OWNERSHIP_VERIFIER=1` — 所有権検証を関数ごとに並列で走らせず、逐次で回す。同じバイナリで両者を比べるためのスイッチ
+- `LYTHON_ABLATE_PARALLEL_OWNERSHIP_VERIFIER=1` / `LYTHON_ABLATE_PARALLEL_UNWIND_CLEANUP=1` — 所有権検証 / refcount 挿入の例外辺クリーンアップを、関数ごとの並列でなく逐次で回す。同じバイナリで両者を比べるためのスイッチ
 - `LYTHON_TRACE_METHOD_CALLS=1` — 大きなメソッドを呼び出し点に複製せず、記号として呼んだ呼び出しを stderr に出す。メソッド自身の本体を呼んだもの (`exact`: 受け手が構築された値か、サブクラスのないクラス) と、受け手のクラスが分からない呼び出しのために `self` を exact とみなさない本体を出したもの (`open`) を区別する。`LYTHON_CALLED_METHOD_NODES=N` は、呼び出しに切り替えるメソッドの大きさ (AST ノード数、既定 100) を変える。0 にすると、呼べるメソッドはすべて呼ぶ。コーパス全体で呼び出しの経路を試すときに使う。`LYTHON_ABLATE_METHOD_CALLS=1` で、従来どおりすべて複製する
 - `LYTHON_ABLATE_PRECOMPILED_RUNTIME=1` — ビルド時にホスト向けに事前コンパイルして lyc に埋め込んだネイティブランタイム (`LythonNativeRuntimeBitcode`) を使わず、コンパイルのたびに下げる。両者が同じモジュールであることを `lyc.precompiled_runtime_is_the_lowered_runtime` が検査する
 - `LYTHON_TRACE_REPR_CLOSURE=1` — 箱詰めの値のフック (repr / str / eq / hash / lt / release) の分岐を絞る根拠 (プログラムが持ち得るクラスの閉包) を stderr に出す。開いた (全分岐を残した) ときはその型と op の位置を出す。`LYTHON_ABLATE_REPR_CLOSURE=1` で常に全分岐を残す (release は例外の系統を常に残す)

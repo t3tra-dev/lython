@@ -15,6 +15,7 @@
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -676,6 +677,9 @@ collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
 // so a mistake with this variable set costs compile time, never a wrong release.
 bool ownershipSymbolTableDisabled();
 
+// The body of the function `value` is defined in, or null.
+mlir::Region *functionBodyOf(mlir::Value value);
+
 class AliasAnalysis {
 public:
   // `symbols` resolves the callees when `root` is not itself the symbol table
@@ -697,6 +701,19 @@ public:
   // bucket-only predicate this replaced had to say so itself -- twelve copies
   // of the same three lines, none of which wanted the raw answer.
   void namesOf(mlir::Value value, llvm::SmallVectorImpl<mlir::Value> &names);
+  // This analysis cut into one per function body, each holding the values
+  // defined in it, in the order this one tracked them, with the classes this
+  // one has. No class spans two functions -- an SSA value is used only in its
+  // own -- so each part answers about its function as this one does, and
+  // only its own function's walk touches it. Each part resolves callees with
+  // this analysis's table, which must outlive it. A part is made for each of
+  // `bodies` even when it tracks nothing.
+  // The values MOVE to the parts, and this analysis is left empty: holding
+  // both was the peak memory of a compile. False, with `parts` empty and this
+  // analysis untouched, when a class does span two bodies.
+  bool splitByFunction(
+      llvm::ArrayRef<mlir::Region *> bodies,
+      llvm::DenseMap<mlir::Region *, std::unique_ptr<AliasAnalysis>> &parts);
 
 private:
   void invalidateAliasBuckets();
