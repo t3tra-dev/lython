@@ -334,6 +334,8 @@ void RuntimeBundleLowerer::eraseLoweredFunction(mlir::Operation *function) {
   // close path then raised GeneratorExit "inside" a handler of a body that no
   // longer existed, and its `finally` ran or did not depending on the heap.
   function->walk([&](mlir::Block *block) { tryHandlerIds.erase(block); });
+  if (PrivateFunctionMemo *memo = PrivateFunctionMemo::of(module))
+    memo->forget(function);
   function->erase();
 }
 

@@ -1280,10 +1280,9 @@ bool ownedLocalMarkerIsRetainRooted(mlir::Operation *marker,
   if (!call || call.getNumOperands() != 1 ||
       call->hasAttr(kAggregateRetainAttr))
     return false;
-  auto module = marker->getParentOfType<mlir::ModuleOp>();
-  if (!module)
+  if (!marker->getParentOfType<mlir::ModuleOp>())
     return false;
-  auto callee = module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+  auto callee = aliases.function(marker, call.getCallee());
   if (!callee)
     return false;
   auto primitive =
@@ -1767,15 +1766,36 @@ static void unionStaticEvidenceCallResultAliases(AliasAnalysis &aliases,
   }
 }
 
+bool ownershipSymbolTableDisabled() {
+  static bool disabled = [] {
+    auto value =
+        llvm::sys::Process::GetEnv("LYTHON_ABLATE_OWNERSHIP_SYMBOL_TABLE");
+    return value && !value->empty() && *value != "0";
+  }();
+  return disabled;
+}
+
+mlir::func::FuncOp AliasAnalysis::function(mlir::Operation *from,
+                                           llvm::StringRef name) {
+  mlir::SymbolTable *table = ownSymbols ? &*ownSymbols : givenSymbols;
+  if (table && !ownershipSymbolTableDisabled())
+    if (auto found = table->lookup<mlir::func::FuncOp>(name))
+      return found;
+  auto module = from->getParentOfType<mlir::ModuleOp>();
+  return module ? module.lookupSymbol<mlir::func::FuncOp>(name)
+                : mlir::func::FuncOp();
+}
+
 void AliasAnalysis::build(mlir::Operation *root, mlir::SymbolTable *symbols) {
   // Resolving each call's callee through `Operation::lookupSymbol` walks the
   // module's symbol list, so the per-call static-evidence union below cost
   // O(calls x symbols) -- the term that exploded once an imported stdlib
   // module's symbols joined the module. One symbol table answers the same
   // question (immediate symbol children of `root`) in constant time.
-  std::optional<mlir::SymbolTable> rootSymbols;
+  ownSymbols.reset();
+  givenSymbols = symbols;
   if (!symbols && root->hasTrait<mlir::OpTrait::SymbolTable>())
-    symbols = &rootSymbols.emplace(root);
+    symbols = &ownSymbols.emplace(root);
   root->walk([&](mlir::Operation *op) {
     for (mlir::Value operand : op->getOperands())
       track(operand);

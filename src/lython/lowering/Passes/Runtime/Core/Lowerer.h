@@ -2188,16 +2188,65 @@ template <typename Step> inline void runToFixpoint(Step &&step) {
   }
 }
 
+// The functions `getOrCreatePrivateFunction` has answered with, kept while the
+// runtime lowering runs: every try marker and traceback push it writes asks
+// for one by name. ⛔ Not the module's symbol list on every ask, which scans
+// every runtime symbol for each one.
+// ⛔ And not kept anywhere a function can disappear unseen: only the runtime
+// lowering installs it, and that pass erases a function only through
+// `eraseLoweredFunction`, which forgets it here as well.
+class PrivateFunctionMemo {
+public:
+  explicit PrivateFunctionMemo(mlir::ModuleOp module)
+      : module(module), previous(active) {
+    active = this;
+  }
+  ~PrivateFunctionMemo() { active = previous; }
+  PrivateFunctionMemo(const PrivateFunctionMemo &) = delete;
+  PrivateFunctionMemo &operator=(const PrivateFunctionMemo &) = delete;
+
+  // The memo of `module`, if one is installed on this thread.
+  static PrivateFunctionMemo *of(mlir::ModuleOp module) {
+    return active && active->module == module ? active : nullptr;
+  }
+  mlir::func::FuncOp find(llvm::StringRef name) const {
+    return functions.lookup(name);
+  }
+  void remember(mlir::func::FuncOp function) {
+    functions[function.getSymName()] = function;
+  }
+  void forget(mlir::Operation *op) {
+    auto function = mlir::dyn_cast<mlir::func::FuncOp>(op);
+    if (!function)
+      return;
+    auto found = functions.find(function.getSymName());
+    if (found != functions.end() && found->second == function)
+      functions.erase(found);
+  }
+
+private:
+  mlir::ModuleOp module;
+  PrivateFunctionMemo *previous;
+  llvm::StringMap<mlir::func::FuncOp> functions;
+  static inline thread_local PrivateFunctionMemo *active = nullptr;
+};
+
 inline mlir::func::FuncOp
 getOrCreatePrivateFunction(mlir::ModuleOp module, mlir::OpBuilder &builder,
                            llvm::StringRef name, mlir::FunctionType type) {
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(name))
-    return existing;
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToEnd(module.getBody());
-  auto function =
-      mlir::func::FuncOp::create(builder, module.getLoc(), name, type);
-  function.setPrivate();
+  PrivateFunctionMemo *memo = PrivateFunctionMemo::of(module);
+  if (memo)
+    if (mlir::func::FuncOp known = memo->find(name))
+      return known;
+  auto function = module.lookupSymbol<mlir::func::FuncOp>(name);
+  if (!function) {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToEnd(module.getBody());
+    function = mlir::func::FuncOp::create(builder, module.getLoc(), name, type);
+    function.setPrivate();
+  }
+  if (memo)
+    memo->remember(function);
   return function;
 }
 

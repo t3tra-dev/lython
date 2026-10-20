@@ -659,11 +659,35 @@ collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
                              llvm::ArrayRef<RuntimeDeallocator> deallocators,
                              mlir::SymbolTable *symbols = nullptr);
 
+// LYTHON_ABLATE_OWNERSHIP_SYMBOL_TABLE=1 restores the callee resolution the
+// ownership passes used before a symbol table was threaded through them: each
+// callee re-resolved with `ModuleOp::lookupSymbol`, which scans the module's
+// symbol list.
+//
+// Why an ablation switch rather than nothing: this change removes WORK and must
+// not change a single instruction, and "the IR is identical" is only evidence
+// when both sides come from one binary -- a separate `before` build re-proves
+// the build, not the change. The two arms differ in which lookup answers, so if
+// the table's scope (immediate symbol children of the module) ever disagreed
+// with `lookupSymbol`'s, the differential would show it as an IR change instead
+// of hiding it as a silently different callee.
+//
+// Why setting it is safe to ship: it is strictly slower and otherwise identical,
+// so a mistake with this variable set costs compile time, never a wrong release.
+bool ownershipSymbolTableDisabled();
+
 class AliasAnalysis {
 public:
   // `symbols` resolves the callees when `root` is not itself the symbol table
   // (a function): without it each call is a scan of the module from the top.
+  // It must outlive the analysis, which keeps answering callee questions with
+  // it (`function`).
   void build(mlir::Operation *root, mlir::SymbolTable *symbols = nullptr);
+  // The function `name` names in the module `from` is in: from the table the
+  // callees were resolved with, and failing that from the module's symbol
+  // list, which also holds what a pass made after the build. A pass that
+  // erases a function must not ask afterwards.
+  mlir::func::FuncOp function(mlir::Operation *from, llvm::StringRef name);
   void track(mlir::Value value);
   mlir::Value find(mlir::Value value);
   bool same(mlir::Value lhs, mlir::Value rhs);
@@ -684,6 +708,10 @@ private:
   llvm::SmallVector<mlir::Value, 0> tracked;
   llvm::DenseMap<mlir::Value, llvm::SmallVector<mlir::Value, 8>> aliasBuckets;
   bool aliasBucketsDirty = true;
+  // The table `build` resolved callees with: the caller's, or its own when the
+  // root is the module.
+  std::optional<mlir::SymbolTable> ownSymbols;
+  mlir::SymbolTable *givenSymbols = nullptr;
 };
 
 // Group predicates shared by release insertion (lowering) and the affine
