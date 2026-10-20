@@ -147,6 +147,16 @@ public:
     return static_cast<bool>(of(value));
   }
 
+  // The answers given so far, cut by the function body each value is defined
+  // in (`functionOf`), for maps that answer one function each from here on.
+  // They MOVE: this map is left with none.
+  void splitAnswers(
+      llvm::function_ref<mlir::Region *(mlir::Value)> functionOf,
+      llvm::DenseMap<mlir::Region *, llvm::DenseMap<mlir::Value, Reference>>
+          &parts) const;
+  // Takes answers another map gave, as if this one had given them.
+  void preload(llvm::DenseMap<mlir::Value, Reference> answers) const;
+
 private:
   Reference compute(mlir::Value value) const;
 

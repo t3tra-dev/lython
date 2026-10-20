@@ -26,6 +26,26 @@ mlir::Operation *mintedReferenceOf(mlir::Operation *marker,
   return marker->getPrevNode();
 }
 
+void ReferenceMap::splitAnswers(
+    llvm::function_ref<mlir::Region *(mlir::Value)> functionOf,
+    llvm::DenseMap<mlir::Region *, llvm::DenseMap<mlir::Value, Reference>>
+        &parts) const {
+  for (const auto &entry : cache)
+    if (mlir::Region *body = functionOf(entry.first))
+      parts[body].try_emplace(entry.first, entry.second);
+  cache.shrink_and_clear();
+}
+
+void ReferenceMap::preload(
+    llvm::DenseMap<mlir::Value, Reference> answers) const {
+  if (cache.empty()) {
+    cache = std::move(answers);
+    return;
+  }
+  for (auto &entry : answers)
+    cache.try_emplace(entry.first, entry.second);
+}
+
 bool preservesReference(mlir::Operation *op) {
   if (!op)
     return false;

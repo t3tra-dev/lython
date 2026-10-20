@@ -1696,6 +1696,57 @@ void AliasAnalysis::namesOf(mlir::Value value,
   names.append(found->second.begin(), found->second.end());
 }
 
+mlir::Region *functionBodyOf(mlir::Value value) {
+  for (mlir::Region *region = value.getParentRegion(); region;) {
+    mlir::Operation *owner = region->getParentOp();
+    if (!owner)
+      return nullptr;
+    if (mlir::isa<mlir::func::FuncOp>(owner))
+      return region;
+    region = owner->getParentRegion();
+  }
+  return nullptr;
+}
+
+bool AliasAnalysis::splitByFunction(
+    llvm::ArrayRef<mlir::Region *> bodies,
+    llvm::DenseMap<mlir::Region *, std::unique_ptr<AliasAnalysis>> &parts) {
+  mlir::SymbolTable *table = ownSymbols ? &*ownSymbols : givenSymbols;
+  for (mlir::Region *body : bodies) {
+    std::unique_ptr<AliasAnalysis> &part = parts[body];
+    if (!part) {
+      part = std::make_unique<AliasAnalysis>();
+      part->givenSymbols = table;
+    }
+  }
+  llvm::SmallVector<mlir::Region *, 0> bodyOf;
+  bodyOf.reserve(tracked.size());
+  for (mlir::Value value : tracked) {
+    mlir::Region *body = functionBodyOf(value);
+    if (functionBodyOf(find(value)) != body) {
+      parts.clear();
+      return false;
+    }
+    bodyOf.push_back(body);
+  }
+  for (auto [value, body] : llvm::zip_equal(tracked, bodyOf)) {
+    if (!body)
+      continue;
+    std::unique_ptr<AliasAnalysis> &part = parts[body];
+    if (!part) {
+      part = std::make_unique<AliasAnalysis>();
+      part->givenSymbols = table;
+    }
+    part->parent[value] = find(value);
+    part->tracked.push_back(value);
+  }
+  parent.shrink_and_clear();
+  tracked = {};
+  aliasBuckets.shrink_and_clear();
+  aliasBucketsDirty = true;
+  return true;
+}
+
 void AliasAnalysis::invalidateAliasBuckets() {
   aliasBuckets.clear();
   aliasBucketsDirty = true;

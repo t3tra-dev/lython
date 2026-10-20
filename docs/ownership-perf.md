@@ -253,8 +253,35 @@ say so at the query sites), or invalidate at each edit.
 Secondary, in rough order: the remaining `getInherentAttr` traffic from
 `readFunctionContract` being re-read rather than cached per callee;
 `AliasAnalysis::track` invalidating the alias buckets on every newly tracked
-value; and the thread-safety verifier's own per-call
+value (closed for the unwind cleanup step, see below); and the thread-safety
+verifier's own per-call
 `module.lookupSymbol<func::FuncOp>()` in `ThreadSafe.cpp` /
 `ThreadSafeModel.cpp`, which is the same O(calls × symbols) shape on a much
 narrower path (`lowering.thread-safety-verifier`, ~0.8s of the 8.55s
 `stdlib_string_template.py` total).
+
+### The unwind cleanup step, per function (2026-10-20)
+
+`insertUnwindCleanupReleases` (refcount insertion and the post-cleanup re-pass)
+now works in three phases: every function is analyzed, then the shared things
+are numbered and made in module order, then every function is mutated. The
+shared things are the handler ids, the `__ly_unwind_cleanup_N` releasers, the
+EH marker and rethrow declarations, and `ly.try.inline_depths`. The analysis
+and the mutation of one function touch that function only, so both run on the
+context's threads, with the module-wide alias analysis and reference memo split
+into one part per function (`AliasAnalysis::splitByFunction`,
+`ReferenceMap::splitAnswers`).
+
+The split is also most of the speed-up, and not because of the threads. One
+module-wide `AliasAnalysis` invalidated its buckets on every newly tracked
+value, and the next `namesOf` rebuilt them over every value in the module. A
+function's part rebuilds over that function's values. On t01 the step went from
+0.57 s to 0.08 s; the largest single function in it, `__lygetattr$14`, spent
+165 ms in group collection alone.
+
+Checked as the verifier's change was: emitted LLVM IR byte-identical over the
+1,136 corpus programs against the previous binary, both at the default thread
+count and at `LYTHON_COMPILE_THREADS=1` (the sequential path).
+`LYTHON_ABLATE_PARALLEL_UNWIND_CLEANUP=1` keeps the three phases and runs them
+on one thread with the shared analyses, as before.
+

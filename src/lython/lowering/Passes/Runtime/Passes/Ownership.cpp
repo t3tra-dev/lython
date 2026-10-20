@@ -15,6 +15,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/Threading.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Pass/Pass.h"
 
@@ -30,8 +31,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <thread>
 
 namespace py::lowering {
 namespace {
@@ -5633,6 +5637,10 @@ public:
     enabled = on;
   }
 
+  // Takes the timing up again after other functions' work ran in between,
+  // which no step of this one is charged for.
+  void resume() { last = Clock::now(); }
+
   void mark(Step step) {
     if (!enabled)
       return;
@@ -5775,6 +5783,71 @@ std::int64_t nextUnusedExceptionHandlerId(mlir::ModuleOp module) {
   return next;
 }
 
+// ONE exceptional exit whose held tokens must be released on the unwind
+// edge. The four types this replaced -- guarded/unguarded x
+// top-level/nested -- differed in exactly two independent facts and in
+// nothing else, and each carried its own mutation loop that re-derived the
+// same five steps. The facts are now fields, and the steps are written once.
+struct UnwindCleanup {
+  // Either the call-site marker that already guards the exit, or the
+  // unguarded call that needs one minted before it.
+  //
+  // Why NOT a second field saying which: the op answers it (its callee is
+  // `LyEH_TryCallSiteMarker` or it is not), and a field would be a copy of
+  // that answer for the analysis and the mutation to disagree about.
+  mlir::func::CallOp site;
+  // The in-function handler to branch to once released, or null: the unwind
+  // leaves the function and the cleanup rethrows instead.
+  mlir::Block *handler;
+  // Where the anchor's cond_br splits the block. The site itself, except
+  // when the site sits inside a region op -- a single-block region cannot
+  // host the wiring, so it goes before that op's top-level ancestor and the
+  // in-region marker still points at the cleanup id (the final EH phase
+  // pairs markers with calls after flattening, so the runtime edge lands on
+  // the cleanup either way).
+  mlir::Operation *anchorBefore;
+  llvm::SmallVector<const UnwindTrackedGroup *, 4> groups;
+};
+
+// NOT one of the above, which is why it is not in that list: a raise
+// primitive never returns, so its held tokens are released INLINE before
+// the call and no marker, anchor, or cleanup block is involved. It shares
+// the collection pass, not a single step of the mutation.
+struct InlineReleaseBeforeRaise {
+  mlir::func::CallOp raiseCall;
+  llvm::SmallVector<const UnwindTrackedGroup *, 4> groups;
+};
+
+// What the analysis of one function decided, and what numbering gave it.
+// Held behind a pointer: the cleanups point into `groups`.
+struct UnwindFunctionPlan {
+  mlir::func::FuncOp function;
+  std::optional<UnwindStepTimer> steps;
+  // The plan the analysis produces, and the mutation consumes. Written by an
+  // analysis whose scope ENDS before the first block split: its reachability
+  // answers are memoised, and memoised reachability outliving the CFG it
+  // describes would present as a MISSING release -- the failure shape this
+  // suite has repeatedly been unable to see.
+  llvm::SmallVector<UnwindTrackedGroup, 16> groups;
+  llvm::SmallVector<UnwindCleanup, 8> cleanups;
+  llvm::SmallVector<InlineReleaseBeforeRaise, 4> inlineReleases;
+  // One cleanup handler per distinct requirement (handler, group set):
+  // cleanups sharing a requirement share the id, block, and releaser. A null
+  // handler means the unwind exits the function: the cleanup block releases
+  // and rethrows instead of branching to a local handler.
+  struct CleanupHandler {
+    mlir::Block *handler = nullptr;
+    llvm::SmallVector<const UnwindTrackedGroup *, 4> groups;
+    std::int64_t id = 0;
+    mlir::func::FuncOp releaser;
+    // Made by the mutation, at the first cleanup that shares it.
+    mlir::Block *block = nullptr;
+  };
+  llvm::SmallVector<CleanupHandler, 8> handlers;
+  // Each cleanup's handler, as an index into `handlers`.
+  llvm::SmallVector<unsigned, 8> handlerOfCleanup;
+};
+
 mlir::LogicalResult insertUnwindCleanupReleases(
     mlir::ModuleOp module, FuncContractCache &contracts,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
@@ -5852,11 +5925,21 @@ mlir::LogicalResult insertUnwindCleanupReleases(
   // cleanup shapes are skipped (RuntimePyLowering rejects leftover markers).
   bool deferMarkerWiring = module->hasAttr(own::kRuntimeInternalLoweringAttr);
 
-  mlir::LogicalResult result = mlir::success();
+  // Every function the step reads, in module order: the order the numbering
+  // below runs in.
+  llvm::SmallVector<std::unique_ptr<UnwindFunctionPlan>, 0> plans;
   module.walk([&](mlir::func::FuncOp function) {
-    if (mlir::failed(result) || function.isDeclaration() ||
-        own::isRuntimeManifestFunction(function))
+    if (function.isDeclaration() || own::isRuntimeManifestFunction(function))
       return;
+    plans.push_back(std::make_unique<UnwindFunctionPlan>());
+    plans.back()->function = function;
+  });
+
+  // ---- one function's analysis: it reads the IR and writes only its plan ----
+  auto analyze = [&](UnwindFunctionPlan &plan, FuncContractCache &contracts,
+                     own::AliasAnalysis &aliases,
+                     const own::ReferenceMap &references) {
+    mlir::func::FuncOp function = plan.function;
     mlir::Region *region = &function.getBody();
     // The final EH phase only invoke-converts functions carrying Python
     // debug info (attachPythonDebugInfo keys off the Python source loc):
@@ -5958,52 +6041,11 @@ mlir::LogicalResult insertUnwindCleanupReleases(
     // of the claim is narrower and still worth knowing -- the marker loop must
     // VISIT every cell, because which groups are held at which exit is the
     // output.
-    UnwindStepTimer steps(function);
-
-    // The plan the analysis produces, and the mutation consumes. Declared out
-    // here so the analysis itself can live in a scope that ENDS before the
-    // first block split: its reachability answers are memoised, and memoised
-    // reachability outliving the CFG it describes would present as a MISSING
-    // release -- the failure shape this suite has repeatedly been unable to
-    // see. A convention would not survive an edit; a scope makes a query after
-    // the mutation fail to compile.
-    llvm::SmallVector<UnwindTrackedGroup, 16> groups;
-    // ONE exceptional exit whose held tokens must be released on the unwind
-    // edge. The four types this replaced -- guarded/unguarded x
-    // top-level/nested -- differed in exactly two independent facts and in
-    // nothing else, and each carried its own mutation loop that re-derived the
-    // same five steps. The facts are now fields, and the steps are written once.
-    struct UnwindCleanup {
-      // Either the call-site marker that already guards the exit, or the
-      // unguarded call that needs one minted before it.
-      //
-      // Why NOT a second field saying which: the op answers it (its callee is
-      // `LyEH_TryCallSiteMarker` or it is not), and a field would be a copy of
-      // that answer for the analysis and the mutation to disagree about.
-      mlir::func::CallOp site;
-      // The in-function handler to branch to once released, or null: the unwind
-      // leaves the function and the cleanup rethrows instead.
-      mlir::Block *handler;
-      // Where the anchor's cond_br splits the block. The site itself, except
-      // when the site sits inside a region op -- a single-block region cannot
-      // host the wiring, so it goes before that op's top-level ancestor and the
-      // in-region marker still points at the cleanup id (the final EH phase
-      // pairs markers with calls after flattening, so the runtime edge lands on
-      // the cleanup either way).
-      mlir::Operation *anchorBefore;
-      llvm::SmallVector<const UnwindTrackedGroup *, 4> groups;
-    };
-    llvm::SmallVector<UnwindCleanup, 8> cleanups;
-
-    // NOT one of the above, which is why it is not in that list: a raise
-    // primitive never returns, so its held tokens are released INLINE before
-    // the call and no marker, anchor, or cleanup block is involved. It shares
-    // the collection pass, not a single step of the mutation.
-    struct InlineReleaseBeforeRaise {
-      mlir::func::CallOp raiseCall;
-      llvm::SmallVector<const UnwindTrackedGroup *, 4> groups;
-    };
-    llvm::SmallVector<InlineReleaseBeforeRaise, 4> inlineReleases;
+    plan.steps.emplace(function);
+    UnwindStepTimer &steps = *plan.steps;
+    auto &groups = plan.groups;
+    auto &cleanups = plan.cleanups;
+    auto &inlineReleases = plan.inlineReleases;
 
     { // ---- analysis: the CFG is FROZEN from here to the closing brace ----
       UnwindCleanupAnalysis analysis(function);
@@ -6681,128 +6723,72 @@ mlir::LogicalResult insertUnwindCleanupReleases(
       steps.walks = analysis.walks;
       steps.walkNodes = analysis.walkNodes;
     } // ---- the analysis, and every memoised answer, dies here ----
+  };
 
-    for (InlineReleaseBeforeRaise &release : inlineReleases) {
-      mlir::OpBuilder builder(release.raiseCall);
-      for (const UnwindTrackedGroup *group : llvm::reverse(release.groups))
-        mlir::func::CallOp::create(builder, release.raiseCall.getLoc(),
-                                   group->deallocator->function,
-                                   group->values);
-    }
-
-    // One cleanup handler per distinct requirement (handler, group set):
-    // markers sharing a requirement share the id, block, and releaser. A
-    // null handler means the unwind exits the function: the cleanup block
-    // releases and rethrows instead of branching to a local handler.
-    struct CleanupHandler {
-      mlir::Block *handler = nullptr;
-      llvm::SmallVector<const UnwindTrackedGroup *, 4> groups;
-      std::int64_t id = 0;
-      mlir::Block *block = nullptr;
+  // ⭐ EVERY FUNCTION IS ANALYZED AND MUTATED ON ITS OWN, so the functions
+  // are taken at once on the context's threads, and only the numbering
+  // between the two stays in order. The analysis of one function reads its
+  // own IR and the contracts of what it calls; the shared analyses it reads
+  // are memos with no class or answer that spans two functions, so each
+  // function gets the part of them that is its own (`splitByFunction`), and
+  // each thread a copy of the contract memo. Its mutation writes that
+  // function's blocks and names symbols the numbering already made.
+  // ⛔ What a part learns does not flow back to `aliases` and `references`:
+  // this step is the last to read them.
+  // ⛔ Not under the trace switches, which print as they walk, nor where a
+  // class spans two functions, which no split can give two threads.
+  mlir::MLIRContext *context = module.getContext();
+  static const bool parallelAblated =
+      std::getenv("LYTHON_ABLATE_PARALLEL_UNWIND_CLEANUP") != nullptr;
+  bool parallel = !parallelAblated && context->isMultithreadingEnabled() &&
+                  plans.size() > 1 && !unwindTrace().enabled &&
+                  !std::getenv("LYTHON_TRACE_UNWIND_HOLD") &&
+                  !own::ownershipRootParityEnabled();
+  llvm::DenseMap<mlir::Region *, std::unique_ptr<own::AliasAnalysis>>
+      aliasParts;
+  if (parallel) {
+    llvm::SmallVector<mlir::Region *, 0> bodies;
+    for (std::unique_ptr<UnwindFunctionPlan> &plan : plans)
+      bodies.push_back(&plan->function.getBody());
+    parallel = aliases.splitByFunction(bodies, aliasParts);
+  }
+  if (parallel) {
+    llvm::DenseMap<mlir::Region *,
+                   llvm::DenseMap<mlir::Value, own::Reference>>
+        answerParts;
+    references.splitAnswers(own::functionBodyOf, answerParts);
+    std::mutex cachesMutex;
+    std::map<std::thread::id, std::unique_ptr<FuncContractCache>> caches;
+    auto threadContracts = [&]() -> FuncContractCache & {
+      std::lock_guard<std::mutex> lock(cachesMutex);
+      std::unique_ptr<FuncContractCache> &cache =
+          caches[std::this_thread::get_id()];
+      if (!cache)
+        cache = std::make_unique<FuncContractCache>(contracts);
+      return *cache;
     };
-    llvm::SmallVector<CleanupHandler, 8> cleanupHandlers;
-    auto getOrCreateCleanupHandler =
-        [&](mlir::Block *handler,
-            llvm::ArrayRef<const UnwindTrackedGroup *> cleanupGroups,
-            mlir::Location loc) -> CleanupHandler * {
-      for (CleanupHandler &candidate : cleanupHandlers)
-        if (candidate.handler == handler &&
-            llvm::ArrayRef<const UnwindTrackedGroup *>(candidate.groups) ==
-                cleanupGroups) {
-          return &candidate;
-        }
-      CleanupHandler created;
-      created.handler = handler;
-      created.groups.assign(cleanupGroups.begin(), cleanupGroups.end());
-      created.id = nextHandlerId++;
-      // The new id stands for the handler it branches to, and so does that
-      // handler's inlined depth (TryOps.cpp): a catching landing pad stops
-      // its traceback push there (EH.cpp).
-      if (handler)
-        for (mlir::Operation &op : *handler) {
-          auto marker = mlir::dyn_cast<mlir::func::CallOp>(op);
-          if (!marker || marker.getCallee() != "LyEH_TryCatchMarker")
-            continue;
-          if (std::optional<std::int64_t> original =
-                  own::exceptionMarkerId(marker))
-            if (auto pairs = module->getAttrOfType<mlir::DenseI64ArrayAttr>(
-                    "ly.try.inline_depths")) {
-              llvm::SmallVector<std::int64_t, 16> words(
-                  pairs.asArrayRef().begin(), pairs.asArrayRef().end());
-              for (std::size_t index = 0; index + 1 < words.size();
-                   index += 2)
-                if (words[index] == *original) {
-                  words.push_back(created.id);
-                  words.push_back(words[index + 1]);
-                  module->setAttr(
-                      "ly.try.inline_depths",
-                      mlir::DenseI64ArrayAttr::get(module.getContext(),
-                                                   words));
-                  break;
-                }
-            }
-          break;
-        }
+    mlir::parallelFor(context, 0, plans.size(), [&](std::size_t index) {
+      UnwindFunctionPlan &plan = *plans[index];
+      mlir::Region *body = &plan.function.getBody();
+      FuncContractCache &threadCache = threadContracts();
+      own::AliasAnalysis &partAliases = *aliasParts.find(body)->second;
+      const own::ReferenceMap partReferences(threadCache, partAliases);
+      if (auto answers = answerParts.find(body); answers != answerParts.end())
+        partReferences.preload(std::move(answers->second));
+      analyze(plan, threadCache, partAliases, partReferences);
+    });
+  } else {
+    for (std::unique_ptr<UnwindFunctionPlan> &plan : plans)
+      analyze(*plan, contracts, aliases, references);
+  }
 
-      mlir::func::FuncOp releaser = createOutlinedUnwindReleaser(
-          module, loc, created.groups, nextReleaserIndex++);
-      llvm::SmallVector<mlir::Value, 8> operands;
-      for (const UnwindTrackedGroup *group : created.groups)
-        operands.append(group->values.begin(), group->values.end());
-
-      auto *cleanupBlock = new mlir::Block;
-      region->getBlocks().insert(region->end(), cleanupBlock);
-      mlir::OpBuilder builder(module.getContext());
-      builder.setInsertionPointToStart(cleanupBlock);
-      mlir::Value cleanupId =
-          mlir::arith::ConstantIntOp::create(builder, loc, created.id, 64)
-              .getResult();
-      mlir::func::CallOp::create(builder, loc, catchMarkerFn,
-                                 mlir::ValueRange{cleanupId});
-      mlir::func::CallOp::create(builder, loc, releaser, operands);
-      if (created.handler) {
-        mlir::cf::BranchOp::create(builder, loc, created.handler);
-      } else {
-        // Continue the unwind out of the function (mirrors the try
-        // lowering's finally-rethrow block: the rethrow never returns, the
-        // self-loop only satisfies the terminator requirement).
-        if (!rethrowFn) {
-          mlir::OpBuilder::InsertionGuard guard(builder);
-          builder.setInsertionPointToEnd(module.getBody());
-          rethrowFn = mlir::func::FuncOp::create(
-              builder, module.getLoc(), "LyEH_RethrowCurrent",
-              builder.getFunctionType({}, {}));
-          rethrowFn.setPrivate();
-        }
-        mlir::func::CallOp::create(builder, loc, rethrowFn,
-                                   mlir::ValueRange{});
-        mlir::cf::BranchOp::create(builder, loc, cleanupBlock);
-      }
-      created.block = cleanupBlock;
-
-      cleanupHandlers.push_back(created);
-      return &cleanupHandlers.back();
-    };
-    // The anchor keeps the cleanup block a reachable cond_br successor rather
-    // than a floating block later phases would drop or fail to verify. It is
-    // wired at the END of `head`, so `tail` must lead with the op the unwind
-    // edge belongs to -- the call-site marker, or the region op containing it.
-    auto wireAnchorBeforeTail = [&](mlir::Block *head, mlir::Block *tail,
-                                    mlir::Block *cleanupBlock,
-                                    std::int64_t cleanupId,
-                                    mlir::Location loc) {
-      mlir::OpBuilder builder(module.getContext());
-      builder.setInsertionPointToEnd(head);
-      mlir::Value headId =
-          mlir::arith::ConstantIntOp::create(builder, loc, cleanupId, 64)
-              .getResult();
-      auto anchor = mlir::func::CallOp::create(builder, loc, anchorFn,
-                                               mlir::ValueRange{headId});
-      mlir::cf::CondBranchOp::create(builder, loc, anchor.getResult(0),
-                                     cleanupBlock, mlir::ValueRange{}, tail,
-                                     mlir::ValueRange{});
-    };
-    for (UnwindCleanup &cleanup : cleanups) {
+  // ---- numbering, in module order: every symbol and id the step makes ----
+  // The mutation of one function touches that function only, so it can run
+  // for any function in any order; what is shared is made here, in the order
+  // the functions and their cleanups come in.
+  for (std::unique_ptr<UnwindFunctionPlan> &planPtr : plans) {
+    UnwindFunctionPlan &plan = *planPtr;
+    for (UnwindCleanup &cleanup : plan.cleanups) {
       if (deferMarkerWiring)
         break; // leaks stay visible: the affine verifier walks the handler
                // path and rejects them, instead of wiring markers the final
@@ -6812,32 +6798,160 @@ mlir::LogicalResult insertUnwindCleanupReleases(
                // this same attribute already clears, so only re-pointed
                // existing markers can be here to skip.
       ensureEHMarkerFunctions();
-      if (cleanup.handler && cleanup.handler->getNumArguments() != 0) {
-        result = cleanup.site.emitError()
-                 << "unwind cleanup cannot target a handler entry with block "
-                    "arguments";
-        return;
-      }
+      if (cleanup.handler && cleanup.handler->getNumArguments() != 0)
+        return cleanup.site.emitError()
+               << "unwind cleanup cannot target a handler entry with block "
+                  "arguments";
       mlir::Location loc = cleanup.site.getLoc();
-      CleanupHandler *shared =
-          getOrCreateCleanupHandler(cleanup.handler, cleanup.groups, loc);
+      std::optional<unsigned> shared;
+      for (auto [index, candidate] : llvm::enumerate(plan.handlers))
+        if (candidate.handler == cleanup.handler &&
+            llvm::ArrayRef<const UnwindTrackedGroup *>(candidate.groups) ==
+                llvm::ArrayRef<const UnwindTrackedGroup *>(cleanup.groups)) {
+          shared = static_cast<unsigned>(index);
+          break;
+        }
+      if (!shared) {
+        UnwindFunctionPlan::CleanupHandler created;
+        created.handler = cleanup.handler;
+        created.groups.assign(cleanup.groups.begin(), cleanup.groups.end());
+        created.id = nextHandlerId++;
+        // The new id stands for the handler it branches to, and so does that
+        // handler's inlined depth (TryOps.cpp): a catching landing pad stops
+        // its traceback push there (EH.cpp).
+        if (cleanup.handler)
+          for (mlir::Operation &op : *cleanup.handler) {
+            auto marker = mlir::dyn_cast<mlir::func::CallOp>(op);
+            if (!marker || marker.getCallee() != "LyEH_TryCatchMarker")
+              continue;
+            if (std::optional<std::int64_t> original =
+                    own::exceptionMarkerId(marker))
+              if (auto pairs = module->getAttrOfType<mlir::DenseI64ArrayAttr>(
+                      "ly.try.inline_depths")) {
+                llvm::SmallVector<std::int64_t, 16> words(
+                    pairs.asArrayRef().begin(), pairs.asArrayRef().end());
+                for (std::size_t index = 0; index + 1 < words.size();
+                     index += 2)
+                  if (words[index] == *original) {
+                    words.push_back(created.id);
+                    words.push_back(words[index + 1]);
+                    module->setAttr(
+                        "ly.try.inline_depths",
+                        mlir::DenseI64ArrayAttr::get(module.getContext(),
+                                                     words));
+                    break;
+                  }
+              }
+            break;
+          }
+        created.releaser = createOutlinedUnwindReleaser(
+            module, loc, created.groups, nextReleaserIndex++);
+        // Continuing the unwind out of the function needs the rethrow.
+        if (!created.handler && !rethrowFn) {
+          mlir::OpBuilder builder(module.getContext());
+          builder.setInsertionPointToEnd(module.getBody());
+          rethrowFn = mlir::func::FuncOp::create(
+              builder, module.getLoc(), "LyEH_RethrowCurrent",
+              builder.getFunctionType({}, {}));
+          rethrowFn.setPrivate();
+        }
+        plan.handlers.push_back(std::move(created));
+        shared = static_cast<unsigned>(plan.handlers.size() - 1);
+      }
+      plan.handlerOfCleanup.push_back(*shared);
+    }
+  }
+
+  // ---- one function's mutation: it writes that function's blocks only ----
+  // The anchor keeps the cleanup block a reachable cond_br successor rather
+  // than a floating block later phases would drop or fail to verify. It is
+  // wired at the END of `head`, so `tail` must lead with the op the unwind
+  // edge belongs to -- the call-site marker, or the region op containing it.
+  auto wireAnchorBeforeTail = [&](mlir::Block *head, mlir::Block *tail,
+                                  mlir::Block *cleanupBlock,
+                                  std::int64_t cleanupId,
+                                  mlir::Location loc) {
+    mlir::OpBuilder builder(module.getContext());
+    builder.setInsertionPointToEnd(head);
+    mlir::Value headId =
+        mlir::arith::ConstantIntOp::create(builder, loc, cleanupId, 64)
+            .getResult();
+    auto anchor = mlir::func::CallOp::create(builder, loc, anchorFn,
+                                             mlir::ValueRange{headId});
+    mlir::cf::CondBranchOp::create(builder, loc, anchor.getResult(0),
+                                   cleanupBlock, mlir::ValueRange{}, tail,
+                                   mlir::ValueRange{});
+  };
+  auto mutate = [&](UnwindFunctionPlan &plan) {
+    if (!plan.steps)
+      return;
+    plan.steps->resume();
+    mlir::Region *region = &plan.function.getBody();
+    for (InlineReleaseBeforeRaise &release : plan.inlineReleases) {
+      mlir::OpBuilder builder(release.raiseCall);
+      for (const UnwindTrackedGroup *group : llvm::reverse(release.groups))
+        mlir::func::CallOp::create(builder, release.raiseCall.getLoc(),
+                                   group->deallocator->function,
+                                   group->values);
+    }
+    for (auto [index, cleanup] : llvm::enumerate(plan.cleanups)) {
+      if (index >= plan.handlerOfCleanup.size())
+        break; // the numbering stopped here: marker wiring is deferred
+      UnwindFunctionPlan::CleanupHandler &shared =
+          plan.handlers[plan.handlerOfCleanup[index]];
+      mlir::Location loc = cleanup.site.getLoc();
+      if (!shared.block) {
+        llvm::SmallVector<mlir::Value, 8> operands;
+        for (const UnwindTrackedGroup *group : shared.groups)
+          operands.append(group->values.begin(), group->values.end());
+        auto *cleanupBlock = new mlir::Block;
+        region->getBlocks().insert(region->end(), cleanupBlock);
+        mlir::OpBuilder builder(module.getContext());
+        builder.setInsertionPointToStart(cleanupBlock);
+        mlir::Value cleanupId =
+            mlir::arith::ConstantIntOp::create(builder, loc, shared.id, 64)
+                .getResult();
+        mlir::func::CallOp::create(builder, loc, catchMarkerFn,
+                                   mlir::ValueRange{cleanupId});
+        mlir::func::CallOp::create(builder, loc, shared.releaser, operands);
+        if (shared.handler) {
+          mlir::cf::BranchOp::create(builder, loc, shared.handler);
+        } else {
+          // Continue the unwind out of the function (mirrors the try
+          // lowering's finally-rethrow block: the rethrow never returns, the
+          // self-loop only satisfies the terminator requirement).
+          mlir::func::CallOp::create(builder, loc, rethrowFn,
+                                     mlir::ValueRange{});
+          mlir::cf::BranchOp::create(builder, loc, cleanupBlock);
+        }
+        shared.block = cleanupBlock;
+      }
 
       mlir::Block *head = cleanup.anchorBefore->getBlock();
       mlir::Block *tail = head->splitBlock(cleanup.anchorBefore);
       mlir::OpBuilder builder(cleanup.site);
       mlir::Value id =
-          mlir::arith::ConstantIntOp::create(builder, loc, shared->id, 64)
+          mlir::arith::ConstantIntOp::create(builder, loc, shared.id, 64)
               .getResult();
       if (cleanup.site.getCallee() == "LyEH_TryCallSiteMarker")
         cleanup.site->setOperand(0, id); // re-point it at the cleanup handler
       else
         mlir::func::CallOp::create(builder, loc, callSiteMarkerFn,
                                    mlir::ValueRange{id}); // guard it with one
-      wireAnchorBeforeTail(head, tail, shared->block, shared->id, loc);
+      wireAnchorBeforeTail(head, tail, shared.block, shared.id, loc);
     }
-    steps.mark(UnwindStepTimer::Mutate);
-  });
-  return result;
+    plan.steps->mark(UnwindStepTimer::Mutate);
+  };
+  if (parallel)
+    mlir::parallelFor(context, 0, plans.size(),
+                      [&](std::size_t index) { mutate(*plans[index]); });
+  else
+    for (std::unique_ptr<UnwindFunctionPlan> &plan : plans)
+      mutate(*plan);
+  // Each function's line, in module order.
+  for (std::unique_ptr<UnwindFunctionPlan> &plan : plans)
+    plan->steps.reset();
+  return mlir::success();
 }
 
 // Post-cleanup unwind re-pass: the canonicalizer/CSE phases after refcount
