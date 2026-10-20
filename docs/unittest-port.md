@@ -466,9 +466,15 @@ CPython も自分のインタプリタでテストを動かしているので、
      - 記号の線形検索 (module の記号列を頭から舐める `lookupSymbol`) が、
        コンパイル全体の約 1 割を占めていた。これを、パスの始めに作った
        表を引く形に替えた。t01 は 8.6 秒から 7.6 秒になった。
+     - 大きなメソッド (AST 100 ノード以上) を、呼び出し点に複製せず
+       呼ぶようにした。`TextTestRunner.run` から `TestSuite.run`、
+       `TestCase.run` へと入れ子で複製されていた分がなくなり、t01 は
+       7.4 秒から 4.9 秒、最大 RSS は 926 MB から 801 MB になった。
+       受け手のクラスが分からない呼び出しには、`self` を exact とみなさない
+       本体を別に出すので、override の選び方は複製したときと同じである
+       (`cases/a_large_inherited_method_runs_its_receivers_override`)。
    - いまの内訳は refcount 挿入、runtime lowering、LLVM への変換、JIT、
-     所有権の検証の順。検証の約 0.7 秒は、ほぼ最大の関数
-     (`TestSuite.run`) 1 つ分である。
+     所有権の検証の順。
    - スレッドは既定で 4 本 (`LYTHON_COMPILE_THREADS`)。4 本を超えると
      CPU だけが増えて壁時間はほとんど縮まない。ctest を 14 並列で
      流しても、変更前より 8% 速かった。

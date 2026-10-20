@@ -5257,9 +5257,278 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
     collectedVararg = collected->vararg;
     collectedKwargs = collected->kwargs;
   }
+  if (bindReceiver && !collectedVararg && !collectedKwargs)
+    if (std::optional<Value> called = tryCallLargeMethod(
+            expr, descriptorReceiver, method, positional, keywords))
+      return *called;
   return emitInlineMethodBody(expr, descriptorReceiver, bindReceiver, method,
                               positional, keywords, collectedVararg,
                               collectedKwargs);
+}
+
+namespace {
+
+// LYTHON_ABLATE_METHOD_CALLS=1 copies every method body into its call site
+// again, for comparing the two with one binary.
+bool methodCallsAblated() {
+  static const bool ablated =
+      std::getenv("LYTHON_ABLATE_METHOD_CALLS") != nullptr;
+  return ablated;
+}
+
+// The AST size of a def from which its call sites call it instead of copying
+// it. A copy is what lets a call site specialize the body, and a small body
+// is cheap to copy; a large one nested a few calls deep was most of what a
+// program that runs unittest compiled.
+// LYTHON_CALLED_METHOD_NODES=N moves it: 0 calls every method that can be
+// called, which is how the whole corpus exercises the call path.
+unsigned calledMethodNodes() {
+  static const unsigned nodes = [] {
+    if (const char *value = std::getenv("LYTHON_CALLED_METHOD_NODES"))
+      return static_cast<unsigned>(std::max(0, std::atoi(value)));
+    return 100u;
+  }();
+  return nodes;
+}
+
+} // namespace
+
+// ⭐ A LARGE METHOD IS CALLED, NOT COPIED, WHERE THE CALL CANNOT TELL THE
+// DIFFERENCE. Every call site used to copy the body in (`emitInlineMethodBody`),
+// so a method that calls a method that calls a method was copied into each
+// level: `TextTestRunner.run` into `main`, `TestSuite.run` into it, `TestCase.run`
+// into that -- a third of the IR of a one-test unittest program.
+//
+// What the copy gives a call site, and why each is the same through a call:
+//
+// - `self` bound to the receiver, so `self.other()` in a base's body finds the
+//   receiver's override. A constructed receiver, or one of a class nothing
+//   derives from, has exactly its static class -- the case the method's own
+//   symbol is written for (`selfIsExact`). Any other receiver gets a body
+//   emitted for its class with `self` NOT exact (`openMethodBody`), which asks
+//   every override question the copy asks of a receiver whose class it does
+//   not know.
+// - The arguments as the call typed them. Taken only when that IS the declared
+//   type (a union parameter takes the union, as the copy does), so the body
+//   types each parameter as the copy would.
+// - An omitted argument's default, read from the cell the class body filled,
+//   as the copy reads it, or a constant.
+//
+// ⛔ Not a dunder, a generic or pack-forwarding method, a decorated one, a
+// generator or coroutine, an exception class's, or one with `*args`,
+// `**kwargs` or keyword-only parameters: each has its own call-site machinery,
+// and the copy is what it is built on.
+// ⛔ Not an open body for a class of the program's own module: it would be
+// emitted wherever the call is, and inside an imported module's code that is
+// that module's scope. An imported class's body is emitted in its own module
+// (`emitInDefiningModuleScope`), as its standalone symbol is.
+std::optional<Value> ModuleEmitter::tryCallLargeMethod(
+    const parser::Node &anchor, Value receiver, const MethodBinding &method,
+    llvm::ArrayRef<Value> positional, const KeywordArguments &keywords) {
+  if (methodCallsAblated() || !method.method || method.kind != "instance" ||
+      method.symbolName.empty() || method.async)
+    return std::nullopt;
+  const FunctionSignature &sig =
+      method.bodySignature.callable ? method.bodySignature : method.signature;
+  if (sig.isGeneratorFunction || sig.isAsyncGeneratorFunction ||
+      sig.isCoroutineFunction || sig.varargName || sig.kwargName ||
+      !sig.kwOnlyNames.empty() || sig.positionalNames.empty() ||
+      sig.positionalNames.size() != sig.positionalTypes.size())
+    return std::nullopt;
+  const parser::Node &def = *method.method;
+  if (specializedAtEachCall(def) || decoratedMethodBodies.contains(&def))
+    return std::nullopt;
+  std::string name(ast::string(def, "name").value_or(""));
+  if (name.size() > 4 && llvm::StringRef(name).starts_with("__") &&
+      llvm::StringRef(name).ends_with("__"))
+    return std::nullopt;
+  auto [size, measured] = methodDefSizes.try_emplace(&def, 0);
+  if (measured)
+    ast::walk(&def, [&](const parser::Node &) {
+      ++size->second;
+      return ast::Walk::Continue;
+    });
+  if (size->second < calledMethodNodes())
+    return std::nullopt;
+  auto receiverClass = mlir::dyn_cast_if_present<py::ContractType>(receiver.type);
+  if (!receiverClass || !receiverClass.getArguments().empty())
+    return std::nullopt;
+  llvm::StringRef receiverName = receiverClass.getContractName();
+  if (isExceptionBackedClass(receiverName) ||
+      isExceptionBackedClass(method.definingClass) ||
+      classTypeArguments.count(receiverName) ||
+      classTypeArguments.count(method.definingClass))
+    return std::nullopt;
+
+  // Every parameter filled by the call or by its default.
+  const std::size_t slots = sig.positionalNames.size();
+  if (positional.size() + 1 > slots)
+    return std::nullopt;
+  llvm::SmallVector<Value, 8> arguments(slots);
+  arguments[0] = receiver;
+  for (auto [index, argument] : llvm::enumerate(positional))
+    arguments[index + 1] = argument;
+  for (const auto &entry : keywords) {
+    auto found = llvm::find(sig.positionalNames, entry.name);
+    if (found == sig.positionalNames.end() ||
+        found == sig.positionalNames.begin())
+      return std::nullopt;
+    std::size_t slot =
+        static_cast<std::size_t>(std::distance(sig.positionalNames.begin(), found));
+    if (arguments[slot].value)
+      return std::nullopt;
+    arguments[slot] = entry.value;
+  }
+  const parser::Node *argumentsNode = ast::node(def, "args");
+  if (!argumentsNode || positionalArgumentNodes(*argumentsNode).size() != slots)
+    return std::nullopt;
+  const auto *defaults = ast::nodeList(*argumentsNode, "defaults");
+  std::size_t firstDefault = defaults && defaults->size() <= slots
+                                 ? slots - defaults->size()
+                                 : slots;
+  auto defaultCell = [&](std::size_t slot) -> const std::string * {
+    auto found = methodDefaultCells.find(method.method);
+    if (found == methodDefaultCells.end())
+      return nullptr;
+    for (const auto &entry : found->second)
+      if (entry.first == slot)
+        return &entry.second;
+    return nullptr;
+  };
+  for (std::size_t slot = 1; slot < slots; ++slot) {
+    if (arguments[slot].value)
+      continue;
+    if (slot < firstDefault)
+      return std::nullopt;
+    const parser::Node *defaultNode = (*defaults)[slot - firstDefault].get();
+    if (!defaultCell(slot) && (!defaultNode || defaultNode->kind != "Constant"))
+      return std::nullopt;
+  }
+  // Each of the type its parameter declares.
+  for (std::size_t slot = 1; slot < slots; ++slot) {
+    if (!arguments[slot].value)
+      continue;
+    mlir::Type declared = sig.positionalTypes[slot];
+    mlir::Type actual = arguments[slot].type;
+    if (!declared || !actual)
+      return std::nullopt;
+    // A literal of the declared type is that type to the body: the method's
+    // own symbol is typed so, and compiled whether or not anything calls it.
+    if (types.widenLiteral(actual) == declared)
+      continue;
+    auto unionType = mlir::dyn_cast<py::UnionType>(declared);
+    if (unionType && !mlir::isa<py::UnionType>(actual) &&
+        unionType.hasMember(types.widenLiteral(actual)))
+      continue;
+    return std::nullopt;
+  }
+
+  // Which body runs it.
+  mlir::Operation *definition = receiver.value.getDefiningOp();
+  bool constructed = definition && mlir::isa<py::NewOp, py::InitOp>(definition);
+  bool leaf = !classHasDeclaredSubclass(receiverName);
+  FunctionSignature callSig = sig;
+  bool exactBody = (constructed || leaf) &&
+                   sig.positionalTypes.front() == receiver.type;
+  if (!exactBody) {
+    if (constructed && !leaf)
+      return std::nullopt;
+    const EmitOptions::SourceModule *source =
+        sourceModuleForClass(method.definingClass);
+    if (!source || source->isStub)
+      return std::nullopt;
+    callSig.positionalTypes.front() = receiver.type;
+    types.refreshCallable(callSig);
+  }
+  auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+      callSig.publicCallable ? callSig.publicCallable : callSig.callable);
+  if (!callable ||
+      !types.inferCallWithEvidence(callable, callSig.positionalTypes, {}))
+    return std::nullopt;
+  std::string symbol = exactBody ? method.symbolName
+                                 : openMethodBody(method, receiver.type, callSig);
+  // LYTHON_TRACE_METHOD_CALLS=1: each call that takes a body by symbol, and
+  // which body -- the class's own (`exact`) or one for a receiver whose class
+  // is not known (`open`).
+  static const bool traceCalls =
+      std::getenv("LYTHON_TRACE_METHOD_CALLS") != nullptr;
+  if (traceCalls)
+    llvm::errs() << "[method-call] " << (exactBody ? "exact " : "open ")
+                 << method.definingClass << "." << name << " on "
+                 << receiverName << " (" << size->second << " nodes)\n";
+
+  for (std::size_t slot = 1; slot < slots; ++slot) {
+    mlir::Type declared = sig.positionalTypes[slot];
+    if (arguments[slot].value) {
+      if (arguments[slot].type != declared)
+        arguments[slot] = coerceValue(arguments[slot], declared, anchor);
+      continue;
+    }
+    Value value;
+    if (const std::string *cell = defaultCell(slot)) {
+      auto get = py::GlobalGetOp::create(builder, loc(anchor), declared,
+                                         builder.getStringAttr(*cell));
+      value = Value{get.getResult(), declared};
+    } else {
+      value = emitExpr((*defaults)[slot - firstDefault].get());
+    }
+    arguments[slot] = coerceValue(value, declared, anchor);
+  }
+  Value callee = emitBindingRef(anchor, symbol, callable);
+  CallOperands operands;
+  for (const Value &argument : arguments) {
+    operands.positional.push_back(argument);
+    operands.positionalTypes.push_back(argument.type);
+    operands.positionalUnpacked.push_back(0);
+  }
+  return emitCallableDispatch(anchor, callee, operands,
+                              sig.resultType ? sig.resultType : types.none());
+}
+
+std::string ModuleEmitter::openMethodBody(const MethodBinding &method,
+                                          mlir::Type receiverType,
+                                          const FunctionSignature &signature) {
+  auto key = std::make_pair(static_cast<const parser::Node *>(method.method),
+                            receiverType);
+  if (auto found = openMethodBodies.find(key); found != openMethodBodies.end())
+    return found->second;
+  std::string receiverName =
+      mlir::cast<py::ContractType>(receiverType).getContractName().str();
+  std::string symbol =
+      method.symbolName + "$open$" + sanitizedSymbolPart(receiverName);
+  // Named before the body: a call in it that reaches this body again names
+  // this symbol, and a recursion is a call.
+  openMethodBodies[key] = symbol;
+  const EmitOptions::SourceModule *source =
+      sourceModuleForClass(method.definingClass);
+  const parser::Node *def = method.method;
+  std::string definer = method.definingClass;
+  auto emitBody = [this, def, symbol, signature, source, definer] {
+    // A function of its own, emitted from wherever the call that asked for it
+    // was: nothing of that body's inlining belongs to this one.
+    auto savedInlining = std::move(methodsBeingInlined);
+    methodsBeingInlined.clear();
+    auto savedInlineFrames = std::move(inlineFrames);
+    inlineFrames.clear();
+    llvm::scope_exit restore([&] {
+      methodsBeingInlined = std::move(savedInlining);
+      inlineFrames = std::move(savedInlineFrames);
+    });
+    emitInDefiningModuleScope(*source, [&] {
+      auto typeParameterScope = types.pushScope();
+      bindClassTypeArguments(definer);
+      superContexts.push_back(SuperContext{definer,
+                                           signature.positionalNames.front(),
+                                           /*selfIsExact=*/false});
+      emitCallableFunction(*def, symbol, signature, {}, /*isLambda=*/false);
+      superContexts.pop_back();
+    });
+  };
+  if (classDeclarationsEmitted)
+    emitBody();
+  else
+    deferredDispatcherBodies.push_back(std::move(emitBody));
+  return symbol;
 }
 
 // ⛔ THE MESSAGE NAMES THE DUNDER'S OWN OPERAND ORDER. CPython builds it from

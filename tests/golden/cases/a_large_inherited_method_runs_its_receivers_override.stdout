@@ -1,0 +1,21 @@
+exact even 0,1,2,3,4
+exact count 5 seen 1
+10
+base-typed big 0,100,200,300,400
+base-typed count 5 seen 2
+1000
+base-typed-mid even 0,10,20,30,40
+base-typed-mid count 5 seen 3
+100
+mid-typed big 0,100,200
+mid-typed count 3 seen 4
+300
+joined even 0-10-20-30-40
+joined count 5 seen 5
+100
+inherited even 0,1,2,3,4
+inherited count 5 seen 6
+10
+other even 0,1,2,3,4
+other count 5 seen 7
+10
