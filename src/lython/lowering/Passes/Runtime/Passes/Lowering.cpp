@@ -38,6 +38,7 @@ public:
       return;
     }
 
+    PrivateFunctionMemo privateFunctions(module);
     if (mlir::failed(RuntimeBundleLowerer(module).lowerModule()))
       signalPassFailure();
   }

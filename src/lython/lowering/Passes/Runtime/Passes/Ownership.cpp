@@ -117,29 +117,7 @@ void tracePlacement(llvm::StringRef strategy, mlir::func::CallOp call,
                << " conditional=" << (group.condition ? 1 : 0) << "\n";
 }
 
-// LYTHON_ABLATE_OWNERSHIP_SYMBOL_TABLE=1 restores the callee resolution this
-// file used before the symbol table below was threaded through it: each
-// `collectOwnedCallResultGroups` re-resolved `call.getCallee()` with
-// `ModuleOp::lookupSymbol`, which scans the module's symbol list.
-//
-// Why an ablation switch rather than nothing: this change removes WORK and must
-// not change a single instruction, and "the IR is identical" is only evidence
-// when both sides come from one binary -- a separate `before` build re-proves
-// the build, not the change. The two arms differ in which lookup answers, so if
-// the table's scope (immediate symbol children of the module) ever disagreed
-// with `lookupSymbol`'s, the differential would show it as an IR change instead
-// of hiding it as a silently different callee.
-//
-// Why setting it is safe to ship: it is strictly slower and otherwise identical,
-// so a mistake with this variable set costs compile time, never a wrong release.
-bool ownershipSymbolTableDisabled() {
-  static bool disabled = [] {
-    auto value =
-        llvm::sys::Process::GetEnv("LYTHON_ABLATE_OWNERSHIP_SYMBOL_TABLE");
-    return value && !value->empty() && *value != "0";
-  }();
-  return disabled;
-}
+using own::ownershipSymbolTableDisabled;
 
 // The SHAPE of the callee-resolution work, printed beside the phase's duration
 // under LYTHON_PERF: `symbols` is the factor the old code paid on every one of
@@ -3131,10 +3109,7 @@ bool releaseOwnedGroupByLiveness(
     auto call = mlir::dyn_cast<mlir::func::CallOp>(consume);
     if (!call)
       continue;
-    auto module = consume->getParentOfType<mlir::ModuleOp>();
-    auto callee =
-        module ? module.lookupSymbol<mlir::func::FuncOp>(call.getCallee())
-               : mlir::func::FuncOp();
+    auto callee = aliases.function(consume, call.getCallee());
     if (!callee || !own::isRaiseLikeFunction(callee))
       continue;
     // ⛔ AND ONLY WHEN THE HANDLER STILL READS IT. The anchor guarding this
@@ -3176,11 +3151,8 @@ bool releaseOwnedGroupByLiveness(
                                  ownsReference))
       return false;
   for (mlir::Operation *consume : unfoldRetainBefore) {
-    mlir::ModuleOp module = consume->getParentOfType<mlir::ModuleOp>();
-    if (mlir::failed(insertRetain(
-            module ? module.lookupSymbol<mlir::func::FuncOp>("Ly_IncRef")
-                   : mlir::func::FuncOp(),
-            consume, group.values.front())))
+    if (mlir::failed(insertRetain(aliases.function(consume, "Ly_IncRef"),
+                                  consume, group.values.front())))
       return false;
   }
   return true;
@@ -5823,6 +5795,10 @@ mlir::LogicalResult insertUnwindCleanupReleases(
   };
   std::int64_t nextHandlerId = nextUnusedExceptionHandlerId(module);
   auto anchorFn = module.lookupSymbol<mlir::func::FuncOp>("LyEH_TryCatchAnchor");
+  // Made at the first cleanup that continues the unwind, if the module has
+  // none. ⛔ Not looked up per cleanup: that is a scan of the module's symbols
+  // for every exit that holds a token.
+  auto rethrowFn = module.lookupSymbol<mlir::func::FuncOp>("LyEH_RethrowCurrent");
   auto catchMarkerFn =
       module.lookupSymbol<mlir::func::FuncOp>("LyEH_TryCatchMarker");
   auto callSiteMarkerFn =
@@ -5848,11 +5824,27 @@ mlir::LogicalResult insertUnwindCleanupReleases(
     ensure(callSiteMarkerFn, "LyEH_TryCallSiteMarker",
            builder.getFunctionType({builder.getI64Type()}, {}));
   };
+  // The first `__ly_unwind_cleanup_N` no symbol has, read off the module once.
+  // ⛔ Not probed name by name: each probe scans the module's symbols, and the
+  // pass after cleanup starts past every releaser the first one made.
   unsigned nextReleaserIndex = 0;
-  while (module.lookupSymbol((llvm::Twine("__ly_unwind_cleanup_") +
-                              llvm::Twine(nextReleaserIndex))
-                                 .str()))
-    ++nextReleaserIndex;
+  {
+    llvm::DenseSet<unsigned> taken;
+    for (mlir::Operation &op : module.getBody()->getOperations()) {
+      auto name = op.getAttrOfType<mlir::StringAttr>(
+          mlir::SymbolTable::getSymbolAttrName());
+      if (!name)
+        continue;
+      llvm::StringRef suffix = name.getValue();
+      unsigned index = 0;
+      if (!suffix.consume_front("__ly_unwind_cleanup_") ||
+          suffix.getAsInteger(10, index) || std::to_string(index) != suffix)
+        continue;
+      taken.insert(index);
+    }
+    while (taken.contains(nextReleaserIndex))
+      ++nextReleaserIndex;
+  }
 
   // Runtime-internal pre-lowered modules link after the final EH phase:
   // marker wiring inserted here would survive as unresolved symbols. Inline
@@ -6774,8 +6766,6 @@ mlir::LogicalResult insertUnwindCleanupReleases(
         // Continue the unwind out of the function (mirrors the try
         // lowering's finally-rethrow block: the rethrow never returns, the
         // self-loop only satisfies the terminator requirement).
-        mlir::func::FuncOp rethrowFn =
-            module.lookupSymbol<mlir::func::FuncOp>("LyEH_RethrowCurrent");
         if (!rethrowFn) {
           mlir::OpBuilder::InsertionGuard guard(builder);
           builder.setInsertionPointToEnd(module.getBody());

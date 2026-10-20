@@ -175,7 +175,8 @@ mlir::LogicalResult verifyFunctionOwnershipShape(mlir::func::FuncOp function) {
   return mlir::success();
 }
 
-mlir::LogicalResult verifyOperationOwnershipShape(mlir::Operation *op) {
+mlir::LogicalResult verifyOperationOwnershipShape(mlir::Operation *op,
+                                                  mlir::SymbolTable &symbols) {
   if (op->hasAttr(own::kOwnedLocalObjectAttr)) {
     if (op->getNumResults() == 0 ||
         !own::isObjectHeaderLikeType(op->getResult(0).getType()))
@@ -198,12 +199,20 @@ mlir::LogicalResult verifyOperationOwnershipShape(mlir::Operation *op) {
   if (*aggregate) {
     auto call = mlir::dyn_cast<mlir::func::CallOp>(op);
     mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
+    // The callee from the walk's table. ⛔ Not the module's symbol list per
+    // marked call, which is a scan of every symbol for each one.
+    auto lookup = [&](llvm::StringRef name) -> mlir::Operation * {
+      if (!module)
+        return nullptr;
+      if (own::ownershipSymbolTableDisabled())
+        return module.lookupSymbol(name);
+      return symbols.lookup(name);
+    };
     if (call) {
       if (call.getNumOperands() == 0)
         return op->emitError()
                << "aggregate ownership call must have at least one operand";
-      mlir::Operation *callee =
-          module ? module.lookupSymbol(call.getCallee()) : nullptr;
+      mlir::Operation *callee = lookup(call.getCallee());
       return verifyAggregateOwnershipCallee(op, **aggregate, call.getCallee(),
                                             callee);
     }
@@ -219,8 +228,7 @@ mlir::LogicalResult verifyOperationOwnershipShape(mlir::Operation *op) {
     if (!calleeName)
       return op->emitError()
              << "aggregate ownership marker requires a direct call target";
-    mlir::Operation *callee =
-        module ? module.lookupSymbol(*calleeName) : nullptr;
+    mlir::Operation *callee = lookup(*calleeName);
     return verifyAggregateOwnershipCallee(op, **aggregate, *calleeName, callee);
   }
 
@@ -231,7 +239,10 @@ mlir::LogicalResult verifyOwnershipContractShapesImpl(mlir::ModuleOp module) {
   if (mlir::failed(
           walkVerify<mlir::func::FuncOp>(module, verifyFunctionOwnershipShape)))
     return mlir::failure();
-  return walkVerifyOperations(module, verifyOperationOwnershipShape);
+  mlir::SymbolTable symbols(module);
+  return walkVerifyOperations(module, [&](mlir::Operation *op) {
+    return verifyOperationOwnershipShape(op, symbols);
+  });
 }
 
 class OwnershipVerifierPass

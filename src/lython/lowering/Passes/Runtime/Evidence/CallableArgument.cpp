@@ -5,6 +5,10 @@ namespace py::lowering {
 using namespace callable_evidence;
 
 mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
+  // Every binding resolved through one table. This only reads the module, so
+  // the table cannot go stale. ⛔ Not the module's symbol list per call, a scan
+  // of every runtime symbol for each one, in each round of both fixpoints.
+  mlir::SymbolTable symbols(module);
   enum EvidenceKind : unsigned {
     CallableEvidence = 1u << 0,
   };
@@ -73,7 +77,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
     if ((requiredKinds & CallableEvidence) != 0) {
       if (auto binding = value.getDefiningOp<py::BindingRefOp>()) {
         mlir::func::FuncOp target =
-            module.lookupSymbol<mlir::func::FuncOp>(binding.getBinding());
+            symbols.lookup<mlir::func::FuncOp>(binding.getBinding());
         if (target && !target.isDeclaration() &&
             target->hasAttr("callable_type")) {
           RuntimeArgumentEvidence evidence;
@@ -106,7 +110,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
       return std::nullopt;
 
     mlir::func::FuncOp producer =
-        module.lookupSymbol<mlir::func::FuncOp>(binding.getBinding());
+        symbols.lookup<mlir::func::FuncOp>(binding.getBinding());
     if (!producer || producer.isDeclaration())
       return std::nullopt;
     py::CallableType callable = callableTypeOf(producer);
@@ -195,7 +199,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
         return mlir::WalkResult::advance();
 
       mlir::func::FuncOp target =
-          module.lookupSymbol<mlir::func::FuncOp>(binding.getBinding());
+          symbols.lookup<mlir::func::FuncOp>(binding.getBinding());
       py::CallableType callable = callableTypeOf(target);
       if (!callable)
         return mlir::WalkResult::advance();
@@ -309,7 +313,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
         return mlir::WalkResult::advance();
 
       mlir::func::FuncOp target =
-          module.lookupSymbol<mlir::func::FuncOp>(binding.getBinding());
+          symbols.lookup<mlir::func::FuncOp>(binding.getBinding());
       py::CallableType callable = callableTypeOf(target);
       if (!callable)
         return mlir::WalkResult::advance();
