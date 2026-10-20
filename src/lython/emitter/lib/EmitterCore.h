@@ -1439,6 +1439,18 @@ private:
                                const parser::Node &anchor);
   Value emitInlineMethodCall(const parser::Node &expr, Value receiver,
                              const MethodBinding &method);
+  // A large method CALLED through a symbol instead of copied into the call
+  // site; nullopt when the copy is what this call needs (EmitterClasses.cpp).
+  std::optional<Value> tryCallLargeMethod(const parser::Node &anchor,
+                                          Value receiver,
+                                          const MethodBinding &method,
+                                          llvm::ArrayRef<Value> positional,
+                                          const KeywordArguments &keywords);
+  // The symbol of `method`'s body with `self` typed `receiverType` and NOT
+  // assumed to be exactly that class, emitted on the first ask.
+  std::string openMethodBody(const MethodBinding &method,
+                             mlir::Type receiverType,
+                             const FunctionSignature &signature);
   Value emitInlineMethodBody(const parser::Node &anchor, Value receiver,
                              bool bindDescriptorReceiver,
                              const MethodBinding &method,
@@ -2281,6 +2293,11 @@ private:
   // case and expands forever: re-entering a body already on this stack is
   // always unbounded, never a recursion that would have terminated.
   llvm::SmallVector<const parser::Node *, 8> methodsBeingInlined;
+  // What `openMethodBody` emitted, by method and receiver type.
+  llvm::DenseMap<std::pair<const parser::Node *, mlir::Type>, std::string>
+      openMethodBodies;
+  // AST nodes in a method's def: what a copy at its call site costs.
+  llvm::DenseMap<const parser::Node *, unsigned> methodDefSizes;
 };
 
 } // namespace lython::emitter

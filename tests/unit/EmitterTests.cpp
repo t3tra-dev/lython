@@ -307,6 +307,47 @@ TEST(EmitterTest, TopLevelDefOutranksBuiltinFastPath) {
   EXPECT_EQ(ir.find("py.binding.ref \"len\""), std::string::npos);
 }
 
+// What: a large method called on an object the call site constructed is a call
+// of the method's own symbol, while a small one beside it is still copied into
+// the caller -- which is what makes "no reference" mean "copied" rather than
+// "nothing emitted".
+TEST(EmitterTest, ALargeMethodIsCalledAndASmallOneCopied) {
+  mlir::MLIRContext context(testRegistry());
+  std::string ir = emittedIR("class Tally:\n"
+                             "    def __init__(self) -> None:\n"
+                             "        self.n = 0\n"
+                             "    def tiny(self) -> int:\n"
+                             "        return self.n\n"
+                             "    def work(self, k: int) -> int:\n"
+                             "        total = 0\n"
+                             "        for i in range(k):\n"
+                             "            if i % 2 == 0:\n"
+                             "                total += i * 3 + 1\n"
+                             "            elif i % 3 == 0:\n"
+                             "                total -= i * 2 - 1\n"
+                             "            else:\n"
+                             "                total += self.n + i\n"
+                             "        for j in range(k, 0, -1):\n"
+                             "            if total > j * 10:\n"
+                             "                total = total // 2 + j\n"
+                             "            else:\n"
+                             "                total = total * 2 - j\n"
+                             "        self.n = total\n"
+                             "        return total + self.n * 2 - k\n"
+                             "t = Tally()\n"
+                             "print(t.work(3))\n"
+                             "print(t.tiny())\n",
+                             context);
+  std::string work =
+      py::mangling::pythonDefinitionSymbol("__main__", "Tally.work");
+  std::string tiny =
+      py::mangling::pythonDefinitionSymbol("__main__", "Tally.tiny");
+  EXPECT_NE(ir.find("@" + work), std::string::npos);
+  EXPECT_NE(ir.find("@" + tiny), std::string::npos);
+  EXPECT_NE(ir.find("py.binding.ref \"" + work + "\""), std::string::npos);
+  EXPECT_EQ(ir.find("py.binding.ref \"" + tiny + "\""), std::string::npos);
+}
+
 TEST(EmitterTest, UnshadowedBuiltinKeepsItsFastPath) {
   mlir::MLIRContext context(testRegistry());
   std::string ir = emittedIR("print(len([1, 2, 3]))\n", context);
