@@ -361,7 +361,7 @@ ut_bug_object_in_str.py AGREE
 ut_bug_object_lambda_into_container_method.py AGREE
 ut_bug_optional_held_across_yield_in_with.py AGREE
 ut_bug_oserror_with_errno.py GAP
-ut_bug_print_of_an_optional_class_value.py GAP
+ut_bug_print_of_an_optional_class_value.py AGREE
 ut_bug_qualified_generator_type_annotation.py AGREE
 ut_bug_return_list_of_base_from_subclass_display.py AGREE
 ut_bug_set_display_solves_no_type_parameter.py AGREE

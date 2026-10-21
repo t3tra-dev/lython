@@ -83,6 +83,10 @@ bool ModuleEmitter::canStringifyType(mlir::Type type) {
   mlir::Type widened = types.widenLiteral(type);
   if (widened == types.contract("builtins.str") || widened == types.none())
     return true;
+  // A class, through `type.__str__` (the ladder's class arm).
+  if (mlir::isa<py::TypeType>(widened))
+    return static_cast<bool>(
+        types.inferMethodCallWithEvidence(types.object(), "__str__", {}));
   if (lookupClassMethod(widened, "__str__") ||
       lookupClassMethod(widened, "__repr__"))
     return true;
@@ -108,6 +112,9 @@ bool ModuleEmitter::canConvertType(mlir::Type type, int64_t conversion) {
   mlir::Type widened = types.widenLiteral(type);
   if (widened == types.none())
     return true;
+  // A class's repr is its str (`<class 'NAME'>`), and ascii of it the same.
+  if (mlir::isa<py::TypeType>(widened))
+    return canStringifyType(widened);
   if (lookupClassMethod(widened, "__repr__"))
     return true;
   if (!types.inferMethodCallWithEvidence(widened, "__repr__", {}))
