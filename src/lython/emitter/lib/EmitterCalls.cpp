@@ -3572,6 +3572,9 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
           declared.getPositionalTypes().end());
       parameterTypes.append(declared.getKwOnlyTypes().begin(),
                             declared.getKwOnlyTypes().end());
+      // `*items: T` names T too: its arguments are what solve it.
+      if (declared.hasVararg())
+        parameterTypes.push_back(declared.getVarargType());
       bool parametersGround = llvm::all_of(parameterTypes, [](mlir::Type t) {
         return unboundStaticParameterCount(t) == 0;
       });
