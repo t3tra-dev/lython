@@ -378,6 +378,23 @@ TEST(EmitterTest, ACallableIsRefusedWhereAnotherNumericRungIsDeclared) {
   EXPECT_TRUE(subclass.succeeded) << subclass.diagnostics;
 }
 
+// What: a module-level class whose base is a class of the module defined
+// further down is refused at the base, naming both classes; the same two
+// classes in the other order emit.
+TEST(EmitterTest, AClassBaseDefinedFurtherDownIsRefused) {
+  ImportedModuleEmit later = emitWithImportedModules(
+      {}, "class A(Later):\n    pass\n\n\nclass Later:\n    pass\n");
+  EXPECT_FALSE(later.succeeded);
+  EXPECT_NE(later.diagnostics.find("main.py:1:8: emit error: class 'A' names "
+                                   "'Later' as a base before the class "
+                                   "statement that defines 'Later' has run"),
+            std::string::npos)
+      << later.diagnostics;
+  ImportedModuleEmit earlier = emitWithImportedModules(
+      {}, "class Later:\n    pass\n\n\nclass A(Later):\n    pass\n");
+  EXPECT_TRUE(earlier.succeeded) << earlier.diagnostics;
+}
+
 TEST(EmitterTest, UnshadowedBuiltinKeepsItsFastPath) {
   mlir::MLIRContext context(testRegistry());
   std::string ir = emittedIR("print(len([1, 2, 3]))\n", context);

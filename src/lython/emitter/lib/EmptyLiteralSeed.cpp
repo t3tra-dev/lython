@@ -67,6 +67,8 @@ void preBindSuiteConstants(const TypeSystem &types, const SuiteCursor &cursor) {
       walk(*(*cursor.suite)[index], walk);
 }
 
+} // namespace
+
 void collectStatementNames(const parser::Node &node, StatementNames &names) {
   if (node.kind == "Name") {
     llvm::StringRef spelling = ast::nameSpelling(node);
@@ -127,6 +129,8 @@ void collectStatementNames(const parser::Node &node, StatementNames &names) {
           collectStatementNames(*child, names);
   }
 }
+
+namespace {
 
 // The statements of the cursors that can matter to a scan for `name`, as a
 // mask on each cursor. One RELEVANT to it spells it, or spells a name bound by

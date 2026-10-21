@@ -176,6 +176,8 @@ struct StatementNames {
   llvm::StringSet<> mentioned;
   llvm::StringSet<> stored;
 };
+// Fills `names` from `node`; a def or class is its name and its header.
+void collectStatementNames(const parser::Node &node, StatementNames &names);
 
 class TypeSystem {
 public:

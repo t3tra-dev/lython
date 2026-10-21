@@ -181,6 +181,9 @@ private:
   // bound: neither a base spelled `module.Class` nor one spelled with the bare
   // name a `from module import Class` bound can be canonicalized before that.
   void resolveTopLevelBaseSpellings();
+  // A module-level class whose base is a class of this module that no earlier
+  // statement has bound yet.
+  void refuseBasesBoundLater(const parser::Node &root);
   // The class's C3 linearization (contract names, self first). Computed and
   // cached by emitClassContract; empty for unknown classes.
   llvm::ArrayRef<std::string> classMro(llvm::StringRef className) const;
