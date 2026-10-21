@@ -2095,7 +2095,10 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultObjectRepr(
   // ⛔ Source classes only. A manifest object's header word 1 is not a class word,
   // and the manifest contracts that reach here have no subclass to be wrong
   // about.
-  if (RuntimeBundleLowerer::classForContract(object.contract)) {
+  // ⭐ Except a generator, whose word 1 IS its class's, and whose repr names
+  // the function rather than the class (`<generator object gen at ...>`).
+  if (RuntimeBundleLowerer::classForContract(object.contract) ||
+      object.contractName() == "types.GeneratorType") {
     if (std::optional<RuntimeSymbol> dynamic =
             manifest.primitive("builtins.object", "default_repr_dynamic")) {
       mlir::FunctionType dynamicType = dynamic->function.getFunctionType();

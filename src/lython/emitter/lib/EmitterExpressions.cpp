@@ -3260,7 +3260,9 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
         }
         // A class written in a function encodes its qualified name in its
         // contract (Contracts.h).
-        llvm::StringRef qualified = contract.getContractName();
+        llvm::StringRef qualified =
+            py::contracts::runtimeClassPathForContract(
+                contract.getContractName());
         llvm::StringRef moduleName = "__main__";
         if (auto dot = qualified.rfind('.'); dot != llvm::StringRef::npos)
           moduleName = qualified.take_front(dot);

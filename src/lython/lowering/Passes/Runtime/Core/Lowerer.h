@@ -1244,6 +1244,8 @@ private:
   };
   struct GeneratorResumeInfo {
     std::string cloneName;
+    // The body's `__qualname__`, which the generator's repr names.
+    std::string qualname;
     unsigned frameWidth = 0;
     unsigned argumentCount = 0;
     // One lane per generator argument. Int arguments keep the legacy raw
@@ -1460,6 +1462,7 @@ private:
   // finalizer before the storage is freed (rfc/stdlib-semantics.md R3:
   // drop/close releases the absorbed frame values; CPython: __del__ closes).
   mlir::LogicalResult generateGeneratorDropHook();
+  mlir::LogicalResult generateGeneratorQualnames();
   mlir::LogicalResult buildGeneratorResumeCloneSignatures();
   mlir::LogicalResult buildGeneratorResumeBodies();
   // Inline statically-bound `yield from inner(...)` delegations into the

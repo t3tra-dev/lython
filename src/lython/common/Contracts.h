@@ -125,7 +125,16 @@ inline std::string localClassContractName(llvm::StringRef qualname) {
 // feeds manifest LOOKUPS, which need the specialization's own name.
 // A class declared in a function reads as its qualified name
 // (`f.<locals>.A`), which is what CPython's repr and messages print.
+// The class CPython's runtime makes of one typeshed names elsewhere: a
+// generator's class is `builtins.generator`, which `types` only re-exports as
+// GeneratorType -- so `type(g).__name__` is "generator".
+inline llvm::StringRef runtimeClassPathForContract(llvm::StringRef name) {
+  return name == "types.GeneratorType" ? llvm::StringRef("builtins.generator")
+                                       : name;
+}
+
 inline std::string displayClassNameForContract(llvm::StringRef name) {
+  name = runtimeClassPathForContract(name);
   std::string display = manifestClassNameForContract(name);
   std::size_t marker = display.rfind("$spec");
   if (marker != std::string::npos && marker != 0) {
@@ -149,6 +158,7 @@ inline std::string displayClassNameForContract(llvm::StringRef name) {
 // CPython's `__qualname__` of the class a contract names: what follows the
 // contract's module, read back from its encoding.
 inline std::string pythonQualnameForContract(llvm::StringRef name) {
+  name = runtimeClassPathForContract(name);
   if (std::size_t dot = name.rfind('.'); dot != llvm::StringRef::npos)
     name = name.drop_front(dot + 1);
   return displayClassNameForContract(name);

@@ -1958,6 +1958,8 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
 
     GeneratorResumeInfo info;
     info.cloneName = cloneName;
+    auto qualname = body->getAttrOfType<mlir::StringAttr>("ly.function.qualname");
+    info.qualname = qualname ? qualname.str() : body.getSymName().str();
     info.frameWidth = frameWidth;
     info.argumentCount = static_cast<unsigned>(bodyArguments.size());
     info.argumentLanes = argumentLanes;
@@ -4533,6 +4535,47 @@ RuntimeBundleLowerer::getOrCreateGeneratorFinalizeFunction(
 // The module drop hook: LyGenerator_DecRef's release-to-zero path calls
 // this dispatcher, which routes the storage's target id (word 3) to the
 // matching per-target finalizer before the storage is freed.
+// `memref<?xi8> __ly_generator_qualname(i64 target)`: the qualified name of
+// the generator body a target id names, which the runtime's default repr
+// prints for a generator object. An id the program never made answers "".
+mlir::LogicalResult RuntimeBundleLowerer::generateGeneratorQualnames() {
+  auto hook =
+      module.lookupSymbol<mlir::func::FuncOp>("__ly_generator_qualname");
+  if (!hook || !hook.isDeclaration())
+    return mlir::success();
+  llvm::SmallVector<llvm::StringRef, 8> targets;
+  for (auto &entry : generatorResumeClones)
+    targets.push_back(entry.getKey());
+  llvm::sort(targets);
+
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  mlir::Location loc = hook.getLoc();
+  mlir::Block *entry = hook.addEntryBlock();
+  mlir::Region &body = hook.getBody();
+  mlir::Value targetId = entry->getArgument(0);
+  mlir::Block *current = entry;
+  for (llvm::StringRef target : targets) {
+    mlir::Block *match = builder.createBlock(&body);
+    mlir::Block *next = builder.createBlock(&body);
+    builder.setInsertionPointToEnd(current);
+    mlir::Value expected = mlir::arith::ConstantIntOp::create(
+        builder, loc, RuntimeBundleLowerer::functionTargetId(target), 64);
+    mlir::Value matches = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::eq, targetId, expected);
+    mlir::cf::CondBranchOp::create(builder, loc, matches, match,
+                                   mlir::ValueRange{}, next,
+                                   mlir::ValueRange{});
+    builder.setInsertionPointToEnd(match);
+    mlir::func::ReturnOp::create(
+        builder, loc,
+        materializeByteBuffer(loc, generatorResumeClones[target].qualname));
+    current = next;
+  }
+  builder.setInsertionPointToEnd(current);
+  mlir::func::ReturnOp::create(builder, loc, materializeByteBuffer(loc, ""));
+  return mlir::success();
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::generateGeneratorDropHook() {
   if (generatorResumeClones.empty())
     return mlir::success();

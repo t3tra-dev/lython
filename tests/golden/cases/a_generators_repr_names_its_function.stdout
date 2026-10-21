@@ -1,0 +1,4 @@
+<generator object gen> <generator object C.m> <generator object outer.<locals>.inner> <generator object gen>
+[<generator object gen>, <generator object C.m>] (<generator object outer.<locals>.inner>, 1)
+{'k': <generator object gen>}
+generator builtins generator <class 'generator'>
