@@ -4012,6 +4012,31 @@ void ModuleEmitter::collectStaticModuleAssignments(
   }
 }
 
+// The name an `if` test compares with None, and whether the BODY is where it
+// is not None: `x is not None` and `x` say the body, `x is None` the else.
+static std::optional<std::pair<std::string, bool>>
+noneTestedName(const parser::Node *test) {
+  if (!test)
+    return std::nullopt;
+  if (test->kind == "Name")
+    return std::make_pair(std::string(ast::nameSpelling(*test)), true);
+  if (test->kind != "Compare")
+    return std::nullopt;
+  const parser::Node *left = ast::node(*test, "left");
+  const auto *ops = ast::nodeList(*test, "ops");
+  const auto *comparators = ast::nodeList(*test, "comparators");
+  if (!left || left->kind != "Name" || !ops || ops->size() != 1 ||
+      !comparators || comparators->size() != 1 || !comparators->front() ||
+      comparators->front()->kind != "Constant" ||
+      !ast::isNoneField(*comparators->front(), "value"))
+    return std::nullopt;
+  const parser::NodePtr &op = ops->front();
+  if (!op || (op->kind != "IsNot" && op->kind != "Is"))
+    return std::nullopt;
+  return std::make_pair(std::string(ast::nameSpelling(*left)),
+                        op->kind == "IsNot");
+}
+
 void ModuleEmitter::collectClassFields(
     const parser::Node &classDef,
     llvm::SmallVectorImpl<std::string> &fieldNames,
@@ -4717,6 +4742,64 @@ void ModuleEmitter::collectClassFields(
               if (stmt->kind == "For" || stmt->kind == "AsyncFor")
                 bindLoopTarget(ast::node(*stmt, "target"),
                                ast::node(*stmt, "iter"));
+              // ⭐ AND A TEST AGAINST None NARROWS THE BRANCH IT GUARDS, as
+              // the emitter's own flow typing does, and the name after the
+              // `if` is the JOIN of what each way through leaves it. Read as
+              // the parameter's Optional type, a guarded store made the field
+              // `int | None` and every read was refused for a None it could
+              // never hold:
+              //
+              //     limit = 5
+              //     def __init__(self, limit: int | None = None) -> None:
+              //         if limit is not None:
+              //             self.limit = limit      # typed int | None
+              //
+              // and read as the last assignment the walk saw, the default
+              // idiom typed the field by the default alone, and a StringIO
+              // was then stored as the TextIOWrapper the default is:
+              //
+              //     if stream is None:
+              //         stream = sys.stderr
+              //     self.stream = stream            # TextIOWrapper only
+              if (stmt->kind == "If") {
+                std::optional<std::pair<std::string, bool>> tested =
+                    noneTestedName(ast::node(*stmt, "test"));
+                std::optional<mlir::Type> before;
+                if (tested)
+                  before = types.lookupSymbol(tested->first);
+                bool narrows = before && *before &&
+                               mlir::isa<py::UnionType>(*before);
+                llvm::SmallVector<mlir::Type, 2> leaves;
+                for (llvm::StringRef region : {"body", "orelse"}) {
+                  // ⛔ The None side is not entered AS None: the rule that
+                  // gives `xs = []` its element type reads the name's type
+                  // before the rebinding, and None has none to give. It
+                  // counts as None only if it leaves the name unbound.
+                  bool notNoneSide =
+                      narrows && tested->second == (region == "body");
+                  mlir::Type entering =
+                      !narrows ? mlir::Type()
+                      : notNoneSide ? removeNoneFromType(*before, types)
+                                    : *before;
+                  if (narrows)
+                    types.bindLocalSymbol(tested->first, entering);
+                  if (const auto *nested = ast::nodeList(*stmt, region))
+                    walkInitBody(nested);
+                  if (narrows) {
+                    std::optional<mlir::Type> leaving =
+                        types.lookupSymbol(tested->first);
+                    mlir::Type left = leaving && *leaving ? *leaving : entering;
+                    if (!notNoneSide && left == *before)
+                      left = types.none();
+                    leaves.push_back(left);
+                    types.bindLocalSymbol(tested->first, *before);
+                  }
+                }
+                if (narrows)
+                  if (mlir::Type joined = types.join(leaves))
+                    types.bindLocalSymbol(tested->first, joined);
+                continue;
+              }
               for (llvm::StringRef region :
                    {"body", "orelse", "finalbody", "handlers"})
                 if (const auto *nested = ast::nodeList(*stmt, region))
@@ -5516,7 +5599,7 @@ std::string ModuleEmitter::openMethodBody(const MethodBinding &method,
       methodsBeingInlined = std::move(savedInlining);
       inlineFrames = std::move(savedInlineFrames);
     });
-    emitInDefiningModuleScope(*source, [&] {
+    auto emitOpen = [&] {
       auto typeParameterScope = types.pushScope();
       bindClassTypeArguments(definer);
       superContexts.push_back(SuperContext{definer,
@@ -5524,7 +5607,12 @@ std::string ModuleEmitter::openMethodBody(const MethodBinding &method,
                                            /*selfIsExact=*/false});
       emitCallableFunction(*def, symbol, signature, {}, /*isLambda=*/false);
       superContexts.pop_back();
-    });
+    };
+    // A class of the main module is emitted in the main module's scope.
+    if (source)
+      emitInDefiningModuleScope(*source, emitOpen);
+    else
+      emitOpen();
   };
   if (classDeclarationsEmitted)
     emitBody();
@@ -6066,7 +6154,45 @@ Value ModuleEmitter::emitInlineMethodBody(
               "call cycle has no base case to stop the expansion"});
       return emitNone(anchor);
     }
-    Value callee = emitBindingRef(anchor, method.symbolName, recursive);
+    // ⭐ THE CLASS'S OWN BODY ONLY FOR A RECEIVER OF EXACTLY THAT CLASS. A
+    // recursion can come back through another receiver: unittest's
+    // `TestSuite.run` calls `test(result)` on the suites it holds, which
+    // reaches `BaseTestSuite.__call__` again with a member typed by the base,
+    // and the standalone body -- whose `self` is the defining class -- ran
+    // `BaseTestSuite.run` for a nested TestSuite, skipping the class fixtures
+    // in silence. The open body asks the receiver's class, as the large-method
+    // calls do (`exactBody` there).
+    std::string recursiveSymbol = method.symbolName;
+    if (auto receiverContract =
+            mlir::dyn_cast_if_present<py::ContractType>(receiver.type);
+        receiverContract && method.kind == "instance") {
+      mlir::Operation *definition = receiver.value.getDefiningOp();
+      bool constructed =
+          definition && mlir::isa<py::NewOp, py::InitOp>(definition);
+      bool leaf = !classHasDeclaredSubclass(receiverContract.getContractName());
+      // `self` of the standalone body names its class.
+      bool standaloneSelf = false;
+      if (!superContexts.empty() && superContexts.back().selfIsExact)
+        if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(receiver.value))
+          standaloneSelf = argument.getArgNumber() == 0 &&
+                           argument.getOwner() &&
+                           argument.getOwner()->isEntryBlock();
+      bool exact = (constructed || leaf || standaloneSelf) &&
+                   !recursiveSig.positionalTypes.empty() &&
+                   recursiveSig.positionalTypes.front() == receiver.type;
+      if (!exact && !recursiveSig.positionalTypes.empty()) {
+        FunctionSignature openSig = recursiveSig;
+        openSig.positionalTypes.front() = receiver.type;
+        types.refreshCallable(openSig);
+        if (auto openCallable = mlir::dyn_cast_if_present<py::CallableType>(
+                openSig.publicCallable ? openSig.publicCallable
+                                       : openSig.callable)) {
+          recursiveSymbol = openMethodBody(method, receiver.type, openSig);
+          recursive = openCallable;
+        }
+      }
+    }
+    Value callee = emitBindingRef(anchor, recursiveSymbol, recursive);
     llvm::SmallVector<Value, 8> arguments{receiver};
     if (keywords.empty())
       arguments.append(positional.begin(), positional.end());

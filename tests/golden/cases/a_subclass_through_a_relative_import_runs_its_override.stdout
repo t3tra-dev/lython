@@ -1,0 +1,3 @@
+['shape', 'square', 'circle', 'triangle', 'hexagon']
+[True, True, True, True, True]
+[False, True, False, False, False]

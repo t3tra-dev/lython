@@ -20,6 +20,7 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -288,9 +289,26 @@ embeddedStdlibSource(StringRef moduleName) {
   return nullptr;
 }
 
+// ⛔ Not `exists` alone: on a case-insensitive file system (macOS) `rb/Base.py`
+// exists when `rb/base.py` does, and `from rb import Base` compiled base.py a
+// second time as the module `rb.Base`. CPython's finder compares the name's
+// case with the directory's entry.
+static bool existsWithExactCase(StringRef path) {
+  if (!llvm::sys::fs::exists(path))
+    return false;
+  llvm::SmallString<256> real;
+  if (llvm::sys::fs::real_path(path, real))
+    return true;
+  return llvm::sys::path::filename(real) == llvm::sys::path::filename(path);
+}
+
+// `moduleName` is looked for under `baseDir`; `absoluteName` is what the
+// module is called, which a relative import spells differently.
 static std::optional<LocalSourceModulePath>
-localSourceModulePath(StringRef baseDir,
-                                                           StringRef moduleName) {
+localSourceModulePath(StringRef baseDir, StringRef moduleName,
+                      StringRef absoluteName = {}) {
+  if (absoluteName.empty())
+    absoluteName = moduleName;
   llvm::SmallVector<StringRef, 8> parts;
   moduleName.split(parts, '.');
   if (parts.empty())
@@ -307,30 +325,39 @@ localSourceModulePath(StringRef baseDir,
   llvm::sys::path::remove_dots(path);
   llvm::SmallString<256> sourcePath(path);
   sourcePath += ".py";
-  if (llvm::sys::fs::exists(sourcePath))
+  if (existsWithExactCase(sourcePath))
     return LocalSourceModulePath{sourcePath.str().str(), false, false};
 
   llvm::SmallString<256> stubPath(path);
   stubPath += ".pyi";
-  if (llvm::sys::fs::exists(stubPath))
+  if (existsWithExactCase(stubPath))
     return LocalSourceModulePath{stubPath.str().str(), true, false};
 
   llvm::SmallString<256> packageSourcePath(path);
   llvm::sys::path::append(packageSourcePath, "__init__.py");
-  if (llvm::sys::fs::exists(packageSourcePath))
+  if (existsWithExactCase(path) &&
+      existsWithExactCase(packageSourcePath))
     return LocalSourceModulePath{packageSourcePath.str().str(), false, true};
 
   llvm::SmallString<256> packageStubPath(path);
   llvm::sys::path::append(packageStubPath, "__init__.pyi");
-  if (llvm::sys::fs::exists(packageStubPath))
+  if (existsWithExactCase(path) &&
+      existsWithExactCase(packageStubPath))
     return LocalSourceModulePath{packageStubPath.str().str(), true, true};
 
   // Embedded stdlib source (runtime/lib/*.py): resolved after user files,
   // before module manifests; compiled with the program like any source module.
-  if (const auto *entry = embeddedStdlibSource(moduleName))
-    return LocalSourceModulePath{
-        ("<stdlib>/" + moduleName + (entry->isStub ? ".pyi" : ".py")).str(),
-        entry->isStub, false, /*isEmbedded=*/true};
+  // ⛔ Not by `moduleName`: `from . import json` in a program's package names
+  // that package's `json`, never the stdlib one.
+  if (const auto *entry = embeddedStdlibSource(absoluteName)) {
+    std::string path = "<stdlib>/" + absoluteName.str();
+    std::replace(path.begin(), path.end(), '.', '/');
+    if (entry->isPackage)
+      path += "/__init__";
+    path += entry->isStub ? ".pyi" : ".py";
+    return LocalSourceModulePath{std::move(path), entry->isStub,
+                                 entry->isPackage, /*isEmbedded=*/true};
+  }
   return std::nullopt;
 }
 
@@ -550,8 +577,9 @@ static void collectImportedModuleRequests(
       if (!relativePackage || !relativeDirectory)
         continue;
       if (moduleName) {
-        appendIfLocal(joinModuleName(*relativePackage, *moduleName),
-                      localSourceModulePath(*relativeDirectory, *moduleName));
+        std::string absolute = joinModuleName(*relativePackage, *moduleName);
+        appendIfLocal(absolute, localSourceModulePath(*relativeDirectory,
+                                                      *moduleName, absolute));
         const auto *aliases = nodeListField(*statement, "names");
         if (!aliases)
           continue;
@@ -562,9 +590,12 @@ static void collectImportedModuleRequests(
           if (!name || *name == "*")
             continue;
           std::string relativeSubmodule = joinModuleName(*moduleName, *name);
-          appendIfLocal(joinModuleName(*relativePackage, relativeSubmodule),
+          std::string absoluteSubmodule =
+              joinModuleName(*relativePackage, relativeSubmodule);
+          appendIfLocal(absoluteSubmodule,
                         localSourceModulePath(*relativeDirectory,
-                                              relativeSubmodule));
+                                              relativeSubmodule,
+                                              absoluteSubmodule));
         }
         continue;
       }
@@ -578,8 +609,9 @@ static void collectImportedModuleRequests(
         std::optional<std::string> name = stringField(*alias, "name");
         if (!name || *name == "*")
           continue;
-        appendIfLocal(joinModuleName(*relativePackage, *name),
-                      localSourceModulePath(*relativeDirectory, *name));
+        std::string absolute = joinModuleName(*relativePackage, *name);
+        appendIfLocal(absolute,
+                      localSourceModulePath(*relativeDirectory, *name, absolute));
       }
     }
   }
@@ -630,12 +662,18 @@ collectLocalSourceModules(const lython::parser::Node &module, StringRef baseDir,
     }
     if (seen.find(request.moduleName) != seen.end())
       continue;
-    if (visiting.find(request.moduleName) != visiting.end()) {
-      diag << request.sourcePath
-           << ": emit error: local source import cycle "
-           << "involving module '" << request.moduleName << "'\n";
-      return failure();
-    }
+    // ⭐ A MODULE ALREADY BEING READ IS THE PARTIAL MODULE CPython HANDS BACK.
+    // Two modules that import each other -- unittest's case and result type
+    // each other's classes -- were refused here as a "local source import
+    // cycle". Skipping the edge keeps this walk's post-order, which is the
+    // order CPython FINISHES the modules in, and that is the order their
+    // globals are initialized at the start of `__main__`. The emitter declares
+    // every module's classes before any body (emitSourceModuleDeclarations).
+    // ⛔ A global read before its module has run is not CPython's
+    // AttributeError on a partially initialized module but the cell's own
+    // RuntimeError: loud, with another exception class.
+    if (visiting.find(request.moduleName) != visiting.end())
+      continue;
 
     std::unique_ptr<llvm::MemoryBuffer> buffer;
     if (request.isEmbedded) {
@@ -762,12 +800,11 @@ LogicalResult emitMLIRFromSource(StringRef source, StringRef sourcePath,
     if (!source.isStub)
       finalizers |= addFinalizerWrappers(*source.parsed.tree, options);
   // And a program that calls `sys.exc_info()`, whose traceback traceback
-  // builds.
+  // builds -- from any module, the stdlib's included (unittest's _Outcome).
   bool excInfo = namesExcInfo(*parsed.tree) ||
                  std::any_of(localSources.begin(), localSources.end(),
                              [](const ParsedLocalSourceModule &source) {
-                               return !source.isEmbedded &&
-                                      namesExcInfo(*source.parsed.tree);
+                               return namesExcInfo(*source.parsed.tree);
                              });
   if (finalizers || excInfo) {
     lython::parser::ParseResult tracebackImport =

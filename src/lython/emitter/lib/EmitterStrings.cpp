@@ -1108,6 +1108,114 @@ Value ModuleEmitter::emitPercentFormatArguments(const parser::Node &expr,
   return emitExpr(call.get());
 }
 
+// CPython's TypeError for a numeric `%` conversion of a builtin that is not
+// a number, or nothing when the value may be one.
+// ⛔ Not for a program's class: `__index__` and `__float__` make one a number
+// here, and the conversion asks it.
+static std::optional<std::string>
+percentNonNumberMessage(char conversion, mlir::Type type, TypeSystem &types) {
+  std::string typeName;
+  if (type == types.none()) {
+    typeName = "NoneType";
+  } else if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type)) {
+    llvm::StringRef name = contract.getContractName();
+    bool integerWanted =
+        conversion == 'x' || conversion == 'X' || conversion == 'o';
+    if (integerWanted && name == "builtins.float")
+      typeName = "float";
+    else if (llvm::is_contained(
+                 {llvm::StringRef("builtins.str"), llvm::StringRef("builtins.bytes"),
+                  llvm::StringRef("builtins.bytearray"),
+                  llvm::StringRef("builtins.list"), llvm::StringRef("builtins.tuple"),
+                  llvm::StringRef("builtins.dict"), llvm::StringRef("builtins.set"),
+                  llvm::StringRef("builtins.frozenset")},
+                 name))
+      typeName = name.drop_front(llvm::StringRef("builtins.").size()).str();
+  }
+  if (typeName.empty())
+    return std::nullopt;
+  switch (conversion) {
+  case 'd':
+  case 'i':
+  case 'u':
+    return "%" + std::string(1, conversion) +
+           " format: a real number is required, not " + typeName;
+  case 'x':
+  case 'X':
+  case 'o':
+    return "%" + std::string(1, conversion) +
+           " format: an integer is required, not " + typeName;
+  default:
+    return "must be real number, not " + typeName;
+  }
+}
+
+// ⭐ A VALUE THAT IS NOT A NUMBER RAISES CPython's TypeError. Handed to
+// `__format__` with the conversion's code, `"%d" % "x"` raised ValueError
+// ("Unknown format code 'd' for object of type 'str'") -- another exception
+// class, which an `except TypeError` does not catch. And a UNION is asked
+// member by member: unittest formats `(i,) + reprs`, whose elements are
+// `int | str`, and the conversion had no answer for the union at all.
+Value ModuleEmitter::emitPercentNumber(const parser::Node &expr,
+                                       Value argument, char conversion,
+                                       const std::string &spec) {
+  mlir::Type strType = types.contract("builtins.str");
+  mlir::Type argumentType = types.widenLiteral(argument.type);
+  if (auto unionType = mlir::dyn_cast<py::UnionType>(argumentType)) {
+    llvm::ArrayRef<mlir::Type> members = unionType.getMemberTypes();
+    std::function<mlir::Value(unsigned)> arm = [&](unsigned index) {
+      mlir::Type member = members[index];
+      auto render = [&]() -> mlir::Value {
+        if (py::isPyNoneType(member))
+          return emitPercentNumber(expr, Value{argument.value, types.none()},
+                                   conversion, spec)
+              .value;
+        auto unwrap = py::UnionUnwrapOp::create(builder, loc(expr), member,
+                                                argument.value);
+        return coerceValue(emitPercentNumber(expr,
+                                             Value{unwrap.getResult(), member},
+                                             conversion, spec),
+                           strType, expr)
+            .value;
+      };
+      if (index + 1 >= members.size())
+        return render();
+      auto test = py::UnionTestOp::create(builder, loc(expr),
+                                          builder.getI1Type(), argument.value,
+                                          mlir::TypeAttr::get(member));
+      return emitValueDiamond(loc(expr), test.getResult(), strType, render,
+                              [&] { return arm(index + 1); });
+    };
+    return Value{arm(0), strType};
+  }
+  if (std::optional<std::string> message =
+          percentNonNumberMessage(conversion, argumentType, types)) {
+    parser::NodePtr raise =
+        raisingCall(expr.range, "TypeError", *message, strType);
+    synthesizedIteratorDefs.push_back(raise);
+    return emitExpr(raise.get());
+  }
+  Value number = argument;
+  // ⭐ A FLOAT operand is truncated toward zero first. CPython's `%d`
+  // goes through `PyNumber_Long`, so `"%d" % (3.7,)` is 3 and
+  // `"%d" % (-3.7,)` is -3; handing the float to `__format__` with a 'd'
+  // code instead died at run time with "Unknown format code 'd' for
+  // object of type 'float'".
+  if ((conversion == 'd' || conversion == 'i' || conversion == 'u') &&
+      argumentType == types.floatType()) {
+    mlir::Type intContract = py::CallableType::get(
+        &context, {types.floatType()}, {}, {}, {}, {types.intType()});
+    auto truncated = py::IntOp::create(
+        builder, loc(expr), types.intType(),
+        mlir::FlatSymbolRefAttr::get(&context, "__int__"),
+        mlir::TypeAttr::get(intContract), number.value);
+    number = Value{truncated.getResult(), types.intType()};
+  }
+  return emitFormatValue(expr, number,
+                         std::optional<Value>(emitStrLiteralPiece(expr, spec)),
+                         false);
+}
+
 Value ModuleEmitter::emitPercentFormat(const parser::Node &expr) {
   mlir::Type strType = types.contract("builtins.str");
   const parser::Node *leftNode = ast::node(expr, "left");
@@ -1121,6 +1229,25 @@ Value ModuleEmitter::emitPercentFormat(const parser::Node &expr) {
   if (leftNode && leftNode->kind == "Constant")
     if (auto text = ast::string(*leftNode, "value"))
       tpl = std::string(*text);
+  // An f-string with no replacement field is its text: unittest's loader
+  // writes `f'%s.%s.%s' % (...)`.
+  if (leftNode && leftNode->kind == "JoinedStr")
+    if (const auto *parts = ast::nodeList(*leftNode, "values")) {
+      std::string text;
+      bool constant = true;
+      for (const parser::NodePtr &part : *parts) {
+        std::optional<std::string_view> piece =
+            part && part->kind == "Constant" ? ast::string(*part, "value")
+                                             : std::nullopt;
+        if (!piece) {
+          constant = false;
+          break;
+        }
+        text += *piece;
+      }
+      if (constant)
+        tpl = std::move(text);
+    }
   if (!tpl)
     return diag("%-formatting requires a compile-time format string here "
                 "(runtime templates are limited to statically-typed forms, "
@@ -1324,27 +1451,10 @@ Value ModuleEmitter::emitPercentFormat(const parser::Node &expr) {
       std::optional<Value> argument = nextArgument(type);
       if (!argument)
         return emitNone(expr);
-      // ⭐ A FLOAT operand is truncated toward zero first. CPython's `%d`
-      // goes through `PyNumber_Long`, so `"%d" % (3.7,)` is 3 and
-      // `"%d" % (-3.7,)` is -3; handing the float to `__format__` with a 'd'
-      // code instead died at run time with "Unknown format code 'd' for
-      // object of type 'float'".
-      Value integral = *argument;
-      if (types.widenLiteral(integral.type) == types.floatType()) {
-        mlir::Type intContract = py::CallableType::get(
-            &context, {types.floatType()}, {}, {}, {}, {types.intType()});
-        auto truncated = py::IntOp::create(
-            builder, loc(expr), types.intType(),
-            mlir::FlatSymbolRefAttr::get(&context, "__int__"),
-            mlir::TypeAttr::get(intContract), integral.value);
-        integral = Value{truncated.getResult(), types.intType()};
-      }
       // Always pass the 'd' spec: with an empty spec a bool would render
       // through str() as True/False, but %d must print 1/0.
-      std::string spec = numericSpec('d', false);
-      appendResult(emitFormatValue(
-          expr, integral,
-          std::optional<Value>(emitStrLiteralPiece(expr, spec)), false));
+      appendResult(
+          emitPercentNumber(expr, *argument, type, numericSpec('d', false)));
       break;
     }
     case 'o':
@@ -1361,10 +1471,8 @@ Value ModuleEmitter::emitPercentFormat(const parser::Node &expr) {
         return emitNone(expr);
       bool isFloatType = type == 'e' || type == 'E' || type == 'f' ||
                          type == 'F' || type == 'g' || type == 'G';
-      std::string spec = numericSpec(type, isFloatType);
-      appendResult(emitFormatValue(
-          expr, *argument,
-          std::optional<Value>(emitStrLiteralPiece(expr, spec)), false));
+      appendResult(emitPercentNumber(expr, *argument, type,
+                                     numericSpec(type, isFloatType)));
       break;
     }
     case 'c': {

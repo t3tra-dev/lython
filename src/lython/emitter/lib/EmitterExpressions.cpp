@@ -1164,6 +1164,33 @@ Value ModuleEmitter::emitBinary(const parser::Node &expr) {
         synthesizedIteratorDefs.push_back(display);
         return emitExpr(display.get());
       }
+    // ⭐ AND A TUPLE OF UNKNOWN LENGTH IS SPREAD: `(i,) + reprs` with
+    // `reprs: tuple[str, ...]` is `(i, *reprs)`, an `int | str` element. The
+    // manifest's `tuple.__add__` answered a tuple of nothing, which no
+    // conversion could read. Each side once, left first.
+    if (types.tupleConcatElement(
+            types.widenLiteral(types.inferExpr(leftNode)),
+            types.widenLiteral(types.inferExpr(rightNode)))) {
+      parser::SourceRange range = expr.range;
+      std::vector<std::string> temps;
+      auto forget = llvm::scope_exit([&] {
+        for (const std::string &name : temps)
+          values.erase(name);
+      });
+      std::vector<parser::NodePtr> members;
+      for (const parser::Node *side : {leftNode, rightNode}) {
+        std::string temp =
+            "__ly_tuplecat" + std::to_string(++syntheticFunctionCounter);
+        Value value = emitExpr(side);
+        values[temp] = value;
+        types.bindSymbol(temp, value.type);
+        temps.push_back(temp);
+        members.push_back(synth::starred(synth::name(temp, range), range));
+      }
+      parser::NodePtr display = synth::tuple(std::move(members), range);
+      synthesizedIteratorDefs.push_back(display);
+      return emitExpr(display.get());
+    }
   }
   // str % args is printf-style formatting, not a manifest __mod__; it needs
   // the unevaluated right-hand AST (tuple literals supply the arguments), so
@@ -5952,8 +5979,35 @@ Value ModuleEmitter::coerceValue(Value value, mlir::Type targetType,
       }
     }
     mlir::Type actual = types.widenLiteral(value.type);
+    // ⭐ AND THE PROGRAM'S OWN HIERARCHY, for a class this module declares
+    // below another module's: the class ops' walk did not see it, the value
+    // was written into the union's lanes UNWRAPPED, and its tag read as None:
+    //
+    //     class Sub(lib.Base): ...
+    //     p = lib.Prog()            # runner: type[Base] | None
+    //     p.runner = Sub
+    //     print(p.runner is None)   # True; CPython prints False
+    //
+    // unittest's `main(testRunner=BufferedRunner)` ran the default runner.
+    auto belowMember = [&](mlir::Type member) {
+      mlir::Type actualClass = actual;
+      mlir::Type memberClass = types.widenLiteral(member);
+      if (auto actualType = mlir::dyn_cast<py::TypeType>(actualClass))
+        if (auto memberType = mlir::dyn_cast<py::TypeType>(memberClass)) {
+          actualClass = actualType.getInstanceType();
+          memberClass = memberType.getInstanceType();
+        }
+      auto actualContract = mlir::dyn_cast_if_present<py::ContractType>(actualClass);
+      auto memberContract = mlir::dyn_cast_if_present<py::ContractType>(memberClass);
+      return actualContract && memberContract &&
+             mlir::isa<py::TypeType>(actual) ==
+                 mlir::isa<py::TypeType>(types.widenLiteral(member)) &&
+             !isNumericPrimitiveContract(actualContract) &&
+             pythonSubclassOf(actualContract, memberContract, types, module);
+    };
     for (mlir::Type member : unionType.getMemberTypes()) {
-      if (!isAssignableWithStaticEvidence(actual, member, module))
+      if (!isAssignableWithStaticEvidence(actual, member, module) &&
+          !belowMember(member))
         continue;
       Value memberValue = coerceValue(value, member, anchor);
       if (memberValue.type != member)
@@ -6093,6 +6147,29 @@ Value ModuleEmitter::coerceValue(Value value, mlir::Type targetType,
               "two share no representation"});
       return value;
     }
+  // ⭐ AND A UNION ONLY OF MEMBERS BELOW THE TARGET, which the arms above
+  // took. Retyping one whose member is another class read that member as the
+  // target: `self.stream = s` for `s: StringIO | TextIOWrapper` into a field
+  // typed TextIOWrapper made a StringIO answer "not writable" as a file.
+  if (auto targetContract = mlir::dyn_cast<py::ContractType>(targetType))
+    if (auto sourceUnion = mlir::dyn_cast<py::UnionType>(value.type);
+        sourceUnion && !py::isPyObjectType(targetContract))
+      for (mlir::Type member : sourceUnion.getMemberTypes()) {
+        auto memberClass =
+            mlir::dyn_cast<py::ContractType>(types.widenLiteral(member));
+        if (!memberClass ||
+            memberClass.getContractName() == targetContract.getContractName() ||
+            pythonSubclassOf(memberClass, targetContract, types, module))
+          continue;
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, anchor.range.start,
+            "a " + pythonTypeSpelling(types.widenLiteral(value.type)) +
+                " value cannot be stored where " +
+                pythonTypeSpelling(targetContract) +
+                " is declared: its member " + pythonTypeSpelling(memberClass) +
+                " is not one, and the declared type is the storage here"});
+        return value;
+      }
   // ⭐ AND A CLASS VALUE ONLY OF A SUBCLASS. A `type[A]` whose class is
   // closed names A and nothing else, so a call through it is answered
   // statically: `t: type[A] = B` with B unrelated put a B where every

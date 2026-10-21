@@ -93,9 +93,18 @@ private:
   // is specialized once). Dropped with the imported ones, for the same reason.
   llvm::DenseMap<std::pair<const parser::Node *, unsigned>, FunctionSignature>
       sourceLocalSignatures;
+  // The type aliases each imported module binds, read in its own scope, for
+  // an importer that spells them through the module (`m.Pair`). Dropped with
+  // the signatures: an alias of a generic class read before that class was
+  // registered names the unspecialized class.
+  std::map<std::string, std::vector<std::pair<std::string, mlir::Type>>>
+      sourceModuleTypeAliasMemo;
+  const std::vector<std::pair<std::string, mlir::Type>> &
+  sourceModuleTypeAliases(const EmitOptions::SourceModule &source);
   void forgetImportedSignatures() {
     importedSignatures.clear();
     sourceLocalSignatures.clear();
+    sourceModuleTypeAliasMemo.clear();
   }
   // The host's global functions (Window's methods), and the spellings the
   // program imported them by.
@@ -138,7 +147,8 @@ private:
                             unsigned aliasDepth = 0);
   bool bindSourceModuleReexport(const EmitOptions::SourceModule &source,
                                 llvm::StringRef exportedName,
-                                llvm::StringRef localName);
+                                llvm::StringRef localName,
+                                unsigned namespaceDepth = 0);
   bool bindSourceModuleStar(llvm::StringRef module,
                             const parser::Node &anchor,
                             bool diagnoseUnsupported);
@@ -1357,6 +1367,11 @@ private:
                                             const parser::Node *calleeNode);
   // printf-style % formatting on a str left operand.
   Value emitPercentFormat(const parser::Node &expr);
+  // One numeric `%` conversion (`d`, `x`, `f`, ...) of `argument`, with the
+  // `__format__` spec it maps to: per member for a union, CPython's TypeError
+  // for a builtin that is not a number.
+  Value emitPercentNumber(const parser::Node &expr, Value argument,
+                          char conversion, const std::string &spec);
   // Attribute/index accessors inside str.format replacement fields
   // ({0.attr} / {0[i]}), applied to an already-emitted value.
   std::optional<Value> emitValueAttribute(const parser::Node &anchor,

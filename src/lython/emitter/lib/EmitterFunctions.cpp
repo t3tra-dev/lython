@@ -543,6 +543,35 @@ std::string ModuleEmitter::methodDefaultCellName(const parser::Node &root,
 //
 // The cell is registered here instead, under the same name the method's
 // emission uses, and written at the class statement either way.
+// ⭐ AN IMMUTABLE DEFAULT OF A PROTOCOL PARAMETER IS EVALUATED PER CALL. A
+// cell holds what the parameter declares, and a protocol value carries no
+// reference count to take when the cell is read: unittest's
+// `BaseTestSuite(tests: Iterable[...] = ())` reached the lowering as "module
+// global ... has no runtime retain primitive". For a constant, or a tuple of
+// them, one evaluation and one per call cannot be told apart.
+// ⛔ Not a mutable default, whose sharing between calls is the point: that one
+// keeps its cell and the lowering's refusal.
+static bool defaultEvaluatedPerCall(mlir::Type declared,
+                                    const parser::Node *expression) {
+  if (!declared || !mlir::isa<py::ProtocolType>(declared))
+    return false;
+  std::function<bool(const parser::Node *)> immutable =
+      [&](const parser::Node *node) -> bool {
+    if (!node)
+      return false;
+    if (node->kind == "Constant")
+      return true;
+    if (node->kind != "Tuple")
+      return false;
+    if (const auto *elements = ast::nodeList(*node, "elts"))
+      for (const parser::NodePtr &element : *elements)
+        if (!immutable(element.get()))
+          return false;
+    return true;
+  };
+  return immutable(expression);
+}
+
 std::optional<std::string>
 ModuleEmitter::methodDefaultCell(const MethodBinding &method, unsigned slot,
                                  mlir::Type declared) {
@@ -554,7 +583,8 @@ ModuleEmitter::methodDefaultCell(const MethodBinding &method, unsigned slot,
       return entry.second;
   const parser::Node *defaultNode =
       defaultExpressionForSlot(*method.method, slot);
-  if (!defaultNode || defaultNode->kind == "Constant" || !declared)
+  if (!defaultNode || defaultNode->kind == "Constant" || !declared ||
+      defaultEvaluatedPerCall(types.widenLiteral(declared), defaultNode))
     return std::nullopt;
   const parser::Node *root = &moduleNode;
   if (const EmitOptions::SourceModule *source =
@@ -1698,7 +1728,10 @@ mlir::ArrayAttr ModuleEmitter::emitCallableDefaultValues(
           "kind", builder.getStringAttr("unsupported"))});
     }
 
-    if (isModuleLevelDef) {
+    mlir::Type slotDeclared = isModuleLevelDef ? declaredSlotType(slot)
+                                               : mlir::Type();
+    bool perCall = defaultEvaluatedPerCall(slotDeclared, expr.get());
+    if (isModuleLevelDef && !perCall) {
       if (mlir::Type declared = declaredSlotType(slot)) {
         // ⭐ A SPECIALIZATION READS ITS GENERIC'S CELL. Its own cell was
         // registered when the specialization was emitted -- at the first

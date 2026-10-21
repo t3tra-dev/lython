@@ -1,0 +1,9 @@
+1: a / b
+TypeError: %d format: a real number is required, not str
+TypeError: %d format: a real number is required, not str
+TypeError: %d format: a real number is required, not NoneType
+TypeError: %x format: an integer is required, not str
+TypeError: %x format: an integer is required, not float
+TypeError: must be real number, not str
+3  2.50 ff
+7

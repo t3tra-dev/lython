@@ -155,6 +155,57 @@ TEST(EmitterTest, RefusesAStatementInAnImportedModuleBody) {
       << emitted.diagnostics;
 }
 
+// What: an imported module's `assert` whose test the compiler can decide is
+// decided: a true one compiles, a false one is refused as the AssertionError
+// the import raises, and one over a run-time value is refused.
+TEST(EmitterTest, DecidesAnAssertInAnImportedModuleBody) {
+  ImportedModuleEmit holds = emitWithImportedModule(
+      "asserts_true", "X = 80\nY = X - (5 + 12)\nassert Y >= 0 and X // 8 == 10\n",
+      "import asserts_true\nprint(asserts_true.X)\n");
+  EXPECT_TRUE(holds.succeeded) << holds.diagnostics;
+  ImportedModuleEmit fails = emitWithImportedModule(
+      "asserts_false", "X = 80\nassert X < 0\n",
+      "import asserts_false\nprint(asserts_false.X)\n");
+  EXPECT_FALSE(fails.succeeded);
+  EXPECT_NE(fails.diagnostics.find(
+                "this assert fails when the module is imported"),
+            std::string::npos)
+      << fails.diagnostics;
+  ImportedModuleEmit runtime = emitWithImportedModule(
+      "asserts_runtime", "import sys\nassert len(sys.argv) > 5\n",
+      "import asserts_runtime\nprint(1)\n");
+  EXPECT_FALSE(runtime.succeeded);
+  EXPECT_NE(runtime.diagnostics.find(
+                "an assert in an imported module needs a test this compiler "
+                "can decide"),
+            std::string::npos)
+      << runtime.diagnostics;
+}
+
+// What: a union stored where one class is declared, with a member that is not
+// that class, is refused naming the member; a union of its subclasses is not.
+TEST(EmitterTest, RefusesAUnionStoredWhereOneOfItsMembersIsNotTheField) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult refused = emitSource(
+      "class A:\n    pass\n\nclass B:\n    pass\n\n"
+      "class H:\n    def __init__(self, a: A) -> None:\n        self.a = a\n\n"
+      "def f(v: A | B) -> None:\n    h = H(A())\n    h.a = v\n",
+      context);
+  EXPECT_FALSE(refused.ok());
+  bool named = false;
+  for (const lython::parser::Diagnostic &diagnostic : refused.diagnostics)
+    named = named || diagnostic.message.find(
+                         "its member B is not one") != std::string::npos;
+  EXPECT_TRUE(named);
+  mlir::MLIRContext second(testRegistry());
+  lython::emitter::EmitResult subclasses = emitSource(
+      "class A:\n    pass\n\nclass B(A):\n    pass\n\nclass C(A):\n    pass\n\n"
+      "class H:\n    def __init__(self, a: A) -> None:\n        self.a = a\n\n"
+      "def f(v: B | C) -> None:\n    h = H(A())\n    h.a = v\n",
+      second);
+  EXPECT_TRUE(subclasses.ok());
+}
+
 // What: what an imported module's decorated method or function-local class
 // cannot be is refused in that module's file: a diagnostic with no file was
 // printed against the main module's name.

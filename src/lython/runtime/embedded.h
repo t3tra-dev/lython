@@ -61,6 +61,9 @@ struct StdlibSourceModule {
   std::size_t size;
   // A `.pyi`: the module's contract, with no implementation to compile.
   bool isStub;
+  // A directory's `__init__`: the module its submodules' relative imports
+  // start from.
+  bool isPackage;
 };
 const StdlibSourceModule *stdlibSourceModules();
 std::size_t stdlibSourceModuleCount();
