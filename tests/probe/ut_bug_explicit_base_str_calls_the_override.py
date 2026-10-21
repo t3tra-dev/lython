@@ -3,9 +3,10 @@
 #   ('fancy text').
 # KIND: バグ (bug) -- silent: prints the wrong text
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# differential: expect-wrong an explicit base __str__ call is dispatched to the override
-# CLASSIFICATION @ lang-gaps fa5c535a: 2 silent 誤実行
-#   cpython='stored fancy text\n' lyc='fancy text fancy text\n'
+# FIXED: 2026-10-21 -- `BaseException.__str__(x)` and `__repr__` are CPython's
+#   BaseException_str/repr over `x.args`; a call naming a builtin class is not
+#   virtual (`int.__repr__(True)` is "1").
+# CLASSIFICATION @ lang-gaps 8639cfed + the fix: 1 正しい
 # CPython 3.14 expects: stored fancy text
 class Fancy(Exception):
     def __str__(self) -> str:

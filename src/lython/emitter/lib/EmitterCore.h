@@ -1107,6 +1107,11 @@ private:
   // `object.__repr__(x)` and its siblings: object's own slot, not x's.
   std::optional<Value> tryEmitObjectSlotCall(const parser::Node &expr,
                                              const parser::Node *calleeNode);
+  // `BaseException.__str__(e)` and `__repr__`: the base's text, not e's.
+  std::optional<Value> tryEmitBaseExceptionText(const parser::Node &expr,
+                                                mlir::Type owner,
+                                                llvm::StringRef methodName,
+                                                const parser::NodePtr &subject);
   std::optional<Value> tryEmitHasattrCall(const parser::Node &expr,
                                           const parser::Node *calleeNode);
   std::optional<std::string> unhashableClassName(mlir::Type type) const;
