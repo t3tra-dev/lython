@@ -114,6 +114,13 @@ EmitResult ModuleEmitter::emit() {
     if (source.moduleNode && !source.isStub)
       markExcInfoCallsInsideHandlers(*source.moduleNode, false);
   markExcInfoCallsInsideHandlers(moduleNode, false);
+  // Before a protocol is added to the bases of the classes that satisfy it:
+  // the order asked about is the one the source wrote.
+  for (const EmitOptions::SourceModule &source : options.sourceModules)
+    if (source.moduleNode && !source.isStub)
+      inSourceModule(source,
+                     [&] { refuseBasesBoundLater(*source.moduleNode); });
+  refuseBasesBoundLater(moduleNode);
   // After the generic desugar (a `Protocol[T]` base is what it leaves for a
   // generic protocol) and before any binder reads a base list.
   desugarProtocols();
@@ -228,6 +235,7 @@ EmitResult ModuleEmitter::emit() {
   // and CPython runs the module body top to bottom.
   emitReplacedStreamInitializers(moduleNode);
   emitImportedModuleGlobalInitializers();
+  emitImportedDefaultCells();
   emitImportedClassAttrInitializers();
   emitStatements(ast::nodeList(moduleNode, "body"), /*skipDeclarations=*/true);
   atModuleScope = false;
@@ -306,6 +314,56 @@ void ModuleEmitter::resolveTopLevelBaseSpellings() {
     }
     if (changed)
       types.bindDeclaredBases(*name, bases);
+  }
+}
+
+// ⭐ A CLASS STATEMENT READS ITS BASES WHEN IT RUNS. Every class of the module
+// is a contract declared before any statement executes, so
+//
+//     class A(Later): ...
+//     class Later: ...
+//
+// compiled and ran, where CPython raises NameError at `class A` -- or, when
+// the name is also a builtin's (`Exception`), builds A on the builtin.
+// ⛔ Only a bare name of a module class: an import, an assignment or an
+// earlier class statement binds it, and the order of those is what this
+// asks; an attribute base (`mod.Base`) names another module's class.
+void ModuleEmitter::refuseBasesBoundLater(const parser::Node &root) {
+  const auto *body = ast::nodeList(root, "body");
+  if (!body)
+    return;
+  llvm::StringSet<> classNames;
+  for (const parser::NodePtr &statement : *body)
+    if (statement && statement->kind == "ClassDef")
+      if (std::optional<std::string_view> name = ast::string(*statement, "name"))
+        classNames.insert(*name);
+  llvm::StringSet<> bound;
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement)
+      continue;
+    if (statement->kind == "ClassDef")
+      if (const auto *bases = ast::nodeList(*statement, "bases"))
+        for (const parser::NodePtr &base : *bases) {
+          if (!base || base->kind != "Name")
+            continue;
+          llvm::StringRef spelling = ast::nameSpelling(*base);
+          if (!classNames.contains(spelling) || bound.contains(spelling))
+            continue;
+          std::string name(ast::string(*statement, "name").value_or(""));
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, base->range.start,
+              "class '" + name + "' names '" + spelling.str() +
+                  "' as a base before the class statement that defines '" +
+                  spelling.str() +
+                  "' has run; CPython reads a base when the class statement "
+                  "runs, so this raises NameError there (or takes the builtin "
+                  "of that name) -- move class '" + spelling.str() +
+                  "' above class '" + name + "'"});
+        }
+    StatementNames names;
+    collectStatementNames(*statement, names);
+    for (const auto &entry : names.stored)
+      bound.insert(entry.getKey());
   }
 }
 

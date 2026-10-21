@@ -4,8 +4,9 @@
 #   executes.
 # KIND: バグ (bug) -- permissive: runs where CPython raises
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 2 silent 誤実行
-#   cpython raised, lyc completed cleanly
+# FIXED: 2026-10-21 -- refused at the base, before anything runs: the order a
+#   class statement reads its bases in is the source's.
+# CLASSIFICATION @ lang-gaps e77e1398 + the fix: 4 両方が拒否
 # CPython 3.14 expects: (例外を送出)
 class A(Later):
     pass

@@ -181,6 +181,9 @@ private:
   // bound: neither a base spelled `module.Class` nor one spelled with the bare
   // name a `from module import Class` bound can be canonicalized before that.
   void resolveTopLevelBaseSpellings();
+  // A module-level class whose base is a class of this module that no earlier
+  // statement has bound yet.
+  void refuseBasesBoundLater(const parser::Node &root);
   // The class's C3 linearization (contract names, self first). Computed and
   // cached by emitClassContract; empty for unknown classes.
   llvm::ArrayRef<std::string> classMro(llvm::StringRef className) const;
@@ -1107,6 +1110,11 @@ private:
   // `object.__repr__(x)` and its siblings: object's own slot, not x's.
   std::optional<Value> tryEmitObjectSlotCall(const parser::Node &expr,
                                              const parser::Node *calleeNode);
+  // `BaseException.__str__(e)` and `__repr__`: the base's text, not e's.
+  std::optional<Value> tryEmitBaseExceptionText(const parser::Node &expr,
+                                                mlir::Type owner,
+                                                llvm::StringRef methodName,
+                                                const parser::NodePtr &subject);
   std::optional<Value> tryEmitHasattrCall(const parser::Node &expr,
                                           const parser::Node *calleeNode);
   std::optional<std::string> unhashableClassName(mlir::Type type) const;
@@ -2215,6 +2223,29 @@ private:
   llvm::DenseMap<const parser::Node *,
                  llvm::SmallVector<PendingDefaultCell, 2>>
       pendingDefaultCells;
+  // The statements whose pending cells have been written: a cell registered
+  // under one of them afterwards would never be.
+  llvm::DenseSet<const parser::Node *> flushedDefaultCellOwners;
+  // The module-level statement whose execution evaluates `def`'s defaults --
+  // the def itself, or the class statement around a method -- in the module
+  // `root`; null when there is none.
+  static const parser::Node *defaultCellOwnerIn(const parser::Node &root,
+                                                const parser::Node &def);
+  // The name of a method's default cell. It depends on the method alone, so
+  // a call site that reaches the method before its body is emitted names the
+  // same cell.
+  std::string methodDefaultCellName(const parser::Node &root,
+                                    const parser::Node &owner,
+                                    const parser::Node &def,
+                                    unsigned slot) const;
+  // The cell a copy of `method`'s body reads `slot`'s default from,
+  // registering it under the class statement if no emission has yet.
+  std::optional<std::string> methodDefaultCell(const MethodBinding &method,
+                                               unsigned slot,
+                                               mlir::Type declared);
+  // Writes the pending cells of every imported module's defs, where CPython
+  // runs the module: before the importer continues.
+  void emitImportedDefaultCells();
   // The cell a METHOD's non-constant default was parked in, per (def node,
   // slot). An inlined method call reads this instead of re-emitting the
   // expression -- which is what made `def add(self, into: list[int] = [])`

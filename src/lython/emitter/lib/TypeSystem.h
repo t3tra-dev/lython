@@ -176,6 +176,8 @@ struct StatementNames {
   llvm::StringSet<> mentioned;
   llvm::StringSet<> stored;
 };
+// Fills `names` from `node`; a def or class is its name and its header.
+void collectStatementNames(const parser::Node &node, StatementNames &names);
 
 class TypeSystem {
 public:
@@ -245,6 +247,13 @@ public:
   std::optional<py::CallableType>
   unboundManifestMethodCallable(mlir::Type typeObject,
                                 llvm::StringRef methodName) const;
+  // The parameter types a call with `argumentCount` positional arguments
+  // meets on a builtin instance's method: the shortest overload that takes
+  // that many, past the receiver. What a lambda argument is typed by.
+  std::optional<py::CallableType>
+  manifestMethodCallExpectations(mlir::Type receiver,
+                                 llvm::StringRef methodName,
+                                 unsigned argumentCount) const;
   // The callable a method read off an INSTANCE of a builtin class is, as the
   // emitter's forwarder takes it (tryEmitBoundManifestMethodObject): the
   // shortest overload, its required parameters, the receiver bound.

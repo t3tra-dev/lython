@@ -643,11 +643,12 @@ mlir::Type ModuleEmitter::storeProvedMember(py::UnionType declared,
 void ModuleEmitter::emitPendingDefaultCells(const parser::Node &statement) {
   // A generic function's cells (genericDefaultCell): written here whether or
   // not a specialization exists yet, which is what its readers rely on.
-  // ⛔ Only a def of the module being compiled, which is where a
-  // specialization reads cells; an imported one evaluates its defaults per
-  // call (the provider path).
+  // A top-level def of the module this statement is run for: the main
+  // module's walk, or an imported module's (emitImportedDefaultCells).
   bool mainModuleDef = false;
-  if (const auto *moduleBody = ast::nodeList(moduleNode, "body"))
+  const parser::Node &runningModule =
+      activeSourceModuleNode ? *activeSourceModuleNode : moduleNode;
+  if (const auto *moduleBody = ast::nodeList(runningModule, "body"))
     mainModuleDef = llvm::any_of(*moduleBody, [&](const parser::NodePtr &top) {
       return top.get() == &statement;
     });
@@ -683,6 +684,7 @@ void ModuleEmitter::emitPendingDefaultCells(const parser::Node &statement) {
                               builder.getStringAttr(cell->name),
                               coerced.value);
     }
+  flushedDefaultCellOwners.insert(&statement);
   auto pending = pendingDefaultCells.find(&statement);
   if (pending == pendingDefaultCells.end())
     return;
@@ -1528,6 +1530,64 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
                declaredContract.getContractName() ==
                    returnedContract.getContractName();
       };
+      // ⭐ A DISPLAY IS BUILT AT THE DECLARED ELEMENT TYPE, so it is judged
+      // element by element. `def make() -> list[Base]: return [Sub()]` was
+      // refused: the display alone infers `list[Sub]`, and a list is
+      // invariant -- but the emission above builds it at `list[Base]`, as the
+      // same display does when assigned to a `list[Base]` name.
+      // ⛔ Not along the numeric tower: an element's type is its storage, and
+      // int and float share no representation
+      // (errors/int_element_in_a_float_container).
+      auto elementAccepted = [&](mlir::Type element, mlir::Type wanted) {
+        int elementRung = numericRung(element);
+        int wantedRung = numericRung(wanted);
+        if (elementRung >= 0 && wantedRung >= 0)
+          return elementRung == wantedRung;
+        return accepted(element, wanted);
+      };
+      // ⛔ And not a generic class the inference left unsolved: in the body of
+      // `def make[T](v: T) -> Box[T]`, `Box(v)` infers the bare generic `Box`,
+      // which is the inference not knowing T -- the emission above builds it
+      // at the declared specialization, as `-> Box[int]` does.
+      auto unsolvedGenericOf = [&](mlir::Type returned, mlir::Type declared) {
+        auto returnedContract =
+            mlir::dyn_cast_if_present<py::ContractType>(returned);
+        auto declaredContract =
+            mlir::dyn_cast_if_present<py::ContractType>(declared);
+        if (!returnedContract || !declaredContract ||
+            !returnedContract.getArguments().empty())
+          return false;
+        GenericClassInfo *generic =
+            lookupGenericClass(returnedContract.getContractName());
+        return generic &&
+               declaredContract.getContractName().starts_with(
+                   (generic->symbolBase + "$spec"));
+      };
+      auto displayAccepted = [&](mlir::Type declared) {
+        auto declaredContract =
+            mlir::dyn_cast_if_present<py::ContractType>(declared);
+        if (!declaredContract)
+          return false;
+        llvm::StringRef name = declaredContract.getContractName();
+        llvm::ArrayRef<mlir::Type> arguments = declaredContract.getArguments();
+        auto each = [&](llvm::StringRef field, mlir::Type wanted) {
+          const auto *elements = ast::nodeList(*returnValue, field);
+          return elements &&
+                 llvm::all_of(*elements, [&](const parser::NodePtr &element) {
+                   return element && element->kind != "Starred" &&
+                          elementAccepted(types.widenLiteral(types.inferExpr(
+                                              element.get())),
+                                          wanted);
+                 });
+        };
+        if ((returnValue->kind == "List" && name == "builtins.list") ||
+            (returnValue->kind == "Set" && name == "builtins.set"))
+          return arguments.size() == 1 && each("elts", arguments[0]);
+        if (returnValue->kind == "Dict" && name == "builtins.dict")
+          return arguments.size() == 2 && each("keys", arguments[0]) &&
+                 each("values", arguments[1]);
+        return false;
+      };
       // ⛔ `object` ANYWHERE IN THE RETURNED TYPE is the inference saying it
       // does not know, not a type to refuse on -- the same rule the class-field
       // walk uses. An empty or heterogeneous list literal infers
@@ -1594,7 +1654,10 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
           !mentionsObject(currentReturnType) &&
           (unionMismatch || (ordinaryContract(returnedType) &&
                              ordinaryContract(currentReturnType) &&
-                             !accepted(returnedType, currentReturnType)))) {
+                             !accepted(returnedType, currentReturnType) &&
+                             !displayAccepted(currentReturnType) &&
+                             !unsolvedGenericOf(returnedType,
+                                                currentReturnType)))) {
         diagnostics.push_back(parser::Diagnostic{
             parser::Severity::Error, statement.range.start,
             "function is annotated to return " + typeText(currentReturnType) +

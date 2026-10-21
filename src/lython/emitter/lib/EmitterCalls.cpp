@@ -2282,18 +2282,92 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         // call, it is how the idiom gets here at all. Both were refused with
         // "!py.type<builtins.str> does not provide manifest method 'upper'",
         // which is the compiler saying it looked on the class object.
-        if (types.manifestMethodReceiverContract(
+        if (mlir::Type owner = types.manifestMethodReceiverContract(
                 types.widenLiteral(types.inferExpr(receiverNode)),
                 *methodName)) {
           const auto *unboundArgs = ast::nodeList(expr, "args");
           if (unboundArgs && !unboundArgs->empty() && unboundArgs->front() &&
               unboundArgs->front()->kind != "Starred") {
+            if (std::optional<Value> text = tryEmitBaseExceptionText(
+                    expr, owner, *methodName, unboundArgs->front()))
+              return *text;
+            // ⭐ The call names the class, so it is not virtual:
+            // `int.__repr__(True)` is int's repr, "1", and `True.__repr__()`
+            // printed "True". The first argument becomes the named class
+            // first, the way CPython's slot wrapper takes it.
+            // ⛔ Not when it already is that class: the plain re-spelling keeps
+            // the receiver's NAME, which a structural mutator
+            // (`list.append(xs, 1)`) rebinds.
+            // ⭐ A class below the named one that declares the method itself
+            // has a body the conversion keeps -- a bool converted to int is
+            // still the bool object, whose repr is "True". bool's int VALUE is
+            // the whole of it, so `int(x)` is int's receiver for the methods
+            // CPython's bool overrides; the rest it inherits, and int's
+            // `__str__` is object's, which asks the bool's repr again
+            // (`int.__str__(False)` is "False"). Any other override has no
+            // non-virtual route here, and calling it would be the override's
+            // answer.
+            parser::NodePtr receiverSpelling = unboundArgs->front();
+            mlir::Type given =
+                types.widenLiteral(types.inferExpr(receiverSpelling.get()));
+            auto givenContract = mlir::dyn_cast_if_present<py::ContractType>(given);
+            bool boolUnderInt =
+                givenContract &&
+                givenContract.getContractName() == "builtins.bool" &&
+                mlir::cast<py::ContractType>(owner).getContractName() ==
+                    "builtins.int";
+            bool givenOverrides =
+                given != owner && givenContract &&
+                (boolUnderInt
+                     ? llvm::is_contained(
+                           {"__repr__", "__and__", "__or__", "__xor__",
+                            "__rand__", "__ror__", "__rxor__", "__invert__"},
+                           *methodName)
+                 : isSourceClassContract(givenContract)
+                     ? lookupClassMethod(given, *methodName).has_value()
+                     : static_cast<bool>(types.manifestMethodReceiverContract(
+                           types.typeObject(given), *methodName)));
+            bool callThroughGiven = boolUnderInt && !givenOverrides;
+            if (givenOverrides) {
+              if (boolUnderInt) {
+                receiverSpelling = synth::call(
+                    synth::name("int", receiverSpelling->range),
+                    {receiverSpelling}, receiverSpelling->range);
+                synthesizedIteratorDefs.push_back(receiverSpelling);
+              } else {
+                diagnostics.push_back(parser::Diagnostic{
+                    parser::Severity::Error, expr.range.start,
+                    typeText(owner) + "." + std::string(*methodName) +
+                        "(x) calls that class's own method, and x is " +
+                        typeText(given) + ", which declares its own; only x." +
+                        std::string(*methodName) +
+                        "() (its own method) can be called here"});
+                return emitNone(expr);
+              }
+            }
+            std::optional<std::string> coercedName;
+            if (!callThroughGiven &&
+                types.widenLiteral(types.inferExpr(receiverSpelling.get())) !=
+                    owner) {
+              Value subject = coerceValue(
+                  emitExpr(receiverSpelling.get()), owner, *receiverSpelling);
+              coercedName =
+                  "__ly_unbound" + std::to_string(++syntheticFunctionCounter);
+              values[*coercedName] = subject;
+              types.bindSymbol(*coercedName, subject.type);
+              receiverSpelling =
+                  synth::name(*coercedName, receiverSpelling->range);
+            }
+            auto forget = llvm::scope_exit([&] {
+              if (coercedName)
+                values.erase(*coercedName);
+            });
             std::vector<parser::NodePtr> rest(std::next(unboundArgs->begin()),
                                               unboundArgs->end());
             parser::NodePtr rewritten = parser::makeNode("Call", expr.range);
             parser::addField(*rewritten, "func",
-                             synth::attribute(unboundArgs->front(), *methodName,
-                                              calleeNode->range));
+                             synth::attribute(std::move(receiverSpelling),
+                                              *methodName, calleeNode->range));
             parser::addField(*rewritten, "args", std::move(rest));
             if (const parser::Field *keywords =
                     parser::findField(expr, "keywords"))
@@ -2409,12 +2483,13 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                 !mlir::isa<py::TypeType>(receiver.type)) {
               Value callee =
                   emitBindingRef(*calleeNode, method->symbolName, directCallable);
-              CallOperands operands = emitCallOperands(expr);
-              operands.positional.insert(operands.positional.begin(), receiver);
-              operands.positionalTypes.insert(operands.positionalTypes.begin(),
-                                              receiver.type);
-              operands.positionalUnpacked.insert(
-                  operands.positionalUnpacked.begin(), 0);
+              // The arguments are emitted at the parameters' types, as any
+              // call's are: a tuple display passed to `xs: tuple[int, ...]`
+              // is built homogeneous, and its fixed-length type matched no
+              // signature here.
+              CallOperands operands =
+                  emitCallOperands(expr, {receiver},
+                                   /*includeAstArguments=*/true, directCallable);
               return emitCallableDispatch(expr, callee, operands);
             }
             return emitCallableDispatch(
@@ -2770,7 +2845,32 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
             return emitNone(expr);
           }
         }
-        CallOperands operands = emitCallOperands(*methodCallNode);
+        // ⭐ A LAMBDA ARGUMENT IS TYPED BY THE PARAMETER IT REACHES, as it is
+        // in a call to a function: `fs.append(lambda: value())` on a
+        // `list[Callable[[], object]]` was refused as "lambda requires a
+        // Callable annotation", since a lambda whose body answers `object`
+        // has no type of its own to offer. The method's parameters on this
+        // receiver -- `append(x: Callable[[], object])` here -- are that
+        // expectation.
+        // ⛔ Only for a lambda: every other argument already has a type of its
+        // own, and its emission is not changed by this.
+        py::CallableType lambdaExpectations;
+        if (const auto *callArgs = ast::nodeList(*methodCallNode, "args");
+            callArgs &&
+            llvm::any_of(*callArgs, [](const parser::NodePtr &argument) {
+              return argument && argument->kind == "Lambda";
+            }) &&
+            llvm::none_of(*callArgs, [](const parser::NodePtr &argument) {
+              return !argument || argument->kind == "Starred";
+            }))
+          if (std::optional<py::CallableType> expectations =
+                  types.manifestMethodCallExpectations(
+                      receiver.type, *methodName,
+                      static_cast<unsigned>(callArgs->size())))
+            lambdaExpectations = *expectations;
+        CallOperands operands = emitCallOperands(
+            *methodCallNode, {}, /*includeAstArguments=*/true,
+            lambdaExpectations);
         if (!operands.valid) {
           diagnostics.push_back(parser::Diagnostic{
               parser::Severity::Error, expr.range.start,
@@ -5428,6 +5528,76 @@ ModuleEmitter::tryEmitObjectSlotCall(const parser::Node &expr,
                        "Add", synth::strConstant(" object at ", range), range),
           "Add", std::move(address), range),
       "Add", synth::strConstant(">", range), range);
+  synthesizedIteratorDefs.push_back(text);
+  return emitExpr(text.get());
+}
+
+// CPython's BaseException_str and BaseException_repr, written over `args`:
+//   __str__   "" for no argument, str(args[0]) for one, repr(args) otherwise;
+//   __repr__  the class's name, then "(repr(args[0]))" or repr(args).
+// ⛔ Not the runtime's BaseException text: a builtin exception keeps the text
+// its own class rendered at construction (KeyError stores its key's repr), and
+// a program exception's `__str__` is reached by calling through the value.
+// `args` is the one record no class rewrites.
+std::optional<Value> ModuleEmitter::tryEmitBaseExceptionText(
+    const parser::Node &expr, mlir::Type owner, llvm::StringRef methodName,
+    const parser::NodePtr &subject) {
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(owner);
+  if (!contract || contract.getContractName() != "builtins.BaseException" ||
+      (methodName != "__str__" && methodName != "__repr__"))
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (!args || args->size() != 1 || (keywords && !keywords->empty()))
+    return std::nullopt;
+  parser::SourceRange range = expr.range;
+  Value receiver = coerceValue(emitExpr(subject.get()), owner, *subject);
+  std::string receiverName =
+      "__ly_exctext" + std::to_string(++syntheticFunctionCounter);
+  values[receiverName] = receiver;
+  types.bindSymbol(receiverName, receiver.type);
+  parser::NodePtr argsRead =
+      synth::attribute(synth::name(receiverName, range), "args", range);
+  synthesizedIteratorDefs.push_back(argsRead);
+  Value argsValue = emitExpr(argsRead.get());
+  std::string argsName = receiverName + "$args";
+  values[argsName] = argsValue;
+  types.bindSymbol(argsName, argsValue.type);
+  auto forget = llvm::scope_exit([&] {
+    values.erase(receiverName);
+    values.erase(argsName);
+  });
+  auto argsNamed = [&] { return synth::name(argsName, range); };
+  auto lengthIs = [&](std::int64_t n) {
+    return synth::compare(synth::lenCall(argsNamed(), range), "Eq",
+                          synth::intConstant(n, range), range);
+  };
+  auto first = [&] {
+    return synth::subscript(argsNamed(), synth::intConstant(0, range), range);
+  };
+  parser::NodePtr text;
+  if (methodName == "__str__") {
+    text = synth::ifExp(
+        lengthIs(0), synth::strConstant("", range),
+        synth::ifExp(lengthIs(1),
+                     synth::call(synth::name("str", range), {first()}, range),
+                     synth::reprCall(argsNamed(), range), range),
+        range);
+  } else {
+    parser::NodePtr className = synth::attribute(
+        synth::call(synth::name("type", range),
+                    {synth::name(receiverName, range)}, range),
+        "__name__", range);
+    parser::NodePtr one = synth::binOp(
+        synth::binOp(synth::strConstant("(", range), "Add",
+                     synth::reprCall(first(), range), range),
+        "Add", synth::strConstant(")", range), range);
+    text = synth::binOp(std::move(className), "Add",
+                        synth::ifExp(lengthIs(1), std::move(one),
+                                     synth::reprCall(argsNamed(), range),
+                                     range),
+                        range);
+  }
   synthesizedIteratorDefs.push_back(text);
   return emitExpr(text.get());
 }

@@ -3,8 +3,9 @@
 #   a free function or a plain method accepts it.
 # KIND: バグ (bug) -- loud: well-typed code refused
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   static type !py.callable<[!py.contract<"G">, !py.contract<"builtins.tuple", [!py.contract<"builtins.int">]>], arg_names = ["self", "xs"], arg_defaults = [false, false], returns = [!py.contract<"types.GeneratorType", [!py
+# FIXED: 2026-10-21 -- a generator method's arguments are emitted at its
+#   parameters' types, as any call's are.
+# CLASSIFICATION @ lang-gaps 1af75821 + the fix: 1 正しい
 # CPython 3.14 expects: [1, 2, 3]
 from collections.abc import Iterator
 

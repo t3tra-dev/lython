@@ -641,10 +641,68 @@ module attributes {
 
   // The address-keyed core, callable from paths that hold only a raw box
   // pointer (a container rendering its elements).
+  // ⭐ A GENERATOR NAMES ITS FUNCTION, as CPython's gen_repr does:
+  // `<generator object outer.<locals>.inner at 0x...>`. Its class is one class
+  // for every generator, so the class's name -- what any other object prints
+  // -- said `GeneratorType` for all of them. Word 3 is the body's target id,
+  // and the lowering answers the qualified name for each
+  // (`__ly_generator_qualname`).
+  func.func private @__ly_default_repr_dynamic_from_addr(%ptr: i64, %class_word: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "default_repr_dynamic_addr", ly.runtime.result_contract = "builtins.str"} {
+    %generator_class = arith.constant {ly.class_of = "types.GeneratorType"} 63 : i64
+    %is_generator = arith.cmpi eq, %class_word, %generator_class : i64
+    %r:2 = scf.if %is_generator -> (memref<2xi64>, memref<?xi8>) {
+      %gh, %gb = func.call @__ly_generator_repr_from_addr(%ptr) : (i64) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %gh, %gb : memref<2xi64>, memref<?xi8>
+    } else {
+      %ch, %cb = func.call @__ly_class_default_repr_from_addr(%ptr, %class_word) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %ch, %cb : memref<2xi64>, memref<?xi8>
+    }
+    func.return %r#0, %r#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  // Defined by the lowering: a switch over the program's generator bodies.
+  func.func private @__ly_generator_qualname(%target_id: i64) -> memref<?xi8>
+  memref.global "private" constant @__ly_repr_prefix_generator : memref<18xi8> = dense<[60, 103, 101, 110, 101, 114, 97, 116, 111, 114, 32, 111, 98, 106, 101, 99, 116, 32]>
+  memref.global "private" constant @__ly_repr_suffix_generator : memref<6xi8> = dense<[32, 97, 116, 32, 48, 120]>
+
+  func.func private @__ly_generator_repr_from_addr(%ptr: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c6 = arith.constant 6 : index
+    %c18 = arith.constant 18 : index
+    %target_slot = arith.constant 3 : i64
+    %target_id = func.call @__ly_entity_word_get(%ptr, %target_slot) : (i64, i64) -> i64
+    %name = func.call @__ly_generator_qualname(%target_id) : (i64) -> memref<?xi8>
+    %name_len = memref.dim %name, %c0 : memref<?xi8>
+    %named = arith.addi %name_len, %c18 : index
+    %total_index = arith.addi %named, %c6 : index
+    %buffer = memref.alloc(%total_index) : memref<?xi8>
+    %open = memref.get_global @__ly_repr_prefix_generator : memref<18xi8>
+    scf.for %i = %c0 to %c18 step %c1 {
+      %byte = memref.load %open[%i] : memref<18xi8>
+      memref.store %byte, %buffer[%i] : memref<?xi8>
+    }
+    scf.for %i = %c0 to %name_len step %c1 {
+      %byte = memref.load %name[%i] : memref<?xi8>
+      %at = arith.addi %i, %c18 : index
+      memref.store %byte, %buffer[%at] : memref<?xi8>
+    }
+    %tail = memref.get_global @__ly_repr_suffix_generator : memref<6xi8>
+    scf.for %i = %c0 to %c6 step %c1 {
+      %byte = memref.load %tail[%i] : memref<6xi8>
+      %at = arith.addi %i, %named : index
+      memref.store %byte, %buffer[%at] : memref<?xi8>
+    }
+    %total = arith.index_cast %total_index : index to i64
+    %h, %b = func.call @__ly_default_repr_from_addr(%ptr, %buffer, %total) : (i64, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    memref.dealloc %buffer : memref<?xi8>
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
   // ⛔ "<", the name and " object at 0x" in a buffer the name's length sizes:
   // a fixed one kept the first 64 bytes of a long name and printed them as
   // the class.
-  func.func private @__ly_default_repr_dynamic_from_addr(%ptr: i64, %class_word: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "default_repr_dynamic_addr", ly.runtime.result_contract = "builtins.str"} {
+  func.func private @__ly_class_default_repr_from_addr(%ptr: i64, %class_word: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c13 = arith.constant 13 : index

@@ -112,6 +112,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
     return mlir::failure();
   if (mlir::failed(RuntimeBundleLowerer::generateGeneratorDropHook()))
     return mlir::failure();
+  if (mlir::failed(RuntimeBundleLowerer::generateGeneratorQualnames()))
+    return mlir::failure();
   // Runs last, not straight after lowerFunctionReturns (where the clone
   // returns it reads first become final): it erases the scf.if whose results
   // valueBundles still holds handles to, so every step that may still consult

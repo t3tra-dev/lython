@@ -348,6 +348,139 @@ TEST(EmitterTest, ALargeMethodIsCalledAndASmallOneCopied) {
   EXPECT_EQ(ir.find("py.binding.ref \"" + tiny + "\""), std::string::npos);
 }
 
+// What: a function is refused where a callable of another numeric rung is
+// declared -- its result (int held as `Callable[[], float]`) or a parameter (a
+// float parameter the declaration passes an int) -- naming which; a bool result
+// held as int is accepted.
+TEST(EmitterTest, ACallableIsRefusedWhereAnotherNumericRungIsDeclared) {
+  const char *prelude = "from collections.abc import Callable\n"
+                        "def one() -> int:\n    return 1\n"
+                        "def half(x: float) -> float:\n    return x / 2\n"
+                        "def flag() -> bool:\n    return True\n";
+  ImportedModuleEmit result = emitWithImportedModules(
+      {}, std::string(prelude) + "f: Callable[[], float] = one\n");
+  EXPECT_FALSE(result.succeeded);
+  EXPECT_NE(result.diagnostics.find(
+                "main.py:8:0: emit error: this function cannot be held as the "
+                "callable declared here: its result is int and the "
+                "declaration's is float"),
+            std::string::npos)
+      << result.diagnostics;
+  ImportedModuleEmit parameter = emitWithImportedModules(
+      {}, std::string(prelude) + "h: Callable[[int], float] = half\n");
+  EXPECT_FALSE(parameter.succeeded);
+  EXPECT_NE(parameter.diagnostics.find("its parameter 1 is float and the "
+                                       "declaration passes int"),
+            std::string::npos)
+      << parameter.diagnostics;
+  ImportedModuleEmit subclass = emitWithImportedModules(
+      {}, std::string(prelude) + "b: Callable[[], int] = flag\nprint(b())\n");
+  EXPECT_TRUE(subclass.succeeded) << subclass.diagnostics;
+}
+
+// What: a module-level class whose base is a class of the module defined
+// further down is refused at the base, naming both classes; the same two
+// classes in the other order emit.
+TEST(EmitterTest, AClassBaseDefinedFurtherDownIsRefused) {
+  ImportedModuleEmit later = emitWithImportedModules(
+      {}, "class A(Later):\n    pass\n\n\nclass Later:\n    pass\n");
+  EXPECT_FALSE(later.succeeded);
+  EXPECT_NE(later.diagnostics.find("main.py:1:8: emit error: class 'A' names "
+                                   "'Later' as a base before the class "
+                                   "statement that defines 'Later' has run"),
+            std::string::npos)
+      << later.diagnostics;
+  ImportedModuleEmit earlier = emitWithImportedModules(
+      {}, "class Later:\n    pass\n\n\nclass A(Later):\n    pass\n");
+  EXPECT_TRUE(earlier.succeeded) << earlier.diagnostics;
+}
+
+// What: a list, set or dict display of subclass instances is returned where
+// the base's container is declared; an element of an unrelated class is still
+// refused at the return.
+TEST(EmitterTest, AReturnedDisplayIsJudgedByItsElements) {
+  const char *classes = "class Base:\n    pass\n"
+                        "class Sub(Base):\n    pass\n"
+                        "class Other:\n    pass\n";
+  ImportedModuleEmit displays = emitWithImportedModules(
+      {}, std::string(classes) +
+              "def l() -> list[Base]:\n    return [Sub()]\n"
+              "def s() -> set[Base]:\n    return {Sub()}\n"
+              "def d() -> dict[str, Base]:\n    return {'a': Sub()}\n"
+              "print(len(l()), len(s()), len(d()))\n");
+  EXPECT_TRUE(displays.succeeded) << displays.diagnostics;
+  ImportedModuleEmit unrelated = emitWithImportedModules(
+      {}, std::string(classes) +
+              "def l() -> list[Base]:\n    return [Other()]\n"
+              "print(len(l()))\n");
+  EXPECT_FALSE(unrelated.succeeded);
+  EXPECT_NE(unrelated.diagnostics.find("main.py:8:4: emit error: function is "
+                                       "annotated to return"),
+            std::string::npos)
+      << unrelated.diagnostics;
+}
+
+// What: a generic function or method declared to return `Box[T]` returns
+// `Box(v)`, the class built from its own type parameter.
+TEST(EmitterTest, AGenericClassBuiltFromATypeParameterIsReturned) {
+  ImportedModuleEmit result = emitWithImportedModules(
+      {}, "class Box[T]:\n"
+          "    def __init__(self, v: T) -> None:\n        self.v = v\n"
+          "class Case:\n"
+          "    def make[T](self, v: T) -> Box[T]:\n        return Box(v)\n"
+          "def make[T](v: T) -> Box[T]:\n    return Box(v)\n"
+          "print(make(3).v + 1, Case().make('x').v.upper())\n");
+  EXPECT_TRUE(result.succeeded) << result.diagnostics;
+}
+
+// What: a generic class written through its module in an annotation
+// (`types.GeneratorType[int, None, None]`) takes its arguments, as the same
+// class imported by name does.
+TEST(EmitterTest, ADottedGenericAnnotationTakesItsArguments) {
+  mlir::MLIRContext context(testRegistry());
+  std::string ir = emittedIR("import types\n"
+                             "def gen() -> types.GeneratorType[int, None, None]:\n"
+                             "    yield 1\n"
+                             "g: types.GeneratorType[int, None, None] = gen()\n"
+                             "print(next(g) + 1)\n",
+                             context);
+  EXPECT_NE(ir.find("py.global.set \"g\""), std::string::npos) << ir;
+  EXPECT_NE(ir.find("!py.contract<\"types.GeneratorType\", "
+                    "[!py.contract<\"builtins.int\">"),
+            std::string::npos)
+      << ir;
+}
+
+// What: a tuple display is passed to a generator method's `tuple[int, ...]`
+// parameter, and a list of subclass instances to its `list[Base]` one.
+TEST(EmitterTest, AGeneratorMethodTakesArgumentsAtItsParameterTypes) {
+  ImportedModuleEmit result = emitWithImportedModules(
+      {}, "from collections.abc import Iterator\n"
+          "class Base:\n    pass\n"
+          "class Sub(Base):\n    pass\n"
+          "class G:\n"
+          "    def walk(self, xs: tuple[int, ...]) -> Iterator[int]:\n"
+          "        for x in xs:\n            yield x\n"
+          "    def each(self, bs: list[Base]) -> Iterator[Base]:\n"
+          "        for b in bs:\n            yield b\n"
+          "print(list(G().walk((1, 2, 3))), len(list(G().each([Sub()]))))\n");
+  EXPECT_TRUE(result.succeeded) << result.diagnostics;
+}
+
+// What: a lambda passed to a builtin container's method is typed by the
+// parameter it reaches -- `append` and `insert` on a list of callables whose
+// result is `object` -- where it has no type of its own.
+TEST(EmitterTest, ALambdaPassedToAContainerMethodTakesTheParameterType) {
+  ImportedModuleEmit result = emitWithImportedModules(
+      {}, "from collections.abc import Callable\n"
+          "def value() -> object:\n    return 3\n"
+          "fs: list[Callable[[], object]] = []\n"
+          "fs.append(lambda: value())\n"
+          "fs.insert(0, lambda: value())\n"
+          "print([f() for f in fs])\n");
+  EXPECT_TRUE(result.succeeded) << result.diagnostics;
+}
+
 TEST(EmitterTest, UnshadowedBuiltinKeepsItsFastPath) {
   mlir::MLIRContext context(testRegistry());
   std::string ir = emittedIR("print(len([1, 2, 3]))\n", context);

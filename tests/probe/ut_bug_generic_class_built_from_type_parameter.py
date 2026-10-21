@@ -4,8 +4,9 @@
 #   A generic function fails the same way.
 # KIND: バグ (bug) -- loud: well-typed code refused
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   function is annotated to return !py.contract<"Box$spec0"> but this return gives !py.contract<"Box">
+# FIXED: 2026-10-21 -- the return check no longer reads the inference's
+#   unsolved generic as a mismatch; the emission builds the specialization.
+# CLASSIFICATION @ lang-gaps af7e6f79 + the fix: 1 正しい
 # CPython 3.14 expects: 3
 class Box[T]:
     def __init__(self, v: T) -> None:
