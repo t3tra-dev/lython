@@ -1110,6 +1110,10 @@ private:
   // some type admits any class (object, a protocol, an exception's args).
   void collectReprReachableContracts();
   bool boxMayHoldContract(llvm::StringRef contract) const;
+  // Whether the program calls `LyObject_New` (`object()`), asked by every
+  // boxed hook and answered by the first.
+  bool objectInstancesAreMade();
+  std::optional<bool> objectInstancesAreMadeAnswer;
   // ⭐ ONE INSTANCE OF EITHER DISPATCH, BY METHOD NAME. Every instance below
   // is the same three steps -- generate only when the merged manifest left an
   // external declaration asking for it, select the manifest functions carrying

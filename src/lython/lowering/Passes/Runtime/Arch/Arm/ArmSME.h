@@ -37,10 +37,13 @@ createMatmulSMEReductionBlockPass(py::TensorLoweringTarget target = {});
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createMatmulSMERhsPackPass(py::TensorLoweringTarget target = {});
 
-void addSMELinalgPipeline(mlir::OpPassManager &pipeline);
+void addSMELinalgPipeline(mlir::OpPassManager &pipeline,
+                          mlir::MLIRContext *context);
 
-void addSMEPreControlFlowLLVMPrepPipeline(mlir::OpPassManager &pipeline);
+void addSMEPreControlFlowLLVMPrepPipeline(mlir::OpPassManager &pipeline,
+                                          mlir::MLIRContext *context);
 
-void addSMEPostControlFlowLLVMPrepPipeline(mlir::OpPassManager &pipeline);
+void addSMEPostControlFlowLLVMPrepPipeline(mlir::OpPassManager &pipeline,
+                                           mlir::MLIRContext *context);
 
 } // namespace py::lowering::arch::arm
