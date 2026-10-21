@@ -395,6 +395,31 @@ TEST(EmitterTest, AClassBaseDefinedFurtherDownIsRefused) {
   EXPECT_TRUE(earlier.succeeded) << earlier.diagnostics;
 }
 
+// What: a list, set or dict display of subclass instances is returned where
+// the base's container is declared; an element of an unrelated class is still
+// refused at the return.
+TEST(EmitterTest, AReturnedDisplayIsJudgedByItsElements) {
+  const char *classes = "class Base:\n    pass\n"
+                        "class Sub(Base):\n    pass\n"
+                        "class Other:\n    pass\n";
+  ImportedModuleEmit displays = emitWithImportedModules(
+      {}, std::string(classes) +
+              "def l() -> list[Base]:\n    return [Sub()]\n"
+              "def s() -> set[Base]:\n    return {Sub()}\n"
+              "def d() -> dict[str, Base]:\n    return {'a': Sub()}\n"
+              "print(len(l()), len(s()), len(d()))\n");
+  EXPECT_TRUE(displays.succeeded) << displays.diagnostics;
+  ImportedModuleEmit unrelated = emitWithImportedModules(
+      {}, std::string(classes) +
+              "def l() -> list[Base]:\n    return [Other()]\n"
+              "print(len(l()))\n");
+  EXPECT_FALSE(unrelated.succeeded);
+  EXPECT_NE(unrelated.diagnostics.find("main.py:8:4: emit error: function is "
+                                       "annotated to return"),
+            std::string::npos)
+      << unrelated.diagnostics;
+}
+
 TEST(EmitterTest, UnshadowedBuiltinKeepsItsFastPath) {
   mlir::MLIRContext context(testRegistry());
   std::string ir = emittedIR("print(len([1, 2, 3]))\n", context);

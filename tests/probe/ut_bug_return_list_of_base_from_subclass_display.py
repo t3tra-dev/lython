@@ -4,8 +4,9 @@
 #   return gives list[Sub]").
 # KIND: バグ (bug) -- loud: well-typed code refused
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   function is annotated to return !py.contract<"builtins.list", [!py.contract<"Base">]> but this return gives !py.contract<"builtins.list", [!py.contract<"Sub">]>
+# FIXED: 2026-10-21 -- the return check judges a display by its elements, at
+#   the declared element type the display is built with.
+# CLASSIFICATION @ lang-gaps 91ead2fc + the fix: 1 正しい
 # CPython 3.14 expects: ['sub']
 class Base:
     def name(self) -> str:

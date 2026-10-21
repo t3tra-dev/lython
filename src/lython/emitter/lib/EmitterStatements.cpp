@@ -1528,6 +1528,46 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
                declaredContract.getContractName() ==
                    returnedContract.getContractName();
       };
+      // ⭐ A DISPLAY IS BUILT AT THE DECLARED ELEMENT TYPE, so it is judged
+      // element by element. `def make() -> list[Base]: return [Sub()]` was
+      // refused: the display alone infers `list[Sub]`, and a list is
+      // invariant -- but the emission above builds it at `list[Base]`, as the
+      // same display does when assigned to a `list[Base]` name.
+      // ⛔ Not along the numeric tower: an element's type is its storage, and
+      // int and float share no representation
+      // (errors/int_element_in_a_float_container).
+      auto elementAccepted = [&](mlir::Type element, mlir::Type wanted) {
+        int elementRung = numericRung(element);
+        int wantedRung = numericRung(wanted);
+        if (elementRung >= 0 && wantedRung >= 0)
+          return elementRung == wantedRung;
+        return accepted(element, wanted);
+      };
+      auto displayAccepted = [&](mlir::Type declared) {
+        auto declaredContract =
+            mlir::dyn_cast_if_present<py::ContractType>(declared);
+        if (!declaredContract)
+          return false;
+        llvm::StringRef name = declaredContract.getContractName();
+        llvm::ArrayRef<mlir::Type> arguments = declaredContract.getArguments();
+        auto each = [&](llvm::StringRef field, mlir::Type wanted) {
+          const auto *elements = ast::nodeList(*returnValue, field);
+          return elements &&
+                 llvm::all_of(*elements, [&](const parser::NodePtr &element) {
+                   return element && element->kind != "Starred" &&
+                          elementAccepted(types.widenLiteral(types.inferExpr(
+                                              element.get())),
+                                          wanted);
+                 });
+        };
+        if ((returnValue->kind == "List" && name == "builtins.list") ||
+            (returnValue->kind == "Set" && name == "builtins.set"))
+          return arguments.size() == 1 && each("elts", arguments[0]);
+        if (returnValue->kind == "Dict" && name == "builtins.dict")
+          return arguments.size() == 2 && each("keys", arguments[0]) &&
+                 each("values", arguments[1]);
+        return false;
+      };
       // ⛔ `object` ANYWHERE IN THE RETURNED TYPE is the inference saying it
       // does not know, not a type to refuse on -- the same rule the class-field
       // walk uses. An empty or heterogeneous list literal infers
@@ -1594,7 +1634,8 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
           !mentionsObject(currentReturnType) &&
           (unionMismatch || (ordinaryContract(returnedType) &&
                              ordinaryContract(currentReturnType) &&
-                             !accepted(returnedType, currentReturnType)))) {
+                             !accepted(returnedType, currentReturnType) &&
+                             !displayAccepted(currentReturnType)))) {
         diagnostics.push_back(parser::Diagnostic{
             parser::Severity::Error, statement.range.start,
             "function is annotated to return " + typeText(currentReturnType) +
