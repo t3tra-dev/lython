@@ -1415,6 +1415,10 @@ private:
   walrusTargetsToBind(const parser::Node &node,
                       const llvm::StringMap<mlir::Type> &hints);
   std::optional<Value> tryEmitIterableMembership(const parser::Node &expr);
+  // `x in s` for a str `s` and an `object` `x`: CPython's run-time check of
+  // the left operand, through one helper per program.
+  std::optional<Value> tryEmitObjectInStr(const parser::Node &expr);
+  std::string objectInStrHelper;
   std::optional<Value> tryEmitReflectedBinary(const parser::Node &anchor,
                                               llvm::StringRef method,
                                               Value lhs, Value rhs,

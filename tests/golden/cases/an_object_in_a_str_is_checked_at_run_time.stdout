@@ -1,0 +1,4 @@
+True False False
+TypeError: 'in <string>' requires string as left operand, not int
+TypeError: 'in <string>' requires string as left operand, not NoneType
+TypeError: 'in <string>' requires string as left operand, not list

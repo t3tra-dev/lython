@@ -1628,12 +1628,117 @@ ModuleEmitter::tryEmitIterableMembership(const parser::Node &expr) {
   return result;
 }
 
+// ⭐ `x in s` WITH AN `object` ON THE LEFT IS DECIDED AT RUN TIME, as CPython's
+// str.__contains__ does: a str needle is searched for, anything else raises
+// "TypeError: 'in <string>' requires string as left operand, not int". The
+// object went to str's `__contains__` as its string lanes, which it has none
+// of, and the lowering refused the program ("cannot adapt builtins.object").
+// One helper per program carries the check:
+//
+//     def __lyobjin$str(x: object, s: str) -> bool:
+//         if isinstance(x, str):
+//             return x in s
+//         raise TypeError("'in <string>' requires string as left operand, not "
+//                         + type(x).__name__)
+//
+// ⛔ A call and not an inline arm: `in` is an expression, and a raise is not.
+std::optional<Value> ModuleEmitter::tryEmitObjectInStr(const parser::Node &expr) {
+  const auto *ops = ast::nodeList(expr, "ops");
+  const auto *comparators = ast::nodeList(expr, "comparators");
+  if (!ops || ops->size() != 1 || !comparators || comparators->size() != 1)
+    return std::nullopt;
+  const parser::Node *op = (*ops)[0].get();
+  bool negated = ast::isOperator(op, "NotIn");
+  if (!negated && !ast::isOperator(op, "In"))
+    return std::nullopt;
+  const parser::Field *leftField = parser::findField(expr, "left");
+  if (!leftField || !std::holds_alternative<parser::NodePtr>(leftField->value))
+    return std::nullopt;
+  parser::NodePtr needle = std::get<parser::NodePtr>(leftField->value);
+  parser::NodePtr haystack = (*comparators)[0];
+  if (!needle || !haystack ||
+      types.widenLiteral(types.inferExpr(haystack.get())) != types.strType() ||
+      !py::isPyObjectType(types.widenLiteral(types.inferExpr(needle.get()))))
+    return std::nullopt;
+  parser::SourceRange range = expr.range;
+  if (objectInStrHelper.empty()) {
+    // `__ly<word>$...`: a synthesized function pushes no traceback frame, so
+    // the raise reads as the `in` expression's own, as CPython's does.
+    std::string symbol = "__lyobjin$str";
+    std::vector<parser::NodePtr> body;
+    body.push_back(synth::ifStmt(
+        synth::call(synth::name("isinstance", range),
+                    {synth::name("x", range), synth::name("str", range)},
+                    range),
+        {synth::returnStmt(synth::compare(synth::name("x", range), "In",
+                                          synth::name("s", range), range),
+                           range)},
+        {}, range));
+    body.push_back(synth::raiseStmt(
+        synth::call(
+            synth::name("TypeError", range),
+            {synth::binOp(
+                synth::strConstant(
+                    "'in <string>' requires string as left operand, not ",
+                    range),
+                "Add",
+                synth::attribute(synth::call(synth::name("type", range),
+                                             {synth::name("x", range)}, range),
+                                 "__name__", range),
+                range)},
+            range),
+        range));
+    llvm::SmallVector<const parser::Node *, 2> paramNodes;
+    parser::NodePtr def = synth::functionDef(
+        symbol, {synth::Param{"x", nullptr}, synth::Param{"s", nullptr}}, {},
+        std::move(body), nullptr, {}, range, &paramNodes);
+    synthesizedIteratorDefs.push_back(def);
+    types.overrideParameterType(paramNodes[0], types.object());
+    types.overrideParameterType(paramNodes[1], types.strType());
+    types.pinResultType(def.get(), types.boolType());
+    FunctionSignature sig = types.functionSignature(*def);
+    if (!sig.publicCallable)
+      return std::nullopt;
+    types.bindRootSymbol(symbol, sig.publicCallable);
+    {
+      auto savedLoops = std::move(loopControlContexts);
+      loopControlContexts.clear();
+      auto savedInlineReturns = std::move(inlineReturnContexts);
+      inlineReturnContexts.clear();
+      auto savedSupers = std::move(superContexts);
+      superContexts.clear();
+      auto savedInlining = std::move(methodsBeingInlined);
+      methodsBeingInlined.clear();
+      auto savedInlineFrames = std::move(inlineFrames);
+      inlineFrames.clear();
+      auto restoreContexts = llvm::scope_exit([&] {
+        loopControlContexts = std::move(savedLoops);
+        inlineReturnContexts = std::move(savedInlineReturns);
+        superContexts = std::move(savedSupers);
+        methodsBeingInlined = std::move(savedInlining);
+        inlineFrames = std::move(savedInlineFrames);
+      });
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      emitCallableFunction(*def, symbol, sig, {}, /*isLambda=*/false);
+    }
+    objectInStrHelper = symbol;
+  }
+  parser::NodePtr call = synth::call(synth::name(objectInStrHelper, range),
+                                     {needle, haystack}, range);
+  if (negated)
+    call = synth::notOp(std::move(call), range);
+  synthesizedIteratorDefs.push_back(call);
+  return emitExpr(call.get());
+}
+
 Value ModuleEmitter::emitCompare(const parser::Node &expr) {
   // Membership against dict views rewrites before operand emission — the
   // views have no runtime object (EmitterIterators.cpp).
   if (std::optional<Value> view = tryEmitDictViewMembership(expr))
     return *view;
   if (std::optional<Value> membership = tryEmitIterableMembership(expr))
+    return *membership;
+  if (std::optional<Value> membership = tryEmitObjectInStr(expr))
     return *membership;
   const auto *comparators = ast::nodeList(expr, "comparators");
   const auto *ops = ast::nodeList(expr, "ops");
