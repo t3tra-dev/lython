@@ -358,7 +358,7 @@ ut_bug_int_function_held_as_float_callable.py GAP
 ut_bug_isinstance_and_keeps_dead_arm_in_generic_method.py AGREE
 ut_bug_join_of_tuple_with_narrowed_optional.py AGREE
 ut_bug_object_in_str.py GAP
-ut_bug_object_lambda_into_container_method.py GAP
+ut_bug_object_lambda_into_container_method.py AGREE
 ut_bug_optional_held_across_yield_in_with.py AGREE
 ut_bug_oserror_with_errno.py GAP
 ut_bug_print_of_an_optional_class_value.py GAP

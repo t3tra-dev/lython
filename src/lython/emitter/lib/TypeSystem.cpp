@@ -2174,6 +2174,43 @@ TypeSystem::boundManifestMethodCallable(mlir::Type receiver,
   return py::CallableType::get(&context, required, {}, {}, {}, {result});
 }
 
+std::optional<py::CallableType>
+TypeSystem::manifestMethodCallExpectations(mlir::Type receiver,
+                                           llvm::StringRef methodName,
+                                           unsigned argumentCount) const {
+  auto contract =
+      mlir::dyn_cast_if_present<py::ContractType>(widenLiteral(receiver));
+  if (!contract ||
+      !py::runtime_classes::isListed(contract.getContractName().str()) ||
+      lookupClass(contract.getContractName()))
+    return std::nullopt;
+  const py::protocols::Table &table = py::protocols::Table::get(context);
+  py::CallableType signature;
+  for (const py::protocols::ContractResolution &candidate :
+       table.methodContractCandidatesWithEvidence(contract, methodName)) {
+    py::CallableType option = candidate.method.signature;
+    if (!option || option.getPositionalTypes().size() < argumentCount + 1 ||
+        mlir::isa<py::TypeType>(option.getPositionalTypes().front()))
+      continue;
+    if (!signature || option.getPositionalTypes().size() <
+                          signature.getPositionalTypes().size())
+      signature = option;
+  }
+  if (!signature || signature.getResultTypes().size() != 1)
+    return std::nullopt;
+  llvm::SmallVector<mlir::Type, 4> parameters;
+  for (unsigned index = 1; index <= argumentCount; ++index) {
+    mlir::Type parameter = signature.getPositionalTypes()[index];
+    if (mlir::isa<py::SelfType>(parameter))
+      return std::nullopt;
+    parameters.push_back(parameter);
+  }
+  mlir::Type result = signature.getResultTypes().front();
+  if (mlir::isa<py::SelfType>(result))
+    result = contract;
+  return py::CallableType::get(&context, parameters, {}, {}, {}, {result});
+}
+
 mlir::Type TypeSystem::boolType() const { return contract("builtins.bool"); }
 mlir::Type TypeSystem::intType() const { return contract("builtins.int"); }
 mlir::Type TypeSystem::strType() const { return contract("builtins.str"); }

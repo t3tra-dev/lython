@@ -2845,7 +2845,32 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
             return emitNone(expr);
           }
         }
-        CallOperands operands = emitCallOperands(*methodCallNode);
+        // ⭐ A LAMBDA ARGUMENT IS TYPED BY THE PARAMETER IT REACHES, as it is
+        // in a call to a function: `fs.append(lambda: value())` on a
+        // `list[Callable[[], object]]` was refused as "lambda requires a
+        // Callable annotation", since a lambda whose body answers `object`
+        // has no type of its own to offer. The method's parameters on this
+        // receiver -- `append(x: Callable[[], object])` here -- are that
+        // expectation.
+        // ⛔ Only for a lambda: every other argument already has a type of its
+        // own, and its emission is not changed by this.
+        py::CallableType lambdaExpectations;
+        if (const auto *callArgs = ast::nodeList(*methodCallNode, "args");
+            callArgs &&
+            llvm::any_of(*callArgs, [](const parser::NodePtr &argument) {
+              return argument && argument->kind == "Lambda";
+            }) &&
+            llvm::none_of(*callArgs, [](const parser::NodePtr &argument) {
+              return !argument || argument->kind == "Starred";
+            }))
+          if (std::optional<py::CallableType> expectations =
+                  types.manifestMethodCallExpectations(
+                      receiver.type, *methodName,
+                      static_cast<unsigned>(callArgs->size())))
+            lambdaExpectations = *expectations;
+        CallOperands operands = emitCallOperands(
+            *methodCallNode, {}, /*includeAstArguments=*/true,
+            lambdaExpectations);
         if (!operands.valid) {
           diagnostics.push_back(parser::Diagnostic{
               parser::Severity::Error, expr.range.start,

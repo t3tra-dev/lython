@@ -6,8 +6,10 @@
 #   and setdefault fail the same way.
 # KIND: バグ (bug) -- loud: well-typed code refused
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   lambda requires a Callable annotation because its type contains unresolved Unknown
+# FIXED: 2026-10-21 -- a lambda argument of a builtin container's method is
+#   typed by the method's parameter on that receiver. (`dict.get` /
+#   `setdefault` with a lambda default take another path and are not.)
+# CLASSIFICATION @ lang-gaps a30d9f09 + the fix: 1 正しい
 # CPython 3.14 expects: [3]
 from collections.abc import Callable
 

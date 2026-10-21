@@ -467,6 +467,20 @@ TEST(EmitterTest, AGeneratorMethodTakesArgumentsAtItsParameterTypes) {
   EXPECT_TRUE(result.succeeded) << result.diagnostics;
 }
 
+// What: a lambda passed to a builtin container's method is typed by the
+// parameter it reaches -- `append` and `insert` on a list of callables whose
+// result is `object` -- where it has no type of its own.
+TEST(EmitterTest, ALambdaPassedToAContainerMethodTakesTheParameterType) {
+  ImportedModuleEmit result = emitWithImportedModules(
+      {}, "from collections.abc import Callable\n"
+          "def value() -> object:\n    return 3\n"
+          "fs: list[Callable[[], object]] = []\n"
+          "fs.append(lambda: value())\n"
+          "fs.insert(0, lambda: value())\n"
+          "print([f() for f in fs])\n");
+  EXPECT_TRUE(result.succeeded) << result.diagnostics;
+}
+
 TEST(EmitterTest, UnshadowedBuiltinKeepsItsFastPath) {
   mlir::MLIRContext context(testRegistry());
   std::string ir = emittedIR("print(len([1, 2, 3]))\n", context);
