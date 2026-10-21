@@ -5922,6 +5922,45 @@ Value ModuleEmitter::coerceValue(Value value, mlir::Type targetType,
             return value;
         }
     }
+  // ⭐ A UNION OF CLASSES BELOW THE TARGET IS THE ACTIVE MEMBER, UPCAST. Each
+  // arm unwraps one member where its tag test proved it, and the arms meet as
+  // the target: `e: Exception = pick()` with `pick() -> ValueError | KeyError`
+  // was a retyping of the whole union, which the lowering can view only when
+  // every member is one header lane -- an exception is its header and its
+  // message.
+  // ⛔ Not a select over the members' lanes: that reads every member's
+  // payload before the tag proves which one is there, which is what the
+  // ownership verifier refuses.
+  if (auto sourceUnion = mlir::dyn_cast<py::UnionType>(value.type))
+    if (auto targetClass = mlir::dyn_cast<py::ContractType>(targetType);
+        targetClass && !py::isPyObjectType(targetClass) &&
+        llvm::all_of(sourceUnion.getMemberTypes(), [&](mlir::Type member) {
+          auto memberClass =
+              mlir::dyn_cast<py::ContractType>(types.widenLiteral(member));
+          return memberClass &&
+                 pythonSubclassOf(memberClass, targetClass, types, module);
+        })) {
+      llvm::ArrayRef<mlir::Type> members = sourceUnion.getMemberTypes();
+      std::function<mlir::Value(unsigned)> fromMember =
+          [&](unsigned index) -> mlir::Value {
+        auto unwrapped = [&, index]() -> mlir::Value {
+          auto unwrap = py::UnionUnwrapOp::create(
+              builder, loc(anchor), members[index], value.value);
+          return coerceValue(Value{unwrap.getResult(), members[index]},
+                             targetType, anchor)
+              .value;
+        };
+        if (index + 1 == members.size())
+          return unwrapped();
+        auto test = py::UnionTestOp::create(
+            builder, loc(anchor), builder.getI1Type(), value.value,
+            mlir::TypeAttr::get(members[index]));
+        return emitValueDiamond(loc(anchor), test.getResult(), targetType,
+                                unwrapped,
+                                [&, index] { return fromMember(index + 1); });
+      };
+      return Value{fromMember(0), targetType};
+    }
   // ⭐ AN UPCAST IS A RETYPING, SO IT NEEDS A SUBCLASS. Two unrelated classes
   // share no representation, and retyping one as the other read its payload as
   // the other's:
