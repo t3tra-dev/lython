@@ -235,6 +235,7 @@ EmitResult ModuleEmitter::emit() {
   // and CPython runs the module body top to bottom.
   emitReplacedStreamInitializers(moduleNode);
   emitImportedModuleGlobalInitializers();
+  emitImportedDefaultCells();
   emitImportedClassAttrInitializers();
   emitStatements(ast::nodeList(moduleNode, "body"), /*skipDeclarations=*/true);
   atModuleScope = false;

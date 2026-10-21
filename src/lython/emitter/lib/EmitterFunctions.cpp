@@ -498,6 +498,134 @@ std::string ModuleEmitter::genericOmittedDefaultMismatch(
   return "";
 }
 
+const parser::Node *ModuleEmitter::defaultCellOwnerIn(const parser::Node &root,
+                                                      const parser::Node &def) {
+  const auto *body = ast::nodeList(root, "body");
+  if (!body)
+    return nullptr;
+  for (const parser::NodePtr &statement : *body) {
+    if (statement.get() == &def)
+      return statement.get();
+    if (!statement || statement->kind != "ClassDef")
+      continue;
+    if (const auto *classBody = ast::nodeList(*statement, "body"))
+      for (const parser::NodePtr &member : *classBody)
+        if (member.get() == &def)
+          return statement.get();
+  }
+  return nullptr;
+}
+
+std::string ModuleEmitter::methodDefaultCellName(const parser::Node &root,
+                                                 const parser::Node &owner,
+                                                 const parser::Node &def,
+                                                 unsigned slot) const {
+  std::string module = "__main__";
+  for (const EmitOptions::SourceModule &source : options.sourceModules)
+    if (source.moduleNode == &root)
+      module = source.moduleName;
+  return (llvm::Twine("__ly.defaultcell.") + module + "." +
+          llvm::StringRef(ast::string(owner, "name").value_or("")) + "." +
+          llvm::StringRef(ast::string(def, "name").value_or("")) + "." +
+          llvm::Twine(slot))
+      .str();
+}
+
+// ⭐ A COPY OF A METHOD'S BODY CAN BE EMITTED BEFORE THE METHOD'S OWN. A call
+// in a function body is emitted before the module walk reaches the class
+// statement, and the cell was registered only by the method's own emission,
+// so the copy found none and evaluated the default where it stood:
+//
+//     class C:
+//         def add(self, into: list[int] = []) -> int: ...
+//     def through(x: C) -> int: return x.add()
+//     print(through(c), through(c))   # printed 1 1; CPython prints 3 4
+//
+// The cell is registered here instead, under the same name the method's
+// emission uses, and written at the class statement either way.
+std::optional<std::string>
+ModuleEmitter::methodDefaultCell(const MethodBinding &method, unsigned slot,
+                                 mlir::Type declared) {
+  if (!method.method)
+    return std::nullopt;
+  auto &cells = methodDefaultCells[method.method];
+  for (const auto &entry : cells)
+    if (entry.first == slot)
+      return entry.second;
+  const parser::Node *defaultNode =
+      defaultExpressionForSlot(*method.method, slot);
+  if (!defaultNode || defaultNode->kind == "Constant" || !declared)
+    return std::nullopt;
+  const parser::Node *root = &moduleNode;
+  if (const EmitOptions::SourceModule *source =
+          sourceModuleForClass(method.definingClass)) {
+    if (source->isStub || !source->moduleNode)
+      return std::nullopt;
+    root = source->moduleNode;
+  }
+  const parser::Node *owner = defaultCellOwnerIn(*root, *method.method);
+  if (!owner || owner == method.method ||
+      flushedDefaultCellOwners.contains(owner))
+    return std::nullopt;
+  // The expression is the def's own node, kept alive by the module's tree.
+  parser::NodePtr expression;
+  const parser::Node *arguments = ast::node(*method.method, "args");
+  for (llvm::StringRef field : {"defaults", "kw_defaults"})
+    if (const auto *list = arguments ? ast::nodeList(*arguments, field) : nullptr)
+      for (const parser::NodePtr &candidate : *list)
+        if (candidate.get() == defaultNode)
+          expression = candidate;
+  if (!expression)
+    return std::nullopt;
+  std::string cellName =
+      methodDefaultCellName(*root, *owner, *method.method, slot);
+  cells.push_back({slot, cellName});
+  pendingDefaultCells[owner].push_back(
+      PendingDefaultCell{cellName, expression, types.widenLiteral(declared)});
+  return cellName;
+}
+
+void ModuleEmitter::emitImportedDefaultCells() {
+  // A def whose cell is written at its statement: one with a default that is
+  // not a literal. A generic one registers nothing pending -- its cell is
+  // genericDefaultCell's -- so the defs are what is asked, not the map.
+  auto hasCellDefault = [&](const parser::Node &def) {
+    for (unsigned slot = 0;; ++slot) {
+      const parser::Node *arguments = ast::node(def, "args");
+      std::size_t slots = 0;
+      if (arguments)
+        for (llvm::StringRef field : {"posonlyargs", "args", "kwonlyargs"})
+          if (const auto *list = ast::nodeList(*arguments, field))
+            slots += list->size();
+      if (slot >= slots)
+        return false;
+      if (const parser::Node *expr = defaultExpressionForSlot(def, slot);
+          expr && expr->kind != "Constant")
+        return true;
+    }
+  };
+  for (const EmitOptions::SourceModule &source : options.sourceModules) {
+    if (!source.moduleNode || source.isStub)
+      continue;
+    const auto *body = ast::nodeList(*source.moduleNode, "body");
+    if (!body || llvm::none_of(*body, [&](const parser::NodePtr &statement) {
+          if (!statement)
+            return false;
+          if (pendingDefaultCells.count(statement.get()))
+            return true;
+          return (statement->kind == "FunctionDef" ||
+                  statement->kind == "AsyncFunctionDef") &&
+                 hasTypeParameters(*statement) && hasCellDefault(*statement);
+        }))
+      continue;
+    emitInDefiningModuleScope(source, [&] {
+      for (const parser::NodePtr &statement : *body)
+        if (statement)
+          emitPendingDefaultCells(*statement);
+    });
+  }
+}
+
 void ModuleEmitter::emitImportedClassAttrInitializers() {
   llvm::SmallVector<PendingClassAttrInit, 4> pending =
       std::move(importedClassAttrInits);
@@ -1512,27 +1640,23 @@ mlir::ArrayAttr ModuleEmitter::emitCallableDefaultValues(
   // CPython semantics for it (the inner def re-executes per enclosing call, so
   // its defaults re-evaluate); a class nested in a function is not a
   // module-lifetime cell either.
-  bool isModuleLevelDef = false;
-  const parser::Node *defaultCellOwner = nullptr;
-  if (const auto *moduleBody = ast::nodeList(moduleNode, "body"))
-    for (const parser::NodePtr &statement : *moduleBody) {
-      if (statement.get() == &function) {
-        isModuleLevelDef = true;
-        defaultCellOwner = statement.get();
-        break;
-      }
-      if (!statement || statement->kind != "ClassDef")
-        continue;
-      if (const auto *classBody = ast::nodeList(*statement, "body"))
-        for (const parser::NodePtr &member : *classBody)
-          if (member.get() == &function) {
-            isModuleLevelDef = true;
-            defaultCellOwner = statement.get();
-            break;
-          }
-      if (isModuleLevelDef)
-        break;
-    }
+  //
+  // ⭐ AN IMPORTED MODULE'S DEFS TOO. Only the main module was searched, so a
+  // def of `lib` fell to the provider and evaluated its default at every call:
+  // `lib.f()` with `def f(xs: list[int] = [])` printed 1 1 1 where CPython
+  // prints 1 2 3. The module being emitted is the def's own; its cells are
+  // written where its other initializers are (emitImportedDefaultCells).
+  const parser::Node &definingModule =
+      activeSourceModuleNode ? *activeSourceModuleNode : moduleNode;
+  const parser::Node *defaultCellOwner =
+      defaultCellOwnerIn(definingModule, function);
+  // ⛔ Nor one whose statement already ran: nothing would write the cell.
+  // A generic function's is the exception -- its statement writes it whether
+  // or not a specialization exists yet, and specializations come later.
+  if (defaultCellOwner && flushedDefaultCellOwners.contains(defaultCellOwner) &&
+      !(defaultCellOwner == &function && hasTypeParameters(function)))
+    defaultCellOwner = nullptr;
+  bool isModuleLevelDef = defaultCellOwner != nullptr;
   auto declaredSlotType = [&](unsigned slot) -> mlir::Type {
     if (slot < positionalCount)
       return types.widenLiteral(sig.positionalTypes[slot]);
@@ -1601,13 +1725,26 @@ mlir::ArrayAttr ModuleEmitter::emitCallableDefaultValues(
               "value", builder.getStringAttr(cell->name)));
           return builder.getDictionaryAttr(attrs);
         }
-        std::string cellName = (llvm::Twine("__ly.defaultcell.") + symbolName +
-                                "." + llvm::Twine(slot))
-                                   .str();
-        pendingDefaultCells[defaultCellOwner].push_back(
-            PendingDefaultCell{cellName, expr, declared});
-        if (defaultCellOwner != &function)
-          methodDefaultCells[&function].push_back({slot, cellName});
+        std::string cellName;
+        if (defaultCellOwner != &function) {
+          // A method: the cell a call site may already have registered.
+          cellName = methodDefaultCellName(definingModule, *defaultCellOwner,
+                                           function, slot);
+          auto &cells = methodDefaultCells[&function];
+          if (llvm::none_of(cells, [&](const auto &entry) {
+                return entry.first == slot;
+              })) {
+            cells.push_back({slot, cellName});
+            pendingDefaultCells[defaultCellOwner].push_back(
+                PendingDefaultCell{cellName, expr, declared});
+          }
+        } else {
+          cellName = (llvm::Twine("__ly.defaultcell.") + symbolName + "." +
+                      llvm::Twine(slot))
+                         .str();
+          pendingDefaultCells[defaultCellOwner].push_back(
+              PendingDefaultCell{cellName, expr, declared});
+        }
         llvm::SmallVector<mlir::NamedAttribute, 2> attrs;
         attrs.push_back(
             builder.getNamedAttr("kind", builder.getStringAttr("global")));

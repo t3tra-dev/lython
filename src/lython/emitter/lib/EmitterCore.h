@@ -2223,6 +2223,29 @@ private:
   llvm::DenseMap<const parser::Node *,
                  llvm::SmallVector<PendingDefaultCell, 2>>
       pendingDefaultCells;
+  // The statements whose pending cells have been written: a cell registered
+  // under one of them afterwards would never be.
+  llvm::DenseSet<const parser::Node *> flushedDefaultCellOwners;
+  // The module-level statement whose execution evaluates `def`'s defaults --
+  // the def itself, or the class statement around a method -- in the module
+  // `root`; null when there is none.
+  static const parser::Node *defaultCellOwnerIn(const parser::Node &root,
+                                                const parser::Node &def);
+  // The name of a method's default cell. It depends on the method alone, so
+  // a call site that reaches the method before its body is emitted names the
+  // same cell.
+  std::string methodDefaultCellName(const parser::Node &root,
+                                    const parser::Node &owner,
+                                    const parser::Node &def,
+                                    unsigned slot) const;
+  // The cell a copy of `method`'s body reads `slot`'s default from,
+  // registering it under the class statement if no emission has yet.
+  std::optional<std::string> methodDefaultCell(const MethodBinding &method,
+                                               unsigned slot,
+                                               mlir::Type declared);
+  // Writes the pending cells of every imported module's defs, where CPython
+  // runs the module: before the importer continues.
+  void emitImportedDefaultCells();
   // The cell a METHOD's non-constant default was parked in, per (def node,
   // slot). An inlined method call reads this instead of re-emitting the
   // expression -- which is what made `def add(self, into: list[int] = [])`

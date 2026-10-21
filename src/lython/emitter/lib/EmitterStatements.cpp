@@ -643,11 +643,12 @@ mlir::Type ModuleEmitter::storeProvedMember(py::UnionType declared,
 void ModuleEmitter::emitPendingDefaultCells(const parser::Node &statement) {
   // A generic function's cells (genericDefaultCell): written here whether or
   // not a specialization exists yet, which is what its readers rely on.
-  // ⛔ Only a def of the module being compiled, which is where a
-  // specialization reads cells; an imported one evaluates its defaults per
-  // call (the provider path).
+  // A top-level def of the module this statement is run for: the main
+  // module's walk, or an imported module's (emitImportedDefaultCells).
   bool mainModuleDef = false;
-  if (const auto *moduleBody = ast::nodeList(moduleNode, "body"))
+  const parser::Node &runningModule =
+      activeSourceModuleNode ? *activeSourceModuleNode : moduleNode;
+  if (const auto *moduleBody = ast::nodeList(runningModule, "body"))
     mainModuleDef = llvm::any_of(*moduleBody, [&](const parser::NodePtr &top) {
       return top.get() == &statement;
     });
@@ -683,6 +684,7 @@ void ModuleEmitter::emitPendingDefaultCells(const parser::Node &statement) {
                               builder.getStringAttr(cell->name),
                               coerced.value);
     }
+  flushedDefaultCellOwners.insert(&statement);
   auto pending = pendingDefaultCells.find(&statement);
   if (pending == pendingDefaultCells.end())
     return;

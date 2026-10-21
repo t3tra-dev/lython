@@ -1,4 +1,4 @@
-# OPEN (found 2026-10-20 while testing calls of large methods). A method's
+# FIXED 2026-10-21 (found 2026-10-20 while testing calls of large methods). A method's
 # default is evaluated ONCE, when its def runs -- class-body time -- so a
 # mutable default is one object every call shares:
 #
@@ -22,11 +22,12 @@
 #   - any method of a class in an IMPORTED module: its class body is never run
 #     as a statement, so no cell is ever made (`b.add(), b.add()` -> 1 1).
 #
-# What a repair needs: the cells made for every method before any body is
-# emitted, filled where CPython evaluates them (the class statement of the main
-# module; an imported module's initialization for its classes). Calling a large
-# method through its symbol does not take this path: it passes a default only
-# from a cell or a constant, and otherwise copies the body as before.
+# The repair: a method's cell is named by the method alone, so a copy emitted
+# first registers the same cell its own emission would; and an imported
+# module's def and class statements write their cells with the module's other
+# initializers. An imported FUNCTION's default was fresh per call too (1 1 1
+# for CPython's 1 2 3). Golden:
+# cases/a_default_is_one_object_wherever_its_def_is_called_from.
 class C:
     def add(self, into: list[int] = []) -> int:
         into.append(1)

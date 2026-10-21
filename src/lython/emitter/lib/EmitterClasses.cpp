@@ -5386,14 +5386,11 @@ std::optional<Value> ModuleEmitter::tryCallLargeMethod(
   std::size_t firstDefault = defaults && defaults->size() <= slots
                                  ? slots - defaults->size()
                                  : slots;
-  auto defaultCell = [&](std::size_t slot) -> const std::string * {
-    auto found = methodDefaultCells.find(method.method);
-    if (found == methodDefaultCells.end())
-      return nullptr;
-    for (const auto &entry : found->second)
-      if (entry.first == slot)
-        return &entry.second;
-    return nullptr;
+  auto defaultCell = [&](std::size_t slot) -> std::optional<std::string> {
+    return methodDefaultCell(method, static_cast<unsigned>(slot),
+                             slot < sig.positionalTypes.size()
+                                 ? sig.positionalTypes[slot]
+                                 : mlir::Type());
   };
   for (std::size_t slot = 1; slot < slots; ++slot) {
     if (arguments[slot].value)
@@ -5465,7 +5462,7 @@ std::optional<Value> ModuleEmitter::tryCallLargeMethod(
       continue;
     }
     Value value;
-    if (const std::string *cell = defaultCell(slot)) {
+    if (std::optional<std::string> cell = defaultCell(slot)) {
       auto get = py::GlobalGetOp::create(builder, loc(anchor), declared,
                                          builder.getStringAttr(*cell));
       value = Value{get.getResult(), declared};
@@ -6577,15 +6574,6 @@ Value ModuleEmitter::emitInlineMethodBody(
   // free-function spelling was already right because its call sites read the
   // callable's default-value attributes, where the cell lives; an inlined method
   // has no such call, so it reads the cell by name.
-  auto defaultCellFor = [&](unsigned slot) -> const std::string * {
-    auto found = methodDefaultCells.find(method.method);
-    if (found == methodDefaultCells.end())
-      return nullptr;
-    for (const auto &entry : found->second)
-      if (entry.first == slot)
-        return &entry.second;
-    return nullptr;
-  };
   auto slotType = [&](unsigned slot) -> mlir::Type {
     if (slot < sig.positionalTypes.size())
       return sig.positionalTypes[slot];
@@ -6596,7 +6584,8 @@ Value ModuleEmitter::emitInlineMethodBody(
   };
   auto emitDefaultFor = [&](unsigned slot,
                             const parser::Node *defaultNode) -> Value {
-    if (const std::string *cellName = defaultCellFor(slot)) {
+    if (std::optional<std::string> cellName =
+            methodDefaultCell(method, slot, slotType(slot))) {
       // ⛔ NOT `markBoxedModuleGlobal`: a default cell is not a module global
       // even though both are py.global.get/set, and the lowering says so at the
       // read ("this population is never marked `ly.global.boxed`, so an int
