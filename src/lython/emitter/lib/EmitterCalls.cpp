@@ -210,6 +210,25 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
                               valueNode,
                               expectedFor(operands.positionalTypes.size()))
                         : emitExpr(valueNode);
+      // ⭐ A UNION OF CLASSES BELOW THE PARAMETER'S IS THAT CLASS: `describe(
+      // pick())` with `pick() -> ValueError | KeyError` and `describe(e:
+      // Exception)` handed the call the union's tag and both members' lanes,
+      // and the lowering could not adapt them to one Exception. Seen as the
+      // base, the tag picks the member's lanes (aliasViewBundle).
+      if (positionalAligned && !unpacked)
+        if (auto expectedClass = mlir::dyn_cast_if_present<py::ContractType>(
+                expectedFor(operands.positionalTypes.size()));
+            expectedClass && !py::isPyObjectType(expectedClass))
+          if (auto unionType = mlir::dyn_cast<py::UnionType>(value.type);
+              unionType &&
+              llvm::all_of(unionType.getMemberTypes(), [&](mlir::Type member) {
+                auto memberClass = mlir::dyn_cast<py::ContractType>(
+                    types.widenLiteral(member));
+                return memberClass &&
+                       pythonSubclassOf(memberClass, expectedClass, types,
+                                        module);
+              }))
+            value = coerceValue(value, expectedClass, *valueNode);
       // ⭐ AN INLINED METHOD'S OWN `*args` IS THE VALUES ITS CALL GAVE. A pack
       // of one has no arity in its type (`tuple[str]` is also the
       // homogeneous spelling), so it is forwarded as those values, not
@@ -2852,13 +2871,18 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         // has no type of its own to offer. The method's parameters on this
         // receiver -- `append(x: Callable[[], object])` here -- are that
         // expectation.
-        // ⛔ Only for a lambda: every other argument already has a type of its
-        // own, and its emission is not changed by this.
+        // ⭐ And a union of classes, which the parameter's class views
+        // (`es.append(pick())` into a `list[Exception]`).
+        // ⛔ Only for those two: every other argument already has the type it
+        // is passed as, and its emission is not changed by this.
         py::CallableType lambdaExpectations;
         if (const auto *callArgs = ast::nodeList(*methodCallNode, "args");
             callArgs &&
-            llvm::any_of(*callArgs, [](const parser::NodePtr &argument) {
-              return argument && argument->kind == "Lambda";
+            llvm::any_of(*callArgs, [&](const parser::NodePtr &argument) {
+              return argument &&
+                     (argument->kind == "Lambda" ||
+                      mlir::isa_and_nonnull<py::UnionType>(
+                          types.inferExpr(argument.get())));
             }) &&
             llvm::none_of(*callArgs, [](const parser::NodePtr &argument) {
               return !argument || argument->kind == "Starred";
@@ -3548,6 +3572,9 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
           declared.getPositionalTypes().end());
       parameterTypes.append(declared.getKwOnlyTypes().begin(),
                             declared.getKwOnlyTypes().end());
+      // `*items: T` names T too: its arguments are what solve it.
+      if (declared.hasVararg())
+        parameterTypes.push_back(declared.getVarargType());
       bool parametersGround = llvm::all_of(parameterTypes, [](mlir::Type t) {
         return unboundStaticParameterCount(t) == 0;
       });

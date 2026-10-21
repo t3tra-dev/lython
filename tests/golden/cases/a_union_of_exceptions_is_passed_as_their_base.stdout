@@ -1,0 +1,8 @@
+ValueError: v
+KeyError: 'k'
+Mine: mine!
+['v', "'k'", 'mine!']
+caught ValueError ('v',)
+caught KeyError ('k',)
+caught Mine ('m',)
+Mine('m')

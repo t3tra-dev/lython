@@ -5,8 +5,9 @@
 # KIND: バグ (bug) -- loud, but only in the lowering
 # FOUND: 2026-10-20, making a class attribute hold a class value (unittest's
 #   failureException).
-# CLASSIFICATION @ lang-gaps 51e1e5ed + the class-attribute fix: 3 loud 拒否 (診断)
-#   unnarrowed !py.union<!py.literal<None>, !py.type<!py.contract<"builtins.BaseException">>> cannot be used where a concrete object is required
+# FIXED: 2026-10-21 -- a class member renders in a union's per-member chain
+#   (canStringifyType / canConvertType had no arm for a class value).
+# CLASSIFICATION @ lang-gaps e8c9b922 + the fix: 1 正しい
 # CPython 3.14 expects: None / <class 'KeyError'>
 u: type[BaseException] | None = None
 print(u)

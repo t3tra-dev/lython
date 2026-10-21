@@ -4,8 +4,10 @@
 #   "apply the result where it is made -- `collect(...)(f)`".
 # KIND: バグ (bug) -- loud, with a misleading message
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   this call's result is generic in a type parameter no argument names: apply the result where it is made -- `collect(...)(f)`, as a decorator does -- which is what solves it
+# FIXED: 2026-10-21 -- a parameter already bound meets the next argument as a
+#   parameter, so two types join (a union, along the numeric tower too);
+#   a bool against another rung is still refused at the call.
+# CLASSIFICATION @ lang-gaps d0cc1f6b + the fix: 1 正しい
 # CPython 3.14 expects: [0, 1.5]
 def collect[T](*items: T) -> list[T]:
     return list(items)

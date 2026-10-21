@@ -259,10 +259,54 @@ bool bindTypeParameter(const TypeSystem &types, llvm::StringRef name,
       found->second = actual;
       return true;
     }
-  if (typeAccepts(types, found->second, actual))
+  // ⛔ Not widened along the numeric tower: bool, int and float share no
+  // representation, so T = int with a bool argument passed the call and failed
+  // where the specialization received it. Both rungs, as a union, are what the
+  // arguments are -- `first(0, 1.5)` is the int, as in CPython.
+  auto numericRung = [&](mlir::Type type) {
+    return type == types.boolType() || type == types.intType() ||
+           type == types.floatType() ||
+           type == types.contract("builtins.complex");
+  };
+  auto boundMembers = [&](mlir::Type type) {
+    if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type))
+      return llvm::SmallVector<mlir::Type, 4>(unionType.getMemberTypes());
+    return llvm::SmallVector<mlir::Type, 4>{type};
+  };
+  bool rungClash =
+      numericRung(actual) &&
+      llvm::any_of(boundMembers(found->second),
+                   [&](mlir::Type member) { return numericRung(member); }) &&
+      !llvm::is_contained(boundMembers(found->second), actual);
+  // ⛔ And a bool against another rung is refused, as it was: a parameter of
+  // `bool | int` has no argument ABI the lowering can take.
+  if (rungClash &&
+      (actual == types.boolType() ||
+       llvm::is_contained(boundMembers(found->second), types.boolType())))
+    return false;
+  if (!rungClash && typeAccepts(types, found->second, actual))
     return true;
-  if (typeAccepts(types, actual, found->second)) {
+  if (!rungClash && typeAccepts(types, actual, found->second)) {
     found->second = actual;
+    return true;
+  }
+  // ⭐ TWO ARGUMENTS THAT NAME DIFFERENT TYPES BIND THE PARAMETER TO BOTH, as
+  // a list display of the same values joins them: `collect(0, 1.5)` for
+  // `def collect[T](*items: T) -> list[T]` is a `list[int | float]`, which is
+  // what pyright infers and what CPython's values are. The refusal named
+  // something else entirely ("generic in a type parameter no argument
+  // names").
+  // ⛔ Only between two ground classes: an unsolved variable or a protocol on
+  // either side is still a question for the rest of the solver.
+  auto ground = [](mlir::Type type) {
+    return mlir::isa_and_nonnull<py::ContractType, py::LiteralType>(type);
+  };
+  auto boundUnion = mlir::dyn_cast_if_present<py::UnionType>(found->second);
+  if ((ground(found->second) ||
+       (boundUnion && llvm::all_of(boundUnion.getMemberTypes(), ground))) &&
+      ground(actual) && !isObjectTop(types, actual)) {
+    found->second = py::UnionType::getNormalized(&types.getContext(),
+                                                 {found->second, actual});
     return true;
   }
   return false;
@@ -408,6 +452,17 @@ bool bindCallableView(const TypeSystem &types, py::CallableType expected,
 
 bool bindExpectedType(const TypeSystem &types, mlir::Type expected,
                       mlir::Type actual, TypeBindingMap &bindings) {
+  // ⭐ A PARAMETER ALREADY BOUND IS STILL A PARAMETER. Substituted first, the
+  // second argument of `first(0, 1.5)` met `int` instead of T, and int does
+  // not accept float -- so the join `bindTypeParameter` makes (the wider
+  // one, or both as a union) was never reached.
+  if (std::optional<std::string> name = staticParameterName(expected);
+      name && bindings.count(*name)) {
+    actual = types.inference().zonk(actual);
+    if (actual && !py::isPyInferVarType(actual) &&
+        !mlir::isa<py::LiteralType>(bindings.find(*name)->second))
+      return bindTypeParameter(types, *name, actual, bindings);
+  }
   expected = substituteType(types, expected, bindings);
   expected = types.inference().zonk(expected);
   actual = types.inference().zonk(actual);
