@@ -420,6 +420,19 @@ TEST(EmitterTest, AReturnedDisplayIsJudgedByItsElements) {
       << unrelated.diagnostics;
 }
 
+// What: a generic function or method declared to return `Box[T]` returns
+// `Box(v)`, the class built from its own type parameter.
+TEST(EmitterTest, AGenericClassBuiltFromATypeParameterIsReturned) {
+  ImportedModuleEmit result = emitWithImportedModules(
+      {}, "class Box[T]:\n"
+          "    def __init__(self, v: T) -> None:\n        self.v = v\n"
+          "class Case:\n"
+          "    def make[T](self, v: T) -> Box[T]:\n        return Box(v)\n"
+          "def make[T](v: T) -> Box[T]:\n    return Box(v)\n"
+          "print(make(3).v + 1, Case().make('x').v.upper())\n");
+  EXPECT_TRUE(result.succeeded) << result.diagnostics;
+}
+
 TEST(EmitterTest, UnshadowedBuiltinKeepsItsFastPath) {
   mlir::MLIRContext context(testRegistry());
   std::string ir = emittedIR("print(len([1, 2, 3]))\n", context);

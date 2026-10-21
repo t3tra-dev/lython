@@ -1543,6 +1543,24 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
           return elementRung == wantedRung;
         return accepted(element, wanted);
       };
+      // ⛔ And not a generic class the inference left unsolved: in the body of
+      // `def make[T](v: T) -> Box[T]`, `Box(v)` infers the bare generic `Box`,
+      // which is the inference not knowing T -- the emission above builds it
+      // at the declared specialization, as `-> Box[int]` does.
+      auto unsolvedGenericOf = [&](mlir::Type returned, mlir::Type declared) {
+        auto returnedContract =
+            mlir::dyn_cast_if_present<py::ContractType>(returned);
+        auto declaredContract =
+            mlir::dyn_cast_if_present<py::ContractType>(declared);
+        if (!returnedContract || !declaredContract ||
+            !returnedContract.getArguments().empty())
+          return false;
+        GenericClassInfo *generic =
+            lookupGenericClass(returnedContract.getContractName());
+        return generic &&
+               declaredContract.getContractName().starts_with(
+                   (generic->symbolBase + "$spec"));
+      };
       auto displayAccepted = [&](mlir::Type declared) {
         auto declaredContract =
             mlir::dyn_cast_if_present<py::ContractType>(declared);
@@ -1635,7 +1653,9 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
           (unionMismatch || (ordinaryContract(returnedType) &&
                              ordinaryContract(currentReturnType) &&
                              !accepted(returnedType, currentReturnType) &&
-                             !displayAccepted(currentReturnType)))) {
+                             !displayAccepted(currentReturnType) &&
+                             !unsolvedGenericOf(returnedType,
+                                                currentReturnType)))) {
         diagnostics.push_back(parser::Diagnostic{
             parser::Severity::Error, statement.range.start,
             "function is annotated to return " + typeText(currentReturnType) +
