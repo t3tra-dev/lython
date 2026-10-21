@@ -433,6 +433,24 @@ TEST(EmitterTest, AGenericClassBuiltFromATypeParameterIsReturned) {
   EXPECT_TRUE(result.succeeded) << result.diagnostics;
 }
 
+// What: a generic class written through its module in an annotation
+// (`types.GeneratorType[int, None, None]`) takes its arguments, as the same
+// class imported by name does.
+TEST(EmitterTest, ADottedGenericAnnotationTakesItsArguments) {
+  mlir::MLIRContext context(testRegistry());
+  std::string ir = emittedIR("import types\n"
+                             "def gen() -> types.GeneratorType[int, None, None]:\n"
+                             "    yield 1\n"
+                             "g: types.GeneratorType[int, None, None] = gen()\n"
+                             "print(next(g) + 1)\n",
+                             context);
+  EXPECT_NE(ir.find("py.global.set \"g\""), std::string::npos) << ir;
+  EXPECT_NE(ir.find("!py.contract<\"types.GeneratorType\", "
+                    "[!py.contract<\"builtins.int\">"),
+            std::string::npos)
+      << ir;
+}
+
 TEST(EmitterTest, UnshadowedBuiltinKeepsItsFastPath) {
   mlir::MLIRContext context(testRegistry());
   std::string ir = emittedIR("print(len([1, 2, 3]))\n", context);

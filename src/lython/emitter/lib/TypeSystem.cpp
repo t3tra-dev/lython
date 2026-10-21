@@ -3824,7 +3824,17 @@ mlir::Type TypeSystem::annotationType(const parser::Node *node) const {
       if (auto aliased = mlir::dyn_cast<py::ContractType>(alias->second);
           aliased && aliased.getArguments().empty() && !arguments.empty())
         return contract(aliased.getContractName(), arguments);
-    if (auto knownClass = lookupClass(baseName)) {
+    // ⭐ A DOTTED BASE NAMES ITS CLASS THROUGH ITS MODULE, as the same name
+    // without arguments does: `types.GeneratorType[int, None, None]` fell
+    // through to `object` while `types.GeneratorType` and
+    // `from types import GeneratorType` both resolved.
+    std::optional<mlir::Type> knownClass = lookupClass(baseName);
+    if (!knownClass && !qualifiedBase.empty())
+      if (auto named = mlir::dyn_cast_if_present<py::ContractType>(
+              annotationType(base));
+          named && named.getArguments().empty() && !py::isPyObjectType(named))
+        knownClass = named;
+    if (knownClass) {
       if (auto contractType =
               mlir::dyn_cast_if_present<py::ContractType>(*knownClass)) {
         if (mlir::Type specialized = resolveGenericClass(
