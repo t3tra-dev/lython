@@ -371,7 +371,7 @@ ut_bug_uncaught_line_ignores_overridden_str.py SKIP
 ut_bug_unhashable_key_error_not_wrapped.py WRONG-DECLARED
 ut_bug_union_dispatch_then_narrow_ownership.py GAP
 ut_bug_union_of_exceptions_into_exception_parameter.py GAP
-ut_bug_unreachable_yield_still_makes_a_generator.py GAP
+ut_bug_unreachable_yield_still_makes_a_generator.py AGREE
 ut_mod_computed_constant.py AGREE
 ut_mod_computed_getattr.py AGREE
 ut_mod_generic_context.py AGREE

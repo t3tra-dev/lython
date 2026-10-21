@@ -1405,9 +1405,11 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
         unsupported = true;
     });
     // A coroutine that never awaits is still one: its body runs at the first
-    // resume, not at the call.
+    // resume, not at the call. So is a generator whose every yield was in a
+    // branch the emitter removed (`if False: yield`).
     bool coroutine = body->hasAttr("ly.coroutine");
-    if (!hasYield && !hasYieldFrom && !coroutine)
+    if (!hasYield && !hasYieldFrom && !coroutine &&
+        !body->hasAttr(kGeneratorPublicResultAttr))
       continue;
     if (unsupported) {
       generatorDeclineReasons[body.getSymName()] =
@@ -1742,7 +1744,15 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
           returnType = operand.getType();
         }
     });
-    if (!eligible || (yields.empty() && !coroutine)) {
+    // ⭐ A GENERATOR WITH NO YIELD LEFT IS STILL ONE: `if False: yield` makes
+    // `def empty()` a generator in CPython, and the emitter removes the dead
+    // branch. Its first resume returns, as a coroutine's with no await does.
+    // The value lane is the one its readers expect, the declared element's,
+    // and nothing is ever put in it.
+    if (yields.empty() && !coroutine && valueContract.empty() && declaredYield)
+      valueContract =
+          laneEligibleContract(declaredYield, /*allowBool=*/true);
+    if (!eligible || (yields.empty() && !coroutine && valueContract.empty())) {
       eraseLoweredFunction(clone);
       continue;
     }

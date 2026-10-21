@@ -5,8 +5,10 @@
 #   function is typed object.
 # KIND: バグ (bug) -- loud: well-typed code refused
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
-#   source generator next lowering currently requires at least one yield
+# FIXED: 2026-10-21 -- the generator state machine takes a body with no yield
+#   left, with the declared element's value lane, as it takes a coroutine
+#   that never awaits.
+# CLASSIFICATION @ lang-gaps a98ba3ee + the fix: 1 正しい
 # CPython 3.14 expects: []
 def empty():
     if False:
