@@ -1468,11 +1468,24 @@ private:
                              const MethodBinding &method);
   // A large method CALLED through a symbol instead of copied into the call
   // site; nullopt when the copy is what this call needs (EmitterClasses.cpp).
-  std::optional<Value> tryCallLargeMethod(const parser::Node &anchor,
-                                          Value receiver,
-                                          const MethodBinding &method,
-                                          llvm::ArrayRef<Value> positional,
-                                          const KeywordArguments &keywords);
+  // A generic method's solution at one call: its signature with the type
+  // parameters substituted, and what each parameter was solved as.
+  struct MethodSpecialization {
+    const FunctionSignature &signature;
+    const std::map<std::string, mlir::Type> &typeArguments;
+  };
+  std::optional<Value>
+  tryCallLargeMethod(const parser::Node &anchor, Value receiver,
+                     const MethodBinding &method,
+                     llvm::ArrayRef<Value> positional,
+                     const KeywordArguments &keywords,
+                     const MethodSpecialization *specialization = nullptr);
+  // The symbol of a generic method's body at one solution, `self` typed
+  // `signature`'s first parameter, emitted on the first ask.
+  std::string specializedMethodBody(const MethodBinding &method,
+                                    const FunctionSignature &signature,
+                                    const std::map<std::string, mlir::Type> &typeArguments,
+                                    bool selfIsExact);
   // The symbol of `method`'s body with `self` typed `receiverType` and NOT
   // assumed to be exactly that class, emitted on the first ask.
   std::string openMethodBody(const MethodBinding &method,
@@ -2346,6 +2359,10 @@ private:
   // What `openMethodBody` emitted, by method and receiver type.
   llvm::DenseMap<std::pair<const parser::Node *, mlir::Type>, std::string>
       openMethodBodies;
+  // What `specializedMethodBody` emitted, by method and its specialized
+  // callable, for a `self` taken as exact and for one that is not.
+  llvm::DenseMap<std::pair<const parser::Node *, mlir::Type>, std::string>
+      specializedMethodBodies[2];
   // AST nodes in a method's def: what a copy at its call site costs.
   llvm::DenseMap<const parser::Node *, unsigned> methodDefSizes;
   // The calls a computed-name dispatcher's arms make (`computedGetattrBody`),

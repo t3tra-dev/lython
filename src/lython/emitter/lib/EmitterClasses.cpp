@@ -5112,10 +5112,15 @@ Value ModuleEmitter::adoptDeclaredContainer(Value value, mlir::Type declared,
       types.widenLiteral(value.type));
   auto expected = mlir::dyn_cast_if_present<py::ContractType>(
       types.widenLiteral(declared));
+  // ⛔ Not to a type that still names a type parameter: `[]` passed to a
+  // generic method's `out: list[T]` became a `list[T]` value, which no
+  // solution's `list[int]` accepts. It adopts the solution's type once T is
+  // solved.
   if (!actual || !expected ||
       actual.getContractName() != expected.getContractName() ||
       actual.getArguments().empty() ||
-      actual.getArguments().size() != expected.getArguments().size())
+      actual.getArguments().size() != expected.getArguments().size() ||
+      unboundStaticParameterCount(expected) != 0)
     return value;
   if (!llvm::all_of(actual.getArguments(), [&](mlir::Type argument) {
         return types.widenLiteral(argument) == types.object();
@@ -5412,19 +5417,23 @@ unsigned calledMethodNodes() {
 // (`emitInDefiningModuleScope`), as its standalone symbol is.
 std::optional<Value> ModuleEmitter::tryCallLargeMethod(
     const parser::Node &anchor, Value receiver, const MethodBinding &method,
-    llvm::ArrayRef<Value> positional, const KeywordArguments &keywords) {
+    llvm::ArrayRef<Value> positional, const KeywordArguments &keywords,
+    const MethodSpecialization *specialization) {
   if (methodCallsAblated() || !method.method || method.kind != "instance" ||
       method.symbolName.empty() || method.async)
     return std::nullopt;
   const FunctionSignature &sig =
-      method.bodySignature.callable ? method.bodySignature : method.signature;
+      specialization ? specialization->signature
+      : method.bodySignature.callable ? method.bodySignature
+                                      : method.signature;
   if (sig.isGeneratorFunction || sig.isAsyncGeneratorFunction ||
       sig.isCoroutineFunction || sig.varargName || sig.kwargName ||
       !sig.kwOnlyNames.empty() || sig.positionalNames.empty() ||
       sig.positionalNames.size() != sig.positionalTypes.size())
     return std::nullopt;
   const parser::Node &def = *method.method;
-  if (specializedAtEachCall(def) || decoratedMethodBodies.contains(&def))
+  if ((specialization ? forwardsItsPacks(def) : specializedAtEachCall(def)) ||
+      decoratedMethodBodies.contains(&def))
     return std::nullopt;
   std::string name(ast::string(def, "name").value_or(""));
   if (name.size() > 4 && llvm::StringRef(name).starts_with("__") &&
@@ -5442,7 +5451,11 @@ std::optional<Value> ModuleEmitter::tryCallLargeMethod(
   // one dispatcher was a third of a unittest file's IR, growing with every
   // test. The arm passes only the receiver, so nothing is specialized by the
   // copy that the method's own body does not already have.
-  if (size->second < calledMethodNodes() &&
+  // ⭐ AND A GENERIC METHOD IS CALLED WHATEVER ITS SIZE, through one body per
+  // solution. Copied, `assertEqual[T]` brought its message formatting and
+  // `assertMultiLineEqual` into every assertion -- about 1,100 lines of IR
+  // each, half of a unittest file -- for the same few solutions.
+  if (size->second < calledMethodNodes() && !specialization &&
       !dispatcherArmCalls.contains(&anchor))
     return std::nullopt;
   auto receiverClass = mlir::dyn_cast_if_present<py::ContractType>(receiver.type);
@@ -5537,8 +5550,12 @@ std::optional<Value> ModuleEmitter::tryCallLargeMethod(
   if (!callable ||
       !types.inferCallWithEvidence(callable, callSig.positionalTypes, {}))
     return std::nullopt;
-  std::string symbol = exactBody ? method.symbolName
-                                 : openMethodBody(method, receiver.type, callSig);
+  std::string symbol =
+      specialization
+          ? specializedMethodBody(method, callSig, specialization->typeArguments,
+                                  exactBody)
+      : exactBody ? method.symbolName
+                  : openMethodBody(method, receiver.type, callSig);
   // LYTHON_TRACE_METHOD_CALLS=1: each call that takes a body by symbol, and
   // which body -- the class's own (`exact`) or one for a receiver whose class
   // is not known (`open`).
@@ -5575,6 +5592,60 @@ std::optional<Value> ModuleEmitter::tryCallLargeMethod(
   }
   return emitCallableDispatch(anchor, callee, operands,
                               sig.resultType ? sig.resultType : types.none());
+}
+
+std::string ModuleEmitter::specializedMethodBody(
+    const MethodBinding &method, const FunctionSignature &signature,
+    const TypeBindingMap &typeArguments, bool selfIsExact) {
+  mlir::Type callable =
+      signature.publicCallable ? signature.publicCallable : signature.callable;
+  auto &memo = specializedMethodBodies[selfIsExact ? 1 : 0];
+  auto key = std::make_pair(static_cast<const parser::Node *>(method.method),
+                            callable);
+  if (auto found = memo.find(key); found != memo.end())
+    return found->second;
+  std::string symbol = method.symbolName + "$spec" +
+                       std::to_string(memo.size()) +
+                       (selfIsExact ? "" : "$open");
+  // Named before the body, as an open body is: a recursion is a call.
+  memo[key] = symbol;
+  const EmitOptions::SourceModule *source =
+      sourceModuleForClass(method.definingClass);
+  const parser::Node *def = method.method;
+  std::string definer = method.definingClass;
+  auto emitBody = [this, def, symbol, signature, typeArguments, source,
+                   definer, selfIsExact] {
+    auto savedInlining = std::move(methodsBeingInlined);
+    methodsBeingInlined.clear();
+    auto savedInlineFrames = std::move(inlineFrames);
+    inlineFrames.clear();
+    llvm::scope_exit restore([&] {
+      methodsBeingInlined = std::move(savedInlining);
+      inlineFrames = std::move(savedInlineFrames);
+    });
+    auto emitSpecialized = [&] {
+      auto typeParameterScope = types.pushScope();
+      bindClassTypeArguments(definer);
+      // Body annotations spell the type parameters by name (`x: T`).
+      for (const auto &binding : typeArguments) {
+        types.bindLocalSymbol(binding.first, binding.second);
+        types.bindLocalTypeParameter(binding.first, binding.second);
+      }
+      superContexts.push_back(
+          SuperContext{definer, signature.positionalNames.front(), selfIsExact});
+      emitCallableFunction(*def, symbol, signature, {}, /*isLambda=*/false);
+      superContexts.pop_back();
+    };
+    if (source)
+      emitInDefiningModuleScope(*source, emitSpecialized);
+    else
+      emitSpecialized();
+  };
+  if (classDeclarationsEmitted)
+    emitBody();
+  else
+    deferredDispatcherBodies.push_back(std::move(emitBody));
+  return symbol;
 }
 
 std::string ModuleEmitter::openMethodBody(const MethodBinding &method,
@@ -6360,6 +6431,13 @@ Value ModuleEmitter::emitInlineMethodBody(
             argument, specializedSig->positionalTypes[firstSlot + index],
             anchor);
     positional = adoptedPositional;
+    if (bindDescriptorReceiver && !collectedVararg && !collectedKwargs) {
+      MethodSpecialization specialization{*specializedSig, typeArguments};
+      if (std::optional<Value> called =
+              tryCallLargeMethod(anchor, receiver, method, positional,
+                                 keywords, &specialization))
+        return *called;
+    }
   }
   const FunctionSignature &sig = specializedSig ? *specializedSig : declaredSig;
   const auto *body = ast::nodeList(*method.method, "body");
