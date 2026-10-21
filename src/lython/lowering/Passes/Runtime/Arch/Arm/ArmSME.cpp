@@ -1,5 +1,7 @@
 #include "ArmSME.h"
 
+#include "Common/LoweringPipeline.h"
+
 #include "mlir/Conversion/ArithToArmSME/ArithToArmSME.h"
 #include "mlir/Conversion/ArmSMEToLLVM/ArmSMEToLLVM.h"
 #include "mlir/Conversion/ArmSMEToSCF/ArmSMEToSCF.h"
@@ -31,8 +33,10 @@ void registerSMEDialects(mlir::DialectRegistry &registry) {
 // tiles cannot take, fuse outer products, and enter streaming mode with ZA.
 // Both entry points below run exactly this, and a pass added to one of them
 // but not the other would make the two ArmSME paths disagree.
-void addSMEVectorClaim(mlir::OpPassManager &pipeline) {
-  pipeline.nestAny().addPass(mlir::createConvertVectorToArmSMEPass());
+void addSMEVectorClaim(mlir::OpPassManager &pipeline,
+                       mlir::MLIRContext *context) {
+  eachIsolatedChild(pipeline, context)
+      .addPass(mlir::createConvertVectorToArmSMEPass());
   // ⛔ Module-wide: it rewrites function signatures and their calls.
   pipeline.addPass(mlir::arm_sme::createVectorLegalizationPass());
   pipeline.addNestedPass<mlir::func::FuncOp>(
@@ -45,23 +49,26 @@ void addSMEVectorClaim(mlir::OpPassManager &pipeline) {
           /*ifContainsScalableVectors=*/false));
 }
 
-void addSMELinalgPipeline(mlir::OpPassManager &pipeline) {
+void addSMELinalgPipeline(mlir::OpPassManager &pipeline,
+                          mlir::MLIRContext *context) {
   // Keep the high-level vector/outer-product form intact until the ArmSME
   // branch has a chance to claim it. The generic fallback is still responsible
   // for scalarizing unsupported vector shapes later.
-  addSMEVectorClaim(pipeline);
+  addSMEVectorClaim(pipeline, context);
   pipeline.addPass(mlir::createCanonicalizerPass());
   pipeline.addPass(mlir::createCSEPass());
 }
 
-void addSMEPreControlFlowLLVMPrepPipeline(mlir::OpPassManager &pipeline) {
+void addSMEPreControlFlowLLVMPrepPipeline(mlir::OpPassManager &pipeline,
+                                          mlir::MLIRContext *context) {
   // Convert scalable vector outer-products to ArmSME while the vector form is
   // still intact. Tile stores are then expanded to SCF slice loops; ArmSME
   // tile allocation expects control-flow lowering before the final
   // ArmSME-to-LLVM conversion.
-  pipeline.nestAny().addPass(mlir::createArithToArmSMEConversionPass());
-  addSMEVectorClaim(pipeline);
-  mlir::OpPassManager &eachFunction = pipeline.nestAny();
+  eachIsolatedChild(pipeline, context)
+      .addPass(mlir::createArithToArmSMEConversionPass());
+  addSMEVectorClaim(pipeline, context);
+  mlir::OpPassManager &eachFunction = eachIsolatedChild(pipeline, context);
   eachFunction.addPass(mlir::createConvertArmSMEToSCFPass());
   eachFunction.addPass(mlir::createCanonicalizerPass());
   eachFunction.addPass(mlir::createCSEPass());
@@ -129,10 +136,11 @@ private:
 
 } // namespace
 
-void addSMEPostControlFlowLLVMPrepPipeline(mlir::OpPassManager &pipeline) {
+void addSMEPostControlFlowLLVMPrepPipeline(mlir::OpPassManager &pipeline,
+                                           mlir::MLIRContext *context) {
   pipeline.addNestedPass<mlir::func::FuncOp>(
       std::make_unique<ConvertArmSMEToLLVMWhereUsed>());
-  mlir::OpPassManager &eachFunction = pipeline.nestAny();
+  mlir::OpPassManager &eachFunction = eachIsolatedChild(pipeline, context);
   eachFunction.addPass(mlir::createCanonicalizerPass());
   eachFunction.addPass(mlir::createCSEPass());
 }

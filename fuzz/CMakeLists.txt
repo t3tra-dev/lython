@@ -30,7 +30,17 @@ file(GLOB LYTHON_FUZZ_GOLDEN_INPUTS CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/tests/golden/cases/*.py")
 list(SORT LYTHON_FUZZ_GOLDEN_INPUTS)
 list(LENGTH LYTHON_FUZZ_GOLDEN_INPUTS LYTHON_FUZZ_GOLDEN_COUNT)
-set(LYTHON_FUZZ_GOLDEN_CHUNKS 4)
+# ⛔ Not a fixed four chunks: a chunk's time grows with every golden added, and
+# four reached the 1800 s timeout on the CI runner at 1,017 cases (about 7 s
+# each there under ASan) with nothing else wrong. A chunk holds at most 128,
+# about half the timeout; ctest -j still runs four at a time, so the job takes
+# as long as before.
+set(LYTHON_FUZZ_GOLDEN_CHUNK_FILES 128)
+math(EXPR LYTHON_FUZZ_GOLDEN_CHUNKS
+    "(${LYTHON_FUZZ_GOLDEN_COUNT} + ${LYTHON_FUZZ_GOLDEN_CHUNK_FILES} - 1) / ${LYTHON_FUZZ_GOLDEN_CHUNK_FILES}")
+if(LYTHON_FUZZ_GOLDEN_CHUNKS LESS 4)
+    set(LYTHON_FUZZ_GOLDEN_CHUNKS 4)
+endif()
 
 set(LYTHON_FUZZ_ASAN_OPTIONS
     "ASAN_OPTIONS=detect_leaks=0:detect_container_overflow=0:allow_user_poisoning=0")

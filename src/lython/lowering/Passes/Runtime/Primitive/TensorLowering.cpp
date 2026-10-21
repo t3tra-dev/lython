@@ -1482,7 +1482,7 @@ public:
     pipeline.addPass(createMatmulMicroTilingPass(target));
     pipeline.addPass(createMatmulVectorizationPass(target));
     if (arch::arm::usesSME(target))
-      arch::arm::addSMELinalgPipeline(pipeline);
+      arch::arm::addSMELinalgPipeline(pipeline, &getContext());
     if (arch::x86::usesX86(target))
       arch::x86::addX86LinalgPipeline(pipeline);
     // Tiling a dimension by a larger tile leaves the partial-tile extent as an

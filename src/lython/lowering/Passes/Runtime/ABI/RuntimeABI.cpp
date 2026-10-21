@@ -2252,6 +2252,18 @@ mlir::LogicalResult RuntimeBundleLowerer::recordUnreachableSlots(
   return mlir::success();
 }
 
+// ⛔ Not asked again by each hook: the use scan walks every attribute of
+// every op in the module, and five hooks asking it was a quarter of the
+// runtime lowering. No hook writes or removes a call to LyObject_New.
+bool RuntimeBundleLowerer::objectInstancesAreMade() {
+  if (!objectInstancesAreMadeAnswer) {
+    auto objectNew = module.lookupSymbol<mlir::func::FuncOp>("LyObject_New");
+    objectInstancesAreMadeAnswer =
+        objectNew && !mlir::SymbolTable::symbolKnownUseEmpty(objectNew, module);
+  }
+  return *objectInstancesAreMadeAnswer;
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
     llvm::StringRef hookName,
     llvm::function_ref<bool(mlir::func::FuncOp)> selects,
@@ -2303,11 +2315,8 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
   // The object candidate is not dropped, it is moved to the end as None's
   // arm: it takes the BOX, so it is the arm that can answer for None.
   mlir::func::FuncOp objectFallback;
-  // Asked once: only a program that calls `object()` has such an object.
-  bool objectInstancesAreMade = false;
-  if (auto objectNew = module.lookupSymbol<mlir::func::FuncOp>("LyObject_New"))
-    objectInstancesAreMade =
-        !mlir::SymbolTable::symbolKnownUseEmpty(objectNew, module);
+  // Only a program that calls `object()` has such an object.
+  bool objectInstancesAreMade = this->objectInstancesAreMade();
   auto conforms = [&](mlir::func::FuncOp function) {
     mlir::FunctionType type = function.getFunctionType();
     if (type.getNumResults() != calleeResultTypes.size() ||
