@@ -214,10 +214,23 @@ ModuleEmitter::DocAnswer ModuleEmitter::docOfMethod(llvm::StringRef cls,
   for (const DecoratedMethod &decorated : decoratedMethods)
     if (decorated.classDef == definer &&
         decorated.hiddenName == "__ly_undecorated$" + method.str()) {
+      // ⭐ AN IMPORTED MODULE'S CELL IS A QUALIFIED GLOBAL, bound in that
+      // module's scope only; the question is asked from the main module's
+      // (unittest's `getattr(self, name).__doc__` over a test class with a
+      // `@skip`), so it is read here under a name of its own.
       if (decorated.source) {
-        answer.text = "'" + shown +
-                      "' is decorated in an imported module, whose cell is "
-                      "not read from here";
+        auto global = moduleGlobals.find(decorated.globalName);
+        if (global == moduleGlobals.end()) {
+          answer.text = "'" + shown +
+                        "' is decorated in an imported module, whose cell "
+                        "is not typed yet";
+          return answer;
+        }
+        std::string reader = "__lydoccell$" + decorated.globalName;
+        types.bindRootCanonicalSymbol(reader, decorated.globalName,
+                                      global->second);
+        answer.kind = DocAnswer::Kind::Cell;
+        answer.text = reader;
         return answer;
       }
       answer.kind = DocAnswer::Kind::Cell;

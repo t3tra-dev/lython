@@ -1,0 +1,4 @@
+kept 'Kept as written.'
+wrapped "The wrapper's own words."
+plain 'Plain.'
+kept wrapped inner plain

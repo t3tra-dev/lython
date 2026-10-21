@@ -5967,6 +5967,32 @@ bool ModuleEmitter::inlineArgumentFits(mlir::Type actual,
                             module)))
         return true;
     }
+  // ⭐ A READ-ONLY PROTOCOL TAKES ITS ELEMENT BY THESE SAME RULES: a
+  // `list[M]` fits `Iterable[Case | Group]` when it is an `Iterable[M]` and M
+  // fits the union. `isAssignableTo` asked the element question with the
+  // class ops' walk and no union member rule, so unittest's
+  // `TestSuite([Mine("test_a")])` was refused while the same call into a
+  // free function was not.
+  // ⛔ Only the protocols that never write an element back: a list passed
+  // where `MutableSequence[Base]` is declared could be given a Base.
+  if (auto expectedProtocol = mlir::dyn_cast<py::ProtocolType>(expected))
+    if (auto actualContract = mlir::dyn_cast<py::ContractType>(actual))
+      if (expectedProtocol.getArguments().size() == 1 &&
+          actualContract.getArguments().size() == 1 &&
+          llvm::is_contained({llvm::StringRef("Iterable"),
+                              llvm::StringRef("Collection"),
+                              llvm::StringRef("Sequence"),
+                              llvm::StringRef("Container"),
+                              llvm::StringRef("Reversible")},
+                             expectedProtocol.getProtocolName())) {
+        mlir::Type element = actualContract.getArguments().front();
+        mlir::Type ownElement = py::ProtocolType::get(
+            &context, expectedProtocol.getProtocolName(), {element});
+        if (isAssignableWithStaticEvidence(actual, ownElement, module) &&
+            inlineArgumentFits(types.widenLiteral(element),
+                               expectedProtocol.getArguments().front()))
+          return true;
+      }
   // ⭐ A BARE generic contract accepts any instantiation of itself. A generic
   // class's own methods spell the receiver without its arguments --
   // `def __add__(self, other: "Counter") -> "Counter"` -- and the argument
@@ -6215,9 +6241,18 @@ Value ModuleEmitter::emitInlineMethodBody(
   // `a == b` while the same def at module level compiled.
   std::optional<FunctionSignature> specializedSig;
   TypeBindingMap typeArguments;
+  llvm::SmallVector<Value, 8> adoptedPositional;
   if (hasTypeParameters(*method.method)) {
     py::CallableType declared =
         mlir::dyn_cast_if_present<py::CallableType>(declaredSig.callable);
+    // The arguments were emitted before T is solved: an empty container
+    // literal is solved as nothing (emptyLiteralSolvingType) and adopts what
+    // its parameter became below, as at a generic function's call.
+    std::optional<EmptyLiteralArguments> emptyLiterals;
+    if (!collectedVararg && !collectedKwargs)
+      emptyLiterals = emptyLiteralArgumentsOf(anchor);
+    if (emptyLiterals && emptyLiterals->positional.size() != positional.size())
+      emptyLiterals.reset();
     llvm::SmallVector<mlir::Type, 8> argumentTypes{receiver.type};
     for (const Value &argument : positional)
       argumentTypes.push_back(argument.type);
@@ -6233,10 +6268,38 @@ Value ModuleEmitter::emitInlineMethodBody(
           CallKeywordType{entry.getKey().str(), entry.getValue().type});
     if (collectedKwargs)
       keywordTypes.push_back(CallKeywordType{"", collectedKwargs->type});
-    CallInferenceResult solved =
-        declared ? types.inferCallWithEvidence(declared, argumentTypes,
-                                               keywordTypes)
-                 : CallInferenceResult();
+    CallInferenceResult solved;
+    if (declared && emptyLiterals) {
+      llvm::SmallVector<mlir::Type, 8> solvingTypes(argumentTypes);
+      llvm::SmallVector<CallKeywordType, 4> solvingKeywords(keywordTypes);
+      bool marked = false;
+      for (auto [index, isEmpty] : llvm::enumerate(emptyLiterals->positional))
+        if (isEmpty)
+          if (mlir::Type marker =
+                  emptyLiteralSolvingType(solvingTypes[index + 1], types)) {
+            solvingTypes[index + 1] = marker;
+            marked = true;
+          }
+      for (CallKeywordType &keyword : solvingKeywords)
+        if (emptyLiterals->keywords.contains(keyword.name))
+          if (mlir::Type marker = emptyLiteralSolvingType(keyword.type, types)) {
+            keyword.type = marker;
+            marked = true;
+          }
+      if (marked) {
+        solved = types.inferCallWithEvidence(declared, solvingTypes,
+                                             solvingKeywords);
+        if (solved &&
+            (mentionsEmptyLiteralMarker(solved.resultType) ||
+             mentionsEmptyLiteralMarker(solved.evidence.callableContract)))
+          solved = CallInferenceResult();
+      }
+      if (!solved)
+        emptyLiterals.reset();
+    }
+    if (declared && !solved)
+      solved = types.inferCallWithEvidence(declared, argumentTypes,
+                                           keywordTypes);
     auto resolved = solved ? mlir::dyn_cast_if_present<py::CallableType>(
                                  solved.evidence.callableContract)
                            : py::CallableType();
@@ -6281,6 +6344,15 @@ Value ModuleEmitter::emitInlineMethodBody(
     specializedSig->kwargType = substitute(specializedSig->kwargType);
     specializedSig->resultType = substitute(specializedSig->resultType);
     types.refreshCallable(*specializedSig);
+    std::size_t firstSlot = methodBindingBindsReceiver(method) ? 1 : 0;
+    adoptedPositional.assign(positional.begin(), positional.end());
+    for (auto [index, argument] : llvm::enumerate(adoptedPositional))
+      if (emptyLiterals && emptyLiterals->positional[index] &&
+          firstSlot + index < specializedSig->positionalTypes.size())
+        argument = adoptDeclaredContainer(
+            argument, specializedSig->positionalTypes[firstSlot + index],
+            anchor);
+    positional = adoptedPositional;
   }
   const FunctionSignature &sig = specializedSig ? *specializedSig : declaredSig;
   const auto *body = ast::nodeList(*method.method, "body");

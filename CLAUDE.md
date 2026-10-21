@@ -56,12 +56,13 @@ ctest --test-dir build -N -L fast                # 何が選ばれるか (実行
 
 - 段ラベル (1 テスト 1 つ): `parse` / `emit` / `tables` / `meta` / `lower` / `e2e`
 - コストラベル: `fast` (lowering を通らない) / `slow` (単体 20 s 超・コンパイル律速) / `bench` (単体 20 s 超・実行律速)
-- スイートラベル: `unit` / `golden` / `golden-cases` / `golden-errors` / `examples`
+- スイートラベル: `unit` / `golden` / `golden-cases` / `golden-errors` / `examples` / `python`
 
 `slow` と `bench` を分けてあるのは、前者は lowering の改善で縮み後者は縮まないから (`examples.tarai` は 96.9% が実行なので lowering 改善の上限は 3%)。混ぜると修正が効いたかが見えなくなる。**ラベルの妥当性は機械が検査する**: unit 側は `LayerManifestTest` がどの層にも属さないテストと何も掴まないパターンを名前付きで落とし、golden 側は `tests/golden/layers.txt` の宣言を `run_case.py --expect-layer` がコンパイラ自身の PerfScope 痕跡と照合する。
 
 - **ユニットテスト** (`tests/unit/`, GoogleTest) — C++ API を直接叩く。ドライバ API (`src/lython/driver/include/Driver.h`) は lyc・テスト・fuzzer が共有するコンパイル入口。
 - **golden テスト** (`tests/golden/`) — `cases/*.py` は stdout 完全一致、`errors/*.py` は exit code + stderr 正規表現。実行前に止まるケースは `layers.txt` に段を宣言する。
+- **unittest のテスト** (`tests/python/test_*.py`) — CPython の `Lib/test` と同じく `unittest` で書いたモジュール。`python.<name>` が `lyc jit` で走らせ、`unittest.main()` の終了コードで判定する。同じファイルを CPython 3.14 でも走らせる (`python.<name>.cpython`、`meta fast`) ので、期待値は CPython が実際に出すものになる。`test_` で始まらない `.py` は補助モジュールで、テストクラスを置くなら `import x as y` で取り込む (`from x import C` は `unittest.main()` がそのクラスも集める)。
 - **バッチ golden** (`golden.batch.NNN`, `-L golden-batch`) — 1 件 0.7 s の大半はコンパイルと JIT build の固定費なので、`batch_cases.py` がまとめられる `cases/` (約 575 件) を 6 件ずつ 1 プログラムに連結して払う。各ケースは module レベルのまま、module で束縛する名前だけ `_c<i>_` にリネームする (ソースのトークン位置で書き換え、綴りは保つ)。まとめられないケース (名前が出力に出る / 文脈を観測する / 隣のモジュールを import する / stderr や exit code を見る) は従来どおり単独で登録される。理由は `batch_cases.py --why tests/golden/cases/*.py`。バッチ内で落ちたケースは単独で再実行され、**単独で通るのにバッチで答えが変わったら BATCH-DISAGREE で赤**(ケース間の干渉は欠陥として扱う。`round(-15, -1)` が共有の小さい int を書き換えた欠陥はこれで見つかった)。意図的に文脈依存なケースは理由付きで `batch-exclusions.txt` に書く。1 件を名前で再実行するには FAILED 行のコマンドか `-DLYTHON_GOLDEN_BATCH=OFF`。6 件より大きくしないのは、連結した module 本体が 1 関数になり ownership 系フェーズが超線形に伸びるため (25 件で 1 件あたり 0.99 s)。
 - **examples smoke** — golden とバイト同一でないものだけ exit code 検証。同一な 20 件は golden がより強い assertion を持つので登録しない (`golden.example_twins` が同一性を守る)。
 

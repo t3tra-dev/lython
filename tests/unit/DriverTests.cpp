@@ -3469,6 +3469,20 @@ TEST(DriverTest, AFinalizerOnAnExceptionClassIsRefused) {
       << result.diagnostics;
 }
 
+// What: a `list[object]` VALUE beside a `list[str]` argument of a generic
+// function is not taken for an empty literal: T is not solved as str from
+// the sibling (which read the int the list holds as a str), and the call is
+// refused as before. Only the spelling `[]` yields to the other argument.
+TEST(DriverTest, AListOfObjectIsNotSolvedAsAnEmptyLiteral) {
+  CompileResult result = compileSource("def make() -> list[object]:\n"
+                                       "    return [1, 'x']\n\n"
+                                       "def first[T](a: list[T], b: list[T]) "
+                                       "-> T:\n"
+                                       "    return a[0]\n\n"
+                                       "print(first(make(), ['a']))\n");
+  EXPECT_FALSE(result.succeeded) << "compiled; T was solved from ['a']";
+}
+
 // What: a name a library module binds for itself -- `os` imports posixpath as
 // `path` -- is not a module in the program that imports the library. A
 // function the program calls `path` is called; a bare `path` the program

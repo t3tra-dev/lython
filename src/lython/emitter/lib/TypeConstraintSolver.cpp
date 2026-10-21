@@ -244,6 +244,20 @@ bool bindTypeVarTuplePack(const TypeSystem &types, llvm::StringRef name,
   return found->second == pack;
 }
 
+// An empty container literal as the emitter hands it to the solver
+// (emptyLiteralSolvingType): it says nothing about what it will hold.
+// ⛔ Not every `list[object]`: a value of that type may hold anything, and
+// letting it take `list[str]` from a sibling argument read its int as a str.
+static bool erasedEmptyContainer(mlir::Type type) {
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+  if (!contract || contract.getArguments().empty())
+    return false;
+  return llvm::all_of(contract.getArguments(), [](mlir::Type argument) {
+    auto element = mlir::dyn_cast_if_present<py::ContractType>(argument);
+    return element && element.getContractName() == "__ly.empty_literal";
+  });
+}
+
 bool bindTypeParameter(const TypeSystem &types, llvm::StringRef name,
                        mlir::Type actual, TypeBindingMap &bindings) {
   actual = types.widenLiteral(actual);
@@ -252,6 +266,22 @@ bool bindTypeParameter(const TypeSystem &types, llvm::StringRef name,
   auto found = bindings.find(name.str());
   if (found == bindings.end()) {
     bindings[name.str()] = actual;
+    return true;
+  }
+  // ⭐ AN EMPTY CONTAINER YIELDS TO A TYPED ONE OF ITS KIND, in either order:
+  // `same(log, [])` and `same([], log)` are both `T = list[str]`. The empty
+  // literal arrived as `list[object]` and either failed against the typed one
+  // or won the solution, and the call died in the lowering.
+  auto sameKind = [](mlir::Type lhs, mlir::Type rhs) {
+    auto left = mlir::dyn_cast_if_present<py::ContractType>(lhs);
+    auto right = mlir::dyn_cast_if_present<py::ContractType>(rhs);
+    return left && right && left.getContractName() == right.getContractName() &&
+           left.getArguments().size() == right.getArguments().size();
+  };
+  if (erasedEmptyContainer(actual) && sameKind(found->second, actual))
+    return true;
+  if (erasedEmptyContainer(found->second) && sameKind(found->second, actual)) {
+    found->second = actual;
     return true;
   }
   if (std::optional<std::string> existing = staticParameterName(found->second))
@@ -382,10 +412,15 @@ bool bindProtocolView(const TypeSystem &types, py::ProtocolType expected,
 bool bindContractView(const TypeSystem &types, py::ContractType expected,
                       mlir::Type actual, TypeBindingMap &bindings) {
   if (auto actualContract = mlir::dyn_cast_if_present<py::ContractType>(actual))
-    if (actualContract.getContractName() == expected.getContractName())
+    if (actualContract.getContractName() == expected.getContractName()) {
+      // And its elements bind nothing: `fill([], source)` for
+      // `into: list[T]` is T from `source`, not `object` from the literal.
+      if (erasedEmptyContainer(actualContract))
+        return true;
       return expected.getArguments().empty() ||
              bindTypeList(types, expected.getArguments(),
                           actualContract.getArguments(), bindings);
+    }
 
   if (structuralProtocolAccepts(types, expected, actual))
     return true;
