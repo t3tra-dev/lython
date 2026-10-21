@@ -5754,10 +5754,66 @@ Value ModuleEmitter::coerceValue(Value value, mlir::Type targetType,
                                  const parser::Node &anchor) {
   if (!targetType || value.type == targetType)
     return value;
-  if (auto targetCallable = mlir::dyn_cast<py::CallableType>(targetType))
+  if (auto targetCallable = mlir::dyn_cast<py::CallableType>(targetType)) {
     if (std::optional<Value> wrapped =
             tryWrapBuiltinFunctionValue(value, targetCallable, anchor))
       return *wrapped;
+    // ⭐ A CALLABLE IS A CELL FOR ITS RESULT AND ITS PARAMETERS. `f:
+    // Callable[[], float] = one` with `one() -> int` is well typed, but an int
+    // and a float share no representation: the retyping left every call
+    // through `f` with no target of its declared type, and it raised
+    // "callable target is not available" where CPython prints 1.
+    // ⛔ Not an adapter that converts: CPython's `f()` IS the int, and a
+    // conversion prints 1.0 -- the reason no other cell converts either.
+    if (auto sourceCallable = mlir::dyn_cast<py::CallableType>(value.type);
+        sourceCallable && !py::isAssignableTo(sourceCallable, targetCallable,
+                                              module.getOperation())) {
+      auto numeric = [&](mlir::Type type) {
+        type = types.widenLiteral(type);
+        return isNumericPrimitiveContract(type) ||
+               type == types.contract("builtins.complex");
+      };
+      // The rung `held` arrives at where `wanted` is declared, if they differ.
+      // ⛔ Not a bool where an int is wanted: a call through the value answers
+      // with its target's result (bool is int's subclass, as at every boundary
+      // that is not a cell), and refusing it took out programs that run.
+      auto clash = [&](mlir::Type held, mlir::Type wanted) {
+        held = types.widenLiteral(held);
+        wanted = types.widenLiteral(wanted);
+        return numeric(held) && numeric(wanted) && held != wanted &&
+               !(held == types.boolType() && wanted == types.intType());
+      };
+      std::string where;
+      if (sourceCallable.getResultTypes().size() == 1 &&
+          targetCallable.getResultTypes().size() == 1 &&
+          clash(sourceCallable.getResultTypes().front(),
+                targetCallable.getResultTypes().front()))
+        where = "its result is " +
+                pythonTypeSpelling(types.widenLiteral(
+                    sourceCallable.getResultTypes().front())) +
+                " and the declaration's is " +
+                pythonTypeSpelling(types.widenLiteral(
+                    targetCallable.getResultTypes().front()));
+      for (auto [index, pair] :
+           llvm::enumerate(llvm::zip(targetCallable.getPositionalTypes(),
+                                     sourceCallable.getPositionalTypes())))
+        if (where.empty() && clash(std::get<0>(pair), std::get<1>(pair)))
+          where = "its parameter " + std::to_string(index + 1) + " is " +
+                  pythonTypeSpelling(types.widenLiteral(std::get<1>(pair))) +
+                  " and the declaration passes " +
+                  pythonTypeSpelling(types.widenLiteral(std::get<0>(pair)));
+      if (!where.empty()) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, anchor.range.start,
+            "this function cannot be held as the callable declared here: " +
+                where +
+                ", and the declared type is the storage here, and the two "
+                "share no representation; declare the callable with the "
+                "function's own types"});
+        return value;
+      }
+    }
+  }
   if (auto unionType = mlir::dyn_cast<py::UnionType>(targetType)) {
     if (unionType.hasMember(value.type)) {
       auto op = py::UnionWrapOp::create(builder, loc(anchor), targetType,

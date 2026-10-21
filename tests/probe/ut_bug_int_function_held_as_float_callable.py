@@ -4,9 +4,10 @@
 #   prints 1.
 # KIND: バグ (bug) -- silent: raises where CPython returns
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
-# differential: expect-wrong the call raises a TypeError the program never asked for
-# CLASSIFICATION @ lang-gaps fa5c535a: 2 silent 誤実行
-#   cpython='1\n' lyc='TypeError: callable target is not available\n'
+# FIXED: 2026-10-21 -- refused at the assignment, as every other declared
+#   storage is: int and float share no representation, and converting would
+#   print 1.0. Now loud; CPython's answer needs a callable that holds either.
+# CLASSIFICATION @ lang-gaps 5d8e3215 + the fix: 3 未対応 (宣言した型が格納の型)
 # CPython 3.14 expects: 1
 from collections.abc import Callable
 

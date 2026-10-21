@@ -348,6 +348,36 @@ TEST(EmitterTest, ALargeMethodIsCalledAndASmallOneCopied) {
   EXPECT_EQ(ir.find("py.binding.ref \"" + tiny + "\""), std::string::npos);
 }
 
+// What: a function is refused where a callable of another numeric rung is
+// declared -- its result (int held as `Callable[[], float]`) or a parameter (a
+// float parameter the declaration passes an int) -- naming which; a bool result
+// held as int is accepted.
+TEST(EmitterTest, ACallableIsRefusedWhereAnotherNumericRungIsDeclared) {
+  const char *prelude = "from collections.abc import Callable\n"
+                        "def one() -> int:\n    return 1\n"
+                        "def half(x: float) -> float:\n    return x / 2\n"
+                        "def flag() -> bool:\n    return True\n";
+  ImportedModuleEmit result = emitWithImportedModules(
+      {}, std::string(prelude) + "f: Callable[[], float] = one\n");
+  EXPECT_FALSE(result.succeeded);
+  EXPECT_NE(result.diagnostics.find(
+                "main.py:8:0: emit error: this function cannot be held as the "
+                "callable declared here: its result is int and the "
+                "declaration's is float"),
+            std::string::npos)
+      << result.diagnostics;
+  ImportedModuleEmit parameter = emitWithImportedModules(
+      {}, std::string(prelude) + "h: Callable[[int], float] = half\n");
+  EXPECT_FALSE(parameter.succeeded);
+  EXPECT_NE(parameter.diagnostics.find("its parameter 1 is float and the "
+                                       "declaration passes int"),
+            std::string::npos)
+      << parameter.diagnostics;
+  ImportedModuleEmit subclass = emitWithImportedModules(
+      {}, std::string(prelude) + "b: Callable[[], int] = flag\nprint(b())\n");
+  EXPECT_TRUE(subclass.succeeded) << subclass.diagnostics;
+}
+
 TEST(EmitterTest, UnshadowedBuiltinKeepsItsFastPath) {
   mlir::MLIRContext context(testRegistry());
   std::string ir = emittedIR("print(len([1, 2, 3]))\n", context);
