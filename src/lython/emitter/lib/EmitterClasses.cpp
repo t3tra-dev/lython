@@ -1316,8 +1316,13 @@ void ModuleEmitter::collectDeclaredAncestors(llvm::StringRef cls,
     llvm::StringRef current = worklist.pop_back_val();
     auto bases = declaredClassBases.find(current);
     if (bases == declaredClassBases.end()) {
-      for (const std::string &ancestor :
-           llvm::drop_begin(manifestLinearization(current)))
+      // ⛔ Not `drop_begin(manifestLinearization(current))` in the loop
+      // header: C++17 does not extend the returned vector's life through
+      // the adaptor, and the loop read freed strings: a name past the
+      // string's inline buffer (libstdc++: every `builtins.*`) was missed,
+      // and `str(e)` printed the builtin's text.
+      auto linearization = manifestLinearization(current);
+      for (const std::string &ancestor : llvm::drop_begin(linearization))
         if (ancestor != "builtins.object")
           out.insert(ancestor);
       continue;
