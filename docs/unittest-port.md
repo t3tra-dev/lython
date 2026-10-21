@@ -65,6 +65,7 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
 | 2026-10-20 | `ut_bug_contextmanager_handler_traceback_lacks_body_frames`、`ut_bug_format_exception_only_drops_module` | A6 (トレースバック)。ジェネレータに throw する例外が、呼び出し側のハンドラが処理中の例外そのものなら、退避したフレームを戻してから raise する (CPython の `__traceback__` の上にジェネレータのフレームが積まれる形)。直すと、それまで消えていたテストのフレームが現れ、その下から前からある欠陥が 4 つ見えた。どれも直した。(1) emitter が合成した関数 (`__lygetattr$` など、CPython なら C の処理) が 1 フレームとして出ていた。展開された本体のフレームは残し、関数自身の段だけ外す。(2) 取り込んだモジュールのコードの中に展開した main のメソッドが、そのモジュールのファイル名で出ていた。(3) 1 つの関数の 2 つの `raise cls("...")` が、numeric kernel のフェーズの上流のパスのブロック併合で 1 つにされ、2 つ目がメッセージと自分のフレームを失っていた (黙った誤り)。テンソルを持たない関数は、そのフェーズの間だけ本体を外に預ける。lowering 前の正規化もブロック併合なしにした。(4) `__exit__` が投げた例外の位置が `with` の文脈式でなかった。あわせて `format_exception_only` がクラスを CPython と同じくモジュール名つきの修飾名で書くようにし、その確認の途中で、長いモジュール名の例外クラスの `__name__` と `repr` が 64 バイトで切れていたのを直した。**これで t01 と t02 が、`-v` の有無どちらでも CPython とバイト単位で一致する (初段の目標)。** |
 | 2026-10-21 | `ut_bug_explicit_base_str_calls_the_override`、`ut_bug_generator_repr_names_its_class`、`ut_bug_int_function_held_as_float_callable`、`ut_bug_class_base_named_before_its_definition`、`wb_a_methods_mutable_default_is_one_object` | その他の欠陥のうち、黙って誤る・黙って通すもの。`BaseException.__str__(e)` / `__repr__` を `args` から作る (クラスを名指しした呼び出しは仮想にしない、`int.__repr__(True)` は "1")。ジェネレータの repr を関数の qualname で出し、クラス名を `generator` にする。数値の段の違う Callable への関数の格納を、ほかの宣言した格納と同じく拒否する (変換すると 1.0 になるため)。後で定義されるクラスを基底にしたクラスを拒否する。メソッドと取り込んだモジュールの def の可変な既定値を、どこから呼んでも 1 つのオブジェクトにする (取り込んだ関数の既定値も呼ぶたびに新しかった)。 |
 | 2026-10-21 | `ut_bug_return_list_of_base_from_subclass_display`、`ut_bug_generic_class_built_from_type_parameter`、`ut_bug_unreachable_yield_still_makes_a_generator`、`ut_bug_qualified_generator_type_annotation`、`ut_bug_generator_method_fixed_tuple_argument`、`ut_bug_object_lambda_into_container_method`、`ut_bug_union_of_exceptions_into_exception_parameter`、`ut_bug_object_in_str`、`ut_bug_print_of_an_optional_class_value`、`ut_bug_generic_call_mixing_int_and_float` | その他の欠陥のうち、正しいコードの拒否。返す表示を要素ごとに判定する。未解決のジェネリッククラスを不一致と読まない。yield が残らない本体もジェネレータにする。モジュール名付きの添字つき注釈を解く。ジェネレータメソッドの引数を引数の型で出す。組み込みのメソッドに渡すラムダと union を引数の型で型付けする。例外の union を、枝ごとに unwrap してから基底に上げる。`object in str` を実行時に判定する。クラス値を含む union を文字列にする。型パラメータを 2 つの型で束縛すると union にする。 |
+| 2026-10-22 | (なし: 試作を CPython と同じモジュール構成のパッケージに分けて出た欠陥) | B1 (埋め込み)。試作を `src/lython/runtime/lib/unittest/` の `__init__`・`case`・`result`・`suite`・`loader`・`runner`・`main`・`util` に分け、CPython と同じ名前と引数の並びにした (`main = TestProgram`、`TextTestRunner(stream=..., resultclass=...)`、`TestResult.__init__(stream, descriptions, verbosity)` など)。埋め込みがディレクトリをパッケージとして扱い、互いに import するモジュール (`case` と `result`) を受けるようにした。分けたことで、単一モジュールの試作では見えなかった欠陥が出た。黙って誤るもの: 相対 import で書いた基底のサブクラスのメソッドが呼ばれない、macOS の大文字小文字を区別しない FS で `from rb import Base` が `rb/base.py` をもう一度読む、`BaseTestSuite.__call__` に入れ子のスイートから戻ると基底の `run` が走る (クラスの fixture が呼ばれない)、`"%d" % "x"` が ValueError になる、別モジュールのクラスの `type[Base] \| None` フィールドに main のサブクラスを入れると None に読める、`StringIO \| TextIOWrapper` が TextIOWrapper のフィールドに読み替えられる。拒否されていたもの: モジュール越しの型エイリアス (`m.Pair`)、クラス属性に入れたクラスの `self.x(...)` 呼び出し、`Optional` な callable フィールドの呼び出し、`if x is None: x = ...` の後の 3 要素の union、長さの決まらないタプルの連結と `%`、`list(filter(入れ子の関数, ...))`、protocol 型引数の不変な既定値、別モジュールのクラス値のキーワード呼び出し、ループのある引数でのフィールドのリストへの append、取り込んだモジュールの `assert`、`sys.exc_info()` を呼ぶ埋め込みモジュール。t01 と t02 は、試作を CPython で動かした出力と `-v` の有無どちらでもバイト単位で一致し、AOT も JIT と一致する。本物の CPython の unittest との差は、記録済みの逸脱 (`assertRaisesCall`、ラッパーの docstring、difflib の差分) だけ。 |
 
 2026-10-21 時点で、その他の欠陥のうち残るものは次のとおり。いずれも仕組みを作る必要がある。
 
@@ -73,6 +74,13 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
 - `ut_bug_union_dispatch_then_narrow_ownership` (遅い拒否): 所有権検証。
 - 今回見つけたもの: `ut_bug_bool_function_held_as_int_callable_in_a_function` (関数のローカルで lowering が落ちる)、`ut_bug_generator_method_int_into_float_parameter` (ジェネレータメソッドが引数の段で特殊化されない)。
 - 既知の違い: 取り込んだモジュールの初期化が、main モジュールの import より前の文より先に走る。
+
+2026-10-22 のパッケージ化で見つけて、まだ直していないもの。
+
+- (黙って) 取り込んだモジュールの、注釈のない、リテラルでない module レベルの代入 (`Y = [c.X[5], 5]`) は、読まれなければ実行されない。CPython が import で投げる IndexError が出ない。
+- 互いに import するモジュールの、初期化前の global を読むと CPython の AttributeError (partially initialized module) ではなく RuntimeError になる (どちらも止まる)。
+- main のクラスのメソッド本体を、取り込んだモジュールの中で展開すると、main の global の別名 (`_S = stream`) が `object` に読める (拒否される)。
+- union の 1 つの要素にない属性の読みが、emit ではなく lowering で `loc(...)` 付きの文で拒否される。
 
 進捗の途中で決めたこと・見つけたこと:
 
@@ -443,9 +451,9 @@ CPython も自分のインタプリタでテストを動かしているので、
 
 ### B. unittest を標準ライブラリにして、テストを ctest から走らせる
 
-1. **埋め込み**。`src/lython/runtime/lib/unittest.py` として埋め込む。
-   埋め込みの glob は平らなので、まずは 1 つのモジュールにする
-   (CPython はパッケージ)。
+1. **埋め込み** (済、2026-10-22)。CPython と同じく `src/lython/runtime/lib/unittest/`
+   のパッケージとして埋め込む。埋め込みはディレクトリをパッケージとして扱い、
+   互いに import するモジュールを受ける。
 2. **テストクラスの発見** (済)。`type.__subclasses__()` を静的に答え
    (`ut_unsupported_subclasses`)、試作の `unittest.main()` は `__main__` で定義された
    TestCase のサブクラスを引数なしで見つける。
