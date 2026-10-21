@@ -103,6 +103,30 @@ computeMro(mlir::Operation *from, llvm::StringRef name,
 
 } // namespace
 
+namespace {
+thread_local mlir::SymbolTableCollection *activeSymbolTables = nullptr;
+thread_local ScopedClassIndex *activeClassIndex = nullptr;
+} // namespace
+
+ScopedClassIndex::ScopedClassIndex(mlir::Operation *table)
+    : table(table), saved(activeClassIndex) {
+  for (mlir::Region &region : table->getRegions())
+    for (mlir::Block &block : region)
+      for (mlir::Operation &op : block)
+        if (auto classOp = mlir::dyn_cast<ClassOp>(op))
+          classes.try_emplace(classOp.getSymNameAttr(), classOp);
+  activeClassIndex = this;
+}
+
+ScopedClassIndex::~ScopedClassIndex() { activeClassIndex = saved; }
+
+ScopedSymbolTables::ScopedSymbolTables(mlir::SymbolTableCollection &tables)
+    : saved(activeSymbolTables) {
+  activeSymbolTables = &tables;
+}
+
+ScopedSymbolTables::~ScopedSymbolTables() { activeSymbolTables = saved; }
+
 ClassOp lookup(mlir::Operation *from, llvm::StringRef name) {
   if (!from || name.empty())
     return nullptr;
@@ -110,8 +134,16 @@ ClassOp lookup(mlir::Operation *from, llvm::StringRef name) {
   for (mlir::Operation *table = from; table; table = table->getParentOp()) {
     if (!table->hasTrait<mlir::OpTrait::SymbolTable>())
       continue;
+    if (activeClassIndex && activeClassIndex->table == table) {
+      if (auto found = activeClassIndex->classes.find(symbolName);
+          found != activeClassIndex->classes.end())
+        return found->second;
+      continue;
+    }
     mlir::Operation *symbol =
-        mlir::SymbolTable::lookupSymbolIn(table, symbolName);
+        activeSymbolTables
+            ? activeSymbolTables->lookupSymbolIn(table, symbolName)
+            : mlir::SymbolTable::lookupSymbolIn(table, symbolName);
     if (auto classOp = mlir::dyn_cast_or_null<ClassOp>(symbol))
       return classOp;
   }

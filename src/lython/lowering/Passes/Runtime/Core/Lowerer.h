@@ -165,6 +165,9 @@ private:
   mlir::FailureOr<llvm::SmallVector<std::string, 8>>
   runtimeClassesForNominalTarget(mlir::Operation *op,
                                  mlir::Type targetType) const;
+  // Its answers: the classes are erased only after everything that asks.
+  mutable llvm::DenseMap<mlir::Type, llvm::SmallVector<std::string, 8>>
+      nominalTargetClasses;
   bool classDefinesMethod(mlir::Type type, llvm::StringRef name) const;
   std::optional<std::string> classMethodSymbol(py::ClassOp classOp,
                                                llvm::StringRef name) const;

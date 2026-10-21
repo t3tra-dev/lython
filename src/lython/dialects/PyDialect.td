@@ -1143,7 +1143,7 @@ def Py_TypeSubclassOp : Py_Op<"type.subclass", [Pure]> {
       "`(` $sub `,` $base `)` attr-dict `:` type($sub) `,` type($base)";
 }
 
-def Py_ClassUpcastOp : Py_Op<"class.upcast", []> {
+def Py_ClassUpcastOp : Py_Op<"class.upcast", [DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
   let summary = "View a class value as one of its nominal base classes";
   let description = [{
     Alias-preserving nominal upcast. The input and result are the same runtime
@@ -1160,7 +1160,7 @@ def Py_ClassUpcastOp : Py_Op<"class.upcast", []> {
   let hasVerifier = 1;
 }
 
-def Py_ClassRefineOp : Py_Op<"class.refine", []> {
+def Py_ClassRefineOp : Py_Op<"class.refine", [DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
   let summary = "View a class value as a proven runtime subclass";
   let description = [{
     Alias-preserving checked-view refinement. The operation performs no runtime

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "llvm/ADT/DenseMap.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/SmallVector.h"
@@ -17,6 +19,39 @@ inline constexpr llvm::StringLiteral kBaseException = "BaseException";
 inline constexpr llvm::StringLiteral kException = "Exception";
 
 ClassOp lookup(mlir::Operation *from, llvm::StringRef name);
+// While alive, `lookup` on this thread resolves names through `tables`
+// instead of walking each enclosing symbol table's operations.
+// ⛔ Only where nothing adds or erases a symbol meanwhile -- an op's
+// `verifySymbolUses`, whose collection the module's verification builds --
+// since the collection is not told of either.
+// While alive, `lookup` on this thread answers for `table` from an index of
+// its `py.class` ops taken here.
+// ⛔ Only while no `py.class` is added to or erased from `table`: runtime
+// lowering, which erases them once it is done with them, ends the scope first.
+class ScopedClassIndex {
+public:
+  explicit ScopedClassIndex(mlir::Operation *table);
+  ~ScopedClassIndex();
+  ScopedClassIndex(const ScopedClassIndex &) = delete;
+  ScopedClassIndex &operator=(const ScopedClassIndex &) = delete;
+
+  mlir::Operation *table;
+  llvm::DenseMap<mlir::StringAttr, ClassOp> classes;
+
+private:
+  ScopedClassIndex *saved;
+};
+
+class ScopedSymbolTables {
+public:
+  explicit ScopedSymbolTables(mlir::SymbolTableCollection &tables);
+  ~ScopedSymbolTables();
+  ScopedSymbolTables(const ScopedSymbolTables &) = delete;
+  ScopedSymbolTables &operator=(const ScopedSymbolTables &) = delete;
+
+private:
+  mlir::SymbolTableCollection *saved;
+};
 mlir::FailureOr<llvm::SmallVector<llvm::StringRef, 8>>
 mroNames(mlir::Operation *from, llvm::StringRef name);
 mlir::LogicalResult verifyBases(ClassOp op);

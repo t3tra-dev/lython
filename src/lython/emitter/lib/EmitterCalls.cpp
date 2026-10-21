@@ -4723,10 +4723,10 @@ std::vector<parser::NodePtr> ModuleEmitter::computedGetattrBody(
     return out;
   };
   auto callArm = [&](llvm::StringRef name) {
-    return synth::returnStmt(
-        synth::call(synth::attribute(receiver(), name, range), forwarded(),
-                    range),
-        range);
+    parser::NodePtr call = synth::call(
+        synth::attribute(receiver(), name, range), forwarded(), range);
+    dispatcherArmCalls.insert(call.get());
+    return synth::returnStmt(std::move(call), range);
   };
   auto qualname = [&](llvm::StringRef definingClass, llvm::StringRef name) {
     return py::contracts::pythonQualnameForContract(definingClass) + "." +
@@ -5021,6 +5021,35 @@ ModuleEmitter::emitComputedDocRead(const parser::Node &expr,
   }
   mlir::Type receiverType =
       types.widenLiteral(types.inferExpr(receiverNode.get()));
+  // ⭐ ONE DISPATCHER FOR A CLASS AND ITS SUBCLASSES: the base's already asks
+  // `isinstance` for every name a subclass declares. unittest reads the
+  // docstring in `TestCase.__init__`, which is copied into each class's
+  // construction, and each test class cost a dispatcher of every name a
+  // TestCase answers.
+  // ⛔ Not an ancestor with a subclass declared after this read: its
+  // dispatcher would be refused where the receiver's own is not.
+  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(receiverType);
+      contract && declaredClassNodes.count(contract.getContractName()))
+    for (const std::string &ancestor :
+         llvm::reverse(classMro(contract.getContractName()))) {
+      if (ancestor == contract.getContractName())
+        break;
+      if (!declaredClassNodes.count(ancestor) ||
+          namedTupleContracts.count(ancestor) || enumClasses.count(ancestor))
+        continue;
+      llvm::SmallVector<std::string, 8> below = programSubclassesOf(ancestor);
+      if (!llvm::is_contained(below, contract.getContractName().str()) ||
+          !llvm::all_of(below, [&](const std::string &member) {
+            return static_cast<bool>(
+                types.lookupClass(member).value_or(mlir::Type()));
+          }))
+        continue;
+      if (mlir::Type ancestorType =
+              types.lookupClass(ancestor).value_or(mlir::Type())) {
+        receiverType = ancestorType;
+        break;
+      }
+    }
   std::optional<llvm::SmallVector<std::string, 8>> hierarchy =
       computedLookupHierarchy(expr, "getattr(...).__doc__", receiverType);
   if (!hierarchy)

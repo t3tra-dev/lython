@@ -644,6 +644,15 @@ mlir::LogicalResult ClassUpcastOp::verify() {
       mlir::failed(
           requireContractTerm(getOperation(), getResult().getType(), "result")))
     return mlir::failure();
+  return mlir::success();
+}
+
+// ⛔ Not in `verify`: the hierarchy is read by symbol, and there each read
+// walked the module's operations -- after runtime import, thousands per
+// upcast, on every verification of every pass.
+mlir::LogicalResult
+ClassUpcastOp::verifySymbolUses(mlir::SymbolTableCollection &tables) {
+  type_object::ScopedSymbolTables scope(tables);
   return verifyNominalSubclass(getOperation(), getInput().getType(),
                                getResult().getType(), "class upcast");
 }
@@ -654,6 +663,12 @@ mlir::LogicalResult ClassRefineOp::verify() {
       mlir::failed(
           requireContractTerm(getOperation(), getResult().getType(), "result")))
     return mlir::failure();
+  return mlir::success();
+}
+
+mlir::LogicalResult
+ClassRefineOp::verifySymbolUses(mlir::SymbolTableCollection &tables) {
+  type_object::ScopedSymbolTables scope(tables);
   return verifyNominalSubclass(getOperation(), getResult().getType(),
                                getInput().getType(), "class refine");
 }

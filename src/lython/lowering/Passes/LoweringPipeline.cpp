@@ -803,6 +803,20 @@ LogicalResult runLoweringPipeline(ModuleOp module,
       PerfScope perf("lowering.collect-final-safety-contracts");
       collectLoweredSafetyContracts(module, finalSafetyContracts);
     }
+    // ⛔ The vector and SME passes only where there is something for them: a
+    // program with no matrix work still paid for each of them over every
+    // function, a third of this phase for a unittest file.
+    bool vectorWork = false;
+    module.walk([&](Operation *op) {
+      llvm::StringRef dialect = op->getName().getDialectNamespace();
+      if (dialect == "vector" || dialect == "arm_sme" ||
+          dialect == "arm_neon" || dialect == "x86vector" ||
+          dialect == "amx") {
+        vectorWork = true;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
     if (failed(runPhase("convert-to-llvm", [&](PassManager &pm) {
           mlir::ConvertVectorToLLVMPassOptions vectorOptions;
           vectorOptions.reassociateFPReductions = true;
@@ -813,23 +827,35 @@ LogicalResult runLoweringPipeline(ModuleOp module,
           stridedForms.addPass(mlir::createLowerAffinePass());
           stridedForms.addPass(mlir::memref::createExpandStridedMetadataPass());
           stridedForms.addPass(mlir::createLowerAffinePass());
+          // ⛔ The SME pipelines' canonicalize and CSE are kept without
+          // vector work: they lay out the blocks of every function.
           if (tensorTarget.usesArmSME())
             lowering::arch::arm::addSMEPreControlFlowLLVMPrepPipeline(
-                pm, pm.getContext());
-          pm.addNestedPass<mlir::func::FuncOp>(
-              mlir::vector::createLowerVectorMultiReductionPass(
-                  mlir::vector::VectorMultiReductionLowering::InnerReduction));
-          OpPassManager &vectorLoops = eachIsolatedChild(pm, pm.getContext());
-          vectorLoops.addPass(mlir::createConvertVectorToSCFPass(transferOptions));
-          vectorLoops.addPass(mlir::createLowerAffinePass());
-          vectorLoops.addPass(createEHSafeCanonicalizerPass());
-          // ⛔ Module-wide: `vector.print` declares printf in the module.
-          pm.addPass(mlir::createConvertVectorToLLVMPass(vectorOptions));
+                pm, pm.getContext(), vectorWork);
+          if (vectorWork) {
+            pm.addNestedPass<mlir::func::FuncOp>(
+                mlir::vector::createLowerVectorMultiReductionPass(
+                    mlir::vector::VectorMultiReductionLowering::
+                        InnerReduction));
+            OpPassManager &vectorLoops =
+                eachIsolatedChild(pm, pm.getContext());
+            vectorLoops.addPass(
+                mlir::createConvertVectorToSCFPass(transferOptions));
+            vectorLoops.addPass(mlir::createLowerAffinePass());
+            vectorLoops.addPass(createEHSafeCanonicalizerPass());
+            // ⛔ Module-wide: `vector.print` declares printf in the module.
+            pm.addPass(mlir::createConvertVectorToLLVMPass(vectorOptions));
+          } else {
+            // ⛔ Not dropped with the vector passes: it also folds the
+            // `scf.if`s SCFToControlFlow then lays out.
+            eachIsolatedChild(pm, pm.getContext())
+                .addPass(createEHSafeCanonicalizerPass());
+          }
           eachIsolatedChild(pm, pm.getContext())
               .addPass(mlir::createSCFToControlFlowPass());
           if (tensorTarget.usesArmSME())
             lowering::arch::arm::addSMEPostControlFlowLLVMPrepPipeline(
-                pm, pm.getContext());
+                pm, pm.getContext(), vectorWork);
           OpPassManager &scalars = eachIsolatedChild(pm, pm.getContext());
           scalars.addPass(mlir::createArithToLLVMConversionPass());
           scalars.addPass(mlir::createUBToLLVMConversionPass());

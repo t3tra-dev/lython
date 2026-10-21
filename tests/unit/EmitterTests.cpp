@@ -2077,10 +2077,10 @@ TEST(EmitterTest, AClassValueIsStoredOnlyWhereItsBaseIsDeclared) {
   EXPECT_TRUE(accepted.ok());
 }
 
-// What: a generic method is specialized where it is called, so the two uses
-// that have no call -- the method calling itself, and the method read as a
-// value -- are refused at emit with a sentence that says why, and an ordinary
-// call compiles.
+// What: a generic method has a body only where a call solves it, so the
+// method read as a value is refused at emit with a sentence that says why;
+// an ordinary call compiles, and so does the method calling itself, which is
+// a call of the body its solution already has.
 TEST(EmitterTest, AGenericMethodHasABodyOnlyWhereItIsCalled) {
   struct Case {
     const char *source;
@@ -2088,13 +2088,6 @@ TEST(EmitterTest, AGenericMethodHasABodyOnlyWhereItIsCalled) {
   };
   for (const Case &shape :
        {Case{"class C:\n"
-             "    def count[T](self, xs: list[T], i: int) -> int:\n"
-             "        if i == len(xs):\n"
-             "            return 0\n"
-             "        return 1 + self.count(xs, i + 1)\n"
-             "print(C().count([1, 2], 0))\n",
-             "the generic method 'count' calls itself"},
-        Case{"class C:\n"
              "    def show[T](self, x: T) -> str:\n"
              "        return repr(x)\n"
              "m = C().show\n",
@@ -2114,7 +2107,11 @@ TEST(EmitterTest, AGenericMethodHasABodyOnlyWhereItIsCalled) {
       "class C:\n"
       "    def same[T](self, a: T, b: T) -> bool:\n"
       "        return a == b\n"
-      "print(C().same(1, 1), C().same(\"a\", \"b\"))\n",
+      "    def count[T](self, xs: list[T], i: int) -> int:\n"
+      "        if i == len(xs):\n"
+      "            return 0\n"
+      "        return 1 + self.count(xs, i + 1)\n"
+      "print(C().same(1, 1), C().same(\"a\", \"b\"), C().count([1, 2], 0))\n",
       called);
   EXPECT_TRUE(accepted.ok());
 }
