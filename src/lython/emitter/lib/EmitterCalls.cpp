@@ -2483,12 +2483,13 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                 !mlir::isa<py::TypeType>(receiver.type)) {
               Value callee =
                   emitBindingRef(*calleeNode, method->symbolName, directCallable);
-              CallOperands operands = emitCallOperands(expr);
-              operands.positional.insert(operands.positional.begin(), receiver);
-              operands.positionalTypes.insert(operands.positionalTypes.begin(),
-                                              receiver.type);
-              operands.positionalUnpacked.insert(
-                  operands.positionalUnpacked.begin(), 0);
+              // The arguments are emitted at the parameters' types, as any
+              // call's are: a tuple display passed to `xs: tuple[int, ...]`
+              // is built homogeneous, and its fixed-length type matched no
+              // signature here.
+              CallOperands operands =
+                  emitCallOperands(expr, {receiver},
+                                   /*includeAstArguments=*/true, directCallable);
               return emitCallableDispatch(expr, callee, operands);
             }
             return emitCallableDispatch(

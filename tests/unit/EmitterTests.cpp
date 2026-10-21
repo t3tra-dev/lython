@@ -451,6 +451,22 @@ TEST(EmitterTest, ADottedGenericAnnotationTakesItsArguments) {
       << ir;
 }
 
+// What: a tuple display is passed to a generator method's `tuple[int, ...]`
+// parameter, and a list of subclass instances to its `list[Base]` one.
+TEST(EmitterTest, AGeneratorMethodTakesArgumentsAtItsParameterTypes) {
+  ImportedModuleEmit result = emitWithImportedModules(
+      {}, "from collections.abc import Iterator\n"
+          "class Base:\n    pass\n"
+          "class Sub(Base):\n    pass\n"
+          "class G:\n"
+          "    def walk(self, xs: tuple[int, ...]) -> Iterator[int]:\n"
+          "        for x in xs:\n            yield x\n"
+          "    def each(self, bs: list[Base]) -> Iterator[Base]:\n"
+          "        for b in bs:\n            yield b\n"
+          "print(list(G().walk((1, 2, 3))), len(list(G().each([Sub()]))))\n");
+  EXPECT_TRUE(result.succeeded) << result.diagnostics;
+}
+
 TEST(EmitterTest, UnshadowedBuiltinKeepsItsFastPath) {
   mlir::MLIRContext context(testRegistry());
   std::string ir = emittedIR("print(len([1, 2, 3]))\n", context);
