@@ -81,6 +81,8 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
 - 互いに import するモジュールの、初期化前の global を読むと CPython の AttributeError (partially initialized module) ではなく RuntimeError になる (どちらも止まる)。
 - main のクラスのメソッド本体を、取り込んだモジュールの中で展開すると、main の global の別名 (`_S = stream`) が `object` に読める (拒否される)。
 - union の 1 つの要素にない属性の読みが、emit ではなく lowering で `loc(...)` 付きの文で拒否される。
+- ジェネレータ (`map(...)`、ジェネレータ式) を `Iterable[T]` 引数に渡せない (拒否)。loader は CPython の `map(testCaseClass, names)` のかわりにリストを渡す。
+- union の値への `is` が拒否される。
 
 進捗の途中で決めたこと・見つけたこと:
 
@@ -457,9 +459,17 @@ CPython も自分のインタプリタでテストを動かしているので、
 2. **テストクラスの発見** (済)。`type.__subclasses__()` を静的に答え
    (`ut_unsupported_subclasses`)、試作の `unittest.main()` は `__main__` で定義された
    TestCase のサブクラスを引数なしで見つける。
-3. **ctest への登録**。`tests/python/test_*.py` を 1 ファイル 1 テストで登録し、
-   `lyc jit` の終了コードで判定する。同じファイルを CPython でも走らせる段を
-   置く。
+3. **ctest への登録** (済、2026-10-22)。`tests/python/test_*.py` を 1 ファイル
+   1 テストで登録し (`python.<name>`、`e2e python`)、`lyc jit` の終了コードで
+   判定する。同じファイルを CPython 3.14 でも走らせる (`python.<name>.cpython`、
+   `meta fast python`)。最初の 2 本は unittest 自身のテスト
+   (`test_unittest_assertions.py`: 失敗メッセージを CPython の文と比べる、
+   `test_unittest_runner.py`: 結果の記録、fixture の順、subTest、説明文、
+   ランナーの出力)。書いている途中で 4 つの欠陥が出た: 空のコンテナを型引数の
+   解に使っていた (総称関数は lowering で落ち、総称メソッドは拒否)、`list[Sub]` を
+   展開したコンストラクタの `Iterable[Base | Other]` 引数に渡せなかった、
+   取り込んだモジュールでデコレートしたメソッドの `__doc__` を読めなかった
+   (実行時の TypeError)、そして下の未対応。
 4. **コンパイル時間**。1 ファイル約 5 秒のうち 3.3 秒が lowering。unittest
    本体の大半はテストファイルによらず同じなので、ファイルあたりの費用を
    `LYTHON_PERF=1` の内訳から詰める。

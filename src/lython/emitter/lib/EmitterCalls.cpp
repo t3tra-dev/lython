@@ -3580,9 +3580,50 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
         parser::Diagnostic{parser::Severity::Error, expr.range.start, reason});
     return emitNone(expr);
   }
-  CallInferenceResult inference = types.inferCallWithEvidence(
-      generic.signature.publicCallable, operands.positionalTypes,
-      operands.keywordTypes);
+  // An empty container literal is solved as nothing (emptyLiteralSolvingType)
+  // and adopts what its parameter became below.
+  // ⛔ Unless that leaves T unsolved or names the marker (`same([], [])`):
+  // then it is solved as it was emitted, `list[object]`.
+  std::optional<EmptyLiteralArguments> emptyLiterals =
+      operands.dynamicTail || operands.dynamicMapping
+          ? std::nullopt
+          : emptyLiteralArgumentsOf(expr);
+  if (emptyLiterals &&
+      emptyLiterals->positional.size() != operands.positionalTypes.size())
+    emptyLiterals.reset();
+  CallInferenceResult inference;
+  if (emptyLiterals) {
+    llvm::SmallVector<mlir::Type, 8> solvingTypes(operands.positionalTypes);
+    llvm::SmallVector<CallKeywordType, 4> solvingKeywords(
+        operands.keywordTypes.begin(), operands.keywordTypes.end());
+    bool marked = false;
+    for (auto [index, type] : llvm::enumerate(solvingTypes))
+      if (emptyLiterals->positional[index])
+        if (mlir::Type marker = emptyLiteralSolvingType(type, types)) {
+          type = marker;
+          marked = true;
+        }
+    for (CallKeywordType &keyword : solvingKeywords)
+      if (emptyLiterals->keywords.contains(keyword.name))
+        if (mlir::Type marker = emptyLiteralSolvingType(keyword.type, types)) {
+          keyword.type = marker;
+          marked = true;
+        }
+    if (marked) {
+      inference = types.inferCallWithEvidence(generic.signature.publicCallable,
+                                              solvingTypes, solvingKeywords);
+      if (inference &&
+          (mentionsEmptyLiteralMarker(inference.resultType) ||
+           mentionsEmptyLiteralMarker(inference.evidence.callableContract)))
+        inference = CallInferenceResult();
+    }
+    if (!inference)
+      emptyLiterals.reset();
+  }
+  if (!inference)
+    inference = types.inferCallWithEvidence(generic.signature.publicCallable,
+                                            operands.positionalTypes,
+                                            operands.keywordTypes);
   if (!inference && generic.node && !operands.dynamicTail) {
     llvm::SmallVector<CallKeywordType, 2> defaults = omittedDefaultArgumentTypes(
         *generic.node, generic.signature,
@@ -3672,6 +3713,14 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
                                   shape ? &*shape : nullptr);
   if (!specialization)
     return emitNone(expr);
+  llvm::ArrayRef<mlir::Type> parameterTypes =
+      specialization->second.getPositionalTypes();
+  for (auto [index, argument] : llvm::enumerate(operands.positional))
+    if (emptyLiterals && emptyLiterals->positional[index] &&
+        index < parameterTypes.size()) {
+      argument = adoptDeclaredContainer(argument, parameterTypes[index], expr);
+      operands.positionalTypes[index] = argument.type;
+    }
   Value callee = emitBindingRef(calleeNode, specialization->first,
                                 specialization->second);
   return emitCallableDispatch(expr, callee, operands);

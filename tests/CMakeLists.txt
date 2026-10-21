@@ -267,6 +267,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AnIntOrFloatAContainerOnlyStoresGoesInAsItsSlotWord"
     "DriverTest.ALibrarysModuleAliasIsNotTheProgramsName"
     "DriverTest.AFinalizerOnAnExceptionClassIsRefused"
+    "DriverTest.AListOfObjectIsNotSolvedAsAnEmptyLiteral"
     "DriverTest.AnImportedModuleKeepsCallablesInAContainer"
     "DriverTest.AClosureCallsACapturedCallableReturningAnOptional"
     "DriverTest.ACallableOfAnyArgumentsTakesAFunctionWithParameters"
@@ -535,6 +536,39 @@ foreach(case_path IN LISTS LYTHON_GOLDEN_CASES)
         set(case_timeout 300)
     endif()
     lython_add_golden_case(cases "${case_path}" ${case_timeout})
+endforeach()
+
+# --- Python unittest files ----------------------------------------------------
+#
+# tests/python/test_*.py are unittest modules, written the way CPython's
+# Lib/test is: each one is compiled and run by lyc (`python.<name>`), and the
+# exit status `unittest.main()` gives is the verdict. The same file is run by
+# CPython 3.14 as well (`python.<name>.cpython`), so what a test expects is what
+# CPython does -- the step a golden's `.stdout` took on trust.
+#
+# ⛔ Not CPython below 3.14: the files are typed the way Lython reads them, and
+# an annotation naming a class declared further down is only lazy there.
+# ⛔ PYTHONDONTWRITEBYTECODE: CPython would leave __pycache__ in the source
+# tree for each helper module a test imports.
+file(GLOB LYTHON_PYTHON_TESTS CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/python/test_*.py")
+foreach(test_path IN LISTS LYTHON_PYTHON_TESTS)
+    get_filename_component(test_name "${test_path}" NAME_WE)
+    add_test(NAME "python.${test_name}"
+        COMMAND $<TARGET_FILE:lyc> jit "${test_path}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/python")
+    set_tests_properties("python.${test_name}" PROPERTIES
+        TIMEOUT 300
+        LABELS "e2e;python")
+    if(Python3_VERSION VERSION_GREATER_EQUAL 3.14)
+        add_test(NAME "python.${test_name}.cpython"
+            COMMAND Python3::Interpreter "${test_path}"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/python")
+        set_tests_properties("python.${test_name}.cpython" PROPERTIES
+            TIMEOUT 120
+            ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1"
+            LABELS "meta;fast;python")
+    endif()
 endforeach()
 
 # --- Precompiled native runtime ----------------------------------------------

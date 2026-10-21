@@ -410,6 +410,62 @@ bool isNoneTypeLike(mlir::Type type) {
   return false;
 }
 
+bool isErasedEmptyContainerType(mlir::Type type, TypeSystem &types) {
+  auto contract =
+      mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(type));
+  if (!contract || contract.getArguments().empty())
+    return false;
+  llvm::StringRef name = contract.getContractName();
+  if (name != "builtins.list" && name != "builtins.dict" &&
+      name != "builtins.set")
+    return false;
+  return llvm::all_of(contract.getArguments(), [](mlir::Type argument) {
+    return py::isPyObjectType(argument);
+  });
+}
+
+mlir::Type emptyLiteralSolvingType(mlir::Type type, TypeSystem &types) {
+  if (!isErasedEmptyContainerType(type, types))
+    return {};
+  auto contract =
+      mlir::cast<py::ContractType>(types.widenLiteral(type));
+  llvm::SmallVector<mlir::Type, 2> marked(
+      contract.getArguments().size(),
+      types.contract("__ly.empty_literal"));
+  return types.contract(contract.getContractName(), marked);
+}
+
+bool mentionsEmptyLiteralMarker(mlir::Type type) {
+  if (!type)
+    return false;
+  std::string printed;
+  llvm::raw_string_ostream os(printed);
+  type.print(os);
+  return llvm::StringRef(printed).contains("__ly.empty_literal");
+}
+
+std::optional<EmptyLiteralArguments>
+emptyLiteralArgumentsOf(const parser::Node &call) {
+  if (call.kind != "Call")
+    return std::nullopt;
+  EmptyLiteralArguments out;
+  if (const auto *args = ast::nodeList(call, "args"))
+    for (const parser::NodePtr &arg : *args) {
+      if (!arg || arg->kind == "Starred")
+        return std::nullopt;
+      out.positional.push_back(isEmptyContainerExpression(arg.get()));
+    }
+  if (const auto *keywords = ast::nodeList(call, "keywords"))
+    for (const parser::NodePtr &keyword : *keywords) {
+      std::optional<llvm::StringRef> name = ast::string(*keyword, "arg");
+      if (!name)
+        return std::nullopt;
+      if (isEmptyContainerExpression(ast::node(*keyword, "value")))
+        out.keywords.insert(*name);
+    }
+  return out;
+}
+
 mlir::Type removeNoneFromType(mlir::Type type, TypeSystem &types) {
   if (!type || isNoneTypeLike(type))
     return {};

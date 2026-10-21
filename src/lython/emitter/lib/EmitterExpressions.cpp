@@ -4601,6 +4601,13 @@ Value ModuleEmitter::emitExprExpected(const parser::Node *expr,
                                       mlir::Type expected) {
   if (!expr || !expected)
     return emitExpr(expr);
+  // ⛔ Not an empty container under an expectation that still names a type
+  // parameter: `[]` passed to `into: list[T]` became a `list[T]` value, which
+  // no specialization's `list[str]` accepts. Erased, it is solved as nothing
+  // and adopts what T became.
+  if (isEmptyContainerExpression(expr) &&
+      unboundStaticParameterCount(expected) != 0)
+    return emitExpr(expr);
   if (expr->kind == "Lambda")
     if (auto expectedCallable =
             mlir::dyn_cast_if_present<py::CallableType>(expected))

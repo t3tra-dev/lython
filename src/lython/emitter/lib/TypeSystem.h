@@ -357,6 +357,10 @@ public:
   // scope happened to demand it made the name unresolvable from the next one
   // ("unresolved name '__lyvdisp$2'" from a method object taken inside a loop).
   void bindRootSymbol(llvm::StringRef name, mlir::Type type);
+  // `bindCanonicalSymbol` outside every scope: a name the module's own scope
+  // reads wherever it is asked from (a reserved one; no source name is).
+  void bindRootCanonicalSymbol(llvm::StringRef name, llvm::StringRef canonical,
+                               mlir::Type type);
   void bindCanonicalSymbol(llvm::StringRef name, llvm::StringRef canonical,
                            mlir::Type type);
   std::optional<mlir::Type> lookupSymbol(llvm::StringRef name) const;

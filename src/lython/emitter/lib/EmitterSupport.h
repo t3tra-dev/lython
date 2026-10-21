@@ -85,6 +85,24 @@ bool isNoneTypeLike(mlir::Type type);
 // region-bound name gets, and the union a `None` seed takes.
 bool containsNameLoad(const parser::Node *node, llvm::StringRef name);
 mlir::Type removeNoneFromType(mlir::Type type, TypeSystem &types);
+// A list, dict or set whose every element type is `object`: what an empty
+// literal is before anything says what it holds.
+bool isErasedEmptyContainerType(mlir::Type type, TypeSystem &types);
+// The type an empty container LITERAL argument is solved with: its kind with
+// every element `__ly.empty_literal`, which the solver lets bind nothing
+// (TypeConstraintSolver's erasedEmptyContainer). Null when `type` is not an
+// erased container.
+mlir::Type emptyLiteralSolvingType(mlir::Type type, TypeSystem &types);
+bool mentionsEmptyLiteralMarker(mlir::Type type);
+// Per positional argument of `call`, and per keyword name, whether the
+// argument is an empty container literal (`[]`, `{}`, `set()`); nothing when
+// a `*` or `**` argument leaves the positions unknown.
+struct EmptyLiteralArguments {
+  llvm::SmallVector<char, 8> positional;
+  llvm::StringSet<> keywords;
+};
+std::optional<EmptyLiteralArguments>
+emptyLiteralArgumentsOf(const parser::Node &call);
 
 struct NoneComparisonNarrowing {
   std::string name;

@@ -26,7 +26,9 @@ class TestLoader(object):
             testCaseNames = self.getTestCaseNames(testCaseClass)
             if not testCaseNames and hasattr(testCaseClass, 'runTest'):
                 testCaseNames = ['runTest']
-        loaded_suite = suite.TestSuite(map(testCaseClass, testCaseNames))
+        # A list where CPython hands over `map(testCaseClass, ...)`: a
+        # generator is not yet passed to an `Iterable` parameter here.
+        loaded_suite = suite.TestSuite([testCaseClass(name) for name in testCaseNames])
         return loaded_suite
 
     def loadTestsFromModule(self, module: str, *, pattern: str | None = None) -> suite.TestSuite:
