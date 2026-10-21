@@ -41,9 +41,11 @@ void addSMELinalgPipeline(mlir::OpPassManager &pipeline,
                           mlir::MLIRContext *context);
 
 void addSMEPreControlFlowLLVMPrepPipeline(mlir::OpPassManager &pipeline,
-                                          mlir::MLIRContext *context);
+                                          mlir::MLIRContext *context,
+                                          bool vectorWork = true);
 
 void addSMEPostControlFlowLLVMPrepPipeline(mlir::OpPassManager &pipeline,
-                                           mlir::MLIRContext *context);
+                                           mlir::MLIRContext *context,
+                                           bool vectorWork = true);
 
 } // namespace py::lowering::arch::arm

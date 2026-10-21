@@ -1,6 +1,7 @@
 #include "Runtime/Core/Lowerer.h"
 
 #include "Common/RuntimeSupport.h"
+#include "PyTypeObject.h"
 
 namespace py::lowering {
 
@@ -9,6 +10,10 @@ RuntimeBundleLowerer::RuntimeBundleLowerer(mlir::ModuleOp module)
       manifest(module) {}
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
+  // Class questions are asked per op; the classes stay as they are until the
+  // end, where the index is dropped before they are erased.
+  std::optional<py::type_object::ScopedClassIndex> classIndex;
+  classIndex.emplace(module.getOperation());
   if (mlir::failed(manifest.verify()))
     return mlir::failure();
   RuntimeBundleLowerer::collectReprReachableContracts();
@@ -139,6 +144,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
   }
   // Class ops survive eraseLoweredPyOps so the hooks above can resolve
   // source-class words and method symbols; drop them now that dispatch is built.
+  classIndex.reset();
   llvm::SmallVector<py::ClassOp, 8> classOps;
   module.walk([&](py::ClassOp classOp) { classOps.push_back(classOp); });
   for (py::ClassOp classOp : classOps)

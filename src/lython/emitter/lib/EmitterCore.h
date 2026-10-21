@@ -2348,6 +2348,9 @@ private:
       openMethodBodies;
   // AST nodes in a method's def: what a copy at its call site costs.
   llvm::DenseMap<const parser::Node *, unsigned> methodDefSizes;
+  // The calls a computed-name dispatcher's arms make (`computedGetattrBody`),
+  // which call a method of any size.
+  llvm::DenseSet<const parser::Node *> dispatcherArmCalls;
 };
 
 } // namespace lython::emitter

@@ -5436,7 +5436,14 @@ std::optional<Value> ModuleEmitter::tryCallLargeMethod(
       ++size->second;
       return ast::Walk::Continue;
     });
-  if (size->second < calledMethodNodes())
+  // ⭐ A DISPATCHER'S ARM CALLS WHATEVER ITS SIZE. `getattr(self, name)()`
+  // has an arm per name every TestCase subclass answers, and copying each
+  // test method -- with the assertion bodies it copies in turn -- into the
+  // one dispatcher was a third of a unittest file's IR, growing with every
+  // test. The arm passes only the receiver, so nothing is specialized by the
+  // copy that the method's own body does not already have.
+  if (size->second < calledMethodNodes() &&
+      !dispatcherArmCalls.contains(&anchor))
     return std::nullopt;
   auto receiverClass = mlir::dyn_cast_if_present<py::ContractType>(receiver.type);
   if (!receiverClass || !receiverClass.getArguments().empty())

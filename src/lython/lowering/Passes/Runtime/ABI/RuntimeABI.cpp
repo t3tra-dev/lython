@@ -614,6 +614,12 @@ RuntimeBundleLowerer::runtimeClassForContract(mlir::Type type) const {
 mlir::FailureOr<llvm::SmallVector<std::string, 8>>
 RuntimeBundleLowerer::runtimeClassesForNominalTarget(
     mlir::Operation *op, mlir::Type targetType) const {
+  // ⛔ Not walked again per test: each walk asks every class of the module
+  // for its MRO, and a unittest program has thousands of isinstance tests and
+  // union tags over the same few targets.
+  if (auto found = nominalTargetClasses.find(targetType);
+      found != nominalTargetClasses.end())
+    return found->second;
   std::optional<std::string> targetName =
       nominalClassSymbolName(op, targetType);
   if (!targetName)
@@ -646,8 +652,10 @@ RuntimeBundleLowerer::runtimeClassesForNominalTarget(
   // No schema means no source class can name it as a base, so the walk below
   // -- which asks `isSubclassOf` about every declared class -- has nothing to
   // find and would error on the missing schema instead.
-  if (!hasSchema)
+  if (!hasSchema) {
+    nominalTargetClasses[targetType] = classes;
     return classes;
+  }
   mutableModule.walk([&](py::ClassOp classOp) {
     if (mlir::failed(status))
       return;
@@ -681,6 +689,7 @@ RuntimeBundleLowerer::runtimeClassesForNominalTarget(
   if (classes.empty())
     return op->emitError() << "class test target has no runtime classes: "
                            << *targetName;
+  nominalTargetClasses[targetType] = classes;
   return classes;
 }
 

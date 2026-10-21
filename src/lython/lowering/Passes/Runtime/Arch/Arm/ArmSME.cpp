@@ -60,16 +60,20 @@ void addSMELinalgPipeline(mlir::OpPassManager &pipeline,
 }
 
 void addSMEPreControlFlowLLVMPrepPipeline(mlir::OpPassManager &pipeline,
-                                          mlir::MLIRContext *context) {
+                                          mlir::MLIRContext *context,
+                                          bool vectorWork) {
   // Convert scalable vector outer-products to ArmSME while the vector form is
   // still intact. Tile stores are then expanded to SCF slice loops; ArmSME
   // tile allocation expects control-flow lowering before the final
   // ArmSME-to-LLVM conversion.
-  eachIsolatedChild(pipeline, context)
-      .addPass(mlir::createArithToArmSMEConversionPass());
-  addSMEVectorClaim(pipeline, context);
+  if (vectorWork) {
+    eachIsolatedChild(pipeline, context)
+        .addPass(mlir::createArithToArmSMEConversionPass());
+    addSMEVectorClaim(pipeline, context);
+  }
   mlir::OpPassManager &eachFunction = eachIsolatedChild(pipeline, context);
-  eachFunction.addPass(mlir::createConvertArmSMEToSCFPass());
+  if (vectorWork)
+    eachFunction.addPass(mlir::createConvertArmSMEToSCFPass());
   eachFunction.addPass(mlir::createCanonicalizerPass());
   eachFunction.addPass(mlir::createCSEPass());
 }
@@ -137,9 +141,11 @@ private:
 } // namespace
 
 void addSMEPostControlFlowLLVMPrepPipeline(mlir::OpPassManager &pipeline,
-                                           mlir::MLIRContext *context) {
-  pipeline.addNestedPass<mlir::func::FuncOp>(
-      std::make_unique<ConvertArmSMEToLLVMWhereUsed>());
+                                           mlir::MLIRContext *context,
+                                           bool vectorWork) {
+  if (vectorWork)
+    pipeline.addNestedPass<mlir::func::FuncOp>(
+        std::make_unique<ConvertArmSMEToLLVMWhereUsed>());
   mlir::OpPassManager &eachFunction = eachIsolatedChild(pipeline, context);
   eachFunction.addPass(mlir::createCanonicalizerPass());
   eachFunction.addPass(mlir::createCSEPass());
