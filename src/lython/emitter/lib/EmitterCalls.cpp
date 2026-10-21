@@ -2543,18 +2543,62 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         // routed wrongly.
         std::optional<mlir::Type> calleeFieldType =
             lookupClassField(receiver.type, *methodName);
+        // ⭐ AND A CLASS ATTRIBUTE HOLDING A CLASS: unittest's
+        // `self.resultclass(stream, ...)`, which an instance may shadow. Read
+        // through the instance it is the class, unbound -- a class is not a
+        // descriptor -- so it is called the same way.
+        if (!calleeFieldType)
+          if (auto receiverContract =
+                  mlir::dyn_cast_if_present<py::ContractType>(
+                      types.widenLiteral(receiver.type)))
+            if (std::optional<mlir::Type> attrType =
+                    types.lookupClassStaticAttrType(
+                        receiverContract.getContractName(), *methodName);
+                attrType &&
+                mlir::isa<py::TypeType>(types.widenLiteral(*attrType)))
+              calleeFieldType = attrType;
+        // A type object in a field is called to CONSTRUCT, so it takes the
+        // same route: the callee is the value, not a method of the receiver.
+        auto callsAValue = [](mlir::Type type) {
+          return mlir::isa<py::CallableType, py::TypeType>(type);
+        };
         if (calleeFieldType) {
           mlir::Type widenedField = types.widenLiteral(*calleeFieldType);
-          // A type object in a field is called to CONSTRUCT, so it takes the
-          // same route: the callee is the value, not a method of the receiver.
-          if (mlir::isa<py::CallableType, py::TypeType>(widenedField)) {
-            if (std::optional<Value> fieldValue =
-                    emitValueAttribute(*calleeNode, receiver, *methodName))
-              return emitCallableDispatch(
-                  expr, *fieldValue,
-                  emitCallOperands(
-                      expr, {}, /*includeAstArguments=*/true,
-                      mlir::dyn_cast<py::CallableType>(widenedField)));
+          // ⭐ AN OPTIONAL ONE TOO, once a test has narrowed it:
+          // `if self._setUpFunc is not None: self._setUpFunc()`. The read is
+          // the narrowed value, which is what decides below.
+          bool optionalValue = false;
+          if (auto unionType = mlir::dyn_cast<py::UnionType>(widenedField)) {
+            optionalValue = true;
+            for (mlir::Type member : unionType.getMemberTypes())
+              if (member != types.none() &&
+                  !callsAValue(types.widenLiteral(member)))
+                optionalValue = false;
+          }
+          if (callsAValue(widenedField) || optionalValue) {
+            // ⛔ Not the raw field read when the receiver is a name: the
+            // attribute expression is what knows a narrowing of `self._f` and
+            // an instance's shadow of a class attribute, and reading a name
+            // again has no effect of its own.
+            const parser::Node *receiverNode = ast::node(*calleeNode, "value");
+            std::optional<Value> fieldValue =
+                receiverNode && receiverNode->kind == "Name"
+                    ? std::optional<Value>(emitExpr(calleeNode))
+                    : emitValueAttribute(*calleeNode, receiver, *methodName);
+            if (fieldValue) {
+              mlir::Type held = types.widenLiteral(fieldValue->type);
+              if (callsAValue(held))
+                return emitCallableDispatch(
+                    expr, *fieldValue,
+                    emitCallOperands(expr, {}, /*includeAstArguments=*/true,
+                                     mlir::dyn_cast<py::CallableType>(held)));
+              diagnostics.push_back(parser::Diagnostic{
+                  parser::Severity::Error, expr.range.start,
+                  "'" + std::string(*methodName) +
+                      "' may hold None here, and calling None raises "
+                      "TypeError: test it against None before the call"});
+              return emitNone(expr);
+            }
           }
         }
 
@@ -3000,6 +3044,17 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                                                  : name.rsplit('.').second.str();
     }
     bool isName = calleeNode->kind == "Name";
+    // ⭐ A CLASS OF ANOTHER MODULE has no bare name here: `c(verbosity=2)`
+    // for `c: type[lib.Runner]` found no `Runner` and fell through to a
+    // call of the type object, which the lowering cannot bind a keyword to
+    // ("kw names lowering is not keyword-aware yet"). It is spelled by a
+    // reserved name bound to the class, which no source identifier is.
+    if (!spelling.empty() && types.lookupClass(spelling) != instance)
+      if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(instance);
+          contract && classMros.count(contract.getContractName())) {
+        spelling = "__lyclass$" + contract.getContractName().str();
+        types.bindClass(spelling, instance);
+      }
     if (!spelling.empty() &&
         (!isName || spelling != ast::nameSpelling(*calleeNode)) &&
         types.lookupClass(spelling) == instance) {
@@ -7103,6 +7158,41 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
           range));
     }
 
+    // ⭐ THE BASE'S ANNOTATIONS ARE READ WHERE THE BASE IS WRITTEN. The
+    // dispatcher is typed in the CALLER's scope, and an annotation names what
+    // the base's module imports -- `def add(self, t: c.TC)` in r.py, called
+    // from c.py, which has no `c`, read `c.TC` as a class nobody declares:
+    // "'c.TC' object has no attribute 'name'" in the override's body.
+    //
+    // ⛔ A spelling whose type keeps a type parameter is left as written:
+    // the parameter means what the caller's specialization binds it to.
+    if (const EmitOptions::SourceModule *definingSource =
+            sourceModuleForClass(base ? base->definingClass : std::string());
+        definingSource && definingSource != activeSourceModule) {
+      llvm::SmallVector<parser::NodePtr *, 8> spelled;
+      for (synth::Param &param : llvm::drop_begin(params))
+        if (param.annotation)
+          spelled.push_back(&param.annotation);
+      if (returns)
+        spelled.push_back(&returns);
+      llvm::SmallVector<mlir::Type, 8> resolved(spelled.size());
+      emitInDefiningModuleScope(*definingSource, [&] {
+        auto typeParameterScope = types.pushScope();
+        bindClassTypeArguments(base->definingClass);
+        for (auto [index, node] : llvm::enumerate(spelled))
+          resolved[index] = types.annotationType(node->get());
+      });
+      for (auto [index, node] : llvm::enumerate(spelled)) {
+        mlir::Type type = resolved[index];
+        if (!type || unboundStaticParameterCount(type) != 0 ||
+            mlir::isa<py::SelfType>(type))
+          continue;
+        std::string alias =
+            "__lydispt$" + std::to_string(++syntheticFunctionCounter);
+        types.bindAnnotationTypeAlias(alias, type);
+        *node = synth::name(alias, range);
+      }
+    }
     parser::NodePtr def = synth::functionDef(symbol, params, {},
                                              std::move(body), returns, {}, range);
     synthesizedIteratorDefs.push_back(def);
@@ -8463,6 +8553,52 @@ ModuleEmitter::tryEmitListCall(const parser::Node &expr,
       listArgs->front()->kind == "GeneratorExp" &&
       (!listKeywords || listKeywords->empty()))
     return emitComprehension(*listArgs->front(), /*isDict=*/false);
+  // ⭐ `list(filter(f, xs))` AND `list(map(f, xs))` WITH A LOCAL `f` ARE THE
+  // COMPREHENSION, in this function. The lazy iterator is a generator of its
+  // own at module level that spells `f` by name, and a nested def there names
+  // nothing: unittest's `list(filter(shouldIncludeMethod, dir(cls)))` reached
+  // the lowering as "unresolved runtime binding 'shouldIncludeMethod'".
+  // `list(...)` consumes the iterator where it stands, so the comprehension
+  // is the same evaluation: the iterable once, then `f` per element.
+  if (listArgs && listArgs->size() == 1 && listArgs->front() &&
+      listArgs->front()->kind == "Call" &&
+      (!listKeywords || listKeywords->empty())) {
+    const parser::Node &inner = *listArgs->front();
+    const parser::Node *innerCallee = ast::node(inner, "func");
+    const auto *innerArgs = ast::nodeList(inner, "args");
+    const auto *innerKeywords = ast::nodeList(inner, "keywords");
+    bool isFilter = callsUnshadowedBuiltin(innerCallee, "filter");
+    bool isMap = callsUnshadowedBuiltin(innerCallee, "map");
+    if ((isFilter || isMap) && innerArgs && innerArgs->size() == 2 &&
+        (!innerKeywords || innerKeywords->empty())) {
+      const parser::NodePtr &function = (*innerArgs)[0];
+      const parser::NodePtr &source = (*innerArgs)[1];
+      if (function && source && source->kind != "Starred" &&
+          function->kind == "Name" &&
+          values.count(ast::nameSpelling(*function))) {
+        parser::SourceRange range = expr.range;
+        std::string element =
+            "__lyfilter" + std::to_string(++listCompCounter) + "_v";
+        parser::NodePtr applied = synth::call(
+            function, {synth::name(element, range)}, range);
+        parser::NodePtr generator = parser::makeNode("comprehension", range);
+        parser::addField(*generator, "target", synth::name(element, range));
+        parser::addField(*generator, "iter", source);
+        std::vector<parser::NodePtr> ifs;
+        if (isFilter)
+          ifs.push_back(applied);
+        parser::addField(*generator, "ifs", std::move(ifs));
+        parser::addField(*generator, "is_async", static_cast<std::int64_t>(0));
+        parser::NodePtr comprehension = parser::makeNode("ListComp", range);
+        parser::addField(*comprehension, "elt",
+                         isFilter ? synth::name(element, range) : applied);
+        parser::addField(*comprehension, "generators",
+                         std::vector<parser::NodePtr>{std::move(generator)});
+        synthesizedIteratorDefs.push_back(comprehension);
+        return emitComprehension(*comprehension, /*isDict=*/false);
+      }
+    }
+  }
   return std::nullopt;
 }
 

@@ -342,6 +342,14 @@ public:
   // list[T] = []`) for the current scope. A plain symbol binding does not
   // serve: annotationTypeForName deliberately ignores value symbols so a
   // local cannot shadow a class annotation.
+  // Whether a scope is open that `bindLocalTypeParameter` binds into.
+  // The element of `left + right` for two tuples, at least one of unknown
+  // length: the join of every element either side holds.
+  std::optional<mlir::Type> tupleConcatElement(mlir::Type left,
+                                               mlir::Type right) const;
+  // A type parameter or a type alias bound under this exact spelling.
+  std::optional<mlir::Type> scopedTypeAlias(llvm::StringRef name) const;
+  bool inTypeParameterScope() const { return !scopedTypeParameters.empty(); }
   void bindLocalTypeParameter(llvm::StringRef name, mlir::Type type) const;
   void bindSymbol(llvm::StringRef name, mlir::Type type);
   // The MODULE's own symbol table, whatever scope is open. A synthesized

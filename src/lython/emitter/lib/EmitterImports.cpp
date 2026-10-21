@@ -11,6 +11,7 @@
 #include "PyProtocols.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/SaveAndRestore.h"
 
@@ -120,10 +121,145 @@ bool importedDecoratorEmitsNoCode(const parser::Node &decorator) {
          leaf == "runtime_checkable" || leaf == "native";
 }
 
+// The value a module-level name is bound to, when one statement binds it.
+const parser::Node *onlyModuleBinding(
+    const std::vector<parser::NodePtr> &body, llvm::StringRef name) {
+  const parser::Node *found = nullptr;
+  unsigned bindings = 0;
+  for (const parser::NodePtr &statement : body) {
+    if (!statement)
+      continue;
+    const parser::Node *target = nullptr;
+    if (statement->kind == "Assign") {
+      const auto *targets = ast::nodeList(*statement, "targets");
+      if (targets && targets->size() == 1)
+        target = targets->front().get();
+    } else if (statement->kind == "AnnAssign" ||
+               statement->kind == "AugAssign") {
+      target = ast::node(*statement, "target");
+    }
+    if (!target || target->kind != "Name" ||
+        llvm::StringRef(ast::nameSpelling(*target)) != name)
+      continue;
+    ++bindings;
+    found = statement->kind == "AugAssign" ? nullptr
+                                           : ast::node(*statement, "value");
+  }
+  return bindings == 1 ? found : nullptr;
+}
+
+// An int (or bool) expression over literals and the module's names assigned
+// once, folded here: `_MIN_DIFF_LEN >= 0` in unittest/util.py.
+// ⛔ Nothing past int64: an overflow is not folded, and the assert stays a
+// refusal rather than a wrong answer.
+static std::optional<std::int64_t>
+foldModuleInt(const parser::Node *node,
+              const std::vector<parser::NodePtr> &moduleBody,
+              unsigned depth = 0) {
+  if (!node || depth > 16)
+    return std::nullopt;
+  auto fold = [&](const parser::Node *operand) {
+    return foldModuleInt(operand, moduleBody, depth + 1);
+  };
+  if (node->kind == "Constant") {
+    if (std::optional<bool> flag = ast::boolean(*node, "value"))
+      return *flag ? 1 : 0;
+    return ast::integer(*node, "value");
+  }
+  if (node->kind == "Name")
+    return fold(onlyModuleBinding(moduleBody, ast::nameSpelling(*node)));
+  if (node->kind == "UnaryOp") {
+    std::optional<std::int64_t> operand = fold(ast::node(*node, "operand"));
+    const parser::Node *op = ast::node(*node, "op");
+    if (!operand || !op)
+      return std::nullopt;
+    if (op->kind == "Not")
+      return *operand == 0 ? 1 : 0;
+    if (op->kind == "USub" && *operand != INT64_MIN)
+      return -*operand;
+    if (op->kind == "UAdd")
+      return operand;
+    return std::nullopt;
+  }
+  if (node->kind == "BinOp") {
+    std::optional<std::int64_t> left = fold(ast::node(*node, "left"));
+    std::optional<std::int64_t> right = fold(ast::node(*node, "right"));
+    const parser::Node *op = ast::node(*node, "op");
+    std::int64_t result;
+    if (!left || !right || !op)
+      return std::nullopt;
+    if (op->kind == "Add" && !llvm::AddOverflow(*left, *right, result))
+      return result;
+    if (op->kind == "Sub" && !llvm::SubOverflow(*left, *right, result))
+      return result;
+    if (op->kind == "Mult" && !llvm::MulOverflow(*left, *right, result))
+      return result;
+    if (op->kind == "FloorDiv" && *right != 0 &&
+        !(*left == INT64_MIN && *right == -1)) {
+      std::int64_t quotient = *left / *right;
+      if ((*left % *right != 0) && ((*left < 0) != (*right < 0)))
+        --quotient;
+      return quotient;
+    }
+    return std::nullopt;
+  }
+  if (node->kind == "BoolOp") {
+    const parser::Node *op = ast::node(*node, "op");
+    const auto *values = ast::nodeList(*node, "values");
+    if (!op || !values || values->empty())
+      return std::nullopt;
+    bool isAnd = op->kind == "And";
+    for (const parser::NodePtr &value : *values) {
+      std::optional<std::int64_t> folded = fold(value.get());
+      if (!folded)
+        return std::nullopt;
+      if ((*folded != 0) != isAnd)
+        return *folded != 0 ? 1 : 0;
+    }
+    return isAnd ? 1 : 0;
+  }
+  if (node->kind == "Compare") {
+    const auto *ops = ast::nodeList(*node, "ops");
+    const auto *comparators = ast::nodeList(*node, "comparators");
+    std::optional<std::int64_t> left = fold(ast::node(*node, "left"));
+    if (!ops || !comparators || ops->size() != comparators->size() || !left)
+      return std::nullopt;
+    for (auto [op, comparator] : llvm::zip(*ops, *comparators)) {
+      std::optional<std::int64_t> right = fold(comparator.get());
+      if (!op || !right)
+        return std::nullopt;
+      bool holds;
+      if (op->kind == "Lt")
+        holds = *left < *right;
+      else if (op->kind == "LtE")
+        holds = *left <= *right;
+      else if (op->kind == "Gt")
+        holds = *left > *right;
+      else if (op->kind == "GtE")
+        holds = *left >= *right;
+      else if (op->kind == "Eq")
+        holds = *left == *right;
+      else if (op->kind == "NotEq")
+        holds = *left != *right;
+      else
+        return std::nullopt;
+      if (!holds)
+        return 0;
+      left = right;
+    }
+    return 1;
+  }
+  return std::nullopt;
+}
+
 void refuseImportTimeStatements(TypeSystem &types,
                                 const std::vector<parser::NodePtr> &body,
                                 llvm::StringRef sourceName,
-                                std::vector<parser::Diagnostic> &diagnostics) {
+                                std::vector<parser::Diagnostic> &diagnostics,
+                                const std::vector<parser::NodePtr> *moduleBody =
+                                    nullptr) {
+  if (!moduleBody)
+    moduleBody = &body;
   for (const parser::NodePtr &statement : body) {
     if (!statement)
       continue;
@@ -148,7 +284,31 @@ void refuseImportTimeStatements(TypeSystem &types,
       }
       if (const auto *branch =
               ast::nodeList(*statement, *truth ? "body" : "orelse"))
-        refuseImportTimeStatements(types, *branch, sourceName, diagnostics);
+        refuseImportTimeStatements(types, *branch, sourceName, diagnostics,
+                                   moduleBody);
+      continue;
+    }
+    // ⭐ AN `assert` THIS COMPILER CAN DECIDE runs at compile time instead:
+    // unittest/util.py checks its own constants (`assert _MIN_DIFF_LEN >= 0`).
+    // A true one is the whole of what running it would do; a false one is
+    // the AssertionError CPython raises at the import, refused here.
+    if (statement->kind == "Assert") {
+      const parser::Node *test = ast::node(*statement, "test");
+      std::optional<bool> truth;
+      if (std::optional<std::int64_t> folded = foldModuleInt(test, *moduleBody))
+        truth = *folded != 0;
+      else if (test)
+        truth = optionalStaticBranchTruth(*test, types, /*from=*/nullptr);
+      if (truth == true)
+        continue;
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, statement->range.start,
+          truth == false
+              ? "this assert fails when the module is imported"
+              : "an assert in an imported module needs a test this compiler "
+                "can decide: an imported module's body does not run, so the "
+                "check would be dropped in silence",
+          sourceName.str()});
       continue;
     }
     if (isImportTimeDeclaration(*statement)) {
@@ -211,7 +371,8 @@ std::string sourceModuleClassSymbol(llvm::StringRef module,
 
 void bindSourceClassLocals(
     TypeSystem &types, llvm::StringRef moduleName,
-    const std::vector<parser::NodePtr> &body) {
+    const std::vector<parser::NodePtr> &body,
+    std::vector<std::pair<std::string, mlir::Type>> *aliases = nullptr) {
   for (const parser::NodePtr &statement : body) {
     if (!statement || !isTopLevelClass(*statement))
       continue;
@@ -255,8 +416,11 @@ void bindSourceClassLocals(
     llvm::StringRef alias = ast::nameSpelling(*target);
     if (statement->kind != "TypeAlias" && bindings.lookup(alias) != 1)
       continue;
-    if (mlir::Type aliased = types.annotationType(value))
+    if (mlir::Type aliased = types.annotationType(value)) {
       types.bindLocalTypeParameter(alias, aliased);
+      if (aliases)
+        aliases->emplace_back(alias.str(), aliased);
+    }
   }
 }
 
@@ -655,6 +819,33 @@ sourceModuleLiteralConstant(TypeSystem &types,
 // b.py `import a as y`), which would otherwise recurse forever.
 static constexpr unsigned kMaxNamespaceDepth = 4;
 
+const std::vector<std::pair<std::string, mlir::Type>> &
+ModuleEmitter::sourceModuleTypeAliases(
+    const EmitOptions::SourceModule &source) {
+  // Inserted before it is filled: a module that imports this one back reads
+  // it as having no aliases while it is being read.
+  auto [entry, inserted] =
+      sourceModuleTypeAliasMemo.try_emplace(source.moduleName);
+  if (!inserted || !source.moduleNode || source.isStub)
+    return entry->second;
+  const auto *rawBody = ast::nodeList(*source.moduleNode, "body");
+  if (!rawBody)
+    return entry->second;
+  std::vector<std::pair<std::string, mlir::Type>> aliases;
+  {
+    ImporterModuleScope importerScope(*this);
+    TypeSystem::ScopeIsolation isolation = types.isolateScopes();
+    auto moduleScope = types.pushScope();
+    ++definingScopeSetupDepth;
+    bindModuleImportScope(*source.moduleNode, /*diagnoseUnsupported=*/false);
+    bindSourceClassLocals(types, source.moduleName,
+                          staticModuleStatements(types, *rawBody), &aliases);
+    --definingScopeSetupDepth;
+  }
+  // ⛔ Not through `entry`: the reading above may have dropped the memo.
+  return sourceModuleTypeAliasMemo[source.moduleName] = std::move(aliases);
+}
+
 bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
                                               llvm::StringRef localName,
                                               unsigned namespaceDepth) {
@@ -684,8 +875,13 @@ bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
   const std::vector<parser::NodePtr> flattened =
       staticModuleStatements(types, *rawBody);
   const std::vector<parser::NodePtr> *body = &flattened;
+  // ⛔ Not the defs of a module whose signatures are being read further up:
+  // that reading binds this one's imports, and a def read now would be read
+  // without them (two modules that import each other). What asked needs the
+  // module's classes, which are bound below either way.
+  const bool signaturesBeingRead = importedSignatureScopes.count(module.str());
   for (const parser::NodePtr &statement : *body) {
-    if (!statement || !isTopLevelFunction(*statement))
+    if (!statement || !isTopLevelFunction(*statement) || signaturesBeingRead)
       continue;
     std::optional<std::string_view> name = ast::string(*statement, "name");
     if (!name)
@@ -764,7 +960,7 @@ bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
       std::string local =
           (llvm::Twine(localName) + "." + llvm::StringRef(*exported)).str();
       bindSourceModuleReexport(*source, llvm::StringRef(*exported),
-                               llvm::StringRef(local));
+                               llvm::StringRef(local), namespaceDepth);
     }
   }
   // `import M as A` inside a source module publishes M's whole namespace as
@@ -816,6 +1012,19 @@ bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
       continue;
     }
     types.bindClass(local, types.contract(sourceModuleClassSymbol(module, *name)));
+  }
+  // ⭐ AND ITS TYPE ALIASES, which an annotation here spells through the
+  // module: `P = case._SysExcInfoType` and `def f(p: m.Pair)` each read the
+  // spelling as a class nobody declares, a contract fabricated from it.
+  for (const auto &[alias, aliased] : sourceModuleTypeAliases(*source)) {
+    // A name standing for a class is bound with the assignments above.
+    if (moduleAliasTarget(*body, alias))
+      continue;
+    std::string local = (llvm::Twine(localName) + "." + alias).str();
+    if (types.inTypeParameterScope())
+      types.bindLocalTypeParameter(local, aliased);
+    else
+      types.bindAnnotationTypeAlias(local, aliased);
   }
   for (const parser::NodePtr &statement : *body) {
     if (!statement ||
@@ -1210,6 +1419,9 @@ bool ModuleEmitter::bindSourceModuleName(llvm::StringRef module,
     std::optional<std::string_view> name = ast::string(*statement, "name");
     if (!name || llvm::StringRef(*name) != exportedName)
       continue;
+    // ⛔ See bindSourceModuleNamespace: read later, with the imports bound.
+    if (importedSignatureScopes.count(module.str()))
+      return true;
     std::string canonical = sourceModuleFunctionSymbol(module, exportedName);
     if (moduleGlobals.count(canonical)) {
       types.bindCanonicalSymbol(localName, canonical, moduleGlobals[canonical]);
@@ -1228,6 +1440,18 @@ bool ModuleEmitter::bindSourceModuleName(llvm::StringRef module,
       continue;
     types.bindClass(localName,
                     types.contract(sourceModuleClassSymbol(module, *name)));
+    return true;
+  }
+  // `from m import Pair` for `Pair = tuple[int, str]` there.
+  // ⛔ Not `main = TestProgram`: a name standing for a class is the class as a
+  // value too, which the alias path below binds.
+  for (const auto &[alias, aliased] : sourceModuleTypeAliases(*source)) {
+    if (alias != exportedName || moduleAliasTarget(*body, alias))
+      continue;
+    if (types.inTypeParameterScope())
+      types.bindLocalTypeParameter(localName, aliased);
+    else
+      types.bindAnnotationTypeAlias(localName, aliased);
     return true;
   }
   if (std::optional<mlir::Type> literal =
@@ -1274,7 +1498,7 @@ bool ModuleEmitter::bindSourceModuleName(llvm::StringRef module,
 
 bool ModuleEmitter::bindSourceModuleReexport(
     const EmitOptions::SourceModule &source, llvm::StringRef exportedName,
-    llvm::StringRef localName) {
+    llvm::StringRef localName, unsigned namespaceDepth) {
   if (!source.moduleNode)
     return false;
   const auto *rawBody = ast::nodeList(*source.moduleNode, "body");
@@ -1325,9 +1549,11 @@ bool ModuleEmitter::bindSourceModuleReexport(
       if (!importName || !localExport ||
           llvm::StringRef(*localExport) != exportedName)
         continue;
-      if (level != 0 && !module) {
+      // ⛔ Not past the bound `import M as A` keeps: two modules of one
+      // package that `from . import` each other nest without end.
+      if (level != 0 && !module && namespaceDepth < kMaxNamespaceDepth) {
         std::string submodule = joinModuleName(*resolvedModule, *importName);
-        if (bindSourceModuleNamespace(submodule, localName))
+        if (bindSourceModuleNamespace(submodule, localName, namespaceDepth + 1))
           return true;
       }
       if (bindSourceModuleName(*resolvedModule, llvm::StringRef(*importName),
@@ -1531,8 +1757,12 @@ void ModuleEmitter::collectImportedModuleGlobals() {
     // bare `A` named `builtins.A`, a class nothing declares, so
     // `_held: list[A]` in lib.py made every `lib._held[0].n` a read of no
     // class ("attr.get object type has no class schema").
+    // ⭐ AND ITS IMPORTS, which the annotation spells just as often:
+    // `_SysExcInfoType = tuple[..., types.TracebackType]` read `types` as
+    // nothing and fabricated the class.
     TypeSystem::ScopeIsolation isolation = types.isolateScopes();
     auto moduleScope = types.pushScope();
+    bindModuleImportScope(*source.moduleNode, /*diagnoseUnsupported=*/false);
     bindSourceClassLocals(types, source.moduleName, body);
     for (const parser::NodePtr &statement : body) {
       if (!statement ||
@@ -1731,6 +1961,18 @@ void ModuleEmitter::bindModuleImportScope(const parser::Node &sourceModule,
   const auto *rawBody = ast::nodeList(sourceModule, "body");
   if (!rawBody)
     return;
+  // ⭐ A RELATIVE IMPORT IS RESOLVED AGAINST THE MODULE'S OWN PACKAGE, not the
+  // package of whichever module asked. Reading an imported module's
+  // signatures from the main module resolved `from . import result` inside
+  // unittest/case.py against the main module's package, bound nothing, and
+  // `def _addSkip(result: result.TestResult | None, ...)` read as a class
+  // nobody declares.
+  std::optional<llvm::SaveAndRestore<std::string>> packageOfModule;
+  for (const EmitOptions::SourceModule &source : options.sourceModules)
+    if (source.moduleNode == &sourceModule) {
+      packageOfModule.emplace(activePackageName, source.packageName);
+      break;
+    }
   const std::vector<parser::NodePtr> flattened =
       staticModuleStatements(types, *rawBody);
   const std::vector<parser::NodePtr> *body = &flattened;
@@ -1837,10 +2079,23 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
       const bool isFrom = statement->kind == "ImportFrom";
       if (statement->kind != "Import" && !isFrom)
         continue;
-      std::optional<std::string_view> fromModule =
-          isFrom ? ast::string(*statement, "module") : std::nullopt;
-      if (isFrom && !fromModule)
-        continue;
+      // ⭐ A RELATIVE ONE TOO, named by the module it reaches. `from .base
+      // import Base` was recorded as `base.Base` and `from . import base` not
+      // at all, so a package's subclass had no recorded base and every call
+      // through the base ran the base's method:
+      //
+      //     # rb/sub.py: from .base import Base / class Sub2(Base): name()
+      //     xs: list[rb.Base] = [rb.Base(), rb.Sub2()]
+      //     print([base.show(x) for x in xs])
+      //     # printed ['base', 'base']; CPython prints ['base', 'sub2']
+      std::optional<std::string> fromModule;
+      if (isFrom) {
+        fromModule = resolveRelativeModule(
+            source.packageName, ast::integer(*statement, "level").value_or(0),
+            ast::string(*statement, "module"));
+        if (!fromModule)
+          continue;
+      }
       const auto *names = ast::nodeList(*statement, "names");
       if (!names)
         continue;
@@ -1852,11 +2107,17 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
           continue;
         std::optional<std::string_view> asname = ast::string(*alias, "asname");
         std::string local(asname ? *asname : *name);
-        if (isFrom)
-          importedClasses[local] =
-              (llvm::Twine(*fromModule) + "." + llvm::StringRef(*name)).str();
-        else
+        if (!isFrom) {
           moduleAliases[local] = std::string(*name);
+          continue;
+        }
+        std::string member =
+            (llvm::Twine(*fromModule) + "." + llvm::StringRef(*name)).str();
+        // `from . import base` names a module.
+        if (lookupSourceModule(member))
+          moduleAliases[local] = std::move(member);
+        else
+          importedClasses[local] = std::move(member);
       }
     }
     // The classes this module declares itself, so a base that is neither one
@@ -1866,12 +2127,22 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
       if (statement && statement->kind == "ClassDef")
         if (auto declared = ast::string(*statement, "name"))
           ownClassNames.insert(*declared);
+    // ⭐ A CLASS A PACKAGE RE-EXPORTS is recorded by the module that declares
+    // it: `from rb import Base` reaches `rb.base.Base`, which is the name the
+    // hierarchy questions ask with. Every module's namespace is bound by now
+    // (predeclareSourceModules), so the type system knows where it leads.
+    auto declaringClass = [&](std::string dotted) -> std::string {
+      if (std::optional<mlir::Type> known = types.lookupClass(dotted))
+        if (auto contract = mlir::dyn_cast<py::ContractType>(*known))
+          return contract.getContractName().str();
+      return dotted;
+    };
     auto qualifyBase = [&](const parser::Node &base) -> std::string {
       if (base.kind == "Name") {
         llvm::StringRef spelling = ast::nameSpelling(base);
         auto imported = importedClasses.find(spelling);
         if (imported != importedClasses.end())
-          return imported->second;
+          return declaringClass(imported->second);
         // ⭐ A MANIFEST BASE IS NOT THIS MODULE'S CLASS. Qualifying every bare
         // name with the module recorded `class MyErr(Exception)` as deriving
         // from `lib_err.Exception`, a class nothing declares -- so every
@@ -1890,12 +2161,12 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
       if (rest.empty())
         return {};
       if (auto alias = moduleAliases.find(head); alias != moduleAliases.end())
-        return (llvm::Twine(alias->second) + "." + rest).str();
+        return declaringClass((llvm::Twine(alias->second) + "." + rest).str());
       // `from pkg import mod` binds a MODULE under a leaf name too, and a base
       // written through it (`mod.X`) is the same question one level down.
       if (auto nested = importedClasses.find(head);
           nested != importedClasses.end())
-        return (llvm::Twine(nested->second) + "." + rest).str();
+        return declaringClass((llvm::Twine(nested->second) + "." + rest).str());
       return {};
     };
     for (const parser::NodePtr &statement : *declarations) {
@@ -1932,169 +2203,216 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
       recordClassBodyDeclarations(qualified, *statement);
     }
   }
-  for (const EmitOptions::SourceModule &source : options.sourceModules) {
-    if (!source.moduleNode)
-      continue;
-    const auto *rawBody = ast::nodeList(*source.moduleNode, "body");
-    if (!rawBody)
-      continue;
-    std::string savedSourceName = sourceName;
-    std::string savedPackageName = activePackageName;
-    sourceName =
-        source.sourceName.empty() ? source.moduleName : source.sourceName;
-    activePackageName = source.packageName;
-    llvm::SaveAndRestore<const parser::Node *> savedSourceModuleNode(
-        activeSourceModuleNode, source.moduleNode);
-    // The pair `emitInDefiningModuleScope` already uses for a specialization
-    // emitted in its own module. This walk pushed a scope but left the
-    // importer's below it, which is a scope that shadows rather than one that
-    // isolates.
-    ImporterModuleScope importerScope(*this);
-    TypeSystem::ScopeIsolation isolation = types.isolateScopes();
-    auto moduleScope = types.pushScope();
-    std::size_t importDiagnosticStart = diagnostics.size();
-    // The module before this one declared its classes.
-    forgetImportedSignatures();
-    bindModuleImportScope(*source.moduleNode, /*diagnoseUnsupported=*/true);
-    for (std::size_t index = importDiagnosticStart; index < diagnostics.size();
-         ++index)
-      if (diagnostics[index].filename.empty())
-        diagnostics[index].filename = sourceName;
-    bindSourceModuleLocals(source.moduleName, *source.moduleNode,
-                           source.isStub);
-    if (source.isStub) {
-      if (!isJsHostModule(source))
-        declareStubClassContracts(types, context, source.moduleName,
-                                  staticModuleStatements(types, *rawBody),
-                                  StubContractPolicy{});
-      activePackageName = std::move(savedPackageName);
-      sourceName = std::move(savedSourceName);
-      continue;
-    }
-    // ⭐ THE SAME FLATTENING EVERY BINDER IN THIS FILE DOES. A module-level
-    // `if` whose test is statically decidable IS one branch's statements, and
-    // `bindSourceModuleLocals` reads the module that way -- but this EMISSION
-    // loop read the raw body, so a def inside such a branch had its name bound
-    // and its body never emitted:
-    //
-    //     # q.py: if sys.platform == "win32": def sep(): ... else: def sep(): ...
-    //     import q
-    //     print(q.sep())      # error: unresolved runtime binding 'q.sep'
-    //
-    // A lowering sentence for a program CPython runs, and the disagreement is
-    // between two walks of one module -- so the fix is to walk it once the
-    // same way, not to teach this loop a second recogniser for `If`.
-    const std::vector<parser::NodePtr> body =
-        staticModuleStatements(types, *rawBody);
-    // ⛔ Over the RAW body, because the flattener DROPS what it cannot decide
-    // and the refusal is precisely for what gets dropped.
-    refuseImportTimeStatements(types, *rawBody, sourceName, diagnostics);
-    // ⭐ THE SAME DECLARE-THEN-DEFINE ORDER THE MAIN MODULE TAKES. Two sibling
-    // subclasses in an IMPORTED module that both recurse through the base read
-    // as "static type shapes.Right does not provide manifest method 'show'":
-    // the first one's body needs the second's method bindings, which its own
-    // `emitClassContract` fills, and this walk emitted bodies as it went.
-    //
-    // ⛔ The queue is drained INSIDE this module's scope, not with the main
-    // module's: the bodies are typed against `sourceName`, the module's own
-    // import scope and its isolated type scopes, all of which are restored
-    // below. A hierarchy split across two imported modules therefore keeps the
-    // old answer -- one module at a time is what this walk can promise.
-    llvm::SaveAndRestore<bool> deferBodies(deferClassMethodBodies, true);
-    std::vector<DeferredMethodBody> outerDeferred;
-    outerDeferred.swap(deferredMethodBodies);
-    for (const parser::NodePtr &statement : body) {
-      if (!statement || !isTopLevelClass(*statement))
-        continue;
-      std::size_t classDiagnosticStart = diagnostics.size();
-      // ⛔ AN ENUM CLASS IN AN IMPORTED MODULE IS REFUSED HERE, where the
-      // program can read the reason. `desugarEnumClasses` runs on the MAIN
-      // module only, so an imported one kept its `Enum` base and reached the
-      // dialect verifier as "'py.class' op unknown base class 'Enum'" -- the
-      // compiler's own sentence for a class CPython has no trouble with.
-      //
-      // ⛔ Not desugared here instead: a desugared member is an INSTANCE held
-      // as a class attribute, and an imported class attribute is carried by
-      // the literal channel, which has no form for one. The refusal is the
-      // honest half until that channel can hold an object.
-      if (enumBaseKind(*statement)) {
-        diagnostics.push_back(parser::Diagnostic{
-            parser::Severity::Error, statement->range.start,
-            "an Enum class in an imported module is not supported: its members "
-            "are instances, and an imported class attribute is carried as a "
-            "compile-time constant; define the enum in the main module"});
-        continue;
-      }
-      if (std::optional<std::string_view> name =
-              ast::string(*statement, "name")) {
-        std::string classSymbol =
-            sourceModuleClassSymbol(source.moduleName, *name);
-        if (genericClasses.count(classSymbol)) {
-          // A specialization's bodies are typed inside the scope that binds
-          // its type parameters; see the same guard in the main module's
-          // puller.
-          llvm::SaveAndRestore<bool> emitNow(deferClassMethodBodies, false);
-          drainGenericClassSpecializations(classSymbol);
-        } else {
-          // `&source` is what says its attribute initializers will be run:
-          // an imported module's body does not, so they are queued for the
-          // start of `__main__`, in import order.
-          emitClassContract(*statement, classSymbol, &source);
+  // ⭐ EVERY IMPORTED MODULE'S CLASSES ARE DECLARED BEFORE ANY OF THEIR BODIES
+  // IS EMITTED: the declare-then-define order below, taken across modules.
+  // Two modules that import each other -- CPython's unittest types
+  // case._Outcome with result.TestResult and result's methods with
+  // case.TestCase -- each read the other's fields in a body, and one module
+  // at a time emitted whichever came first against a class with no fields.
+  //
+  // ⛔ The module's scope is entered once per pass rather than held across
+  // both: each pass isolates the type scopes of every module it is not in.
+  std::vector<std::vector<DeferredMethodBody>> moduleMethodBodies(
+      options.sourceModules.size());
+  auto inSourceModuleScope =
+      [&](const EmitOptions::SourceModule &source, bool declaring,
+          llvm::function_ref<void(const std::vector<parser::NodePtr> &,
+                                  const std::vector<parser::NodePtr> &)>
+              walk) {
+        if (!source.moduleNode)
+          return;
+        const auto *rawBody = ast::nodeList(*source.moduleNode, "body");
+        if (!rawBody)
+          return;
+        std::string savedSourceName = sourceName;
+        std::string savedPackageName = activePackageName;
+        sourceName =
+            source.sourceName.empty() ? source.moduleName : source.sourceName;
+        activePackageName = source.packageName;
+        llvm::SaveAndRestore<const parser::Node *> savedSourceModuleNode(
+            activeSourceModuleNode, source.moduleNode);
+        // The pair `emitInDefiningModuleScope` already uses for a
+        // specialization emitted in its own module. This walk pushed a scope
+        // but left the importer's below it, which is a scope that shadows
+        // rather than one that isolates.
+        ImporterModuleScope importerScope(*this);
+        TypeSystem::ScopeIsolation isolation = types.isolateScopes();
+        auto moduleScope = types.pushScope();
+        std::size_t importDiagnosticStart = diagnostics.size();
+        // The module before this one declared its classes.
+        forgetImportedSignatures();
+        bindModuleImportScope(*source.moduleNode, declaring);
+        for (std::size_t index = importDiagnosticStart;
+             index < diagnostics.size(); ++index)
+          if (diagnostics[index].filename.empty())
+            diagnostics[index].filename = sourceName;
+        bindSourceModuleLocals(source.moduleName, *source.moduleNode,
+                               source.isStub);
+        if (source.isStub) {
+          if (declaring && !isJsHostModule(source))
+            declareStubClassContracts(types, context, source.moduleName,
+                                      staticModuleStatements(types, *rawBody),
+                                      StubContractPolicy{});
+          activePackageName = std::move(savedPackageName);
+          sourceName = std::move(savedSourceName);
+          return;
         }
-      }
-      for (std::size_t index = classDiagnosticStart; index < diagnostics.size();
-           ++index)
-        if (diagnostics[index].filename.empty())
-          diagnostics[index].filename = sourceName;
-    }
-    for (const parser::NodePtr &statement : body) {
-      if (!statement)
-        continue;
-      std::size_t diagnosticStart = diagnostics.size();
-      if (isTopLevelFunction(*statement)) {
-        std::optional<std::string_view> name = ast::string(*statement, "name");
-        if (!name)
-          continue;
-        FunctionSignature sig = types.functionSignature(*statement);
-        std::string canonical =
-            sourceModuleFunctionSymbol(source.moduleName, *name);
-        if (unboundStaticParameterCount(sig.publicCallable) != 0 ||
-            forwardsParamSpec(sig)) {
-          // Same monomorphization strategy as main-module generics: no
-          // direct emission (the py ABI cannot carry a type parameter), one
-          // specialization per ground instantiation demanded by a use site.
-          // Registration is canonical-keyed so call sites reach it through
-          // the import binding regardless of local spelling.
-          GenericFunctionInfo &info = genericFunctions[canonical];
-          info.node = statement.get();
-          info.signature = sig;
-          info.symbolBase = canonical;
-          info.source = &source;
-        } else {
-          emitCallableFunction(*statement, canonical, sig, {},
-                               /*isLambda=*/false);
-          recordMonomorphicFunction(canonical, *statement, sig, canonical,
-                                    &source);
-        }
-      } else {
-        continue;
-      }
-      for (std::size_t index = diagnosticStart; index < diagnostics.size();
-           ++index)
-        if (diagnostics[index].filename.empty())
-          diagnostics[index].filename = sourceName;
-    }
-    {
-      std::size_t bodyDiagnosticStart = diagnostics.size();
-      emitDeferredMethodBodies();
-      for (std::size_t index = bodyDiagnosticStart; index < diagnostics.size();
-           ++index)
-        if (diagnostics[index].filename.empty())
-          diagnostics[index].filename = sourceName;
-    }
-    deferredMethodBodies.swap(outerDeferred);
-    activePackageName = std::move(savedPackageName);
-    sourceName = std::move(savedSourceName);
+        // ⭐ THE SAME FLATTENING EVERY BINDER IN THIS FILE DOES. A module-level
+        // `if` whose test is statically decidable IS one branch's statements,
+        // and `bindSourceModuleLocals` reads the module that way -- but this
+        // EMISSION loop read the raw body, so a def inside such a branch had
+        // its name bound and its body never emitted:
+        //
+        //     # q.py: if sys.platform == "win32": def sep(): ...
+        //     #       else: def sep(): ...
+        //     import q
+        //     print(q.sep())      # error: unresolved runtime binding 'q.sep'
+        //
+        // A lowering sentence for a program CPython runs, and the disagreement
+        // is between two walks of one module -- so the fix is to walk it once
+        // the same way, not to teach this loop a second recogniser for `If`.
+        const std::vector<parser::NodePtr> body =
+            staticModuleStatements(types, *rawBody);
+        walk(body, *rawBody);
+        activePackageName = std::move(savedPackageName);
+        sourceName = std::move(savedSourceName);
+      };
+  for (std::size_t moduleIndex = 0; moduleIndex < options.sourceModules.size();
+       ++moduleIndex) {
+    const EmitOptions::SourceModule &source =
+        options.sourceModules[moduleIndex];
+    inSourceModuleScope(
+        source, /*declaring=*/true,
+        [&](const std::vector<parser::NodePtr> &body,
+            const std::vector<parser::NodePtr> &rawBody) {
+          // ⛔ Over the RAW body, because the flattener DROPS what it cannot
+          // decide and the refusal is precisely for what gets dropped.
+          refuseImportTimeStatements(types, rawBody, sourceName, diagnostics);
+          // ⭐ THE SAME DECLARE-THEN-DEFINE ORDER THE MAIN MODULE TAKES. Two
+          // sibling subclasses in an IMPORTED module that both recurse through
+          // the base read as "static type shapes.Right does not provide
+          // manifest method 'show'": the first one's body needs the second's
+          // method bindings, which its own `emitClassContract` fills, and this
+          // walk emitted bodies as it went.
+          //
+          // ⛔ The queue is drained INSIDE this module's scope, not with the
+          // main module's: the bodies are typed against `sourceName`, the
+          // module's own import scope and its isolated type scopes, which the
+          // second pass enters again.
+          llvm::SaveAndRestore<bool> deferBodies(deferClassMethodBodies, true);
+          std::vector<DeferredMethodBody> outerDeferred;
+          outerDeferred.swap(deferredMethodBodies);
+          for (const parser::NodePtr &statement : body) {
+            if (!statement || !isTopLevelClass(*statement))
+              continue;
+            std::size_t classDiagnosticStart = diagnostics.size();
+            // ⛔ AN ENUM CLASS IN AN IMPORTED MODULE IS REFUSED HERE, where the
+            // program can read the reason. `desugarEnumClasses` runs on the
+            // MAIN module only, so an imported one kept its `Enum` base and
+            // reached the dialect verifier as "'py.class' op unknown base class
+            // 'Enum'" -- the compiler's own sentence for a class CPython has no
+            // trouble with.
+            //
+            // ⛔ Not desugared here instead: a desugared member is an INSTANCE
+            // held as a class attribute, and an imported class attribute is
+            // carried by the literal channel, which has no form for one. The
+            // refusal is the honest half until that channel can hold an object.
+            if (enumBaseKind(*statement)) {
+              diagnostics.push_back(parser::Diagnostic{
+                  parser::Severity::Error, statement->range.start,
+                  "an Enum class in an imported module is not supported: its "
+                  "members are instances, and an imported class attribute is "
+                  "carried as a compile-time constant; define the enum in the "
+                  "main module"});
+              continue;
+            }
+            if (std::optional<std::string_view> name =
+                    ast::string(*statement, "name")) {
+              std::string classSymbol =
+                  sourceModuleClassSymbol(source.moduleName, *name);
+              if (genericClasses.count(classSymbol)) {
+                // A specialization's bodies are typed inside the scope that
+                // binds its type parameters; see the same guard in the main
+                // module's puller.
+                llvm::SaveAndRestore<bool> emitNow(deferClassMethodBodies,
+                                                   false);
+                drainGenericClassSpecializations(classSymbol);
+              } else {
+                // `&source` is what says its attribute initializers will be
+                // run: an imported module's body does not, so they are queued
+                // for the start of `__main__`, in import order.
+                emitClassContract(*statement, classSymbol, &source);
+              }
+            }
+            for (std::size_t index = classDiagnosticStart;
+                 index < diagnostics.size(); ++index)
+              if (diagnostics[index].filename.empty())
+                diagnostics[index].filename = sourceName;
+          }
+          moduleMethodBodies[moduleIndex].swap(deferredMethodBodies);
+          deferredMethodBodies.swap(outerDeferred);
+        });
+  }
+  for (std::size_t moduleIndex = 0; moduleIndex < options.sourceModules.size();
+       ++moduleIndex) {
+    const EmitOptions::SourceModule &source =
+        options.sourceModules[moduleIndex];
+    inSourceModuleScope(
+        source, /*declaring=*/false,
+        [&](const std::vector<parser::NodePtr> &body,
+            const std::vector<parser::NodePtr> &) {
+          llvm::SaveAndRestore<bool> deferBodies(deferClassMethodBodies, true);
+          std::vector<DeferredMethodBody> outerDeferred;
+          outerDeferred.swap(deferredMethodBodies);
+          deferredMethodBodies = std::move(moduleMethodBodies[moduleIndex]);
+          for (const parser::NodePtr &statement : body) {
+            if (!statement)
+              continue;
+            std::size_t diagnosticStart = diagnostics.size();
+            if (isTopLevelFunction(*statement)) {
+              std::optional<std::string_view> name =
+                  ast::string(*statement, "name");
+              if (!name)
+                continue;
+              FunctionSignature sig = types.functionSignature(*statement);
+              std::string canonical =
+                  sourceModuleFunctionSymbol(source.moduleName, *name);
+              if (unboundStaticParameterCount(sig.publicCallable) != 0 ||
+                  forwardsParamSpec(sig)) {
+                // Same monomorphization strategy as main-module generics: no
+                // direct emission (the py ABI cannot carry a type parameter),
+                // one specialization per ground instantiation demanded by a use
+                // site. Registration is canonical-keyed so call sites reach it
+                // through the import binding regardless of local spelling.
+                GenericFunctionInfo &info = genericFunctions[canonical];
+                info.node = statement.get();
+                info.signature = sig;
+                info.symbolBase = canonical;
+                info.source = &source;
+              } else {
+                emitCallableFunction(*statement, canonical, sig, {},
+                                     /*isLambda=*/false);
+                recordMonomorphicFunction(canonical, *statement, sig, canonical,
+                                          &source);
+              }
+            } else {
+              continue;
+            }
+            for (std::size_t index = diagnosticStart;
+                 index < diagnostics.size(); ++index)
+              if (diagnostics[index].filename.empty())
+                diagnostics[index].filename = sourceName;
+          }
+          {
+            std::size_t bodyDiagnosticStart = diagnostics.size();
+            emitDeferredMethodBodies();
+            for (std::size_t index = bodyDiagnosticStart;
+                 index < diagnostics.size(); ++index)
+              if (diagnostics[index].filename.empty())
+                diagnostics[index].filename = sourceName;
+          }
+          deferredMethodBodies.swap(outerDeferred);
+        });
   }
   // The bridge's entry points are reached from the host, not from the
   // program, and a private function nobody calls is dropped.

@@ -1,0 +1,41 @@
+test_error (__main__.Fixtures.test_error) ... ERROR
+test_known (__main__.Fixtures.test_known) ... expected failure
+test_long_reprs (__main__.Fixtures.test_long_reprs) ... FAIL
+test_pass (__main__.Fixtures.test_pass) ... ok
+test_skipped (__main__.Fixtures.test_skipped) ... skipped 'not today'
+test_sub (__main__.Fixtures.test_sub) ... 
+  test_sub (__main__.Fixtures.test_sub) (n=1) ... FAIL
+
+======================================================================
+ERROR: test_error (__main__.Fixtures.test_error)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "...", line 44, in test_error
+    raise KeyError("missing")
+KeyError: 'missing'
+
+======================================================================
+FAIL: test_long_reprs (__main__.Fixtures.test_long_reprs)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "...", line 41, in test_long_reprs
+    self.assertEqual(Big("abc"), Big("abd"))
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Big(x[30 chars]xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxabc) != Big(x[30 chars]xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxabd)
+
+======================================================================
+FAIL: test_sub (__main__.Fixtures.test_sub) (n=1)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "...", line 57, in test_sub
+    self.assertNotEqual(n, 1)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^
+AssertionError: 1 == 1
+
+----------------------------------------------------------------------
+Ran 6 tests
+
+FAILED (failures=2, errors=1, skipped=1, expected failures=1)
+
+6 2 1 1 1 False
+['setUpClass', 'tearDownClass']

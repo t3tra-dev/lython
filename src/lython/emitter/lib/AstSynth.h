@@ -44,6 +44,8 @@ NodePtr attribute(NodePtr value, llvm::StringRef attr, SourceRange range);
 NodePtr selfAttribute(llvm::StringRef receiver, llvm::StringRef attr,
                       SourceRange range);
 NodePtr subscript(NodePtr value, NodePtr slice, SourceRange range);
+// `*value`, an element of a display.
+NodePtr starred(NodePtr value, SourceRange range);
 NodePtr tuple(std::vector<NodePtr> elts, SourceRange range);
 NodePtr call(NodePtr func, std::vector<NodePtr> args, SourceRange range);
 // A `name=value` argument, and a call that carries some. The dispatcher's arms

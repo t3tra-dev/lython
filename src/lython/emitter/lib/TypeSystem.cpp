@@ -2684,6 +2684,13 @@ bool TypeSystem::namesAType(const parser::Node *node) const {
       return true;
     return static_cast<bool>(lookupClass(name));
   }
+  // `m.Pair` and `m.Widget`: a member of an imported module that is a type
+  // there.
+  if (node->kind == "Attribute") {
+    std::string qualified = ast::qualifiedName(node);
+    return !qualified.empty() && (scopedTypeAlias(qualified) ||
+                                  lookupClass(qualified));
+  }
   if (node->kind == "Subscript")
     return namesAType(ast::node(*node, "value"));
   if (node->kind == "BinOp") {
@@ -2693,6 +2700,35 @@ bool TypeSystem::namesAType(const parser::Node *node) const {
            namesAType(ast::node(*node, "right"));
   }
   return false;
+}
+
+std::optional<mlir::Type> TypeSystem::tupleConcatElement(mlir::Type left,
+                                                         mlir::Type right) const {
+  llvm::SmallVector<mlir::Type, 8> elements;
+  for (mlir::Type side : {left, right}) {
+    auto tuple = mlir::dyn_cast_if_present<py::ContractType>(side);
+    if (!tuple || tuple.getContractName() != "builtins.tuple" ||
+        tuple.getArguments().empty())
+      return std::nullopt;
+    for (mlir::Type argument : tuple.getArguments())
+      elements.push_back(widenLiteral(argument));
+  }
+  mlir::Type joined = join(elements);
+  if (!joined)
+    return std::nullopt;
+  return joined;
+}
+
+std::optional<mlir::Type>
+TypeSystem::scopedTypeAlias(llvm::StringRef name) const {
+  for (auto it = scopedTypeParameters.rbegin(), e = scopedTypeParameters.rend();
+       it != e; ++it)
+    if (auto found = it->find(name); found != it->end())
+      return found->second;
+  if (auto alias = annotationTypeAliases.find(name);
+      alias != annotationTypeAliases.end())
+    return alias->second;
+  return std::nullopt;
 }
 
 std::string TypeSystem::resolveAnnotationName(llvm::StringRef name) const {
@@ -3680,6 +3716,8 @@ mlir::Type TypeSystem::annotationType(const parser::Node *node) const {
       return contract(*contractName);
     if (auto knownClass = lookupClass(name))
       return *knownClass;
+    if (std::optional<mlir::Type> alias = scopedTypeAlias(name))
+      return *alias;
     return contract(name);
   }
   if (node->kind == "BinOp" && ast::isOperator(ast::node(*node, "op"), "BitOr"))
@@ -4761,6 +4799,11 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           members.append(rhs->begin(), rhs->end());
           return tupleOfMembers(*this, members);
         }
+    // A tuple of unknown length on either side is `(*left, *right)`, whose
+    // element is the join of the two sides' (emitBinary builds that display).
+    if (ast::isOperator(op, "Add"))
+      if (std::optional<mlir::Type> element = tupleConcatElement(left, right))
+        return contract("builtins.tuple", {*element});
     llvm::StringRef method = "__add__";
     if (ast::isOperator(op, "Sub"))
       method = "__sub__";

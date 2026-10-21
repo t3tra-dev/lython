@@ -732,6 +732,26 @@ static const parser::Node *anchorlessCallOf(const parser::Node &statement) {
   return value;
 }
 
+// Does the expression call anything (a call the emitter may inline)?
+static bool containsCallNode(const parser::Node &node) {
+  if (node.kind == "Call")
+    return true;
+  if (node.kind == "Lambda")
+    return false;
+  for (const parser::Field &field : node.fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child && containsCallNode(**child))
+        return true;
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &item : *children)
+        if (item && containsCallNode(*item))
+          return true;
+    }
+  }
+  return false;
+}
+
 void ModuleEmitter::emitStatement(const parser::Node &statement) {
   // ⛔ SAVED AND RESTORED RATHER THAN JUST ASSIGNED. A call the emitter inlines
   // emits the callee's statements in the middle of the caller's expression, and
@@ -757,6 +777,59 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     if (value && value->kind == "Constant" &&
         ast::isEllipsisField(*value, "value"))
       return;
+    // ⭐ A LIST IN A FIELD, MUTATED WITH AN ARGUMENT THAT CALLS, IS MUTATED
+    // THROUGH A LOCAL. The field is read first, as Python reads it, and a call
+    // in the argument the emitter inlines may bring blocks of its own -- a
+    // loop in the callee -- so the mutation landed in another block than the
+    // read, which the lowering refuses for a field ("list.append on a field
+    // or borrowed list is not supported inside a branch or loop body"):
+    //
+    //     for n in range(2):
+    //         result.errors.append(result.render(["v", str(n)]))
+    //
+    // unittest's `self.errors.append((test, self._exc_info_to_string(...)))`.
+    // The local is what that message asks for, and it is the same evaluation:
+    // the receiver once, then the arguments.
+    if (value && value->kind == "Call")
+      if (const parser::Node *callee = ast::node(*value, "func");
+          callee && callee->kind == "Attribute")
+        if (const parser::Node *receiver = ast::node(*callee, "value");
+            receiver && receiver->kind == "Attribute")
+          if (auto method = ast::string(*callee, "attr");
+              method && (*method == "append" || *method == "extend" ||
+                         *method == "insert"))
+            if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+                    types.widenLiteral(types.inferExpr(receiver)));
+                contract && contract.getContractName() == "builtins.list")
+              if (const auto *args = ast::nodeList(*value, "args");
+                  args && llvm::any_of(*args, [](const parser::NodePtr &arg) {
+                    return arg && containsCallNode(*arg);
+                  })) {
+                parser::SourceRange range = statement.range;
+                std::string local =
+                    "__lyfieldlist" + std::to_string(++syntheticFunctionCounter);
+                parser::NodePtr bind = synth::assign(
+                    synth::name(local, range),
+                    std::get<parser::NodePtr>(
+                        parser::findField(*callee, "value")->value),
+                    range);
+                parser::NodePtr call = parser::makeNode("Call", value->range);
+                parser::addField(*call, "func",
+                                 synth::attribute(synth::name(local, range),
+                                                  *method, range));
+                for (llvm::StringRef field : {"args", "keywords"})
+                  if (const parser::Field *original = parser::findField(*value, field))
+                    call->fields.push_back(*original);
+                parser::NodePtr expression = parser::makeNode("Expr", range);
+                parser::addField(*expression, "value", call);
+                synthesizedIteratorDefs.push_back(bind);
+                synthesizedIteratorDefs.push_back(expression);
+                runWithScratchNames({local}, [&] {
+                  emitStatement(*bind);
+                  emitStatement(*expression);
+                });
+                return;
+              }
     llvm::SaveAndRestore<const parser::Node *> discarded(discardedHostResult,
                                                          value);
     emitExpr(value);
@@ -791,6 +864,11 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
             types.namesAType(rhs);
         if (!valueless && rhs->kind == "Name")
           valueless = valuelessTypeAliases.contains(ast::nameSpelling(*rhs));
+        // And an imported module's alias read through the module
+        // (`P = m.Pair`); `W = m.Widget` is a class, which has a value.
+        if (!valueless && rhs->kind == "Attribute")
+          valueless = types.namesAType(rhs) &&
+                      !types.lookupClass(ast::qualifiedName(rhs));
         if (valueless) {
           valuelessTypeAliases.insert(ast::nameSpelling(*aliasTarget));
           return;

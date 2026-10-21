@@ -939,13 +939,24 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
     mlir::Type fallThroughType;
     if (!hasElse) {
       mlir::Type edgeType = types.widenLiteral(outer.type);
+      // ⭐ AND A SUB-UNION, which is what `A | B | None` narrows to: one
+      // member short is not a member, so `if s is None: s = default` kept
+      // the None of a three-member union forever (unittest's
+      // `TextTestRunner(stream=None)`). The unwrap takes a union result.
       for (const BranchTypeNarrowing &fact : narrowings)
         if (fact.name == name && fact.falseType)
-          if (auto unionType = mlir::dyn_cast<py::UnionType>(outer.type))
-            if (unionType.hasMember(fact.falseType)) {
+          if (auto unionType = mlir::dyn_cast<py::UnionType>(outer.type)) {
+            auto narrowedUnion = mlir::dyn_cast<py::UnionType>(fact.falseType);
+            if (unionType.hasMember(fact.falseType) ||
+                (narrowedUnion &&
+                 llvm::all_of(narrowedUnion.getMemberTypes(),
+                              [&](mlir::Type member) {
+                                return unionType.hasMember(member);
+                              }))) {
               fallThroughType = fact.falseType;
               edgeType = fallThroughType;
             }
+          }
       parts.push_back(edgeType);
     }
     bool valuesPresent = true;

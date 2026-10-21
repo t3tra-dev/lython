@@ -43,8 +43,9 @@ set(LYTHON_LIB_INTERNAL_PY
 )
 
 # `.pyi` modules are contracts with no implementation of their own: `js`, whose
-# values the JavaScript host supplies.
-file(GLOB LYTHON_STDLIB_PY CONFIGURE_DEPENDS
+# values the JavaScript host supplies. A directory is a package, as in CPython's
+# Lib/ (`unittest/__init__.py`, `unittest/case.py`).
+file(GLOB_RECURSE LYTHON_STDLIB_PY CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/src/lython/runtime/lib/*.py"
     "${CMAKE_SOURCE_DIR}/src/lython/runtime/lib/*.pyi"
 )
@@ -181,8 +182,18 @@ set(entries "")
 if(MODULES)
     string(REPLACE "," ";" module_list "${MODULES}")
     foreach(path IN LISTS module_list)
-        get_filename_component(name "${path}" NAME_WE)
+        # The module's dotted name is its path under LIB_ROOT; a package is its
+        # directory's `__init__`.
+        file(RELATIVE_PATH relative "${LIB_ROOT}" "${path}")
         get_filename_component(extension "${path}" EXT)
+        string(REGEX REPLACE "\\.pyi?$" "" stem "${relative}")
+        set(is_package false)
+        if(stem MATCHES "(^|/)__init__$")
+            string(REGEX REPLACE "/?__init__$" "" stem "${stem}")
+            set(is_package true)
+        endif()
+        string(REPLACE "/" "." name "${stem}")
+        string(MAKE_C_IDENTIFIER "${name}" symbol)
         if(extension STREQUAL ".pyi")
             set(is_stub true)
         else()
@@ -197,9 +208,9 @@ if(MODULES)
         endif()
         string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," bytes "${hex}")
         string(APPEND arrays
-            "static const unsigned char k_stdlib_${name}[] = {${bytes}};\n")
+            "static const unsigned char k_stdlib_${symbol}[] = {${bytes}};\n")
         string(APPEND entries
-            "    {\"${name}\", k_stdlib_${name}, sizeof(k_stdlib_${name}), ${is_stub}},\n")
+            "    {\"${name}\", k_stdlib_${symbol}, sizeof(k_stdlib_${symbol}), ${is_stub}, ${is_package}},\n")
     endforeach()
 endif()
 
@@ -230,6 +241,7 @@ add_custom_command(
     OUTPUT "${LYTHON_EMBEDDED_STDLIB_CPP}"
     COMMAND ${CMAKE_COMMAND}
         -DOUTPUT=${LYTHON_EMBEDDED_STDLIB_CPP}
+        -DLIB_ROOT=${CMAKE_SOURCE_DIR}/src/lython/runtime/lib
         -DMODULES=${LYTHON_EMBEDDED_STDLIB_INPUTS}
         -P ${LYTHON_EMBEDDED_STDLIB_GENERATOR}
     DEPENDS ${LYTHON_STDLIB_PY} ${LYTHON_EMBEDDED_STDLIB_GENERATOR}

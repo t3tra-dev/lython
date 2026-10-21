@@ -22,23 +22,21 @@ Deviations from CPython:
     and expands `~user` for other users; there is no `pwd` module yet, so
     both cases return the path unchanged (CPython also returns it unchanged
     when it cannot resolve the user).
-  - `realpath`, `samefile`, `relpath`, `commonprefix`, `commonpath`,
-    `expandvars`, `getsize`, `getmtime`, `ismount` and the
-    `splitdrive`/`splitroot` drive surface are not ported yet. commonprefix in
-    particular does not compile: reassigning a list element alias inside a
-    loop and returning it trips the ownership verifier
-    ("owned resource ... is returned with 1 additional retained ownership
-    token(s)"). `altsep` is None on posix and is omitted rather than
-    given a non-str value.
+  - `realpath`, `samefile`, `relpath`, `commonpath`, `expandvars`,
+    `getsize`, `getmtime`, `ismount` and the `splitdrive`/`splitroot` drive
+    surface are not ported yet. `altsep` is None on posix and is omitted
+    rather than given a non-str value.
+  - `commonprefix` (genericpath's in CPython) takes a sequence of str only.
 """
 
 import posix
+from collections.abc import Sequence
 
 __all__ = [
     "curdir", "pardir", "sep", "pathsep", "defpath", "extsep", "devnull",
     "normcase", "isabs", "join", "split", "splitext", "basename", "dirname",
     "exists", "lexists", "isfile", "isdir", "islink",
-    "abspath", "normpath", "expanduser",
+    "abspath", "normpath", "expanduser", "commonprefix",
 ]
 
 curdir: str = "."
@@ -130,6 +128,18 @@ def splitext(p: str) -> tuple[str, str]:
 def basename(p: str) -> str:
     """Returns the final component of a pathname"""
     return p[p.rfind("/") + 1:]
+
+
+def commonprefix(m: Sequence[str]) -> str:
+    "Given a list of pathnames, returns the longest common leading component"
+    if not m:
+        return ''
+    s1 = min(m)
+    s2 = max(m)
+    for i, c in enumerate(s1):
+        if c != s2[i]:
+            return s1[:i]
+    return s1
 
 
 def dirname(p: str) -> str:

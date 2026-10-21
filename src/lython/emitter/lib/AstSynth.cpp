@@ -81,6 +81,12 @@ NodePtr cloneTree(const parser::Node &node) {
   return clone;
 }
 
+NodePtr starred(NodePtr value, SourceRange range) {
+  NodePtr node = parser::makeNode("Starred", range);
+  parser::addField(*node, "value", std::move(value));
+  return node;
+}
+
 NodePtr tuple(std::vector<NodePtr> elts, SourceRange range) {
   NodePtr node = parser::makeNode("Tuple", range);
   parser::addField(*node, "elts", std::move(elts));
