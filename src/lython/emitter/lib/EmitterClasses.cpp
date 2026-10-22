@@ -5697,6 +5697,23 @@ std::optional<Value> ModuleEmitter::tryCallLargeMethod(
     if (unionType && !mlir::isa<py::UnionType>(actual) &&
         unionType.hasMember(types.widenLiteral(actual)))
       continue;
+    // ⭐ AND A VALUE THAT ENTERS `object`, A UNION OR A CALLABLE AS ITSELF:
+    // the call below converts it to the declared type (a box, a member, the
+    // forwarder a class becomes), and the body takes that type anyway. The
+    // copy this refused was the whole body per call -- argparse's
+    // `_add_argument` (450 nodes) behind every `parser.add_argument(...)`,
+    // whose wrapper hands it the caller's own narrower types: 770 blocks a
+    // call, 125 s to compile thirty-two options.
+    // ⛔ Not every assignable value: a narrower CONTRACT is what the copy
+    // specializes the body on, and a list display is typed by its slot.
+    // ⛔ Nor a generic method's specialization: its declared types ARE the
+    // solution, and a wider one compiles the body at a type its operations
+    // were never asked about (`assertSetEqual[S]`'s `d1 or d2`).
+    if (!specialization &&
+        (declared == types.object() || unionType ||
+         mlir::isa<py::CallableType>(declared)) &&
+        inlineArgumentFits(types.widenLiteral(actual), declared))
+      continue;
     return std::nullopt;
   }
 
@@ -6195,6 +6212,21 @@ bool ModuleEmitter::inlineArgumentFits(mlir::Type actual,
       if (llvm::is_contained(classMro(actualContract.getContractName()),
                              expectedContract.getContractName()))
         return true;
+  // ⭐ A CLASS IS A CALLABLE whose call is its construction, here as in the
+  // solver (TypeConstraintSolver.cpp): `type[int]` meets
+  // `Callable[[str], object]` because `int(str)` builds what `object` takes,
+  // and the union rule above then lets it meet `Callable[...] | None`.
+  if (auto expectedCallable = mlir::dyn_cast<py::CallableType>(expected))
+    if (auto actualClass = mlir::dyn_cast<py::TypeType>(actual))
+      if (!expectedCallable.hasVararg() && !expectedCallable.hasKwarg() &&
+          expectedCallable.getKwOnlyTypes().empty() &&
+          expectedCallable.getResultTypes().size() == 1)
+        if (mlir::Type instance = types.inferClassInstantiation(
+                actualClass.getInstanceType(),
+                expectedCallable.getPositionalTypes(), {}))
+          if (inlineArgumentFits(types.widenLiteral(instance),
+                                 expectedCallable.getResultTypes().front()))
+            return true;
   // ⭐ A SUBCLASS IS A CLASS VALUE OF ITS BASE: `type[Sq]` passed where
   // `type[Shape]` is declared is the class value naming Sq, which is what
   // the parameter holds at run time.

@@ -974,7 +974,27 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
     }
     if (!valuesPresent || parts.empty())
       continue;
+    // ⭐ A UNION THE NAME ALREADY HAS IS ITS STORAGE, and a value that fits it
+    // enters it as itself. `choice: A | None = None` then `choice = B()` in an
+    // arm (B a subclass of A) was joined to `A | B | None`, and the read
+    // after `if choice is not None:` unwrapped the A member while the B member
+    // was the one present -- a null field read, a segfault (argparse's
+    // `add_parser(..., help=...)`).
+    // ⛔ Only when the join would ADD a member: a join inside the union is a
+    // narrowing (`if ns is None: ns = Namespace()` leaves Namespace), and
+    // keeping the declared union there undid it.
     mlir::Type merged = types.join(parts);
+    mlir::Type outerUnion = types.widenLiteral(outer.type);
+    if (auto declared = mlir::dyn_cast<py::UnionType>(outerUnion))
+      if (auto joined = mlir::dyn_cast_if_present<py::UnionType>(merged))
+        if (llvm::any_of(joined.getMemberTypes(),
+                         [&](mlir::Type member) {
+                           return !declared.hasMember(member);
+                         }) &&
+            llvm::all_of(parts, [&](mlir::Type part) {
+              return part == outerUnion || inlineArgumentFits(part, outerUnion);
+            }))
+          merged = outerUnion;
     if (!merged)
       continue;
     replacementIndices.push_back(static_cast<unsigned>(index));
@@ -1078,13 +1098,70 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
   // -- and without carrying the fact into `savedMembers` the restore below
   // would drop it at the `if`'s closing line, which is where the narrowing is
   // needed.
+  //
+  // ⛔ EXCEPT WHAT THE SURVIVING ARM REBINDS. The test's fact is about the
+  // value the name held when it was asked; an arm that assigns the name has
+  // replaced that value, and re-applying the fact at the continuation
+  // unwrapped the NEW value as the old member:
+  //
+  //     while True:
+  //         if x is not None:
+  //             x = None          # the next trip saw '' again: it looped
+  //         else:                 # forever, or indexed an empty str
+  //             return n
+  //
+  // The arm's own value is what reaches the continuation, with its own type.
+  auto applySurvivingNarrowings = [&](bool conditionIsTrue,
+                                      const std::vector<parser::NodePtr> *arm) {
+    llvm::StringSet<> rebound;
+    collectAssignedNames(arm, rebound);
+    std::function<void(const parser::Node *)> attributeTargets =
+        [&](const parser::Node *node) {
+          if (!node)
+            return;
+          auto note = [&](const parser::Node *target) {
+            if (target && target->kind == "Attribute") {
+              std::string path = ast::qualifiedName(target);
+              if (!path.empty())
+                rebound.insert(path);
+            }
+          };
+          if (node->kind == "Assign") {
+            if (const auto *targets = ast::nodeList(*node, "targets"))
+              for (const parser::NodePtr &target : *targets)
+                note(target.get());
+          } else if (node->kind == "AnnAssign" || node->kind == "AugAssign") {
+            note(ast::node(*node, "target"));
+          }
+          if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
+              node->kind == "ClassDef" || node->kind == "Lambda")
+            return;
+          for (const parser::Field &field : node->fields)
+            if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+              attributeTargets(child->get());
+            } else if (const auto *children =
+                           std::get_if<std::vector<parser::NodePtr>>(
+                               &field.value)) {
+              for (const parser::NodePtr &item : *children)
+                attributeTargets(item.get());
+            }
+        };
+    if (arm)
+      for (const parser::NodePtr &statement : *arm)
+        attributeTargets(statement.get());
+    for (const BranchTypeNarrowing &fact : narrowings)
+      if (!rebound.contains(fact.name))
+        applyBranchNarrowing(statement, fact, conditionIsTrue);
+  };
   if (thenTerminates && !elseTerminates) {
     narrowedMemberTypes = savedMembers;
-    applyNarrowings(/*conditionIsTrue=*/false);
+    applySurvivingNarrowings(/*conditionIsTrue=*/false,
+                             ast::nodeList(statement, "orelse"));
     savedMembers = narrowedMemberTypes;
   } else if (hasElse && elseTerminates && !thenTerminates) {
     narrowedMemberTypes = savedMembers;
-    applyNarrowings(/*conditionIsTrue=*/true);
+    applySurvivingNarrowings(/*conditionIsTrue=*/true,
+                             ast::nodeList(statement, "body"));
     savedMembers = narrowedMemberTypes;
   } else if (!thenTerminates && !elseTerminates) {
     // ⭐ AND A FACT BOTH ARMS AGREE ON, which is the lazy-cache idiom:

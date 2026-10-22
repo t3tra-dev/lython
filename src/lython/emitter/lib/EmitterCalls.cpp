@@ -1129,6 +1129,29 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
       }
   if (std::optional<Value> subclasses = tryEmitSubclassesCall(expr))
     return *subclasses;
+  // ⛔ A METHOD OF A CLASS THAT DEFINES `__getattribute__` IS NOT CALLED
+  // DIRECTLY: CPython looks `obj.m` up through that method first, and what it
+  // answers is what is called. Calling the method the class declares would
+  // skip it in silence, and the delegation it would need --
+  // `object.__getattribute__(self, name)` with the name a value -- has no
+  // static answer here.
+  if (calleeNode && calleeNode->kind == "Attribute")
+    if (std::optional<std::string_view> method = ast::string(*calleeNode, "attr");
+        method && *method != "__getattribute__" && *method != "__getattr__")
+      if (auto receiver = mlir::dyn_cast_if_present<py::ContractType>(
+              types.widenLiteral(types.inferExpr(ast::node(*calleeNode, "value")))))
+        if (std::optional<MethodBinding> hook =
+                lookupClassMethod(receiver, "__getattribute__");
+            hook && hook->method && lookupClassMethod(receiver, *method)) {
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, expr.range.start,
+              "'" + receiver.getContractName().str() + "' defines "
+              "__getattribute__, which CPython asks for '" +
+                  std::string(*method) +
+                  "' before calling it; a method call cannot be resolved "
+                  "around it statically"});
+          return emitNone(expr);
+        }
   if (std::optional<Value> program = tryEmitTestProgramWithModuleFixtures(expr))
     return *program;
   if (calleeNode && calleeNode->kind == "Call")

@@ -4295,6 +4295,22 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
                 simple = qualifiedName.drop_front(dot + 1);
               return literal("\"" + simple.str() + "\"");
             }
+        // A class that defines `__getattribute__` answers every read on an
+        // instance with it, as the emitter calls it (EmitterExpressions.cpp,
+        // emitAttribute).
+        if (auto instance =
+                mlir::dyn_cast_if_present<py::ContractType>(widenLiteral(objectType));
+            instance && lookupClass(instance.getContractName())) {
+          std::vector<py::protocols::ContractResolution> hook =
+              table.methodContractCandidatesWithEvidence(instance,
+                                                         "__getattribute__");
+          if (hook.size() == 1 &&
+              hook.front().method.signature.getResultTypes().size() == 1 &&
+              !hook.front().method.signature.getPositionalTypes().empty() &&
+              hook.front().method.signature.getPositionalTypes().front() !=
+                  object())
+            return hook.front().method.signature.getResultTypes().front();
+        }
         if (std::optional<py::protocols::FieldResolution> field =
                 table.resolveFieldContractWithEvidence(widenLiteral(objectType),
                                                        *attr))
@@ -4361,6 +4377,22 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
                   signature.getPositionalTypes().front() == receiverInstance)
                 return signature;
             }
+          }
+          // ⭐ AN ATTRIBUTE NOTHING ELSE RESOLVES IS `__getattr__`'s RESULT,
+          // which is what the emitter calls for it (EmitterExpressions.cpp,
+          // the unresolved-attribute path), on an instance of a source class
+          // that defines one.
+          if (!mlir::isa<py::TypeType>(widenLiteral(objectType)) &&
+              lookupClass(contractType.getContractName()) &&
+              table.methodContractCandidatesWithEvidence(receiverInstance,
+                                                         *attr)
+                  .empty()) {
+            std::vector<py::protocols::ContractResolution> getattr =
+                table.methodContractCandidatesWithEvidence(receiverInstance,
+                                                           "__getattr__");
+            if (getattr.size() == 1 &&
+                getattr.front().method.signature.getResultTypes().size() == 1)
+              return getattr.front().method.signature.getResultTypes().front();
           }
         }
         if (std::optional<py::CallableType> bound =

@@ -2026,7 +2026,12 @@ private:
                             llvm::ArrayRef<std::pair<std::string, mlir::Type>>
                                 params,
                             parser::SourceRange range,
-                            std::function<std::vector<parser::NodePtr>()> body);
+                            std::function<std::vector<parser::NodePtr>()> body,
+                            bool returnsStr = false);
+  // `__name__` of a function value the static type does not name.
+  std::string functionNameDispatcher(mlir::Type callable,
+                                     parser::SourceRange range);
+  std::optional<Value> tryEmitFunctionValueNameRead(const parser::Node &expr);
   std::string classDocDispatcher(llvm::StringRef cls,
                                  parser::SourceRange range);
   std::string methodDocDispatcher(llvm::StringRef cls, llvm::StringRef method,

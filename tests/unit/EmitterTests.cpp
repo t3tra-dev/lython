@@ -2183,6 +2183,36 @@ TEST(EmitterTest, AContextManagerFunctionHandsItsParametersOnByName) {
                "positional-only parameters and *args or **kwargs"));
 }
 
+TEST(EmitterTest, WhatAClassDefiningGetattributeCannotDoIsRefused) {
+  // A method call on such an instance would be looked up through
+  // __getattribute__ first; calling the declared method directly is refused.
+  mlir::MLIRContext called(testRegistry());
+  lython::emitter::EmitResult call = emitSource(
+      "class C:\n    def __getattribute__(self, name: str) -> str:\n"
+      "        return name\n    def m(self) -> int:\n        return 1\n"
+      "print(C().m())\n",
+      called);
+  EXPECT_FALSE(call.ok());
+  EXPECT_TRUE(reportsDiagnostic(
+      call, "'C' defines __getattribute__, which CPython asks for 'm' before "
+            "calling it; a method call cannot be resolved around it "
+            "statically"));
+
+  // With __getattr__ beside it, a read would need the fallback CPython takes
+  // when __getattribute__ raises AttributeError.
+  mlir::MLIRContext both(testRegistry());
+  lython::emitter::EmitResult paired = emitSource(
+      "class C:\n    def __getattribute__(self, name: str) -> str:\n"
+      "        return name\n    def __getattr__(self, name: str) -> str:\n"
+      "        return name\nprint(C().x)\n",
+      both);
+  EXPECT_FALSE(paired.ok());
+  EXPECT_TRUE(reportsDiagnostic(
+      paired, "'C' defines both __getattribute__ and __getattr__; reading "
+              "'x' would need __getattr__ called when __getattribute__ raises "
+              "AttributeError, which is not supported"));
+}
+
 TEST(EmitterTest, AnAttributeASourceClassDoesNotHaveIsRefusedAtEmit) {
   // Nothing resolves the read -- not a field, a class attribute, a method or
   // a property -- and it used to be emitted anyway and die in the lowering as
@@ -2201,21 +2231,15 @@ TEST(EmitterTest, AnAttributeASourceClassDoesNotHaveIsRefusedAtEmit) {
             std::string::npos;
   EXPECT_TRUE(saidAttribute);
 
-  // A class that declares __getattr__ is told that the hook is not the answer,
-  // rather than being refused with the same sentence as one that does not.
+  // A class that declares __getattr__ is answered by it: the read is the
+  // call, and is not refused.
   mlir::MLIRContext hooked(testRegistry());
   lython::emitter::EmitResult hook = emitSource(
       "class C:\n    def __init__(self) -> None:\n        self.a = 1\n"
       "    def __getattr__(self, name: str) -> int:\n        return 0\n"
       "print(C().missing)\n",
       hooked);
-  EXPECT_FALSE(hook.ok());
-  bool saidHook = false;
-  for (const lython::parser::Diagnostic &diagnostic : hook.diagnostics)
-    saidHook = saidHook ||
-               diagnostic.message.find("__getattr__ is not called") !=
-                   std::string::npos;
-  EXPECT_TRUE(saidHook);
+  EXPECT_TRUE(hook.ok());
 
   // An attribute a manifest BASE provides is not this: the lowering resolves
   // it from the base's schema.
