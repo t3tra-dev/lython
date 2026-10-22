@@ -267,6 +267,11 @@ mlir::Type ModuleEmitter::postTryLaneCarrierType(mlir::Type type) const {
       name == "builtins.dict" || name == "builtins.set" ||
       name == "builtins.frozenset" || name == "builtins.bytes")
     return widened;
+  // ⭐ AND A BOX: `result = type_func(arg)` with a `Callable[[str], object]`
+  // is one header like the containers above, and argparse's `_get_value`
+  // read it after a `try` whose handlers all raise -- "unresolved name".
+  if (name == "builtins.object")
+    return widened;
   // A user class instance carries the same way. Why not leave it out:
   // a non-carrier candidate used to be skipped SILENTLY, so `obj = C(...)`
   // inside a handler was discarded and the post-try read answered the

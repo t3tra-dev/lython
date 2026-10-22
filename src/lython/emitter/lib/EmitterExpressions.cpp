@@ -3429,6 +3429,8 @@ ModuleEmitter::tryEmitDynamicClassName(const parser::Node &expr) {
 Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   if (std::optional<Value> doc = tryEmitDocRead(expr))
     return *doc;
+  if (std::optional<Value> name = tryEmitFunctionValueNameRead(expr))
+    return *name;
   if (std::optional<std::string_view> dynamicName = ast::string(expr, "attr");
       dynamicName && *dynamicName == "__name__")
     if (std::optional<Value> answered = tryEmitDynamicClassName(expr))
@@ -3452,6 +3454,41 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   auto attr = ast::string(expr, "attr");
   if (!attr)
     return emitNone(expr);
+  // ⭐ A CLASS THAT DEFINES `__getattribute__` ANSWERS EVERY READ ITSELF, as
+  // CPython asks it before anything else -- a field the class also declares
+  // included. The field was read directly, and `__getattribute__` returning
+  // 42 for `l.x` printed the field's 1.
+  // ⛔ Refused with `__getattr__` beside it: CPython calls that one when
+  // `__getattribute__` raises AttributeError, and the read would need the
+  // handler around the call.
+  if (auto instance = mlir::dyn_cast_if_present<py::ContractType>(object.type))
+    if (std::optional<MethodBinding> hook =
+            lookupClassMethod(instance, "__getattribute__");
+        hook && hook->method) {
+      if (std::optional<MethodBinding> fallback =
+              lookupClassMethod(instance, "__getattr__");
+          fallback && fallback->method) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "'" + instance.getContractName().str() +
+                "' defines both __getattribute__ and __getattr__; reading '" +
+                std::string(*attr) +
+                "' would need __getattr__ called when __getattribute__ "
+                "raises AttributeError, which is not supported"});
+        return emitNone(expr);
+      }
+      mlir::Type nameType =
+          types.literal(("\"" + std::string(*attr) + "\"").c_str());
+      Value name{py::StrConstantOp::create(builder, loc(expr), nameType,
+                                           builder.getStringAttr(*attr))
+                     .getResult(),
+                 nameType};
+      bool refused = false;
+      if (std::optional<Value> answered = tryEmitClassDunder(
+              expr, object, "__getattribute__", {name}, &refused))
+        return *answered;
+      return emitNone(expr);
+    }
   // A class attribute read through a class value the static type does not
   // decide is answered by the class the value names.
   if (mlir::isa_and_nonnull<py::TypeType>(object.type) &&
@@ -3820,12 +3857,32 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
       if (!table.resolveFieldContractWithEvidence(receiverInstance, *attr) &&
           table.methodContractCandidatesWithEvidence(receiverInstance, *attr)
               .empty()) {
+        // ⭐ `__getattr__` ANSWERS WHAT NOTHING ELSE DOES, as CPython calls it
+        // when the normal lookup fails: here that failure is static, so the
+        // read IS the call `obj.__getattr__("name")`, and its value has the
+        // method's declared type (TypeSystem.cpp answers the same).
+        // ⛔ An instance only: CPython does not consult `__getattr__` for an
+        // attribute read off the class (that is the metaclass's).
+        if (!mlir::isa<py::TypeType>(object.type))
+          if (std::optional<MethodBinding> getattr =
+                  lookupClassMethod(receiverInstance, "__getattr__");
+              getattr && getattr->method) {
+            mlir::Type nameType =
+                types.literal(("\"" + std::string(*attr) + "\"").c_str());
+            Value name{py::StrConstantOp::create(builder, loc(expr), nameType,
+                                                 builder.getStringAttr(*attr))
+                           .getResult(),
+                       nameType};
+            bool refused = false;
+            if (std::optional<Value> answered = tryEmitClassDunder(
+                    expr, object, "__getattr__", {name}, &refused))
+              return *answered;
+            if (refused)
+              return emitNone(expr);
+          }
         std::string message = "'" + contract.getContractName().str() +
                               "' object has no attribute '" +
                               std::string(*attr) + "'";
-        if (lookupClassMethod(receiverInstance, "__getattr__"))
-          message += ": __getattr__ is not called for a statically unresolved "
-                     "attribute";
         diagnostics.push_back(parser::Diagnostic{
             parser::Severity::Error, expr.range.start, std::move(message)});
         return emitNone(expr);
@@ -4901,9 +4958,21 @@ Value ModuleEmitter::emitExprExpected(const parser::Node *expr,
   Value value = emitExpr(expr);
   // A builtin function named where a callable value is expected becomes one
   // (tryWrapBuiltinFunctionValue); every other value is what it was.
-  if (auto expectedCallable =
-          mlir::dyn_cast_if_present<py::CallableType>(expected);
-      expectedCallable && (expr->kind == "Name" || expr->kind == "Attribute"))
+  // ⭐ And where `Callable[...] | None` is expected, the union's one callable
+  // member is the expectation: `type=int` into argparse's `type` parameter.
+  py::CallableType expectedCallable =
+      mlir::dyn_cast_if_present<py::CallableType>(expected);
+  if (auto expectedUnion = mlir::dyn_cast_if_present<py::UnionType>(expected)) {
+    unsigned callables = 0;
+    for (mlir::Type member : expectedUnion.getMemberTypes())
+      if (auto callable = mlir::dyn_cast<py::CallableType>(member)) {
+        expectedCallable = callable;
+        ++callables;
+      }
+    if (callables != 1)
+      expectedCallable = py::CallableType();
+  }
+  if (expectedCallable && (expr->kind == "Name" || expr->kind == "Attribute"))
   {
     if (std::optional<Value> wrapped =
             tryWrapBuiltinFunctionValue(value, expectedCallable, *expr))
@@ -5778,8 +5847,15 @@ ModuleEmitter::emitBuiltinForwarder(llvm::StringRef binding,
       mlir::OpBuilder::InsertionGuard guard(builder);
       emitCallableFunction(*def, symbol, sig, {}, /*isLambda=*/false);
     }
-    if (auto made = module.lookupSymbol<mlir::func::FuncOp>(symbol))
+    if (auto made = module.lookupSymbol<mlir::func::FuncOp>(symbol)) {
       made->setAttr("ly.function.doc_of", builder.getStringAttr(binding));
+      // What `__name__` of the value answers (EmitterDocstrings.cpp): the
+      // builtin's, `sqrt` for `math.sqrt`.
+      made->setAttr("ly.function.value_name",
+                    builder.getStringAttr(binding.rsplit('.').second.empty()
+                                              ? binding
+                                              : binding.rsplit('.').second));
+    }
     memo = builtinFunctionObjects
                .try_emplace(key, std::make_pair(symbol, sig.publicCallable))
                .first;
@@ -5887,6 +5963,14 @@ ModuleEmitter::tryWrapClassValue(Value value, py::CallableType target,
       emitCallableFunction(*def, symbol, sig, {}, /*isLambda=*/false,
                            /*positionalNodeOffset=*/1,
                            typeType.getInstanceType());
+      // What `__name__` of the value answers: the class's, as `int.__name__`.
+      if (auto made = module.lookupSymbol<mlir::func::FuncOp>(symbol))
+        if (auto contract = mlir::dyn_cast<py::ContractType>(
+                typeType.getInstanceType()))
+          made->setAttr("ly.function.value_name",
+                        builder.getStringAttr(
+                            py::contracts::displayClassNameForContract(
+                                contract.getContractName())));
     }
     memo = builtinFunctionObjects
                .try_emplace(key, std::make_pair(symbol, sig.publicCallable))
@@ -6199,6 +6283,23 @@ Value ModuleEmitter::coerceValue(Value value, mlir::Type targetType,
                                  const parser::Node &anchor) {
   if (!targetType || value.type == targetType)
     return value;
+  // A class or a builtin handed to `Callable[...] | None` becomes the
+  // forwarder of the union's one callable member, and that value then enters
+  // the union as any callable does.
+  if (auto targetUnion = mlir::dyn_cast<py::UnionType>(targetType);
+      targetUnion && mlir::isa<py::TypeType>(types.widenLiteral(value.type))) {
+    py::CallableType member;
+    unsigned callables = 0;
+    for (mlir::Type candidate : targetUnion.getMemberTypes())
+      if (auto callable = mlir::dyn_cast<py::CallableType>(candidate)) {
+        member = callable;
+        ++callables;
+      }
+    if (callables == 1)
+      if (std::optional<Value> wrapped =
+              tryWrapClassValue(value, member, anchor))
+        return coerceValue(*wrapped, targetType, anchor);
+  }
   if (auto targetCallable = mlir::dyn_cast<py::CallableType>(targetType)) {
     if (std::optional<Value> wrapped =
             tryWrapBuiltinFunctionValue(value, targetCallable, anchor))

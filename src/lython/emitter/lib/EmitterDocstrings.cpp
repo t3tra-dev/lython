@@ -2,6 +2,7 @@
 #include "AstSynth.h"
 #include "Contracts.h"
 #include "EmitterCore.h"
+#include "Mangling.h"
 #include "EmitterPyOps.h"
 #include "PyProtocols.h"
 #include "TypeInference.h"
@@ -318,7 +319,8 @@ std::string ModuleEmitter::docDispatcher(
     llvm::StringRef key, llvm::StringRef prefix,
     llvm::ArrayRef<std::pair<std::string, mlir::Type>> params,
     parser::SourceRange range,
-    std::function<std::vector<parser::NodePtr>()> body) {
+    std::function<std::vector<parser::NodePtr>()> body,
+    bool returnsStr) {
   if (auto found = computedLookupDispatchers.find(key);
       found != computedLookupDispatchers.end())
     return found->second;
@@ -331,8 +333,9 @@ std::string ModuleEmitter::docDispatcher(
   llvm::SmallVector<const parser::Node *, 2> paramNodes;
   parser::NodePtr def = synth::functionDef(
       symbol, synthParams, {}, {},
-      synth::binOp(synth::name("str", range), "BitOr",
-                   synth::noneConstant(range), range),
+      returnsStr ? synth::name("str", range)
+                 : synth::binOp(synth::name("str", range), "BitOr",
+                                synth::noneConstant(range), range),
       {}, range, &paramNodes);
   synthesizedIteratorDefs.push_back(def);
   for (auto [node, param] : llvm::zip(paramNodes, params))
@@ -464,6 +467,97 @@ ModuleEmitter::functionDocBody(mlir::Type callable,
       "function this program does not declare",
       range));
   return body;
+}
+
+// `__name__` of a function VALUE: the name of the function it was made for,
+// read off its target as `__doc__` is -- a def's own name, `<lambda>`, and
+// for the forwarder a class or a builtin became, that class's or builtin's.
+std::string ModuleEmitter::functionNameDispatcher(mlir::Type callable,
+                                                  parser::SourceRange range) {
+  if (!types.lookupSymbol("__ly$target_is"))
+    types.bindRootSymbol(
+        "__ly$target_is",
+        py::CallableType::get(&context, {types.object(), types.strType()}, {},
+                              mlir::Type(), mlir::Type(), {types.boolType()}));
+  return docDispatcher(
+      "fnname|" + typeText(callable), "__lyfnname$", {{"__ly_f", callable}},
+      range,
+      [this, callable, range] {
+        std::vector<parser::NodePtr> body;
+        for (mlir::func::FuncOp function :
+             module.getOps<mlir::func::FuncOp>()) {
+          auto typeAttr =
+              function->getAttrOfType<mlir::TypeAttr>("callable_type");
+          llvm::StringRef symbol = function.getSymName();
+          if (!typeAttr || function.isDeclaration() ||
+              symbol.starts_with("__lyfn") ||
+              symbol.starts_with("__lyclassdoc$") ||
+              symbol.starts_with("__lymethdoc$") ||
+              symbol.starts_with("__lygetattr") ||
+              symbol.starts_with("__lyhasattr$"))
+            continue;
+          if (!py::isAssignableTo(typeAttr.getValue(), callable,
+                                  module.getOperation()))
+            continue;
+          mlir::StringAttr name =
+              function->getAttrOfType<mlir::StringAttr>(
+                  "ly.function.value_name");
+          if (!name)
+            name = function->getAttrOfType<mlir::StringAttr>(
+                py::mangling::kFunctionNameAttr);
+          if (!name)
+            continue;
+          body.push_back(synth::ifStmt(
+              synth::call(synth::name("__ly$target_is", range),
+                          {synth::name("__ly_f", range),
+                           synth::strConstant(symbol, range)},
+                          range),
+              {synth::returnStmt(synth::strConstant(name.getValue(), range),
+                                 range)},
+              {}, range));
+        }
+        body.push_back(synth::raiseCall(
+            "TypeError",
+            "'__name__' is not supported here: the function value was made "
+            "for a function the compiler wrote, which has no name of its own",
+            range));
+        return body;
+      },
+      /*returnsStr=*/true);
+}
+
+// `f.__name__` where `f` holds a function the static type does not name:
+// a parameter, a field, an element. A def read by its own name keeps its
+// fold (emitAttribute), which this leaves alone.
+std::optional<Value>
+ModuleEmitter::tryEmitFunctionValueNameRead(const parser::Node &expr) {
+  if (ast::string(expr, "attr").value_or("") != "__name__")
+    return std::nullopt;
+  const parser::Field *field = parser::findField(expr, "value");
+  const auto *subject =
+      field ? std::get_if<parser::NodePtr>(&field->value) : nullptr;
+  if (!subject || !*subject)
+    return std::nullopt;
+  if ((*subject)->kind == "Name") {
+    llvm::StringRef spelling = ast::nameSpelling(**subject);
+    if (moduleFunctionNames.count(spelling) ||
+        types.lookupCanonicalBinding(spelling))
+      return std::nullopt;
+  }
+  if ((*subject)->kind == "Attribute")
+    if (const parser::Node *owner = ast::node(**subject, "value");
+        owner && owner->kind == "Name" &&
+        types.lookupClass(ast::nameSpelling(*owner)))
+      return std::nullopt;
+  auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+      types.widenLiteral(types.inferExpr(subject->get())));
+  if (!callable)
+    return std::nullopt;
+  std::string symbol = functionNameDispatcher(callable, expr.range);
+  parser::NodePtr call = synth::call(synth::name(symbol, expr.range),
+                                     {*subject}, expr.range);
+  synthesizedIteratorDefs.push_back(call);
+  return emitExpr(call.get());
 }
 
 std::optional<Value> ModuleEmitter::tryEmitDocRead(const parser::Node &expr) {

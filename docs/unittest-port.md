@@ -694,7 +694,7 @@ CPython も自分のインタプリタでテストを動かしているので、
      を渡す形 (A がうまく決まらない)、呼び出し位置の builtin をジェネリック
      な引数に渡す形、キーワード専用引数のある形の forwarder。
 5. クラスに付ける `@skip`、setUpModule、warnings (assertWarns)、
-   logging (assertLogs)、argparse。進め方は利用者の判断 (2026-10-23):
+   logging (assertLogs)、argparse (すべて済、2026-10-23)。進め方は利用者の判断 (2026-10-23):
    skip の印は unittest 側でクラスの表に記録する、setUpModule は
    `unittest.main()` を呼んだモジュールの関数をコンパイル時に探す、警告と
    ログは実行時に呼び出し元を引く、そのためのフレームは「使う関数だけ
@@ -723,11 +723,8 @@ CPython も自分のインタプリタでテストを動かしているので、
         `sys.modules` でなくその表で引く。setUpModule が例外を出すと
         モジュールのテストは走らず、エラーが 1 件出る。出力の順は CPython
         と同じ。
-      - 開いたまま: `unittest.addModuleCleanup(events.append, "x")` など、
-        unittest を import したプログラムで ParamSpec の転送に束縛メソッド
-        と str を渡すと lowering が拒否する (「block with no terminator」、
-        位置は case.py の `lambda: function(*args, **kwargs)`)。base の
-        lyc でも同じ。unittest を import しないと通る。
+      - `unittest.addModuleCleanup(events.append, "x")` が lowering で
+        拒否されていた件は 5 の 4 で直した。
    3. warnings と assertWarns / assertWarnsRegex (済、2026-10-23)。
       - 呼び出しのフレーム: `_frame` (新しい native モジュール、
         `modules/_frame.mlir`) が `sys._getframe(level)` の代わりに、
@@ -816,6 +813,71 @@ CPython も自分のインタプリタでテストを動かしているので、
            のものだった。そのモジュールのものを先に答える。
         3. (拒否) `x is y` で x が `C | None`、y が C のとき「no stable
            identity」。None の側は False、C の側はアドレスの比較にする。
+   5. `__getattr__` / `__getattribute__` と argparse (済、2026-10-23)。
+      - 静的に解決できない属性の読み出しは、インスタンスのクラスが
+        `__getattr__` を持てば `obj.__getattr__("name")` の呼び出しになる
+        (型はそのメソッドの戻り値の型、型推論も同じ答えを返す)。クラスが
+        `__getattribute__` を持てば、宣言済みのフィールドを含むすべての
+        読み出しがそれを呼ぶ。そのクラスのメソッド呼び出しと、両方を持つ
+        クラスの読み出しは拒否する (CPython は `__getattribute__` を先に
+        引き、委譲の `object.__getattribute__(self, name)` は名前が値なので
+        静的に答えられない)。
+      - `lib/argparse.py` は CPython の `Lib/argparse.py` の移植。Namespace
+        は値を dict に持ち `__getattr__` で答えるので、`args.name` は
+        `object`。`lib/textwrap.py` も移した (ヘルプの折り返し)。printf の
+        `%` は `lib/_printf.py` に一本化し、logging もそれを使う。逸脱は
+        argparse の冒頭に書いた (色なし、幅は `COLUMNS` か 80、action は
+        `namespace._set` で書く、fromfile / parents / FileType / intermixed
+        は無い)。テストは `tests/python/test_argparse.py` (11 件、使い方・
+        エラー・ヘルプの文字列が CPython と一致)。
+      - 書いている途中で見つけて直したもの (golden は base で赤):
+        1. (黙った誤り、base でも) クラスが定義した `__getattribute__` を、
+           静的に分かるフィールドの読み出しが素通りした (CPython 42 のところ
+           1)。
+        2. (黙った誤り、base でも、無限ループ) ループの中の
+           `if x is not None:` の腕が `x` に代入し、`else` がループを出る
+           とき、次の周回が代入前の値を見た。`else` が抜けるので「None で
+           ない」を `if` の後にも持ち越し、腕が代入した値をその型で unwrap
+           していた。生き残る腕が代入した名前・フィールドには持ち越さない。
+           argparse の `-vv` で見つかった。
+        3. (SIGSEGV、base でも) `x: A | None = None` に腕の中でサブクラス B
+           を代入すると、合流が `A | B | None` を作り、後の読み出しが A の
+           member を unwrap して空の lane を読んだ。合流が宣言済みの union に
+           member を足すなら、宣言済みの union に入れる。argparse の
+           `add_parser(..., help=...)`。
+        4. (拒否、base でも) unittest を import したプログラムで、
+           `Callable[..., object]` を通した呼び出しの候補に `*args` を持つ
+           関数があると、そのアームが tuple を作った後の命令を合流点の後ろに
+           書き、「block with no terminator」になった (C-5 の
+           addModuleCleanup)。間接呼び出しの dispatcher が各アームを書く間、
+           呼び出しの op をそのアームに置く (`op` の前に書く補助関数が数十
+           ある)。
+        5. (遅さ・拒否) 大きなメソッドを記号で呼ぶ条件が「引数が宣言型と
+           同じ」だったため、ラッパー経由で狭い型の値が来ると本体ごと複製
+           された (`add_argument` 1 回が 770 ブロック、32 個で所有権検査の
+           20000 状態を超え、通っても 125 秒)。宣言型が object・union・
+           Callable で値がそれに入るなら変換して呼ぶ (13 秒)。
+        6. (拒否) クラスを `Callable[...] | None` の引数に渡せなかった
+           (メソッドと関数の両方の経路)。
+        7. (拒否) `object` 型の値を `try` の中で束縛し、ハンドラがすべて
+           raise するとき、`try` の後で「unresolved name」。
+        8. (拒否) 関数の値の `__name__`。どの関数のために作られた値かを
+           `py.target.is` で引く dispatcher で答える (クラスや builtin の
+           forwarder はその名前)。
+      - 開いたまま:
+        - (拒否、base でも) ハンドラが return する `try` の中で束縛した
+          `object` 型の値 (slot が `object` を持てない)。
+        - (拒否、base でも) `SystemExit.code` (int / str / None を返す
+          primitive が要る)。
+        - (拒否) `dict[K, C | None]` の `pop`、`Iterable[object] | None` の
+          引数、protocol 型の引数をさらに関数へ渡す形、`isinstance` で
+          絞った list を合流する変数に入れる形 (所有権検査)。
+        - (拒否) 1 つの関数が約 20000 ブロックを超えると所有権検査の上限に
+          当たる。上限を関数の大きさに比例させると、資源ごとの探索で全体が
+          二乗になり 900 秒を超えたので戻した。
+        - argparse は custom action が `setattr` でなく `namespace._set` を
+          使う必要がある (Namespace に `__setattr__` が無い)。
+        - コンパイル時間: argparse を import するプログラムは 10〜13 秒。
 
 ### D. テストを移す
 

@@ -4,6 +4,7 @@
 #include "Runtime/ABI/BoxLayout.h"
 
 #include "mlir/IR/IRMapping.h"
+#include "llvm/ADT/ScopeExit.h"
 
 #include <cstddef>
 #include <cstdlib>
@@ -764,9 +765,29 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
     }
   }
 
+  // ⭐ EACH ARM IS WRITTEN WITH THE CALL IN IT. The helpers an arm reaches
+  // place what they write before `op` (`builder.setInsertionPoint(op)`) --
+  // which is right everywhere else, and here would be the continuation the
+  // split put `op` at the head of. A vararg target's `*args` tuple stored its
+  // element there, and the arm was left with no terminator ("block with no
+  // terminator" for `function(*args)` through a `Callable[..., object]` once
+  // `unittest.util._common_shorten_repr(*args)` was a candidate). So `op` is
+  // parked at the end of each arm while it is written, and put back after.
+  // ⛔ Not a fix in each helper: there are dozens, and the next one written
+  // would anchor at `op` too.
+  auto parkOpIn = [&](mlir::Block *block) {
+    operation->moveBefore(block, block->end());
+  };
+  auto restoreOp = [&] {
+    operation->moveBefore(continuation, continuation->begin());
+  };
   for (auto [index, target] : llvm::enumerate(targets)) {
     llvm::StringRef targetName = target.getSymName();
-    builder.setInsertionPointToStart(targetBlocks[index]);
+    parkOpIn(targetBlocks[index]);
+    llvm::scope_exit unpark(restoreOp);
+    // Before the parked call, so what a helper writes "before `op`" and what
+    // is written at the insertion point are one stream, in order.
+    builder.setInsertionPoint(operation);
 
     RuntimeBundle selectedCallable = callable;
     selectedCallable.functionTarget = targetName.str();
@@ -780,7 +801,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
       selectedCallable.closureValues = alternative->closureValues;
     }
     if (selectedCallable.closureValues.empty()) {
-      builder.setInsertionPointToEnd(targetBlocks[index]);
+      builder.setInsertionPoint(operation);
       mlir::FailureOr<llvm::SmallVector<RuntimeValue, 4>> fromObject =
           RuntimeBundleLowerer::closureValuesFromFunctionObject(op, callable,
                                                                target);
