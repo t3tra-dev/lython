@@ -1790,6 +1790,13 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
       mlir::func::CallOp indexCall = RuntimeBundleLowerer::createRuntimeCall(
           loc, *unbox, index.physicalValues());
       raw = indexCall.getResult(0);
+    } else if (std::optional<mlir::Value> deferred =
+                   RuntimeBundleLowerer::deferredIntValueChecked(op, index)) {
+      // ⛔ Not the lane alone: a DEFERRED int carries its object beside it,
+      // and where the flag is false (an int that came boxed -- `ord(c)`, an
+      // element read from a list) the lane is a stale 0. `xs[ch >> 5]` read
+      // `xs[0]`: re's character sets, silently.
+      raw = *deferred;
     } else if (index.primitiveI64 && index.primitiveI64->value) {
       // No boxed payload to fall back to (primitive-i64 clone lanes carry
       // only the (value, valid) pair): the lane is the sole carrier.

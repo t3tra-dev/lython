@@ -389,7 +389,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesFieldAttrSet(
       !(value->primitiveI64 && value->primitiveI64->valid &&
         isKnownTrue(value->primitiveI64->valid))) {
     mlir::Value raw;
-    if (value->primitiveI64 && value->primitiveI64->value) {
+    if (std::optional<mlir::Value> deferred =
+            RuntimeBundleLowerer::deferredIntValueChecked(op, *value)) {
+      raw = *deferred;
+    } else if (value->primitiveI64 && value->primitiveI64->value) {
       raw = value->primitiveI64->value;
     } else if (std::optional<RuntimeSymbol> unbox = manifest.primitive(
                    value->contractName(), "unbox.i64")) {

@@ -3,6 +3,7 @@
 import sys
 import difflib
 import pprint
+import re
 import contextlib
 import time
 import types
@@ -172,7 +173,8 @@ def expectedFailure[T: TestCase](test_item: Callable[[T], None]) -> Callable[[T]
 class _AssertRaisesContext[E: BaseException]:
     """A context manager used to implement TestCase.assertRaises* methods."""
 
-    def __init__(self, expected: type[E], test_case: TestCase, msg: str | None = None) -> None:
+    def __init__(self, expected: type[E], test_case: TestCase,
+                 msg: str | None = None) -> None:
         self.expected = expected
         self.test_case = test_case
         self.msg = msg
@@ -206,6 +208,38 @@ class _AssertRaisesContext[E: BaseException]:
             return False
         if isinstance(exc_value, self.expected):
             self._exception = exc_value
+        return True
+
+
+class _AssertRaisesRegexContext[E: BaseException]:
+    """assertRaisesRegex's context manager: _AssertRaisesContext's, and the
+    raised exception's text searched for expected_regex."""
+
+    def __init__(self, expected: type[E], test_case: TestCase,
+                 expected_regex: str | re.Pattern,
+                 msg: str | None = None) -> None:
+        self.raises = _AssertRaisesContext[E](expected, test_case, msg)
+        self.expected_regex = re.compile(expected_regex)
+
+    @property
+    def exception(self) -> E:
+        return self.raises.exception
+
+    def __enter__(self) -> _AssertRaisesRegexContext[E]:
+        return self
+
+    def __exit__(self, exc_type: type[BaseException] | None, exc_value: BaseException | None,
+                 tb: types.TracebackType | None) -> bool:
+        # ⛔ Not `tb`: a traceback has no value here, and the inner context
+        # does not read it.
+        if not self.raises.__exit__(exc_type, exc_value, None):
+            return False
+        expected_regex = self.expected_regex
+        if expected_regex.search(str(exc_value)) is None:
+            test_case = self.raises.test_case
+            test_case.fail(test_case._formatMessage(
+                self.raises.msg, '"{}" does not match "{}"'.format(
+                    expected_regex.pattern, str(exc_value))))
         return True
 
 
@@ -505,6 +539,47 @@ class TestCase(object):
         context = _AssertRaisesContext[E](expected_exception, self)
         with context:
             callable_obj(*args, **kwargs)
+
+    def assertRaisesRegex[E: BaseException](self, expected_exception: type[E],
+                                            expected_regex: str | re.Pattern,
+                                            msg: str | None = None) -> _AssertRaisesRegexContext[E]:
+        """Asserts that the message in a raised exception matches a regex.
+
+        Args:
+            expected_exception: Exception class expected to be raised.
+            expected_regex: Regex (re.Pattern object or string) expected
+                    to be found in error message.
+            msg: Optional message used in case of failure. Can only be used
+                    when assertRaisesRegex is used as a context manager.
+        """
+        return _AssertRaisesRegexContext[E](expected_exception, self, expected_regex, msg)
+
+    def assertRegex(self, text: str, expected_regex: str | re.Pattern,
+                    msg: str | None = None) -> None:
+        """Fail the test unless the text matches the regular expression."""
+        if isinstance(expected_regex, str):
+            assert expected_regex, "expected_regex must not be empty."
+        regex = re.compile(expected_regex)
+        if regex.search(text) is None:
+            standardMsg = "Regex didn't match: %r not found in %r" % (
+                regex.pattern, text)
+            # _formatMessage ensures the longMessage option is respected
+            msg = self._formatMessage(msg, standardMsg)
+            raise self.failureException(msg)
+
+    def assertNotRegex(self, text: str, unexpected_regex: str | re.Pattern,
+                       msg: str | None = None) -> None:
+        """Fail the test if the text matches the regular expression."""
+        regex = re.compile(unexpected_regex)
+        match = regex.search(text)
+        if match is not None:
+            standardMsg = 'Regex matched: %r matches %r in %r' % (
+                text[match.start() : match.end()],
+                regex.pattern,
+                text)
+            # _formatMessage ensures the longMessage option is respected
+            msg = self._formatMessage(msg, standardMsg)
+            raise self.failureException(msg)
 
     def _baseAssertEqual[T](self, first: T, second: T, msg: str | None = None) -> None:
         """The default assertEqual implementation, not type specific."""

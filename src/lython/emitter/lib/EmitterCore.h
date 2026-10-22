@@ -919,6 +919,18 @@ private:
                               GenericFunctionInfo &generic,
                               py::CallableType target,
                               const ParamSpecCallShape *paramSpecShape = nullptr);
+  llvm::SmallVector<unsigned, 2>
+  concretizeParamSpecCallables(const parser::Node &def, FunctionSignature &sig,
+                               unsigned declaredCount,
+                               llvm::ArrayRef<mlir::Type> packPositional,
+                               llvm::ArrayRef<CallKeywordType> packKeywords,
+                               llvm::ArrayRef<bool> needsForwarder);
+  // Whether a value is a builtin function or a class: what only a forwarder
+  // makes a callable value of.
+  bool needsCallableForwarder(Value value);
+  // Per parameter of the generic call being specialized: whether its
+  // argument needs a forwarder (emitGenericCall sets it).
+  llvm::SmallVector<bool, 4> paramSpecForwarderArguments;
   ParamSpecCallShape paramSpecCallShape(const FunctionSignature &sig,
                                         const CallOperands &operands) const;
   // Binds the `*args` and `**kwargs` of a body specialized at one call's
@@ -1462,6 +1474,9 @@ private:
                                                   bool &refused);
   // Adopts a declared container type for an argument that came back with
   // erased arguments -- the `set()` spelling (EmitterClasses.cpp).
+  // A fresh display literal argument retyped to the solved generic formal.
+  Value adoptSolvedDisplay(Value value, mlir::Type declared,
+                           const parser::Node *node);
   Value adoptDeclaredContainer(Value value, mlir::Type declared,
                                const parser::Node &anchor);
   Value emitInlineMethodCall(const parser::Node &expr, Value receiver,
@@ -1600,6 +1615,14 @@ private:
   std::optional<Value> tryWrapBuiltinFunctionValue(Value value,
                                                    py::CallableType target,
                                                    const parser::Node &anchor);
+  std::optional<Value> emitBuiltinForwarder(llvm::StringRef binding,
+                                            py::CallableType target,
+                                            const parser::Node &anchor);
+  // A class named where a callable value is expected: the forwarder
+  // `return C(a0, ...)`, typed by the callable, memoized with the builtin
+  // ones under "<type>|<callable>".
+  std::optional<Value> tryWrapClassValue(Value value, py::CallableType target,
+                                         const parser::Node &anchor);
   std::optional<Value> tryEmitManifestMethodObject(const parser::Node &anchor,
                                                    Value object,
                                                    llvm::StringRef methodName);
@@ -2350,6 +2373,9 @@ private:
   };
   // The bodies desugarMethodDecorators hid behind their decorators.
   llvm::DenseSet<const parser::Node *> decoratedMethodBodies;
+  // The defs written directly in a class body, recorded as the class is
+  // declared.
+  llvm::DenseSet<const parser::Node *> classBodyDefs;
   llvm::SmallVector<SuperContext, 4> superContexts;
   // Method bodies currently being inlined, innermost last. Inlining emits
   // BOTH arms of every branch, so a cycle in the inline graph has no base

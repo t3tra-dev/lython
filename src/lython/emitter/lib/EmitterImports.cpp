@@ -754,8 +754,8 @@ resolveRelativeModule(llvm::StringRef packageName, std::int64_t level,
 // Lib modules use, e.g. `if name == 'posix': from posix import *`).
 // Unfoldable module-level ifs contribute no static bindings.
 std::vector<parser::NodePtr>
-staticModuleStatements(TypeSystem &types,
-                       const std::vector<parser::NodePtr> &body) {
+flattenStaticModuleStatements(TypeSystem &types,
+                              const std::vector<parser::NodePtr> &body) {
   std::vector<parser::NodePtr> out;
   out.reserve(body.size());
   for (const parser::NodePtr &statement : body) {
@@ -773,13 +773,25 @@ staticModuleStatements(TypeSystem &types,
       if (!branch)
         continue;
       std::vector<parser::NodePtr> nested =
-          staticModuleStatements(types, *branch);
+          flattenStaticModuleStatements(types, *branch);
       out.insert(out.end(), nested.begin(), nested.end());
       continue;
     }
     out.push_back(statement);
   }
   return out;
+}
+
+// Read once per module body: every binding of one of its names asks.
+const std::vector<parser::NodePtr> &
+staticModuleStatements(TypeSystem &types,
+                       const std::vector<parser::NodePtr> &body) {
+  std::unique_ptr<std::vector<parser::NodePtr>> &memo =
+      types.moduleStatementsMemo[&body];
+  if (!memo)
+    memo = std::make_unique<std::vector<parser::NodePtr>>(
+        flattenStaticModuleStatements(types, body));
+  return *memo;
 }
 
 } // namespace
@@ -872,7 +884,7 @@ bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
   const auto *rawBody = ast::nodeList(*source->moduleNode, "body");
   if (!rawBody)
     return true;
-  const std::vector<parser::NodePtr> flattened =
+  const std::vector<parser::NodePtr> &flattened =
       staticModuleStatements(types, *rawBody);
   const std::vector<parser::NodePtr> *body = &flattened;
   // ⛔ Not the defs of a module whose signatures are being read further up:
@@ -1229,6 +1241,11 @@ foldModuleConstant(const std::vector<parser::NodePtr> &body,
   return FoldedConstant{false, out, {}};
 }
 
+static std::optional<mlir::Type>
+computeSourceModuleLiteralConstant(TypeSystem &types,
+                                   const std::vector<parser::NodePtr> &body,
+                                   llvm::StringRef exportedName);
+
 // A top-level `NAME: T = <literal>` / `NAME = <literal>` assigned exactly once
 // in a source module is a static literal constant: its literal type fully
 // determines the value, so importers materialize it without module state.
@@ -1236,6 +1253,24 @@ static std::optional<mlir::Type>
 sourceModuleLiteralConstant(TypeSystem &types,
                             const std::vector<parser::NodePtr> &body,
                             llvm::StringRef exportedName) {
+  std::pair<const void *, unsigned> key{
+      body.empty() ? nullptr : body.front().get(),
+      static_cast<unsigned>(body.size())};
+  llvm::StringMap<std::optional<mlir::Type>> &names =
+      types.moduleConstantMemo[key];
+  auto found = names.find(exportedName);
+  if (found != names.end())
+    return found->second;
+  std::optional<mlir::Type> answer =
+      computeSourceModuleLiteralConstant(types, body, exportedName);
+  types.moduleConstantMemo[key][exportedName] = answer;
+  return answer;
+}
+
+static std::optional<mlir::Type>
+computeSourceModuleLiteralConstant(TypeSystem &types,
+                                   const std::vector<parser::NodePtr> &body,
+                                   llvm::StringRef exportedName) {
   const parser::Node *constantNode = nullptr;
   unsigned assignments = 0;
   for (const parser::NodePtr &statement : body) {
@@ -1410,7 +1445,7 @@ bool ModuleEmitter::bindSourceModuleName(llvm::StringRef module,
   const auto *rawBody = ast::nodeList(*source->moduleNode, "body");
   if (!rawBody)
     return false;
-  const std::vector<parser::NodePtr> flattened =
+  const std::vector<parser::NodePtr> &flattened =
       staticModuleStatements(types, *rawBody);
   const std::vector<parser::NodePtr> *body = &flattened;
   for (const parser::NodePtr &statement : *body) {
@@ -1504,7 +1539,7 @@ bool ModuleEmitter::bindSourceModuleReexport(
   const auto *rawBody = ast::nodeList(*source.moduleNode, "body");
   if (!rawBody)
     return false;
-  const std::vector<parser::NodePtr> flattened =
+  const std::vector<parser::NodePtr> &flattened =
       staticModuleStatements(types, *rawBody);
   const std::vector<parser::NodePtr> *body = &flattened;
   for (const parser::NodePtr &statement : *body) {
@@ -1750,7 +1785,7 @@ void ModuleEmitter::collectImportedModuleGlobals() {
     const auto *rawBody = ast::nodeList(*source.moduleNode, "body");
     if (!rawBody)
       continue;
-    const std::vector<parser::NodePtr> body =
+    const std::vector<parser::NodePtr> &body =
         staticModuleStatements(types, *rawBody);
     // The annotation is read in ITS module, where `A` is that module's class.
     // ⛔ Not in the importer's scope, which is where this walk runs: there a
@@ -1884,7 +1919,7 @@ void ModuleEmitter::bindSourceModuleLocals(llvm::StringRef moduleName,
   const auto *rawBody = ast::nodeList(sourceModule, "body");
   if (!rawBody)
     return;
-  const std::vector<parser::NodePtr> flattened =
+  const std::vector<parser::NodePtr> &flattened =
       staticModuleStatements(types, *rawBody);
   const std::vector<parser::NodePtr> *body = &flattened;
   bindSourceClassLocals(types, moduleName, *body);
@@ -1973,7 +2008,7 @@ void ModuleEmitter::bindModuleImportScope(const parser::Node &sourceModule,
       packageOfModule.emplace(activePackageName, source.packageName);
       break;
     }
-  const std::vector<parser::NodePtr> flattened =
+  const std::vector<parser::NodePtr> &flattened =
       staticModuleStatements(types, *rawBody);
   const std::vector<parser::NodePtr> *body = &flattened;
   for (const parser::NodePtr &statement : *body) {
@@ -2271,7 +2306,7 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
         // A lowering sentence for a program CPython runs, and the disagreement
         // is between two walks of one module -- so the fix is to walk it once
         // the same way, not to teach this loop a second recogniser for `If`.
-        const std::vector<parser::NodePtr> body =
+        const std::vector<parser::NodePtr> &body =
             staticModuleStatements(types, *rawBody);
         walk(body, *rawBody);
         activePackageName = std::move(savedPackageName);
@@ -2940,7 +2975,7 @@ void ModuleEmitter::declareJsHostModule() {
     TypeSystem::ScopeIsolation isolation = types.isolateScopes();
     auto moduleScope = types.pushScope();
     bindModuleImportScope(*host->moduleNode, /*diagnoseUnsupported=*/false);
-    const std::vector<parser::NodePtr> body =
+    const std::vector<parser::NodePtr> &body =
         staticModuleStatements(types, *rawBody);
     bindSourceClassLocals(types, host->moduleName, body);
     // Aliases in source order, twice: the stub spells some before the types

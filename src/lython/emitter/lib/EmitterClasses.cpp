@@ -2973,6 +2973,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       if (!statement || (statement->kind != "FunctionDef" &&
                          statement->kind != "AsyncFunctionDef"))
         continue;
+      classBodyDefs.insert(statement.get());
       auto methodName = ast::string(*statement, "name");
       if (!methodName)
         continue;
@@ -5200,6 +5201,49 @@ Value ModuleEmitter::adoptDeclaredContainer(Value value, mlir::Type declared,
   return coerceValue(value, declared, anchor);
 }
 
+// ⭐ A DISPLAY LITERAL PASSED TO A GENERIC PARAMETER IS BUILT AS WHAT T WAS
+// SOLVED TO. `assertEqual(m.groups(), ('a', None))` solves T from both
+// arguments as `tuple[str | None, ...]`, but the literal was emitted before
+// that, against T itself, so it stayed `tuple[str, None]` and was refused
+// against its own formal -- while `x: tuple[str | None, ...] = ('a', None)`
+// one line up retypes the same literal at its annotation
+// (emitContainerLiteral's coercion). The solver accepting the call is the
+// check that its elements fit.
+// ⛔ Only a FRESH display (`[...]`, `(...)`, `{...}` with no starred element):
+// any other container already has a type of its own that other names see.
+Value ModuleEmitter::adoptSolvedDisplay(Value value, mlir::Type declared,
+                                        const parser::Node *node) {
+  if (!node || !declared || value.type == declared ||
+      unboundStaticParameterCount(declared) != 0)
+    return value;
+  llvm::StringRef wanted;
+  if (node->kind == "List")
+    wanted = "builtins.list";
+  else if (node->kind == "Tuple")
+    wanted = "builtins.tuple";
+  else if (node->kind == "Dict")
+    wanted = "builtins.dict";
+  else if (node->kind == "Set")
+    wanted = "builtins.set";
+  if (wanted.empty())
+    return value;
+  if (const auto *elements = ast::nodeList(*node, "elts"))
+    for (const parser::NodePtr &element : *elements)
+      if (!element || element->kind == "Starred")
+        return value;
+  if (const auto *keys = ast::nodeList(*node, "keys"))
+    for (const parser::NodePtr &key : *keys)
+      if (!key)
+        return value;
+  auto actual = mlir::dyn_cast_if_present<py::ContractType>(
+      types.widenLiteral(value.type));
+  auto expected = mlir::dyn_cast_if_present<py::ContractType>(declared);
+  if (!actual || !expected || actual.getContractName() != wanted ||
+      expected.getContractName() != wanted)
+    return value;
+  return coerceValue(value, declared, *node);
+}
+
 // The parameters an inlined method's call fills, its receiver's slot excluded,
 // for a call that collects a starred argument or a `**` mapping of unknown size.
 ModuleEmitter::DynamicUnpackTarget
@@ -6492,15 +6536,63 @@ Value ModuleEmitter::emitInlineMethodBody(
         substitute(specializedSig->callableVarargType);
     specializedSig->kwargType = substitute(specializedSig->kwargType);
     specializedSig->resultType = substitute(specializedSig->resultType);
-    types.refreshCallable(*specializedSig);
     std::size_t firstSlot = methodBindingBindsReceiver(method) ? 1 : 0;
     adoptedPositional.assign(positional.begin(), positional.end());
-    for (auto [index, argument] : llvm::enumerate(adoptedPositional))
+    // `addCleanup(int, "x")`: the `Callable[P, R]` parameter takes the shape
+    // of what this call passes on (concretizeParamSpecCallables), and a
+    // builtin or a class given to it becomes a forwarder of that shape.
+    if (specializedSig->paramSpecArgs && !collectedVararg && !collectedKwargs &&
+        specializedSig->positionalTypes.size() >= firstSlot) {
+      std::size_t fixed = specializedSig->positionalTypes.size() - firstSlot;
+      llvm::SmallVector<mlir::Type, 4> packPositional;
+      for (std::size_t index = fixed; index < positional.size(); ++index)
+        packPositional.push_back(types.widenLiteral(positional[index].type));
+      llvm::SmallVector<CallKeywordType, 2> packKeywords;
+      for (const auto &entry : keywords)
+        if (!llvm::is_contained(specializedSig->positionalNames,
+                                entry.getKey().str()) &&
+            !llvm::is_contained(specializedSig->kwOnlyNames,
+                                entry.getKey().str()))
+          packKeywords.push_back(
+              CallKeywordType{entry.getKey().str(),
+                              types.widenLiteral(entry.getValue().type)});
+      llvm::SmallVector<bool, 4> forwarded(firstSlot, false);
+      for (const Value &argument : positional)
+        forwarded.push_back(needsCallableForwarder(argument));
+      for (unsigned index : concretizeParamSpecCallables(
+               *method.method, *specializedSig,
+               static_cast<unsigned>(specializedSig->positionalTypes.size()),
+               packPositional, packKeywords, forwarded)) {
+        if (index < firstSlot || index - firstSlot >= adoptedPositional.size())
+          continue;
+        auto target = mlir::cast<py::CallableType>(
+            specializedSig->positionalTypes[index]);
+        Value &argument = adoptedPositional[index - firstSlot];
+        std::optional<Value> wrapped =
+            tryWrapBuiltinFunctionValue(argument, target, anchor);
+        if (!wrapped)
+          wrapped = tryWrapClassValue(argument, target, anchor);
+        if (wrapped)
+          argument = *wrapped;
+      }
+    }
+    types.refreshCallable(*specializedSig);
+    const auto *argumentNodes =
+        anchor.kind == "Call" ? ast::nodeList(anchor, "args") : nullptr;
+    if (argumentNodes && argumentNodes->size() != adoptedPositional.size())
+      argumentNodes = nullptr;
+    for (auto [index, argument] : llvm::enumerate(adoptedPositional)) {
       if (emptyLiterals && emptyLiterals->positional[index] &&
           firstSlot + index < specializedSig->positionalTypes.size())
         argument = adoptDeclaredContainer(
             argument, specializedSig->positionalTypes[firstSlot + index],
             anchor);
+      else if (argumentNodes &&
+               firstSlot + index < specializedSig->positionalTypes.size())
+        argument = adoptSolvedDisplay(
+            argument, specializedSig->positionalTypes[firstSlot + index],
+            (*argumentNodes)[index].get());
+    }
     positional = adoptedPositional;
     if (bindDescriptorReceiver && !collectedVararg && !collectedKwargs) {
       MethodSpecialization specialization{*specializedSig, typeArguments};

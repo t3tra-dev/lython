@@ -7158,12 +7158,42 @@ public:
       // every edge are one name. A coroutine whose awaited `__aenter__`
       // returns `self` met this: the try normalization threads both `span`
       // and the receiver, and the merged body folds them together.
+      //
+      // ⛔ Not at a LOOP HEADER. There the two arguments are two loop-carried
+      // names, and the emitter has already given each of them its own token
+      // on the edges it writes (the back edge's `py.incref` for the second
+      // lane, a `py.decref` per lane where the body replaces them) -- the
+      // entry edge's tokens are this pass's to place. Folded, the one
+      // argument got two tokens from the back edge and one from the entry:
+      //
+      //     got = get(0)
+      //     char = got
+      //     while True:
+      //         got = get(n)
+      //         char = got
+      //         if char == ':': break
+      //
+      // "released or transferred more than once" (re's _parse_flags). Kept
+      // apart, the entry edge's transfer goes to one and lends the other
+      // (`edgeTokenClaims`).
       py::PerfScope perf("refcount-insertion.fold-duplicate-arguments");
+      llvm::DenseMap<mlir::Operation *, std::unique_ptr<mlir::DominanceInfo>>
+          dominance;
+      auto isLoopHeader = [&](mlir::Block *block) {
+        mlir::Operation *fn = block->getParentOp();
+        auto &info = dominance[fn];
+        if (!info)
+          info = std::make_unique<mlir::DominanceInfo>(fn);
+        return llvm::any_of(block->getPredecessors(), [&](mlir::Block *pred) {
+          return info->dominates(block, pred);
+        });
+      };
       bool folded = true;
       while (folded) {
         folded = false;
         module.walk([&](mlir::Block *block) {
-          if (block->isEntryBlock() || block->getNumArguments() < 2)
+          if (block->isEntryBlock() || block->getNumArguments() < 2 ||
+              isLoopHeader(block))
             return;
           llvm::SmallVector<std::pair<mlir::BranchOpInterface, unsigned>, 4>
               edges;

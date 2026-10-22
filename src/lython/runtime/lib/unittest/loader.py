@@ -1,5 +1,7 @@
 """Loading unittests."""
 
+from fnmatch import fnmatchcase
+
 from . import case, suite, util
 
 __unittest = True
@@ -50,7 +52,7 @@ class TestLoader(object):
             )
             patterns = self.testNamePatterns
             return patterns is None or \
-                any(pattern in fullName for pattern in patterns)
+                any(fnmatchcase(fullName, pattern) for pattern in patterns)
         testFnNames = list(filter(shouldIncludeMethod, dir(testCaseClass)))
         testFnNames.sort()
         return testFnNames

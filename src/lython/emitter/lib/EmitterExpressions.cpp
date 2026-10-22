@@ -41,6 +41,8 @@ static constexpr const char *kNoEllipsisObject =
     "`...` is accepted as a statement and inside annotations";
 namespace lython::emitter {
 
+static bool isCallPositionBuiltin(llvm::StringRef name);
+
 // ⭐ TWO TYPE OBJECTS NAME ONE CLASS WHEN THEIR CONTRACTS DO, arguments aside.
 // `list[int]` and `list[str]` are the same runtime class -- CPython answers
 // True to `type([1]) is type(["a"])` -- because the parameters are the
@@ -4801,15 +4803,32 @@ Value ModuleEmitter::emitExprExpected(const parser::Node *expr,
     llvm::SaveAndRestore<mlir::Type> wanted(expectedResultType, expected);
     return emitExpr(expr);
   }
+  // ⭐ A BUILTIN THE EMITTER ANSWERS AT ITS CALL has no value to read
+  // (`repr`, `min`, `next`: "unresolved name"), so where a callable is
+  // expected its forwarder is made from the NAME -- the call in its body is
+  // the builtin's call, with whatever folding that call gets.
+  if (auto expectedCallable =
+          mlir::dyn_cast_if_present<py::CallableType>(expected);
+      expectedCallable && expr->kind == "Name" &&
+      isCallPositionBuiltin(ast::nameSpelling(*expr)) &&
+      callsUnshadowedBuiltin(expr, ast::nameSpelling(*expr)))
+    if (std::optional<Value> wrapped = emitBuiltinForwarder(
+            ast::nameSpelling(*expr), expectedCallable, *expr))
+      return *wrapped;
   Value value = emitExpr(expr);
   // A builtin function named where a callable value is expected becomes one
   // (tryWrapBuiltinFunctionValue); every other value is what it was.
   if (auto expectedCallable =
           mlir::dyn_cast_if_present<py::CallableType>(expected);
       expectedCallable && (expr->kind == "Name" || expr->kind == "Attribute"))
+  {
     if (std::optional<Value> wrapped =
             tryWrapBuiltinFunctionValue(value, expectedCallable, *expr))
       return *wrapped;
+    if (std::optional<Value> wrapped =
+            tryWrapClassValue(value, expectedCallable, *expr))
+      return *wrapped;
+  }
   return value;
 }
 
@@ -5598,8 +5617,29 @@ ModuleEmitter::tryWrapBuiltinFunctionValue(Value value, py::CallableType target,
   if (binding.empty() ||
       !py::protocols::Table::get(context).freeFunctionContract(qualified))
     return std::nullopt;
+  return emitBuiltinForwarder(binding, target, anchor);
+}
+
+// The builtins the emitter answers only at a call: their name reads as no
+// value.
+static bool isCallPositionBuiltin(llvm::StringRef name) {
+  return llvm::is_contained(
+      std::initializer_list<llvm::StringRef>{"repr", "ascii", "format", "iter",
+                                             "next", "min", "max", "sum",
+                                             "any", "all", "round",
+                                             "callable"},
+      name);
+}
+
+// The forwarder `return <binding>(a0, ...)` typed by `target`, memoized by
+// the two.
+std::optional<Value>
+ModuleEmitter::emitBuiltinForwarder(llvm::StringRef binding,
+                                    py::CallableType target,
+                                    const parser::Node &anchor) {
   if (target.hasVararg() || target.hasKwarg() ||
-      !target.getKwOnlyTypes().empty() || target.getResultTypes().size() != 1)
+      !target.getKwOnlyTypes().empty() || target.getResultTypes().size() != 1 ||
+      unboundStaticParameterCount(target) != 0)
     return std::nullopt;
   std::string key = binding.str() + "|" + typeText(target);
   auto memo = builtinFunctionObjects.find(key);
@@ -5657,6 +5697,114 @@ ModuleEmitter::tryWrapBuiltinFunctionValue(Value value, py::CallableType target,
     }
     if (auto made = module.lookupSymbol<mlir::func::FuncOp>(symbol))
       made->setAttr("ly.function.doc_of", builder.getStringAttr(binding));
+    memo = builtinFunctionObjects
+               .try_emplace(key, std::make_pair(symbol, sig.publicCallable))
+               .first;
+  }
+  return emitFunctionObject(anchor, memo->second.first, memo->second.second,
+                            {});
+}
+
+bool ModuleEmitter::needsCallableForwarder(Value value) {
+  if (mlir::isa_and_present<py::TypeType>(value.type))
+    return true;
+  auto ref = value.value ? value.value.getDefiningOp<py::BindingRefOp>()
+                         : py::BindingRefOp();
+  if (!ref || !ref.getCaptures().empty())
+    return false;
+  llvm::StringRef binding = ref.getBinding();
+  std::string qualified = binding.contains('.')
+                              ? binding.str()
+                              : ("builtins." + binding).str();
+  return !binding.empty() &&
+         py::protocols::Table::get(context).freeFunctionContract(qualified);
+}
+
+// ⭐ A CLASS PASSED WHERE A CALLABLE VALUE IS EXPECTED becomes one, the way a
+// builtin does above: `self.addCleanup(Point, 1, 2)`, `map(int, words)` with
+// a declared callable, `call(P, 3)`. A class value is static here (type[X]
+// has no lanes), so the forwarder reaches it through a type object prebound
+// to its first parameter, as the __init_subclass__ copy does -- not through
+// the class's spelling, which a local or an aliased class does not have at
+// the module root.
+//
+// ⛔ Typed by the TARGET, as the builtin forwarder is: which constructor
+// signature the class has is the call `C(a0, ...)`'s question, asked by the
+// body, so an overloaded constructor (`int(x)`, `int(x, base)`) picks the one
+// the callable's arity names.
+std::optional<Value>
+ModuleEmitter::tryWrapClassValue(Value value, py::CallableType target,
+                                 const parser::Node &anchor) {
+  auto typeType = mlir::dyn_cast_if_present<py::TypeType>(value.type);
+  if (!typeType || !typeType.getInstanceType())
+    return std::nullopt;
+  if (target.hasVararg() || target.hasKwarg() ||
+      !target.getKwOnlyTypes().empty() || target.getResultTypes().size() != 1 ||
+      unboundStaticParameterCount(target) != 0)
+    return std::nullopt;
+  std::string key = "type:" + typeText(value.type) + "|" + typeText(target);
+  auto memo = builtinFunctionObjects.find(key);
+  if (memo == builtinFunctionObjects.end()) {
+    parser::SourceRange range = anchor.range;
+    llvm::ArrayRef<mlir::Type> parameterTypes = target.getPositionalTypes();
+    llvm::SmallVector<synth::Param, 4> params{
+        synth::Param{"__ly_cls", nullptr}};
+    std::vector<parser::NodePtr> arguments;
+    for (unsigned index = 0; index < parameterTypes.size(); ++index) {
+      std::string name = "__ly_a" + std::to_string(index);
+      params.push_back(synth::Param{name, nullptr});
+      arguments.push_back(synth::name(name, range));
+    }
+    std::vector<parser::NodePtr> body;
+    body.push_back(synth::returnStmt(
+        synth::call(synth::name("__ly_cls", range), std::move(arguments),
+                    range),
+        range));
+    std::string symbol =
+        "__lycls$" + std::to_string(++syntheticFunctionCounter);
+    llvm::SmallVector<const parser::Node *, 4> paramNodes;
+    parser::NodePtr def = synth::functionDef(
+        symbol, params, {}, std::move(body), nullptr, {}, range, &paramNodes);
+    synthesizedIteratorDefs.push_back(def);
+    types.overrideParameterType(paramNodes[0], value.type);
+    for (auto [index, type] : llvm::enumerate(parameterTypes))
+      types.overrideParameterType(paramNodes[index + 1], type);
+    FunctionSignature sig = types.functionSignature(*def);
+    if (sig.positionalTypes.empty())
+      return std::nullopt;
+    sig.positionalTypes.erase(sig.positionalTypes.begin());
+    sig.positionalNames.erase(sig.positionalNames.begin());
+    if (!sig.positionalDefaults.empty())
+      sig.positionalDefaults.erase(sig.positionalDefaults.begin());
+    if (sig.positionalOnlyCount > 0)
+      --sig.positionalOnlyCount;
+    types.refreshCallable(sig);
+    if (!sig.publicCallable)
+      return std::nullopt;
+    types.bindRootSymbol(symbol, sig.publicCallable);
+    {
+      auto savedLoops = std::move(loopControlContexts);
+      loopControlContexts.clear();
+      auto savedInlineReturns = std::move(inlineReturnContexts);
+      inlineReturnContexts.clear();
+      auto savedSupers = std::move(superContexts);
+      superContexts.clear();
+      auto savedInlining = std::move(methodsBeingInlined);
+      methodsBeingInlined.clear();
+      auto savedInlineFrames = std::move(inlineFrames);
+      inlineFrames.clear();
+      auto restoreContexts = llvm::scope_exit([&] {
+        loopControlContexts = std::move(savedLoops);
+        inlineReturnContexts = std::move(savedInlineReturns);
+        superContexts = std::move(savedSupers);
+        methodsBeingInlined = std::move(savedInlining);
+        inlineFrames = std::move(savedInlineFrames);
+      });
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      emitCallableFunction(*def, symbol, sig, {}, /*isLambda=*/false,
+                           /*positionalNodeOffset=*/1,
+                           typeType.getInstanceType());
+    }
     memo = builtinFunctionObjects
                .try_emplace(key, std::make_pair(symbol, sig.publicCallable))
                .first;
@@ -5971,6 +6119,9 @@ Value ModuleEmitter::coerceValue(Value value, mlir::Type targetType,
   if (auto targetCallable = mlir::dyn_cast<py::CallableType>(targetType)) {
     if (std::optional<Value> wrapped =
             tryWrapBuiltinFunctionValue(value, targetCallable, anchor))
+      return *wrapped;
+    if (std::optional<Value> wrapped =
+            tryWrapClassValue(value, targetCallable, anchor))
       return *wrapped;
     // ⭐ A CALLABLE IS A CELL FOR ITS RESULT AND ITS PARAMETERS. `f:
     // Callable[[], float] = one` with `one() -> int` is well typed, but an int

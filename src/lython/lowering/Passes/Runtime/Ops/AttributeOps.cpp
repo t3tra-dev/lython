@@ -198,6 +198,20 @@ bool RuntimeBundleLowerer::optionalPayloadRebuildableFromBox(
   if (name.empty())
     return false;
   const RuntimeValueShape *shape = manifest.valueShape(name);
+  // ⭐ A SOURCE EXCEPTION CLASS HAS ITS ANCESTOR'S SHAPE, as everywhere else it
+  // is laid out (runtimeValueTypesFor, laneWordsPrimitiveFor). Without it a
+  // `PErr | None` field -- unittest's `self._exception: E | None` for a
+  // program's exception -- fell to the inline lane splice, whose store on a
+  // with's exception exit released the lanes its normal exit had stored:
+  // "operand #0 does not dominate this use", and on older builds `None`
+  // where CPython has the exception.
+  if (!shape)
+    if (std::optional<std::string> ancestor =
+            RuntimeBundleLowerer::exceptionAncestorContractFor(payload)) {
+      shape = manifest.valueShape(*ancestor);
+      if (!shape)
+        shape = manifest.valueShape("builtins.BaseException");
+    }
   // A SOURCE class has no manifest shape and needs none: it is one handle, and
   // that is what the recursive `nxt: "Node | None"` depends on.
   if (!shape || shape->valueTypes.empty())
@@ -751,6 +765,11 @@ mlir::LogicalResult RuntimeBundleLowerer::storePrimitiveFieldSlot(
                .getResult();
   } else if (primitiveI64LaneKnownValid(value.primitiveI64)) {
     word = value.primitiveI64->value;
+  } else if (std::optional<mlir::Value> deferred =
+                 RuntimeBundleLowerer::deferredIntValueChecked(op, value)) {
+    // A deferred int's lane is stale where its flag is false; its object
+    // holds the value then (GetItemOps' index read says how that showed).
+    word = *deferred;
   } else if (value.physicalValues().empty() && value.primitiveI64 &&
              value.primitiveI64->value) {
     // No boxed payload to fall back to (primitive-i64 clone lanes carry only

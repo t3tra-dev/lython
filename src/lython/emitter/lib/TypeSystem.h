@@ -643,6 +643,21 @@ public:
   const std::vector<StatementNames> &
   statementNamesOf(const std::vector<parser::NodePtr> &suite) const;
 
+  // The emitter's reads of an imported module's static constants
+  // (`sourceModuleLiteralConstant`), keyed by the module body -- its first
+  // statement and its length -- and the name. ⛔ Not recomputed per read:
+  // each is a walk of the whole body, and every inlined method of a module's
+  // class re-binds that module's names, so `from ._constants import *` with
+  // 130 names made the unittest emitter ten times slower.
+  llvm::DenseMap<std::pair<const void *, unsigned>,
+                 llvm::StringMap<std::optional<mlir::Type>>>
+      moduleConstantMemo;
+  // A module body's statically taken statements (EmitterImports.cpp), by the
+  // body; boxed, so a reference survives the map growing.
+  llvm::DenseMap<const void *,
+                 std::unique_ptr<std::vector<std::shared_ptr<parser::Node>>>>
+      moduleStatementsMemo;
+
 private:
   mlir::Type inferExprImpl(const parser::Node *node,
                            const ExprInferenceContext *ctx) const;
