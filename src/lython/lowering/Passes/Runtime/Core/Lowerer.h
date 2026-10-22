@@ -1293,6 +1293,10 @@ private:
     // ownership between suspensions (frame words in its storage), which the
     // frame store/load helpers transfer in and out.
     llvm::SmallVector<GeneratorResumeLane, 8> frameLanes;
+    // The storage the generator object needs, in words: the fixed 64 unless
+    // its argument and frame lanes run past the EH stash, in which case the
+    // object is created wider (`new_wide`) and the lanes continue after it.
+    unsigned storageWords = 64;
     // Lazily synthesized driver functions (see GeneratorStateMachine.cpp):
     // step resumes once and reports (has, value, ret); advance additionally
     // raises StopIteration on exhaustion; throw/close inject exceptions at

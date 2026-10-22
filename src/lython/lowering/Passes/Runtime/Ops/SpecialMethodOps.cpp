@@ -2612,7 +2612,23 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNext(py::NextOp op) {
                           return false;
                     return true;
                   })) {
-        forwardedIterator = *forwarded;
+        // ⭐ THE TARGET IS ADOPTED, NOT THE GENERATOR. The forwarded bundle's
+        // physical value is the generator as its call produced it, and the
+        // read is of the block argument that carries it -- across a resume's
+        // frame lane, a different value. Copying the whole bundle passed the
+        // creating call's value to the step, which does not dominate the
+        // resume path ("operand #0 does not dominate this use") for every
+        //
+        //     def outer():
+        //         for g in inner():
+        //             yield g + 1
+        //
+        // while `yield g` alone was inlined as a delegation and worked.
+        forwardedIterator = *iterator;
+        forwardedIterator.generatorTarget = forwarded->generatorTarget;
+        forwardedIterator.generatorSources = forwarded->generatorSources;
+        forwardedIterator.generatorSourceBundles =
+            forwarded->generatorSourceBundles;
         iterator = &forwardedIterator;
       }
     // ⭐ With no creation site in reach, the frame names its own body

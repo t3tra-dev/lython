@@ -753,6 +753,15 @@ set(LYTHON_LEAK_GATE_CASES
     # arguments; exactly one of them may take its token, and only a leak check
     # says the other's retain was paid back.
     a_short_circuit_on_an_object_inside_a_generator
+    # An inner generator carried across the outer one's suspensions, dropped
+    # part way and raised out of: its frame is released exactly once.
+    a_generator_transforms_what_another_yields
+    # Lanes past the fixed frame live in a wider allocation, read back and
+    # released from there by the finalizer of a generator dropped part way.
+    a_generator_whose_frame_outgrows_the_fixed_one
+    # One value forwarded into two loop lanes: the edge retains for the second
+    # lane, and each lane releases what it held.
+    one_value_carried_into_two_loop_lanes
     # A nested generator's captures ride its frame as argument lanes: each
     # cell or captured object is held for the generator's life and given back
     # once.

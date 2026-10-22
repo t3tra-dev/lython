@@ -40,85 +40,112 @@ bool isPrimitiveOnlyCallableFunction(mlir::func::FuncOp function) {
 // for slots and edges, and what is needed here is only "is this the value that
 // other lane carries", on a CFG whose suspend block is reached by branches
 // that forward it directly.
-// What one query has already resolved, and how many times it stopped at a
-// back edge.
-// ⛔ Not the walk alone: a value reached by two paths was resolved once per
-// path, and a chain of diamonds made that exponential -- a generator body
-// that keeps its locals alive to its end (a program with a finalizer) has a
-// block argument per local at every join, and `asyncio`'s task step took 45 s
-// here. An answer that stopped at a back edge is conservative for the path
-// that met the edge, so only the ones that met none are remembered.
+// What a function's block arguments resolve to, computed once for the whole
+// function: an argument whose predecessors all forward one value -- itself
+// aside, which a loop's back edge forwards -- IS that value on every path.
+// ⛔ Not a walk per question. It was one, memoized only where it met no back
+// edge, and a generator clone with its `yield from` chain inlined (difflib's
+// ndiff) is loops all the way down: hundreds of returns times dozens of lanes
+// re-walked the loops and the lowering ran for over five minutes. Before
+// that, a walk per path made a chain of diamonds exponential (`asyncio`'s task
+// step took 45 s).
+// ⛔ And not optimistic over a cycle of arguments that forward only each other
+// and one outside value: those stay themselves, which is the answer the walk
+// gave -- "different" costs a retain (a leak the gate measures), "the same"
+// for two objects is the abort this exists to stop.
+//
+// ⭐ REBUILT WHEN AN ARGUMENT IT HAS NOT SEEN IS ASKED ABOUT. The lowering
+// gives a block its physical arguments as it reaches them, appended after the
+// ones already there, so an answer built before is stale only for arguments
+// that did not exist yet -- and a stale "itself" for one of those dropped the
+// retain a yielded list needs when the frame also carries it (golden
+// a_generator_replaces_the_list_it_just_yielded crashed).
 struct LaneEntityQuery {
-  llvm::SmallPtrSet<mlir::Value, 8> visiting;
-  llvm::DenseMap<mlir::Value, mlir::Value> resolved;
-  unsigned backEdges = 0;
+  bool built = false;
+  llvm::DenseMap<mlir::Value, mlir::Value> representative;
+  llvm::DenseSet<mlir::Value> known;
+
+  mlir::Value find(mlir::Value value) const {
+    value = ownership::underlyingObjectValue(value);
+    for (unsigned guard = 0; guard < 1u << 20; ++guard) {
+      auto next = representative.find(value);
+      if (next == representative.end() || next->second == value)
+        return value;
+      value = ownership::underlyingObjectValue(next->second);
+    }
+    return value;
+  }
+
+  void build(mlir::Operation *function) {
+    built = true;
+    representative.clear();
+    known.clear();
+    llvm::SmallVector<mlir::Block *, 64> blocks;
+    function->walk([&](mlir::Block *block) {
+      for (mlir::BlockArgument argument : block->getArguments())
+        known.insert(argument);
+      if (!block->isEntryBlock() && !block->hasNoPredecessors())
+        blocks.push_back(block);
+    });
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (mlir::Block *blockPointer : blocks) {
+        mlir::Block &block = *blockPointer;
+        for (mlir::BlockArgument argument : block.getArguments()) {
+          if (find(argument) != mlir::Value(argument))
+            continue;
+          mlir::Value common;
+          bool single = true;
+          for (mlir::Block *predecessor : block.getPredecessors()) {
+            auto branch = mlir::dyn_cast<mlir::BranchOpInterface>(
+                predecessor->getTerminator());
+            if (!branch) {
+              single = false;
+              break;
+            }
+            for (unsigned index = 0, count = predecessor->getNumSuccessors();
+                 index < count && single; ++index) {
+              if (predecessor->getSuccessor(index) != &block)
+                continue;
+              mlir::Value candidate =
+                  branch.getSuccessorOperands(index)[argument.getArgNumber()];
+              if (!candidate) {
+                single = false;
+                break;
+              }
+              mlir::Value resolved = find(candidate);
+              if (resolved == mlir::Value(argument))
+                continue;
+              if (!common)
+                common = resolved;
+              else if (common != resolved)
+                single = false;
+            }
+            if (!single)
+              break;
+          }
+          if (single && common) {
+            representative[argument] = common;
+            changed = true;
+          }
+        }
+      }
+    }
+  }
 };
 
-mlir::Value resolveLaneEntity(mlir::Value value, LaneEntityQuery &query);
-
-mlir::Value resolveLaneEntityUncached(mlir::Value value,
-                                      LaneEntityQuery &query) {
-  llvm::SmallPtrSetImpl<mlir::Value> &visiting = query.visiting;
-  auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
-  if (!argument)
-    return value;
-  mlir::Block *block = argument.getOwner();
-  if (block->isEntryBlock() || block->hasNoPredecessors())
-    return value;
-  // A back edge reaches the argument it defines; stopping keeps the answer
-  // conservative rather than making it up.
-  if (!visiting.insert(value).second) {
-    ++query.backEdges;
-    return value;
-  }
-  mlir::Value common;
-  for (mlir::Block *predecessor : block->getPredecessors()) {
-    auto branch =
-        mlir::dyn_cast<mlir::BranchOpInterface>(predecessor->getTerminator());
-    if (!branch) {
-      visiting.erase(value);
-      return value;
-    }
-    mlir::Value forwarded;
-    bool found = false;
-    for (unsigned index = 0, count = predecessor->getNumSuccessors();
-         index < count; ++index) {
-      if (predecessor->getSuccessor(index) != block)
-        continue;
-      mlir::Value candidate =
-          branch.getSuccessorOperands(index)[argument.getArgNumber()];
-      if (!candidate || (found && candidate != forwarded)) {
-        visiting.erase(value);
-        return value;
-      }
-      forwarded = candidate;
-      found = true;
-    }
-    if (!found) {
-      visiting.erase(value);
-      return value;
-    }
-    mlir::Value resolved = resolveLaneEntity(forwarded, query);
-    if (!common)
-      common = resolved;
-    else if (common != resolved) {
-      visiting.erase(value);
-      return value;
-    }
-  }
-  visiting.erase(value);
-  return common ? common : value;
-}
-
 mlir::Value resolveLaneEntity(mlir::Value value, LaneEntityQuery &query) {
-  value = ownership::underlyingObjectValue(value);
-  if (auto known = query.resolved.find(value); known != query.resolved.end())
-    return known->second;
-  unsigned backEdgesBefore = query.backEdges;
-  mlir::Value result = resolveLaneEntityUncached(value, query);
-  if (query.backEdges == backEdgesBefore)
-    query.resolved.try_emplace(value, result);
-  return result;
+  mlir::Value underlying = ownership::underlyingObjectValue(value);
+  if (!query.built || (mlir::isa<mlir::BlockArgument>(underlying) &&
+                       !query.known.contains(underlying)))
+    if (mlir::Region *region = value.getParentRegion())
+      if (auto function =
+              region->getParentOp()->getParentOfType<mlir::func::FuncOp>())
+        query.build(function);
+      else if (auto self = mlir::dyn_cast<mlir::func::FuncOp>(
+                   region->getParentOp()))
+        query.build(self);
+  return query.find(value);
 }
 
 bool isErasedObjectResult(mlir::Type type) {
@@ -231,6 +258,13 @@ std::int64_t RuntimeBundleLowerer::functionTargetId(llvm::StringRef target) {
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
   mlir::LogicalResult result = mlir::success();
+  // One lane query per function, shared by its every return and lane: what a
+  // value resolves to without meeting a back edge does not depend on which
+  // return asked. ⛔ Not one per lane, which walked the whole CFG again for
+  // each of them -- a generator clone with its `yield from` chain inlined
+  // (difflib's ndiff) has hundreds of returns and dozens of lanes, and this
+  // walk ran for over ten minutes there.
+  llvm::DenseMap<mlir::Operation *, LaneEntityQuery> laneQueries;
   module.walk([&](mlir::func::ReturnOp op) {
     auto function = op->getParentOfType<mlir::func::FuncOp>();
     if (!function || !function->hasAttr("callable_type"))
@@ -310,7 +344,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
           bool duplicate =
               !boxesItsOwn && !laneCarriedValues.insert(operand).second;
           if (!boxesItsOwn && !bundle->physicalValues().empty()) {
-            LaneEntityQuery visiting;
+            LaneEntityQuery &visiting = laneQueries[function.getOperation()];
             if (std::getenv("LYTHON_TRACE_LANES")) {
               LaneEntityQuery probe;
               llvm::errs() << "[lane] idx=" << operandIndex << " phys="

@@ -540,6 +540,8 @@ std::optional<mlir::Type> isinstanceTargetType(const parser::Node *node,
       return types.listOf(types.object());
     if (name == "builtins.set")
       return types.contract("builtins.set", {types.object()});
+    if (name == "builtins.frozenset")
+      return types.contract("builtins.frozenset", {types.object()});
     if (name == "builtins.tuple")
       return types.tupleOf(types.object());
     if (name == "builtins.dict")
@@ -911,7 +913,21 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
     return analysis;
   }
 
-  if (containsObjectTop(analysis.sourceType, types)) {
+  // ⭐ A CONTAINER OF `object` IS STILL A CONTAINER: its own class is the one
+  // its contract names, so whether it is a `dict` is the question the paths
+  // below answer for `list[int]`. Refusing it here refused pprint's
+  // `isinstance(object, dict)` arm for `pformat([])`, whose element type is
+  // all an empty literal leaves.
+  // ⛔ Only a contract with a class at the top: `object` and `Any` there are
+  // the dynamic inspection, and a protocol or callable names no class.
+  auto sourceContractTop =
+      mlir::dyn_cast<py::ContractType>(analysis.sourceType);
+  bool onlyArgumentsAreObject =
+      sourceContractTop &&
+      sourceContractTop.getContractName() != "builtins.object" &&
+      sourceContractTop.getContractName() != "typing.Any";
+  if (containsObjectTop(analysis.sourceType, types) &&
+      !onlyArgumentsAreObject) {
     // ⭐ `object` ITSELF IS A CLASS TEST, not dynamic inspection. The value is
     // a handle and word 1 of every header is the class word, so
     // `isinstance(o, A)` is the SAME load-and-compare a source-class receiver

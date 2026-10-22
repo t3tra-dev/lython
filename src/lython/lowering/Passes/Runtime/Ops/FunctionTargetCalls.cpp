@@ -225,8 +225,27 @@ mlir::LogicalResult RuntimeBundleLowerer::emitGeneratorFunctionTargetCallResult(
           builder, op->getLoc(),
           RuntimeBundleLowerer::functionTargetId(targetName), 64)
           .getResult();
-  mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
-      op->getLoc(), *initializer, mlir::ValueRange{targetId});
+  // A frame that runs past the fixed storage is created wide, the words its
+  // lanes need (GeneratorStateMachine.cpp, `placeGeneratorFrameWords`).
+  mlir::func::CallOp call;
+  if (auto resumeInfo = generatorResumeClones.find(targetName);
+      resumeInfo != generatorResumeClones.end() &&
+      resumeInfo->second.storageWords > 64) {
+    std::optional<RuntimeSymbol> wide =
+        manifest.primitive("types.GeneratorType", "new_wide");
+    if (!wide)
+      return op->emitError()
+             << "runtime manifest has no types.GeneratorType new_wide";
+    mlir::Value words =
+        mlir::arith::ConstantIntOp::create(builder, op->getLoc(),
+                                           resumeInfo->second.storageWords, 64)
+            .getResult();
+    call = RuntimeBundleLowerer::createRuntimeCall(
+        op->getLoc(), *wide, mlir::ValueRange{targetId, words});
+  } else {
+    call = RuntimeBundleLowerer::createRuntimeCall(
+        op->getLoc(), *initializer, mlir::ValueRange{targetId});
+  }
 
   mlir::Type resultContract = resultValue.getType();
   if (auto publicResult =

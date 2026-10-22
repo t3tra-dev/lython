@@ -542,7 +542,21 @@ llvm::SmallVector<mlir::Value, 4> ModuleEmitter::carriedLoopEdgeOperands(
     //   inside the loop must not steal base's token).
     bool bringsOwnToken;
     if (mlir::isa<mlir::BlockArgument>(root)) {
-      bringsOwnToken = !keptRoots.contains(root);
+      // ⛔ Not for an argument of THIS header: its token is the one its own
+      // lane holds, and when that lane abandons it on this edge the release
+      // is already counted in `transferred` above. Counting it here as well
+      // gave one token to two lanes --
+      //
+      //     dump_i, dump_j = 0, blo
+      //     for j in range(n):
+      //         dump_i, dump_j = j, j    # j's header token, two lanes
+      //
+      // retained nothing, and both lanes released it on the next trip
+      // (difflib's _fancy_replace; "borrowed entry argument ... released
+      // without a prior retain").
+      auto argument = mlir::cast<mlir::BlockArgument>(root);
+      bringsOwnToken = !keptRoots.contains(root) &&
+                       argument.getOwner() != headerBlock;
     } else {
       bringsOwnToken = true;
       if (headerBlock) {

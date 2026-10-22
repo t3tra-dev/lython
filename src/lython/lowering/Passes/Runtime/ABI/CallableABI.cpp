@@ -3,6 +3,7 @@
 #include <cstdlib>
 
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/StringSwitch.h"
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
@@ -525,6 +526,33 @@ bool RuntimeBundleLowerer::isUsablePrimitiveI64Clone(
   return clone && !refusedPrimitiveI64Clones.contains(clone.getOperation());
 }
 
+// The contract a default value of `target`'s parameter `index` is, for a
+// default spelled as a literal: what a call that leaves the parameter out
+// passes, and so what a protocol parameter is specialized for there.
+static mlir::Type protocolDefaultContract(mlir::MLIRContext *context,
+                                          mlir::func::FuncOp target,
+                                          unsigned index) {
+  auto values =
+      target ? target->getAttrOfType<mlir::ArrayAttr>(kCallableDefaultValuesAttr)
+             : mlir::ArrayAttr();
+  if (!values || index >= values.size())
+    return {};
+  auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(values[index]);
+  auto kind = dict ? dict.getAs<mlir::StringAttr>("kind") : mlir::StringAttr();
+  if (!kind)
+    return {};
+  llvm::StringRef contract = llvm::StringSwitch<llvm::StringRef>(kind.getValue())
+                                 .Case("str", "builtins.str")
+                                 .Case("int", "builtins.int")
+                                 .Case("bool", "builtins.bool")
+                                 .Case("float", "builtins.float")
+                                 .Case("bytes", "builtins.bytes")
+                                 .Default("");
+  if (contract.empty())
+    return {};
+  return runtimeContractType(context, contract);
+}
+
 std::optional<std::string>
 RuntimeBundleLowerer::callableProtocolSpecializationFor(
     llvm::StringRef target,
@@ -533,6 +561,9 @@ RuntimeBundleLowerer::callableProtocolSpecializationFor(
   if (found == callableProtocolSpecializations.end())
     return std::nullopt;
 
+  mlir::ModuleOp symbols = module;
+  mlir::func::FuncOp targetFunction =
+      symbols.lookupSymbol<mlir::func::FuncOp>(target);
   for (const CallableProtocolSpecialization &specialization :
        found->second) {
     bool matches = true;
@@ -540,11 +571,15 @@ RuntimeBundleLowerer::callableProtocolSpecializationFor(
          llvm::enumerate(specialization.argumentTypes)) {
       if (!expected)
         continue;
-      if (index >= sources.size() || !sources[index]) {
+      mlir::Type actual;
+      if (index < sources.size() && sources[index])
+        actual = sources[index]->contract;
+      else
+        actual = protocolDefaultContract(context, targetFunction, index);
+      if (!actual) {
         matches = false;
         break;
       }
-      mlir::Type actual = sources[index]->contract;
       if (actual == expected)
         continue;
       if (py::isAssignableTo(actual, expected))
@@ -911,6 +946,17 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableProtocolArgumentABIs() {
         continue;
 
       std::string sourceContract = runtimeContractName(sourceType);
+      // ⭐ A PARAMETER THE CALL LEAVES OUT TAKES ITS DEFAULT'S CONTRACT. The
+      // plan hands back the protocol itself there, which names no
+      // specialization, so `f()` over `def f(a: Sequence[str] = '')` had none
+      // to select ("no static specialization for these argument contracts").
+      if (sourceContract.empty())
+        if (mlir::Type fromDefault =
+                protocolDefaultContract(context, target, index))
+          if (sourceType == logicalType) {
+            argumentTypes[index] = fromDefault;
+            continue;
+          }
       if (sourceContract.empty())
         continue;
       argumentTypes[index] = sourceType;

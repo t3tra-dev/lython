@@ -60,9 +60,26 @@ constexpr unsigned kGeneratorFrameSlotBase = 8;
 // parked exception chain-node address, the rest stays reserved): a body
 // suspended inside an exception handler must not keep the process's single
 // TLS token — nor its traceback/chain globals — occupied between
-// resumptions. Frame lanes must fit below this region.
+// resumptions. Frame lanes never overlap it: past word 48 they continue at
+// 64, in a generator created wide (`placeGeneratorFrameWords`).
 constexpr unsigned kGeneratorEHStashWordBase = 48;
 constexpr unsigned kGeneratorFrameSlotLimit = 64;
+// The widest storage a generator is created with (`new_wide`): lanes that do
+// not fit below the EH stash continue at kGeneratorFrameSlotLimit.
+constexpr unsigned kGeneratorWideStorageLimit = 1024;
+
+// The word a lane of `width` words starts at, given the next free `word`, and
+// the word after it. ⛔ A lane never straddles the EH stash: one that would
+// cross word 48 starts at 64 instead, so the stash keeps its fixed place and
+// a generator that fits below it keeps the layout it always had.
+unsigned placeGeneratorFrameWords(unsigned &word, unsigned width) {
+  if (word < kGeneratorFrameSlotLimit &&
+      word + width > kGeneratorEHStashWordBase)
+    word = kGeneratorFrameSlotLimit;
+  unsigned offset = word;
+  word += width;
+  return offset;
+}
 constexpr llvm::StringLiteral kGeneratorBodyResultAttr{
     "ly.generator.body_result"};
 constexpr llvm::StringLiteral kGeneratorPublicResultAttr{
@@ -657,10 +674,9 @@ RuntimeBundleLowerer::generatorArgumentWordOffsets(
     }
     return offsets;
   }
-  for (const GeneratorResumeLane &lane : info.argumentLanes) {
-    offsets.push_back(word);
-    word += RuntimeBundleLowerer::generatorArgumentFrameWords(lane);
-  }
+  for (const GeneratorResumeLane &lane : info.argumentLanes)
+    offsets.push_back(placeGeneratorFrameWords(
+        word, RuntimeBundleLowerer::generatorArgumentFrameWords(lane)));
   return offsets;
 }
 
@@ -673,12 +689,12 @@ RuntimeBundleLowerer::generatorFrameLaneWordOffsets(
     frameWord += 2 * info.argumentCount;
   } else {
     for (const GeneratorResumeLane &lane : info.argumentLanes)
-      frameWord += RuntimeBundleLowerer::generatorArgumentFrameWords(lane);
+      placeGeneratorFrameWords(
+          frameWord, RuntimeBundleLowerer::generatorArgumentFrameWords(lane));
   }
-  for (const GeneratorResumeLane &lane : info.frameLanes) {
-    offsets.push_back(frameWord);
-    frameWord += RuntimeBundleLowerer::generatorLaneFrameWords(lane);
-  }
+  for (const GeneratorResumeLane &lane : info.frameLanes)
+    offsets.push_back(placeGeneratorFrameWords(
+        frameWord, RuntimeBundleLowerer::generatorLaneFrameWords(lane)));
   return offsets;
 }
 
@@ -1378,6 +1394,59 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       bodies.push_back(fn);
   });
 
+  // ⭐ A GENERATOR NOTHING CREATES HAS NO FRAME TO RESUME. Every body here
+  // used to get a state machine, a finalizer in the drop hook and an arm in
+  // every dispatch whose yield it could match -- so a program that consumes
+  // one generator through its frame (`"".join(difflib.ndiff(a, b))`) compiled
+  // difflib's context_diff, unified_diff and restore as well, about a third
+  // of the IR of a unittest file. A body is kept when something outside it
+  // names it: a call, a binding, a function value.
+  // ⛔ Names in string attributes count: `py.binding.ref` spells its target
+  // as a string, not a symbol reference.
+  // A clone the CALL picks when it is lowered -- a protocol specialization, a
+  // primitive-i64 clone -- is named through its original until then, which is
+  // after this: the clone counts as named when the original is.
+  auto originalOf = [](mlir::func::FuncOp body) -> mlir::StringAttr {
+    for (llvm::StringRef attr :
+         {llvm::StringRef(kProtocolSpecializationAttr),
+          llvm::StringRef(kPrimitiveI64CloneAttr)})
+      if (auto name = body->getAttrOfType<mlir::StringAttr>(attr))
+        return name;
+    return {};
+  };
+  llvm::StringSet<> bodyNames;
+  for (mlir::func::FuncOp body : bodies) {
+    bodyNames.insert(body.getSymName());
+    if (mlir::StringAttr original = originalOf(body))
+      bodyNames.insert(original.getValue());
+  }
+  llvm::StringSet<> namedFromOutside;
+  module.walk([&](mlir::Operation *op) {
+    if (mlir::isa<mlir::func::FuncOp>(op))
+      return;
+    auto enclosing = op->getParentOfType<mlir::func::FuncOp>();
+    auto note = [&](llvm::StringRef name) {
+      if (bodyNames.contains(name) &&
+          (!enclosing || enclosing.getSymName() != name))
+        namedFromOutside.insert(name);
+    };
+    for (mlir::NamedAttribute attr : op->getAttrs())
+      attr.getValue().walk([&](mlir::Attribute nested) {
+        if (auto ref = mlir::dyn_cast<mlir::FlatSymbolRefAttr>(nested))
+          note(ref.getValue());
+        else if (auto text = mlir::dyn_cast<mlir::StringAttr>(nested))
+          note(text.getValue());
+      });
+  });
+  llvm::erase_if(bodies, [&](mlir::func::FuncOp body) {
+    if (namedFromOutside.contains(body.getSymName()))
+      return false;
+    if (mlir::StringAttr original = originalOf(body))
+      if (namedFromOutside.contains(original.getValue()))
+        return false;
+    return true;
+  });
+
   for (mlir::func::FuncOp body : bodies)
     generatorBodies.insert(body.getSymName());
 
@@ -1753,6 +1822,10 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       valueContract =
           laneEligibleContract(declaredYield, /*allowBool=*/true);
     if (!eligible || (yields.empty() && !coroutine && valueContract.empty())) {
+      if (!generatorDeclineReasons.count(body.getSymName()))
+        generatorDeclineReasons[body.getSymName()] =
+            "its yields have no single lane to cross in, or a region other "
+            "than `try` holds one";
       eraseLoweredFunction(clone);
       continue;
     }
@@ -1896,11 +1969,28 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       }
     }
     unsigned frameWidth = static_cast<unsigned>(frameLanes.size());
-    unsigned argumentWords = 0;
+    // ⭐ A FRAME THAT DOES NOT FIT BELOW THE EH STASH CONTINUES PAST IT, in a
+    // generator object created wider. The frame was the fixed words 8..48,
+    // and a str lane takes four, so a generator with ten strings live across
+    // a yield -- or one whose `yield from` chain is inlined, as difflib's
+    // ndiff -> compare -> _fancy_replace is -- had no state machine, and a
+    // str generator has no other tier to fall to.
+    unsigned endWord = kGeneratorFrameSlotBase;
     for (const GeneratorResumeLane &lane : argumentLanes)
-      argumentWords += RuntimeBundleLowerer::generatorArgumentFrameWords(lane);
-    if (!livesEligible || kGeneratorFrameSlotBase + argumentWords + frameWords >
-                              kGeneratorEHStashWordBase) {
+      placeGeneratorFrameWords(
+          endWord, RuntimeBundleLowerer::generatorArgumentFrameWords(lane));
+    for (const GeneratorResumeLane &lane : frameLanes)
+      placeGeneratorFrameWords(
+          endWord, RuntimeBundleLowerer::generatorLaneFrameWords(lane));
+    if (livesEligible && endWord > kGeneratorWideStorageLimit) {
+      std::string reason;
+      llvm::raw_string_ostream stream(reason);
+      stream << "its arguments and the values live across its yields need "
+             << endWord << " storage words, and a generator has at most "
+             << kGeneratorWideStorageLimit;
+      generatorDeclineReasons[body.getSymName()] = reason;
+    }
+    if (!livesEligible || endWord > kGeneratorWideStorageLimit) {
       eraseLoweredFunction(clone);
       continue;
     }
@@ -1971,6 +2061,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
     auto qualname = body->getAttrOfType<mlir::StringAttr>("ly.function.qualname");
     info.qualname = qualname ? qualname.str() : body.getSymName().str();
     info.frameWidth = frameWidth;
+    info.storageWords = std::max(endWord, kGeneratorFrameSlotLimit);
     info.argumentCount = static_cast<unsigned>(bodyArguments.size());
     info.argumentLanes = argumentLanes;
     info.valueLane = *valueLane;
