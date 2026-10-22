@@ -2,6 +2,7 @@ add_library(LythonRuntimeLowering STATIC
     Common/Instrumentation.cpp
     Common/LibcPrototypes.cpp
     Common/RuntimeLibrary.cpp
+    Common/FrameSupportBuilder.cpp
     Common/HostSupportBuilder.cpp
     Common/OsSupportBuilder.cpp
     Common/RuntimeSupportBuilder.cpp
@@ -25,6 +26,7 @@ add_library(LythonRuntimeLowering STATIC
     Passes/Runtime/Cleanup/CannotRaise.cpp
     Passes/Runtime/Cleanup/DualEdges.cpp
     Passes/Runtime/Cleanup/EH.cpp
+    Passes/Runtime/Cleanup/Frames.cpp
     Passes/Runtime/Cleanup/UnreachableBodies.cpp
     Passes/Runtime/Core/Dispatch.cpp
     Passes/Runtime/Core/CollectionPayload.cpp

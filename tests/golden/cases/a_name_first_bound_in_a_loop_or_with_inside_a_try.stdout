@@ -1,0 +1,3 @@
+6
+4
+UnboundLocalError: cannot access local variable 'n' where it is not associated with a value

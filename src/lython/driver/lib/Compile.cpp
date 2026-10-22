@@ -29,6 +29,7 @@ LogicalResult translateToVerifiedLLVMIR(ModuleOp module,
   LLVMSafetyProfile safetyProfile;
   if (!options.releaseMode)
     collectLLVMSafetyContracts(module, safetyProfile);
+  py::installFrameRecords(module);
   llvm::SmallVector<py::PythonCallSiteRange, 16> pythonCallSites;
   py::collectPythonCallSiteRanges(module, pythonCallSites);
   llvm::DenseMap<std::int64_t, unsigned> tryInlineDepths;

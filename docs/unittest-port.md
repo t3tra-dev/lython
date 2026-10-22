@@ -694,7 +694,128 @@ CPython も自分のインタプリタでテストを動かしているので、
      を渡す形 (A がうまく決まらない)、呼び出し位置の builtin をジェネリック
      な引数に渡す形、キーワード専用引数のある形の forwarder。
 5. クラスに付ける `@skip`、setUpModule、warnings (assertWarns)、
-   logging (assertLogs)、argparse。
+   logging (assertLogs)、argparse。進め方は利用者の判断 (2026-10-23):
+   skip の印は unittest 側でクラスの表に記録する、setUpModule は
+   `unittest.main()` を呼んだモジュールの関数をコンパイル時に探す、警告と
+   ログは実行時に呼び出し元を引く、そのためのフレームは「使う関数だけ
+   積む」、argparse の Namespace は静的に名前が決まらない属性を
+   `__getattr__` で引く。
+   1. クラスに付ける `@skip` / `skipIf` / `skipUnless` (済、2026-10-23)。
+      - クラスの decorator は、クラス文の位置で内側から `C = d(C)` として
+        走らせ、結果がそのクラス (`type[C]`) であることを静的に確かめる
+        (違えば拒否)。`skip(reason)` が返す `_SkipDecorator` は、メソッドに
+        付けば `__call__` で包み、クラスに付けば内部の
+        `__ly_decorate_class__` がクラスと理由を `case._skipped_classes`
+        に記録する (CPython はクラスに `__unittest_skip__` を書く。ここでは
+        クラスにその属性が無い)。`run()` は最初にその表を
+        `issubclass` で引くので、サブクラスも skip される。setUpClass は
+        走らない。
+      - 直したもの: `dir()` が decorator の付いたクラスをすべて拒否して
+        いた (拒否するのは `@dataclass` だけでよい)。`hasattr(cls, name)`
+        がサブクラスのあるクラスで拒否されていた (どのサブクラスもその
+        名前を宣言しないなら False と決まる)。
+   2. setUpModule / tearDownModule (済、2026-10-23)。
+      - コンパイラが、主モジュールの `unittest.main()` (TestProgram の構築)
+        に、そのモジュールのトップレベルの setUpModule / tearDownModule を
+        隠しキーワード `_setUpModule` / `_tearDownModule` として渡す。
+        TestProgram はそれをモジュール名で suite の表に入れ、suite は
+        CPython の `_handleModuleFixture` / `_handleModuleTearDown` を
+        `sys.modules` でなくその表で引く。setUpModule が例外を出すと
+        モジュールのテストは走らず、エラーが 1 件出る。出力の順は CPython
+        と同じ。
+      - 開いたまま: `unittest.addModuleCleanup(events.append, "x")` など、
+        unittest を import したプログラムで ParamSpec の転送に束縛メソッド
+        と str を渡すと lowering が拒否する (「block with no terminator」、
+        位置は case.py の `lambda: function(*args, **kwargs)`)。base の
+        lyc でも同じ。unittest を import しないと通る。
+   3. warnings と assertWarns / assertWarnsRegex (済、2026-10-23)。
+      - 呼び出しのフレーム: `_frame` (新しい native モジュール、
+        `modules/_frame.mlir`) が `sys._getframe(level)` の代わりに、
+        ファイル・行・モジュール名・関数名を答える。値はランタイムの
+        スタック (`lowering/Common/FrameSupportBuilder.cpp`) にあり、
+        LLVM dialect のパス (`Passes/Runtime/Cleanup/Frames.cpp`) が、
+        `_frame` の読み出しに呼び出しで届く関数だけで、届く呼び出しの
+        直前に自分のフレーム (inline した本体のフレームも) を書く。
+        関数は入口で深さを 1 回読み、書くたびに深さをその次に置く。pop は
+        無い (呼び出し側の次の書き込みが戻す)。読み出しが無いプログラム
+        は何も払わない。間接呼び出しは、アドレスを取られた関数のどれかが
+        届くなら届くとみなす。
+      - `lib/warnings.py` は CPython の `_py_warnings.py` の global
+        context 側の移植。stacklevel の数え方は CPython が実際に使う C の
+        `_warnings` (setup_context) に合わせた (1 未満も呼び出し元)。
+        `lib/linecache.py` も移した (ディスク上のファイルだけ)。逸脱は
+        各ファイル冒頭に書いた: registry はモジュール名で引く (globals の
+        `__warningregistry__` は無い)、`showwarning` / `formatwarning`
+        は代入で差し替えられない、catch_warnings は filters を同じリストの
+        中身で戻す、`deprecated` と `-W` は無い。
+      - unittest: assertWarns / assertWarnsRegex (文脈管理器の形)。
+        runner は CPython と同じく実行を `catch_warnings()` で囲み、
+        `unittest.main()` の既定は `warnings='default'`。テストは
+        `tests/python/test_warnings.py` (14 件、出力の形・stacklevel・
+        filter・catch_warnings・assertWarns)。
+      - 書いている途中で見つけて直したもの:
+        1. (拒否) `try` の中の `for` / `with` で初めて束縛した名前を
+           `try` の後で読むと「unresolved name」。`try` が前もって取る
+           slot の型付けが、`for` / `with` の本体の束縛まで「その文の
+           ターゲット」と見て諦めていた。直した後も、`n = x * 2` の `x`
+           (ループ変数、`as` の変数) が型付けの時点で束縛されていなかった
+           ので、入れ子の `for` / `with` のターゲットも推論に渡す。
+        2. (拒否) `text.splitlines(keepends=True)` のようにキーワードで
+           書いた組み込みメソッドの引数が、型推論では解けなかった (emit は
+           表で位置に直していた)。表を `BuiltinMethodKeywords.h` に出して
+           両方が引く。ループの中で束縛して後で読むと「unresolved name」
+           だった。
+        3. (拒否) 関数の中の `__name__` / `__file__` が「unresolved name」。
+           主モジュールのトップレベルでしか束縛していなかった。関数が
+           書かれたモジュールのものを定数で答える。
+        4. (誤り、この作業の中で入れて直したもの) フレームの書き込みが、
+           try の呼び出し位置の印と印の付いた呼び出しの間に入り、EH パスが
+           印を捨てて例外が `try` を素通りした。書き込みは refcount の
+           操作と同じく印を保つ側に入れた。
+      - 開いたまま:
+        - (拒否、base でも) 呼び出しが返す `list[M] | None` を
+          `is not None` で絞ってフィールドに入れると、M のフィールドに
+          3 つ以上の型の union (`io.TextIOWrapper | io.StringIO | None`)
+          があるとき、所有権検証が「解放されない」と拒否する。絞った側の
+          枝で retain が 1 つ多く、None の枝で戻り値が解放されない。
+          WarningMessage.file がその形なので、assertWarns は
+          `catch_warnings._enter_recording()` (常に list を返す) を使う。
+        - (拒否、base でも) モジュールの大域変数 `b: bool = (True, 1)[0]`
+          が lowering で拒否される (箱の bool を i1 の大域変数に入れない)。
+        - (拒否) `if self.attr:` は Optional の属性を絞らない
+          (`if self.attr is not None:` は絞る)。
+        - `contextlib.nullcontext(value)` は値を取れない。
+        - ランタイムの宣言 (`sorted` の `key=` など) から呼び戻される関数
+          では、それを渡した関数のフレームがスタックに無い (C の関数が
+          CPython のスタックに無いのと同じ形だが、渡した Python の関数も
+          抜ける)。
+        - コンパイル時間: unittest の 1 ファイルが 13.6 秒から 16 秒に
+          なった (warnings、linecache、logging、`_frame`)。emit 5.8 秒、
+          lowering 8.1 秒。
+   4. logging と assertLogs / assertNoLogs (済、2026-10-23)。
+      - `lib/logging/__init__.py` は CPython の `Lib/logging/__init__.py`
+        の移植 (handlers と config は無い)。呼び出し元は `_frame` で引き、
+        CPython と同じく logging 自身のファイルのフレームを飛ばす。逸脱は
+        冒頭に書いた。大きいもの: `str(msg) % args` の `%` は実行時に
+        テンプレートが決まるので `_percent_format` で行う (変換は CPython と
+        同じ、mapping 1 つを渡す形と `*` 幅は無い)、`extra` は属性でなく
+        record の横に持ち Formatter が読む、`thread` は無い、filter は
+        Filter のみ、`{` と `$` の形は record のフィールドに要るぶん、
+        `Logger.manager` / `root` はモジュールの状態。
+      - unittest: assertLogs / assertNoLogs (CPython の `_log.py` の中身を
+        case.py に置いた。関数の中の import が無いため)。テストは
+        `tests/python/test_logging.py` (15 件)。
+      - 書いている途中で見つけて直したもの:
+        1. (遅い拒否) import したモジュールの大域変数の初期化が、同じ
+           モジュールのクラス属性の初期化より前にすべて走った
+           (`_defaultFormatter = Formatter()` が `default_format` を読む前に
+           「referenced before assignment」)。大域変数、既定値のセル、
+           クラス属性をモジュールごとに文の順で書く。
+        2. (黙った誤り、この作業の中で入れて直したもの) import した
+           モジュールのトップレベルの `__file__` / `__name__` が主モジュール
+           のものだった。そのモジュールのものを先に答える。
+        3. (拒否) `x is y` で x が `C | None`、y が C のとき「no stable
+           identity」。None の側は False、C の側はアドレスの比較にする。
 
 ### D. テストを移す
 

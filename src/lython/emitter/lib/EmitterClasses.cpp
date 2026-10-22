@@ -536,6 +536,58 @@ ModuleEmitter::decoratedMethodApplication(const DecoratedMethod &method,
   return applied;
 }
 
+// ⭐ A CLASS DECORATOR IS `C = d(C)`, run where the class statement runs,
+// innermost first. A class is a declared contract here, so the name stays the
+// class it names and the decorator has to give that class back: `d(C)` must
+// be `type[C]`, which is what `register[T](cls: type[T]) -> type[T]` and every
+// decorator that records a class and returns it are.
+//
+// A decorator VALUE whose class defines `__ly_decorate_class__` is called
+// through that method instead (a Lython protocol, not CPython's): one value
+// can then decorate a method -- `__call__`, which returns a NEW function --
+// and a class, which it cannot replace. unittest's `skip` is such a value.
+void ModuleEmitter::applyClassDecorators(const parser::Node &classDef) {
+  const auto *decorators = ast::nodeList(classDef, "decorator_list");
+  if (!decorators || decorators->empty() ||
+      hoistedClassPrefixes.contains(&classDef))
+    return;
+  std::string className(ast::nameSpelling(classDef));
+  std::optional<mlir::Type> instance = types.lookupClass(className);
+  for (auto it = decorators->rbegin(); it != decorators->rend(); ++it) {
+    const parser::NodePtr &decorator = *it;
+    if (!decorator)
+      continue;
+    auto [callee, spelling] = decoratorCallee(*decorator);
+    llvm::StringRef leaf = decoratorLeafName(spelling);
+    if (leaf == "dataclass" || leaf == "overload" || leaf == "override" ||
+        leaf == "final" || leaf == "runtime_checkable")
+      continue;
+    parser::SourceRange range = decorator->range;
+    parser::NodePtr applied;
+    auto decoratorType = mlir::dyn_cast_if_present<py::ContractType>(
+        types.inferExpr(decorator.get()));
+    if (decoratorType &&
+        resolveMroMethod(decoratorType.getContractName(),
+                         "__ly_decorate_class__"))
+      applied = synth::methodCall(decorator, "__ly_decorate_class__",
+                                  {synth::name(className, range)}, range);
+    else
+      applied = synth::call(decorator, {synth::name(className, range)}, range);
+    synthesizedIteratorDefs.push_back(applied);
+    Value result = emitExpr(applied.get());
+    auto resultType = mlir::dyn_cast_if_present<py::TypeType>(result.type);
+    if (!instance || !resultType ||
+        types.widenLiteral(resultType.getInstanceType()) !=
+            types.widenLiteral(*instance))
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, range.start,
+          "class decorator '" + (spelling.empty() ? "<expression>" : spelling) +
+              "' does not return the class it decorates: a class here is a "
+              "declared contract, so its name cannot be rebound to what a "
+              "decorator returns"});
+  }
+}
+
 void ModuleEmitter::applyMethodDecorators(const parser::Node &classDef) {
   for (const DecoratedMethod &method : decoratedMethods) {
     if (method.classDef != &classDef || !method.typed || method.source)
@@ -607,7 +659,12 @@ void ModuleEmitter::checkDecorators(const parser::Node &node,
                      rebindingDecoratedDefs.contains(&node)));
       break;
     case DecoratorRole::Class:
-      recognized = leaf == "dataclass" || isTypingMarker(leaf);
+      // Any other decorator of a module-level class is applied at the class
+      // statement (applyClassDecorators). ⛔ Not of a class written in a
+      // function: that one is declared at the top level and has no
+      // statement of its own at which to call it.
+      recognized = leaf == "dataclass" || isTypingMarker(leaf) ||
+                   !hoistedClassPrefixes.contains(&node);
       break;
     }
     if (recognized)

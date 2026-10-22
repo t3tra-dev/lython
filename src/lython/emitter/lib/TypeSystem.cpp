@@ -8,6 +8,7 @@
 #include "AstAccess.h"
 #include "JsHost.h"
 #include "AstSynth.h"
+#include "BuiltinMethodKeywords.h"
 #include "CandidateSelection.h"
 #include "EmptyLiteralSeed.h"
 #include "ExceptionTaxonomy.h"
@@ -5598,8 +5599,43 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
                   widenLiteral(receiver));
               instance && isManifestClassMethod(instance, *methodName))
             receiver = py::TypeType::get(&context, instance);
+          // A keyword spelling of a builtin method's positional argument is
+          // that position, as the emitter rewrites it (BuiltinMethodKeywords.h).
+          // ⛔ A gap -- `split(maxsplit=1)` names no separator -- is left as
+          // it is: the emitter refuses that call, and so does this.
+          llvm::SmallVector<mlir::Type, 8> spelledPositional(positional);
+          llvm::SmallVector<CallKeywordType, 4> spelledKeywords(keywords);
+          mlir::Type receiverOwner = widenLiteral(receiver);
+          if (auto type = mlir::dyn_cast_if_present<py::TypeType>(receiverOwner))
+            receiverOwner = type.getInstanceType();
+          auto ownerContract =
+              mlir::dyn_cast_if_present<py::ContractType>(receiverOwner);
+          if (!keywords.empty() && ownerContract &&
+              ownerContract.getContractName().starts_with("builtins."))
+            if (std::optional<BuiltinMethodParameters> entry =
+                    builtinMethodParameters(*methodName);
+                entry && positional.size() >= entry->positionalOnly) {
+              llvm::SmallVector<mlir::Type, 8> moved(positional);
+              unsigned used = 0;
+              for (std::size_t index = positional.size();
+                   index < entry->names.size(); ++index) {
+                const CallKeywordType *found = nullptr;
+                for (const CallKeywordType &keyword : keywords)
+                  if (keyword.name == entry->names[index])
+                    found = &keyword;
+                if (!found)
+                  break;
+                moved.push_back(found->type);
+                ++used;
+              }
+              if (used == keywords.size()) {
+                spelledPositional = std::move(moved);
+                spelledKeywords.clear();
+              }
+            }
           CallInferenceResult inference = inferMethodCallWithEvidence(
-              widenLiteral(receiver), *methodName, positional, keywords);
+              widenLiteral(receiver), *methodName, spelledPositional,
+              spelledKeywords);
           if (inference)
             return inference.resultType;
           if (mlir::Type joined =

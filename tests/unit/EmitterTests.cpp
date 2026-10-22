@@ -874,6 +874,31 @@ TEST(EmitterTest, ADecoratorThatReturnsNoFunctionIsRefusedByName) {
       refused, "decorator 'to_int' does not return a function here"));
 }
 
+// What: a class decorator that does not hand back the class it decorates is
+// refused by name, where one that does compiles.
+TEST(EmitterTest, AClassDecoratorMustReturnItsClass) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult refused = emitSource(
+      "def describe[T](cls: type[T]) -> str:\n"
+      "    return 'x'\n"
+      "@describe\n"
+      "class A:\n"
+      "    pass\n",
+      context);
+  EXPECT_FALSE(refused.ok());
+  EXPECT_TRUE(reportsDiagnostic(
+      refused, "class decorator 'describe' does not return the class it "
+               "decorates"));
+  lython::emitter::EmitResult kept = emitSource(
+      "def keep[T](cls: type[T]) -> type[T]:\n"
+      "    return cls\n"
+      "@keep\n"
+      "class B:\n"
+      "    pass\n",
+      context);
+  EXPECT_TRUE(kept.ok());
+}
+
 // What: a decorated method compiles when its decorator returns a function,
 // and one whose decorator returns anything else is refused by name, with no
 // second sentence about the cell the rewrite reads. A method with defaults

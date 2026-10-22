@@ -1294,11 +1294,21 @@ void collectNameBindingExpressions(
         opaque = true;
     }
   } else {
+    // ⛔ The statement's OWN targets, not `collectAssignedNames` of it: that
+    // walks the body too, so `n = 3` inside a `for` or a `with` made `n` a
+    // target here, the slot an enclosing `try` takes for it was never typed,
+    // and `return n` after the `try` was "unresolved name 'n'". The body's
+    // statements are visited below like any other suite's.
     llvm::StringSet<> written;
     if (node->kind == "AugAssign" || node->kind == "NamedExpr" ||
-        node->kind == "For" || node->kind == "AsyncFor" ||
-        node->kind == "With" || node->kind == "AsyncWith")
-      collectAssignedNames(node, written);
+        node->kind == "For" || node->kind == "AsyncFor")
+      collectAssignedNameTargets(ast::node(*node, "target"), written);
+    else if (node->kind == "With" || node->kind == "AsyncWith")
+      if (const auto *items = ast::nodeList(*node, "items"))
+        for (const parser::NodePtr &item : *items)
+          if (item)
+            collectAssignedNameTargets(ast::node(*item, "optional_vars"),
+                                       written);
     if (written.contains(name))
       opaque = true;
   }
@@ -1577,6 +1587,32 @@ mlir::Type ModuleEmitter::inferConditionalLocalType(
               }
             }
           }
+          // ⭐ AND THE TARGETS OF A NESTED `for` OR `with`, which the loop and
+          // the `with` pass in as hints when the region is their own body: a
+          // `try` around them has to type the slot for `n` in
+          // `for x in xs: n = x * 2` before the loop has bound `x`.
+          auto bindTarget = [&](const parser::Node *target, mlir::Type type) {
+            if (target && target->kind == "Name" && type &&
+                type != types.object() &&
+                llvm::StringRef(ast::nameSpelling(*target)) != name)
+              types.bindLocalSymbol(ast::nameSpelling(*target), type);
+          };
+          if (node->kind == "For")
+            bindTarget(ast::node(*node, "target"),
+                       types.iterationElementType(ast::node(*node, "iter")));
+          if (node->kind == "With")
+            if (const auto *items = ast::nodeList(*node, "items"))
+              for (const parser::NodePtr &item : *items) {
+                if (!item)
+                  continue;
+                mlir::Type contextType = types.widenLiteral(
+                    types.inferExpr(ast::node(*item, "context_expr")));
+                CallInferenceResult entered = types.inferMethodCallWithEvidence(
+                    contextType, "__enter__", {});
+                if (entered)
+                  bindTarget(ast::node(*item, "optional_vars"),
+                             entered.resultType);
+              }
           for (const parser::Field &field : node->fields) {
             if (const auto *child =
                     std::get_if<parser::NodePtr>(&field.value)) {

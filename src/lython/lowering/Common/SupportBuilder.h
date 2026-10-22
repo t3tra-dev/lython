@@ -520,4 +520,8 @@ void buildOsSupport(SupportBuilder &b);
 // TracebackSupportBuilder.cpp.
 void buildTracebackSupport(SupportBuilder &b);
 
+// Emits the live call stack the frame pass writes and `_frame` reads;
+// implemented in FrameSupportBuilder.cpp.
+void buildFrameSupport(SupportBuilder &b);
+
 } // namespace py::runtime_library

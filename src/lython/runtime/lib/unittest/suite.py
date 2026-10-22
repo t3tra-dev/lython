@@ -1,7 +1,7 @@
 """TestSuite"""
 
 import sys
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 
 from . import case
 from . import result
@@ -10,6 +10,12 @@ from . import util
 __unittest = True
 
 _SysExcInfoType = case._SysExcInfoType
+
+# Each module's setUpModule and tearDownModule, by module name: what CPython
+# reads off `sys.modules[name]`. `unittest.main()` registers its caller's
+# (TestProgram).
+_module_set_ups: dict[str, Callable[[], object]] = {}
+_module_tear_downs: dict[str, Callable[[], object]] = {}
 
 
 class BaseTestSuite(object):
@@ -76,18 +82,75 @@ class TestSuite(BaseTestSuite):
 
             if isinstance(test, case.TestCase):
                 self._tearDownPreviousClass(test, result)
+                self._handleModuleFixture(test, result)
                 self._handleClassSetUp(test, result)
                 result._previousTestClass = test.__class__
 
-                if result._classSetupFailed.get(test.__class__, False):
+                if (result._classSetupFailed.get(test.__class__, False) or
+                        result._moduleSetUpFailed):
                     continue
 
             test(result)
 
         if topLevel:
             self._tearDownPreviousClass(None, result)
+            self._handleModuleTearDown(result)
             result._testRunEntered = False
         return result
+
+    def _get_previous_module(self, result: result.TestResult) -> str | None:
+        previousClass = result._previousTestClass
+        if previousClass is None:
+            return None
+        return previousClass.__module__
+
+    def _handleModuleFixture(self, test: case.TestCase, result: result.TestResult) -> None:
+        previousModule = self._get_previous_module(result)
+        currentModule = test.__class__.__module__
+        if currentModule == previousModule:
+            return
+
+        self._handleModuleTearDown(result)
+
+        result._moduleSetUpFailed = False
+        setUpModule = _module_set_ups.get(currentModule)
+        if setUpModule is not None:
+            try:
+                setUpModule()
+            except Exception as e:
+                result._moduleSetUpFailed = True
+                self._createClassOrModuleLevelException(result, e,
+                                                        'setUpModule',
+                                                        currentModule)
+            if result._moduleSetUpFailed:
+                try:
+                    case.doModuleCleanups()
+                except Exception as e:
+                    self._createClassOrModuleLevelException(result, e,
+                                                            'setUpModule',
+                                                            currentModule)
+
+    def _handleModuleTearDown(self, result: result.TestResult) -> None:
+        previousModule = self._get_previous_module(result)
+        if previousModule is None:
+            return
+        if result._moduleSetUpFailed:
+            return
+
+        tearDownModule = _module_tear_downs.get(previousModule)
+        if tearDownModule is not None:
+            try:
+                tearDownModule()
+            except Exception as e:
+                self._createClassOrModuleLevelException(result, e,
+                                                        'tearDownModule',
+                                                        previousModule)
+        try:
+            case.doModuleCleanups()
+        except Exception as e:
+            self._createClassOrModuleLevelException(result, e,
+                                                    'tearDownModule',
+                                                    previousModule)
 
     ################################
 
@@ -96,8 +159,12 @@ class TestSuite(BaseTestSuite):
         currentClass = test.__class__
         if currentClass == previousClass:
             return
+        if result._moduleSetUpFailed:
+            return
 
         result._classSetupFailed[currentClass] = False
+        if case._class_skip_reason(currentClass) is not None:
+            return
         try:
             currentClass.setUpClass()
         except Exception as e:
@@ -134,6 +201,10 @@ class TestSuite(BaseTestSuite):
         if test is not None and test.__class__ is previousClass:
             return
         if result._classSetupFailed.get(previousClass, False):
+            return
+        if result._moduleSetUpFailed:
+            return
+        if case._class_skip_reason(previousClass) is not None:
             return
 
         try:

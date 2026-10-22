@@ -1,0 +1,7 @@
+before
+register Plain
+between
+register Stacked
+tag outer Stacked
+['Plain', 'Stacked', 'outer:Stacked']
+plain Stacked

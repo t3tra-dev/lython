@@ -1,0 +1,4 @@
+__main__ a_function_reads_its_modules_name_and_file.py
+a_module_that_reports_its_name a_module_that_reports_its_name.py
+a_module_that_reports_its_name a_module_that_reports_its_name.py
+True

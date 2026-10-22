@@ -234,9 +234,7 @@ EmitResult ModuleEmitter::emit() {
   // Module-level constants first: a class attribute initializer may read one,
   // and CPython runs the module body top to bottom.
   emitReplacedStreamInitializers(moduleNode);
-  emitImportedModuleGlobalInitializers();
-  emitImportedDefaultCells();
-  emitImportedClassAttrInitializers();
+  emitImportedModuleInitializers();
   emitStatements(ast::nodeList(moduleNode, "body"), /*skipDeclarations=*/true);
   atModuleScope = false;
   if (!insertionBlockTerminated(builder)) {
