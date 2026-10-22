@@ -2913,6 +2913,10 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   // such a copy, which spells the parameters of the class that wrote it.
   llvm::SmallVector<std::string, 8> pendingBodyDefiners;
   llvm::StringSet<> propertyNames = classPropertyNames(classDef);
+  // Entries published ahead of their method's turn (below), replaced rather
+  // than added to when the turn comes: the table holds a method's overloads
+  // as a list, and the early entry would stay as a second overload.
+  llvm::StringSet<> provisionalMethods;
   if (const auto *body = ast::nodeList(classDef, "body")) {
     for (const parser::NodePtr &statement : *body) {
       // ⭐ A NESTED CLASS IS DROPPED, and only its USE said so. The refusals
@@ -3054,21 +3058,86 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       // exact; an UNANNOTATED self-recursive generator still ends at `object`,
       // which is the boundary the progressive publication already documents
       // for two unannotated methods that call each other.
-      if ((bodySig.isGeneratorFunction || bodySig.isAsyncGeneratorFunction) &&
-          bodyMentionsAttribute(*statement, *methodName)) {
+      //
+      // ⭐ AND SO DOES ONE THAT CALLS A METHOD WRITTEN BELOW IT. Every other
+      // method reaches a later sibling, because its body is emitted after the
+      // whole class is published; a generator's walk runs here, in textual
+      // order, so difflib's
+      //
+      //     def _fancy_replace(self, ...) -> Iterator[str]:
+      //         yield from self._fancy_helper(...)   # defined below
+      //
+      // was refused with "does not provide manifest method '_fancy_helper'".
+      // The later method is published from its own signature first, and
+      // republished in its own turn.
+      // ⛔ Only a plain instance method: a property, a static or a class
+      // method has its receiver and binding decided further down this loop,
+      // and publishing one under the instance rule would be a wrong entry
+      // rather than a missing one.
+      // A sibling whose own walk went through is published as inferred: the
+      // annotation `Iterator[str]` and the inferred `GeneratorType[str, ...]`
+      // join to `object`, so `g = self._dump(...)` in one arm and
+      // `g = self._fancy_replace(...)` in the other lost the yield type.
+      auto annotatedGeneratorEntry = [&](const parser::Node &def,
+                                         FunctionSignature signature,
+                                         bool spoiled) {
         // ⭐ THE ANNOTATION IS WHAT THE FIRST PASS PUBLISHES. A generator's
         // public result is the INFERRED generator type, and on the first pass
         // that inference is exactly what the missing entry spoiled -- so
         // publishing it would hand the second pass the same `object` back.
         // With `-> Iterator[int]` written down the answer is already there.
-        FunctionSignature published = bodySig;
-        if (const parser::Node *returns = ast::node(*statement, "returns"))
-          if (mlir::Type annotated = types.annotationType(returns)) {
-            published.inferredGeneratorType = annotated;
-            types.refreshCallable(published);
+        if (spoiled && (signature.isGeneratorFunction ||
+                        signature.isAsyncGeneratorFunction))
+          if (const parser::Node *returns = ast::node(def, "returns"))
+            if (mlir::Type annotated = types.annotationType(returns)) {
+              signature.inferredGeneratorType = annotated;
+              types.refreshCallable(signature);
+            }
+        return signature.publicCallable;
+      };
+      llvm::SmallVector<const parser::Node *, 4> laterSiblings;
+      if (bodySig.isGeneratorFunction || bodySig.isAsyncGeneratorFunction) {
+        bool below = false;
+        for (const parser::NodePtr &other : *body) {
+          if (other.get() == statement.get()) {
+            below = true;
+            continue;
           }
-        addProtocolMethod(progressiveInfo, *methodName,
-                          published.publicCallable);
+          if (!below || !other || other->kind != "FunctionDef")
+            continue;
+          const auto *decorators = ast::nodeList(*other, "decorator_list");
+          if (decorators && !decorators->empty())
+            continue;
+          auto otherName = ast::string(*other, "name");
+          if (otherName && *otherName != *methodName &&
+              bodyMentionsAttribute(*statement, *otherName))
+            laterSiblings.push_back(other.get());
+        }
+      }
+      if ((bodySig.isGeneratorFunction || bodySig.isAsyncGeneratorFunction) &&
+          (bodyMentionsAttribute(*statement, *methodName) ||
+           !laterSiblings.empty())) {
+        auto publishProvisionally = [&](llvm::StringRef name,
+                                        mlir::Type entry) {
+          if (provisionalMethods.insert(name).second)
+            addProtocolMethod(progressiveInfo, name, entry);
+        };
+        publishProvisionally(*methodName,
+                             annotatedGeneratorEntry(*statement, bodySig,
+                                                     /*spoiled=*/true));
+        for (const parser::Node *sibling : laterSiblings) {
+          FunctionSignature siblingSig = types.functionSignature(
+              *sibling, llvm::StringRef("self"), py::CallableType(),
+              types.contract(contractName));
+          replaceSelfInSignature(siblingSig, types.contract(contractName),
+                                 types);
+          publishProvisionally(
+              *ast::string(*sibling, "name"),
+              annotatedGeneratorEntry(
+                  *sibling, siblingSig,
+                  !siblingSig.generatorAnalysisFailures.empty() ||
+                      !siblingSig.generatorAnnotationMismatch.empty()));
+        }
         publishProgress();
         std::size_t before = diagnostics.size();
         bodySig = computeBodySignature();
@@ -3113,6 +3182,8 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       // -- while the same call compiled once the walk was over. Textual
       // order is what this buys; two unannotated methods that call each
       // other still need the annotation.
+      if (provisionalMethods.erase(*methodName))
+        progressiveInfo.methods.erase(std::string(*methodName));
       addProtocolMethod(progressiveInfo, *methodName, bodySig.publicCallable);
       publishProgress();
 
@@ -6886,6 +6957,20 @@ Value ModuleEmitter::emitInlineMethodBody(
     }
     return emitExpr(defaultNode);
   };
+  // ⭐ A DEFAULT BINDS AS AN ARGUMENT WOULD. Into a protocol parameter, an
+  // argument is bound as it came -- `SequenceMatcher(None, '', '')` binds two
+  // strs -- while the default was viewed as the protocol, and a protocol
+  // view's evidence did not survive into a generator body's state machine:
+  // `SequenceMatcher(isjunk)` inside one reached "protocol-typed receiver
+  // ... has no concrete runtime method evidence for __next__".
+  auto coerceDefault = [&](Value value, mlir::Type declared) -> Value {
+    mlir::Type own = types.widenLiteral(value.type);
+    if (mlir::isa_and_nonnull<py::ProtocolType>(declared) &&
+        mlir::isa_and_nonnull<py::ContractType>(own) &&
+        py::isAssignableTo(own, declared))
+      return coerceValue(value, own, anchor);
+    return coerceValue(value, declared, anchor);
+  };
   for (auto [index, name] : llvm::enumerate(sig.positionalNames)) {
     if (bound.contains(name))
       continue;
@@ -6893,7 +6978,7 @@ Value ModuleEmitter::emitInlineMethodBody(
             positionalDefault(static_cast<unsigned>(index))) {
       Value defaultValue =
           emitDefaultFor(static_cast<unsigned>(index), defaultNode);
-      bind(name, coerceValue(defaultValue, sig.positionalTypes[index], anchor));
+      bind(name, coerceDefault(defaultValue, sig.positionalTypes[index]));
       continue;
     }
     reportMissing(name);
@@ -6912,7 +6997,7 @@ Value ModuleEmitter::emitInlineMethodBody(
           emitDefaultFor(static_cast<unsigned>(sig.positionalNames.size() +
                                                index),
                          defaultNode);
-      bind(name, coerceValue(defaultValue, sig.kwOnlyTypes[index], anchor));
+      bind(name, coerceDefault(defaultValue, sig.kwOnlyTypes[index]));
       continue;
     }
     reportMissing(name);

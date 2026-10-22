@@ -2769,6 +2769,40 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
             std::vector<parser::NodePtr> materialized;
             bool anyMaterialized = false;
             for (auto [index, argument] : llvm::enumerate(*methodArgs)) {
+              // ⭐ AN ITERATOR KNOWN ONLY BY ITS PROTOCOL IS A GENERATOR TOO.
+              // A function annotated `-> Iterator[str]` that returns a
+              // generator it did not create itself -- difflib's `ndiff` returns
+              // `Differ().compare(a, b)` -- reads as the protocol, not as
+              // `types.GeneratorType`, so `"".join(ndiff(a, b))` skipped the
+              // rewrite below and reached the ABI ("cannot adapt
+              // types.GeneratorType to runtime input 2 of builtins.str.join"),
+              // while `list(ndiff(a, b))` worked.
+              // ⛔ Only into a parameter declared `Iterable`: one that takes
+              // the iterator itself keeps it. And only an `Iterator` or a
+              // `Generator`: an `Iterable` -- a bound `"-".join`'s own
+              // parameter -- is specialized from what is passed, a list
+              // more often than not, which the copy would only duplicate.
+              if (argument && argument->kind != "Starred" &&
+                  index < declaredTypes.size())
+                if (auto actualProtocol =
+                        mlir::dyn_cast_if_present<py::ProtocolType>(
+                            types.widenLiteral(
+                                types.inferExpr(argument.get())))) {
+                  auto declaredProtocol =
+                      mlir::dyn_cast_if_present<py::ProtocolType>(
+                          declaredTypes[index]);
+                  llvm::StringRef name = actualProtocol.getProtocolName();
+                  if (declaredProtocol &&
+                      declaredProtocol.getProtocolName() == "Iterable" &&
+                      (name == "Iterator" || name == "Generator")) {
+                    materialized.push_back(synth::call(
+                        synth::name("list", argument->range),
+                        std::vector<parser::NodePtr>{argument},
+                        argument->range));
+                    anyMaterialized = true;
+                    continue;
+                  }
+                }
               if (argument && argument->kind != "Starred")
                 if (auto actual = mlir::dyn_cast_if_present<py::ContractType>(
                         types.widenLiteral(types.inferExpr(argument.get())));
@@ -7028,7 +7062,12 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
       if (!seen.contains(receiverClass))
         continue;
       unsigned depth = seen.size();
-      if (types.lookupClass(candidate) == mlir::Type())
+      // ⛔ Not refused for a class whose contract is still to come when the
+      // body waits for it (below): a library's method body is emitted before
+      // the program's classes are, and the program's `maxDiff = None` on its
+      // TestCase is the commonest override there is.
+      if (types.lookupClass(candidate) == mlir::Type() &&
+          classDeclarationsEmitted)
         return nullptr;
       candidates.push_back({depth, candidate.str()});
     }
@@ -7047,7 +7086,7 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
     // imports it. Building the dispatcher anyway produced "'pets.Bird' object
     // has no attribute 'sound'" -- a sentence that is false about the program
     // and worse than the refusal it replaced.
-    if (asAttribute)
+    if (asAttribute && classDeclarationsEmitted)
       for (const auto &candidate : candidates) {
         if (resolveClassAttrSlot(candidate.second, methodName))
           continue;

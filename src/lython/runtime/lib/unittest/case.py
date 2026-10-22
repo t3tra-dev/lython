@@ -1,6 +1,8 @@
 """Test case implementation"""
 
 import sys
+import difflib
+import pprint
 import contextlib
 import time
 import types
@@ -12,6 +14,9 @@ from .util import strclass, safe_repr, _common_shorten_repr
 __unittest = True
 
 _SysExcInfoType = tuple[type[BaseException], BaseException, types.TracebackType]
+
+DIFF_OMITTED = ('\nDiff is %s characters long. '
+                 'Set self.maxDiff to None to see it.')
 
 _subtest_msg_sentinel = object()
 
@@ -515,6 +520,21 @@ class TestCase(object):
         if isinstance(first, str) and isinstance(second, str):
             self.assertMultiLineEqual(first, second, msg)
             return
+        if isinstance(first, list) and isinstance(second, list):
+            self.assertListEqual(first, second, msg)
+            return
+        if isinstance(first, tuple) and isinstance(second, tuple):
+            self.assertTupleEqual(first, second, msg)
+            return
+        if isinstance(first, dict) and isinstance(second, dict):
+            self.assertDictEqual(first, second, msg)
+            return
+        if isinstance(first, set) and isinstance(second, set):
+            self.assertSetEqual(first, second, msg)
+            return
+        if isinstance(first, frozenset) and isinstance(second, frozenset):
+            self.assertSetEqual(first, second, msg)
+            return
         self._baseAssertEqual(first, second, msg)
 
     def assertNotEqual[T](self, first: T, second: T, msg: str | None = None) -> None:
@@ -571,7 +591,7 @@ class TestCase(object):
         msg = self._formatMessage(msg, standardMsg)
         raise self.failureException(msg)
 
-    def assertSequenceEqual[T](self, seq1: list[T], seq2: list[T], msg: str | None = None,
+    def assertSequenceEqual[S](self, seq1: S, seq2: S, msg: str | None = None,
                                seq_type: type | None = None) -> None:
         """An equality assertion for ordered sequences (like lists and tuples).
 
@@ -594,41 +614,51 @@ class TestCase(object):
         len1 = len(seq1)
         len2 = len(seq2)
 
-        if True:
-            if seq1 == seq2:
+        if seq1 == seq2:
+            return
+
+        differing = '%ss differ: %s != %s\n' % (
+                (seq_type_name.capitalize(),) +
+                _common_shorten_repr(seq1, seq2))
+
+        for i in range(min(len1, len2)):
+            item1 = seq1[i]
+            item2 = seq2[i]
+
+            if item1 != item2:
+                differing += ('\nFirst differing element %d:\n%s\n%s\n' %
+                             ((i,) + _common_shorten_repr(item1, item2)))
+                break
+        else:
+            if (len1 == len2 and seq_type is None and
+                type(seq1) != type(seq2)):
+                # The sequences are the same, but have differing types.
                 return
 
-            differing = '%ss differ: %s != %s\n' % (
-                    (seq_type_name.capitalize(),) +
-                    _common_shorten_repr(seq1, seq2))
-
-            for i in range(min(len1, len2)):
-                item1 = seq1[i]
-                item2 = seq2[i]
-
-                if item1 != item2:
-                    differing += ('\nFirst differing element %d:\n%s\n%s\n' %
-                                 ((i,) + _common_shorten_repr(item1, item2)))
-                    break
-            else:
-                if (len1 == len2 and seq_type is None and
-                    type(seq1) != type(seq2)):
-                    # The sequences are the same, but have differing types.
-                    return
-
-            if len1 > len2:
-                differing += ('\nFirst %s contains %d additional '
-                             'elements.\n' % (seq_type_name, len1 - len2))
-                differing += ('First extra element %d:\n%s\n' %
-                              (len2, safe_repr(seq1[len2])))
-            elif len1 < len2:
-                differing += ('\nSecond %s contains %d additional '
-                             'elements.\n' % (seq_type_name, len2 - len1))
-                differing += ('First extra element %d:\n%s\n' %
-                              (len1, safe_repr(seq2[len1])))
+        if len1 > len2:
+            differing += ('\nFirst %s contains %d additional '
+                         'elements.\n' % (seq_type_name, len1 - len2))
+            differing += ('First extra element %d:\n%s\n' %
+                          (len2, safe_repr(seq1[len2])))
+        elif len1 < len2:
+            differing += ('\nSecond %s contains %d additional '
+                         'elements.\n' % (seq_type_name, len2 - len1))
+            differing += ('First extra element %d:\n%s\n' %
+                          (len1, safe_repr(seq2[len1])))
         standardMsg = differing
+        diffMsg = '\n' + '\n'.join(
+            difflib.ndiff(pprint.pformat(seq1).splitlines(),
+                          pprint.pformat(seq2).splitlines()))
+
+        standardMsg = self._truncateMessage(standardMsg, diffMsg)
         msg = self._formatMessage(msg, standardMsg)
         self.fail(msg)
+
+    def _truncateMessage(self, message: str, diff: str) -> str:
+        max_diff = self.maxDiff
+        if max_diff is None or len(diff) <= max_diff:
+            return message + diff
+        return message + (DIFF_OMITTED % len(diff))
 
     def assertListEqual[T](self, list1: list[T], list2: list[T], msg: str | None = None) -> None:
         """A list-specific equality assertion.
@@ -642,7 +672,18 @@ class TestCase(object):
         """
         self.assertSequenceEqual(list1, list2, msg, seq_type=list)
 
-    def assertSetEqual[T](self, set1: set[T], set2: set[T], msg: str | None = None) -> None:
+    def assertTupleEqual[S](self, tuple1: S, tuple2: S, msg: str | None = None) -> None:
+        """A tuple-specific equality assertion.
+
+        Args:
+            tuple1: The first tuple to compare.
+            tuple2: The second tuple to compare.
+            msg: Optional message to use on failure instead of a list of
+                    differences.
+        """
+        self.assertSequenceEqual(tuple1, tuple2, msg, seq_type=tuple)
+
+    def assertSetEqual[S](self, set1: S, set2: S, msg: str | None = None) -> None:
         """A set-specific equality assertion.
 
         Args:
@@ -704,12 +745,42 @@ class TestCase(object):
     def assertDictEqual[K, V](self, d1: dict[K, V], d2: dict[K, V], msg: str | None = None) -> None:
         if d1 != d2:
             standardMsg = '%s != %s' % _common_shorten_repr(d1, d2)
+            diff = ('\n' + '\n'.join(difflib.ndiff(
+                           pprint.pformat(d1).splitlines(),
+                           pprint.pformat(d2).splitlines())))
+            standardMsg = self._truncateMessage(standardMsg, diff)
             self.fail(self._formatMessage(msg, standardMsg))
 
     def assertMultiLineEqual(self, first: str, second: str, msg: str | None = None) -> None:
         """Assert that two multi-line strings are equal."""
         if first != second:
+            # Don't use difflib if the strings are too long
+            if (len(first) > self._diffThreshold or
+                len(second) > self._diffThreshold):
+                self._baseAssertEqual(first, second, msg)
+
+            # Append \n to both strings if either is missing the \n.
+            # This allows the final ndiff to show the \n difference. The
+            # exception here is if the string is empty, in which case no
+            # \n should be added
+            first_presplit = first
+            second_presplit = second
+            if first and second:
+                if first[-1] != '\n' or second[-1] != '\n':
+                    first_presplit += '\n'
+                    second_presplit += '\n'
+            elif second and second[-1] != '\n':
+                second_presplit += '\n'
+            elif first and first[-1] != '\n':
+                first_presplit += '\n'
+
+            firstlines = first_presplit.splitlines(keepends=True)
+            secondlines = second_presplit.splitlines(keepends=True)
+
+            # Generate the message and diff, then raise the exception
             standardMsg = '%s != %s' % _common_shorten_repr(first, second)
+            diff = '\n' + ''.join(difflib.ndiff(firstlines, secondlines))
+            standardMsg = self._truncateMessage(standardMsg, diff)
             self.fail(self._formatMessage(msg, standardMsg))
 
     def assertLess[T: float](self, a: T, b: T, msg: str | None = None) -> None:

@@ -6779,8 +6779,14 @@ TypeSystem::functionSignature(const parser::Node &function,
                     table.protocolArgumentsFor(annotatedReturn, protocolName))
               if (!args->empty() && (*args)[0])
                 annotatedYield = (*args)[0];
+      // ⭐ AND WHEN THE WALK COULD TYPE NO YIELD AT ALL. A generator read
+      // before its module has published what its body calls -- `pick` above
+      // `cd`, where `cd` iterates a method of a class defined further down --
+      // inferred no yield and so `GeneratorType[None, ...]`, and the caller's
+      // `g = cd(...)` joined that with its other arm's `GeneratorType[str,
+      // ...]` and was refused. The yields are still checked at their sites.
       bool takesAnnotatedYield =
-          annotatedYield && *annotatedYield && !generator.yieldTypes.empty();
+          annotatedYield && *annotatedYield && generator.hasYield;
       if (takesAnnotatedYield) {
         sig.generatorYieldType = *annotatedYield;
         sig.generatorYieldTypeIsAnnotated = true;

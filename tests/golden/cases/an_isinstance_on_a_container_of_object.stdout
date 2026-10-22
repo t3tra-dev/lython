@@ -1,0 +1,2 @@
+list 0 tuple 0 dict 0 set 0 list 1 frozenset 1
+['frozenset of 2', 'set of 1', 'list of 3', "'s'"]

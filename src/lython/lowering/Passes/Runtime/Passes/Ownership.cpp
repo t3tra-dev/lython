@@ -3382,6 +3382,52 @@ forwardedBlockArgGroupOnEdge(mlir::Operation *terminator,
   return destArgs;
 }
 
+// Every destination group on ONE of `terminator`'s edges: the one
+// `forwardedBlockArgGroupOnEdge` picks, and for a one-value group each further
+// argument the edge forwards the same value into.
+// ⭐ EACH OF THEM IS A MERGE THAT HAS TO OWN ITS ARGUMENT. Seeded from the
+// lowest only, the second never became a candidate, so the edge that brings
+// it a BORROWED value got no retain while the body still released it:
+//
+//     dump_i, dump_j = 0, blo     # blo: a borrowed parameter
+//     for j in range(n):
+//         dump_i, dump_j = j, j   # one value into two loop lanes
+//
+// "borrowed entry argument 0 ... is released or transferred without a prior
+// retain". Which of them keeps the edge's token is still decided once, by the
+// claims below (the lowest transfers, the others lend).
+// ⛔ One-value groups only: a multi-lane group forwarded twice would need its
+// lanes paired up across the two copies, and none is known to occur.
+// ⛔ And into a LOOP HEADER only -- a block one of whose predecessors it
+// dominates. A short-circuit's merge receives the carried local beside the
+// `and` value that is that local (golden
+// a_short_circuit_on_an_object_inside_a_generator), and making the second a
+// merge of its own retained what nothing then released: 48 bytes a run.
+llvm::SmallVector<llvm::SmallVector<mlir::Value, 4>, 2>
+forwardedBlockArgGroupsOnEdge(
+    mlir::Operation *terminator, unsigned successorIndex,
+    llvm::ArrayRef<mlir::Value> group, own::AliasAnalysis &aliases,
+    llvm::function_ref<bool(mlir::Block *)> isLoopHeader) {
+  llvm::SmallVector<llvm::SmallVector<mlir::Value, 4>, 2> groups;
+  auto first =
+      forwardedBlockArgGroupOnEdge(terminator, successorIndex, group, aliases);
+  if (!first)
+    return groups;
+  groups.push_back(*first);
+  if (group.size() != 1 ||
+      !isLoopHeader(terminator->getSuccessor(successorIndex)))
+    return groups;
+  auto branch = mlir::cast<mlir::BranchOpInterface>(terminator);
+  mlir::Block *successor = terminator->getSuccessor(successorIndex);
+  mlir::SuccessorOperands ops = branch.getSuccessorOperands(successorIndex);
+  unsigned n = std::min<unsigned>(successor->getNumArguments(), ops.size());
+  for (unsigned a = 0; a < n; ++a)
+    if (ops[a] && aliases.same(ops[a], group.front()) &&
+        successor->getArgument(a) != first->front())
+      groups.push_back({successor->getArgument(a)});
+  return groups;
+}
+
 // If `terminator` forwards every value of `group` to arguments of a single
 // successor block, return that successor's argument group (in `group` order).
 std::optional<llvm::SmallVector<mlir::Value, 4>>
@@ -3520,6 +3566,31 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
     std::size_t lanes = 0;
     std::size_t views = 0;
   };
+  // A block one of whose predecessors it dominates: where a loop's lanes
+  // merge. Answered once per block; nothing below edits the CFG until the
+  // candidates are settled.
+  llvm::DenseMap<mlir::Operation *, std::unique_ptr<mlir::DominanceInfo>>
+      loopDominance;
+  llvm::DenseMap<mlir::Block *, bool> loopHeaders;
+  auto isLoopHeader = [&](mlir::Block *block) {
+    auto known = loopHeaders.find(block);
+    if (known != loopHeaders.end())
+      return known->second;
+    bool header = false;
+    if (auto fn = block->getParentOp()->getParentOfType<mlir::func::FuncOp>()
+                      ? block->getParentOp()->getParentOfType<mlir::func::FuncOp>()
+                      : mlir::dyn_cast<mlir::func::FuncOp>(block->getParentOp())) {
+      std::unique_ptr<mlir::DominanceInfo> &dominance =
+          loopDominance[fn.getOperation()];
+      if (!dominance)
+        dominance = std::make_unique<mlir::DominanceInfo>(fn);
+      for (mlir::Block *predecessor : block->getPredecessors())
+        if (dominance->dominates(block, predecessor))
+          header = true;
+    }
+    loopHeaders[block] = header;
+    return header;
+  };
   auto seedGroup = [&](mlir::func::FuncOp fn, const own::ResourceGroup &g,
                        mlir::Block *from) -> std::optional<Seeded> {
     llvm::SmallVector<mlir::Value, 4> values(g.values.begin(), g.values.end());
@@ -3564,16 +3635,15 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
     for (mlir::Operation *terminator : forwardingTerminators(fn, values))
       for (unsigned edge = 0, edges = terminator->getNumSuccessors();
            edge < edges; ++edge) {
-        auto dest =
-            forwardedBlockArgGroupOnEdge(terminator, edge, values, aliases);
-        if (!dest)
-          continue;
         auto destViews = forwardedViews(terminator, edge, views);
         if (!destViews)
           continue;
-        candidates.insert(
-            {dest->front(), Candidate{*dest, *destViews, g.deallocator}});
-        ++seeded.candidates;
+        for (auto &dest : forwardedBlockArgGroupsOnEdge(
+                 terminator, edge, values, aliases, isLoopHeader)) {
+          candidates.insert(
+              {dest.front(), Candidate{dest, *destViews, g.deallocator}});
+          ++seeded.candidates;
+        }
       }
     return seeded;
   };
@@ -3753,16 +3823,16 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
            forwardingTerminators(fn, candidate.args))
         for (unsigned edge = 0, edges = terminator->getNumSuccessors();
              edge < edges; ++edge) {
-          auto dest = forwardedBlockArgGroupOnEdge(terminator, edge,
-                                                   candidate.args, aliases);
-          if (!dest)
-            continue;
           auto destViews = forwardedViews(terminator, edge, candidate.views);
-          if (destViews && !candidates.count(dest->front())) {
-            candidates.insert({dest->front(), Candidate{*dest, *destViews,
-                                                        candidate.deallocator}});
-            changed = true;
-          }
+          if (!destViews)
+            continue;
+          for (auto &dest : forwardedBlockArgGroupsOnEdge(
+                   terminator, edge, candidate.args, aliases, isLoopHeader))
+            if (!candidates.count(dest.front())) {
+              candidates.insert({dest.front(), Candidate{dest, *destViews,
+                                                         candidate.deallocator}});
+              changed = true;
+            }
         }
     }
   }

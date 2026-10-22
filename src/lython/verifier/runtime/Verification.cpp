@@ -327,7 +327,10 @@ verifyOwnedTokensAreAcquiredIn(mlir::func::FuncOp function,
                                mlir::SymbolTable &symbols) {
   llvm::SmallVector<mlir::Operation *, 8> tokens;
   function.walk([&](mlir::Operation *op) {
-    if (op->hasAttr(own::kOwnedLocalObjectAttr) && op->getNumOperands() != 0)
+    // ⛔ Not an `alloc`: it IS the acquisition, and its operands are the
+    // dynamic sizes, which this walk would have read as the marked value.
+    if (op->hasAttr(own::kOwnedLocalObjectAttr) && op->getNumOperands() != 0 &&
+        !mlir::isa<mlir::memref::AllocOp>(op))
       tokens.push_back(op);
   });
   // ⛔ Not an alias analysis of every function: most of the runtime holds no

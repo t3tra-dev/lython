@@ -567,8 +567,15 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
   auto bundleDefault = [&](llvm::StringRef contractName,
                            mlir::ValueRange values) -> mlir::LogicalResult {
     auto unionType = mlir::dyn_cast<py::UnionType>(parameterType);
+    // ⭐ AND A PROTOCOL PARAMETER, for the same reason: `a: Sequence[str] =
+    // ''` has no contract of its own, and the default IS a str -- the
+    // concrete producer every other argument of that parameter is
+    // specialized from. difflib's `SequenceMatcher(isjunk)` reached
+    // "default argument has no concrete runtime contract".
     mlir::Type memberType =
-        unionType ? runtimeContractType(context, contractName) : parameterType;
+        unionType || runtimeContractName(parameterType).empty()
+            ? runtimeContractType(context, contractName)
+            : parameterType;
     RuntimeBundle member;
     if (mlir::failed(RuntimeBundleLowerer::bundleRawObjectValues(
             op, memberType, values, member)))

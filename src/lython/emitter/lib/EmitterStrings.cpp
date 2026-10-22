@@ -1248,6 +1248,17 @@ Value ModuleEmitter::emitPercentFormat(const parser::Node &expr) {
       if (constant)
         tpl = std::move(text);
     }
+  // ⭐ AND A NAME WHOSE TYPE IS ITS TEXT: a module constant the program
+  // never rebinds reads as its str literal, which is the template.
+  // unittest's `DIFF_OMITTED % len(diff)` is the shape.
+  if (!tpl && leftNode && leftNode->kind == "Name")
+    if (auto literal = mlir::dyn_cast_if_present<py::LiteralType>(
+            types.inferExpr(leftNode))) {
+      llvm::StringRef spelling = literal.getSpelling();
+      if (spelling.size() >= 2 && spelling.front() == '"' &&
+          spelling.back() == '"')
+        tpl = spelling.drop_front().drop_back().str();
+    }
   if (!tpl)
     return diag("%-formatting requires a compile-time format string here "
                 "(runtime templates are limited to statically-typed forms, "

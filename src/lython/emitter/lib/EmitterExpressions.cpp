@@ -901,8 +901,21 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
         restoreMembers.clear();
       };
       if (allBool) {
-        mlir::Value accumulated =
-            emitBoolValue(emitExpr(operandNodes->front().get()), *expr);
+        // An operand emitted as the literal True or False: what it decides is
+        // a constant, and the operands it short-circuits are not emitted
+        // (emitBoolOpValue says why).
+        auto literalTruth = [&](const Value &value) -> std::optional<bool> {
+          auto literal = mlir::dyn_cast_if_present<py::LiteralType>(value.type);
+          if (literal && (literal.getSpelling() == "True" ||
+                          literal.getSpelling() == "False"))
+            return literal.getSpelling() == "True";
+          return std::nullopt;
+        };
+        Value first = emitExpr(operandNodes->front().get());
+        std::optional<bool> firstTruth = literalTruth(first);
+        mlir::Value accumulated = emitBoolValue(first, *expr);
+        if (firstTruth && *firstTruth == isOr)
+          operandCount = 1;
         for (unsigned index = 1; index < operandCount; ++index) {
           mlir::Block *origin = builder.getInsertionBlock();
           mlir::Region *region = origin->getParent();
@@ -935,13 +948,16 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
           // dominate this use" on `a is not None and b is not None and f(a,b)`.
           for (unsigned earlier = 0; earlier < index; ++earlier)
             proveValue(earlier);
-          mlir::Value next =
-              emitBoolValue(emitExpr((*operandNodes)[index].get()), *expr);
+          Value nextValue = emitExpr((*operandNodes)[index].get());
+          std::optional<bool> nextTruth = literalTruth(nextValue);
+          mlir::Value next = emitBoolValue(nextValue, *expr);
           restoreNarrowedValues();
           mlir::cf::BranchOp::create(builder, loc(*expr), merge,
                                      mlir::ValueRange{next});
           builder.setInsertionPointToStart(merge);
           accumulated = joined;
+          if (nextTruth && *nextTruth == isOr)
+            break;
         }
         auto boxed = py::CastFromPrimOp::create(builder, loc(*expr),
                                                 types.boolType(), accumulated);
@@ -4562,6 +4578,45 @@ Value ModuleEmitter::emitBoolOpValue(
     // deciding branch leaves from wherever the test's emission landed.
     mlir::Block *decide = builder.getInsertionBlock();
     mlir::Block *keepBlock = builder.createBlock(region, merge->getIterator());
+    // ⭐ AN OPERAND WHOSE TRUTH IS A CONSTANT THAT DECIDES ENDS THE CHAIN
+    // HERE: the operands after it never run, so they are not emitted. In an
+    // inlined method the receiver can make one statically so --
+    //
+    //     max_diff = self.maxDiff        # None, on a class that says so
+    //     if max_diff is None or len(diff) <= max_diff:
+    //
+    // -- and emitting the second operand compared an int with None and was
+    // refused ("__le__ ... no signature that accepts (None)"), for a branch
+    // CPython never takes. ⛔ Asked of the EMITTED truth, not of the static
+    // pre-pass, which types the local from the declaration (`int | None`).
+    std::optional<bool> constantTruth;
+    if (auto literal = mlir::dyn_cast_if_present<py::LiteralType>(current.type);
+        literal && (literal.getSpelling() == "True" ||
+                    literal.getSpelling() == "False"))
+      constantTruth = literal.getSpelling() == "True";
+    else if (llvm::APInt bits;
+             mlir::matchPattern(condition, mlir::m_ConstantInt(&bits)))
+      constantTruth = bits.getBoolValue();
+    if (constantTruth && *constantTruth == !isAnd) {
+      builder.setInsertionPointToEnd(decide);
+      mlir::cf::BranchOp::create(builder, location, keepBlock);
+      builder.setInsertionPointToStart(keepBlock);
+      mlir::Value kept;
+      if (!isAnd && member) {
+        auto unwrap = py::UnionUnwrapOp::create(builder, location, member,
+                                                current.value);
+        kept = coerceValue(Value{unwrap.getResult(), member}, resultType, expr)
+                   .value;
+      } else if (isAnd && member && !canBeFalsyWhenPresent(member)) {
+        kept = coerceValue(emitNone(expr), resultType, expr).value;
+      } else {
+        kept = coerceValue(current, resultType, expr).value;
+      }
+      mlir::cf::BranchOp::create(builder, location, merge,
+                                 mlir::ValueRange{kept});
+      builder.setInsertionPointToStart(merge);
+      return Value{result, resultType};
+    }
     mlir::Block *nextBlock = builder.createBlock(region, merge->getIterator());
     builder.setInsertionPointToEnd(decide);
     if (isAnd)
@@ -4608,10 +4663,28 @@ Value ModuleEmitter::emitExprExpected(const parser::Node *expr,
   if (isEmptyContainerExpression(expr) &&
       unboundStaticParameterCount(expected) != 0)
     return emitExpr(expr);
-  if (expr->kind == "Lambda")
+  if (expr->kind == "Lambda") {
     if (auto expectedCallable =
             mlir::dyn_cast_if_present<py::CallableType>(expected))
       return emitLambda(*expr, expectedCallable);
+    // ⭐ AND THE ONE CALLABLE OF AN OPTIONAL: `isjunk: Callable[[str], bool]
+    // | None` is how an optional filter is written, and a lambda passed
+    // there had no parameter types to take ("lambda requires a Callable
+    // annotation"). A lambda is never None, so the callable member is what
+    // it has to be. ⛔ Only when there is one: two callables in a union
+    // leave its parameters undecided.
+    if (auto expectedUnion = mlir::dyn_cast_if_present<py::UnionType>(expected)) {
+      py::CallableType only;
+      unsigned callables = 0;
+      for (mlir::Type member : expectedUnion.getMemberTypes())
+        if (auto callable = mlir::dyn_cast<py::CallableType>(member)) {
+          only = callable;
+          ++callables;
+        }
+      if (callables == 1)
+        return emitLambda(*expr, only);
+    }
+  }
   // ⭐ A container literal under a UNION expectation takes the member of its
   // own kind. `xs: list[int] | None` then `xs = []` typed the literal
   // `list[object]` (the union is not a container contract, so the
@@ -6251,6 +6324,16 @@ mlir::Value ModuleEmitter::emitBoolValue(Value value,
   if (mlir::isa<py::TypeType>(widened))
     return mlir::arith::ConstantIntOp::create(builder, loc(anchor), 1, 1)
         .getResult();
+  // ⭐ A CALLABLE VALUE IS TRUE: what a `Callable` holds is a function, a
+  // lambda, a closure or a bound method, and none defines `__bool__` or
+  // `__len__`. ⛔ Not asked of the manifest, which has no `__bool__` for a
+  // callable, so `if isjunk:` over `Callable[[str], bool] | None` (difflib)
+  // was refused. An instance whose class defines `__call__` is refused where
+  // it would become a `Callable`, so its own `__bool__` cannot be skipped
+  // here; that refusal has to move here first if it is ever lifted.
+  if (mlir::isa<py::CallableType>(widened))
+    return mlir::arith::ConstantIntOp::create(builder, loc(anchor), 1, 1)
+        .getResult();
   // R1: implicit numeric truthiness is rejected (deliberate deviation from
   // CPython — `if n:` over int/float hides the comparison); bool stays exempt
   // because its truth bit IS the value.
@@ -6300,7 +6383,7 @@ mlir::Value ModuleEmitter::emitBoolValue(Value value,
       if (isNoneTypeLike(member) || widenedMember == types.intType() ||
           widenedMember == types.floatType() ||
           widenedMember == types.boolType() ||
-          mlir::isa<py::TypeType>(widenedMember))
+          mlir::isa<py::TypeType, py::CallableType>(widenedMember))
         return true;
       // Asked of the MEMBER, not of the union: this is the question the code
       // below asks of a concrete type, and it is the one that has an answer.
@@ -6316,7 +6399,8 @@ mlir::Value ModuleEmitter::emitBoolValue(Value value,
         if (isNoneTypeLike(member))
           return mlir::arith::ConstantIntOp::create(builder, loc(anchor), 0, 1)
               .getResult();
-        if (mlir::isa<py::TypeType>(types.widenLiteral(member)))
+        if (mlir::isa<py::TypeType, py::CallableType>(
+                types.widenLiteral(member)))
           return mlir::arith::ConstantIntOp::create(builder, loc(anchor), 1, 1)
               .getResult();
         auto unwrap = py::UnionUnwrapOp::create(builder, loc(anchor), member,

@@ -22,9 +22,9 @@
 # generator; the two-loop section is there because each loop must delegate to its
 # own fresh sub-generator.
 #
-# ⛔ A body that is anything else stays refused: `yield x * 2` is not delegation
-# and `py.yield.from` cannot carry it. That is the nested-generator frame work
-# the resume-target rule waits on.
+# A body that is anything else -- `yield x * 2` -- is not delegation; it runs
+# the inner generator from the outer one's frame, and is pinned by
+# a_generator_transforms_what_another_yields.
 #
 # ⭐ THE DIAGNOSTIC'S ADVICE WORKS, and the note here used to say it did not.
 # Re-measured 2026-09-07: `for x in list(src(n))` INSIDE a generator compiles

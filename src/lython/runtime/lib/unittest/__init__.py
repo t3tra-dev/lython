@@ -32,7 +32,10 @@ Deviations from CPython:
   Its docstring is the wrapper's (None), where CPython's skip copies the
   test's through functools.wraps and expectedFailure returns the test itself.
 - assertEqual dispatches on the static type of its arguments (a generic
-  method), not on a `_type_equality_funcs` dict keyed by run-time class.
+  method), not on a `_type_equality_funcs` dict keyed by run-time class; the
+  same six types reach the same six assertions. assertSequenceEqual,
+  assertTupleEqual and assertSetEqual take two arguments of ONE static type,
+  so a list is not compared with a tuple through them.
 - assertRaises' callable form is assertRaisesCall (one name cannot be both a
   context manager factory and a call forwarder here).
 - cleanups are stored as closures over their arguments, not as triples.
@@ -45,7 +48,7 @@ Deviations from CPython:
   namespace, so a TestCase imported into the module is not one of its tests.
 - `-k` matches a substring, not an fnmatch pattern; command-line test names,
   discovery, `-c` (signals) and `-b` (buffering) are not provided.
-- failure messages carry no difflib/pprint diff, and output is never colored.
+- output is never colored.
 - a stream is an `io.TextIOWrapper | io.StringIO`, not any object with write.
 - a FunctionTestCase compares and hashes as any TestCase does (by class and
   method name, not by its functions), and its repr names the function rather

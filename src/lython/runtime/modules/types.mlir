@@ -132,6 +132,43 @@ module attributes {
     func.return %storage : memref<64xi64>
   }
 
+  // A generator whose frame runs past word 48 (the EH stash): the same
+  // header, `%words` words in all, the lanes past the stash at 64 and on. The
+  // object is still typed as its first 64 words -- every driver and the
+  // deallocator take that type -- and the lanes past it are reached through
+  // their computed word index, inside the allocation.
+  func.func @LyGenerator_NewWide(%target_id: i64, %words: i64) -> memref<64xi64> attributes {ly.ownership.owned_result_contracts = ["types.GeneratorType"], ly.ownership.owned_results = [0], ly.runtime.contract = "types.GeneratorType", ly.runtime.primitive = "new_wide"} {
+    %one = arith.constant 1 : i64
+    %zero = arith.constant 0 : i64
+    %layout_generator = arith.constant {ly.class_of = "types.GeneratorType"} 63 : i64
+    %refcount_slot = arith.constant 0 : index
+    %layout_slot = arith.constant 1 : index
+    %state_slot = arith.constant 2 : index
+    %target_slot = arith.constant 3 : index
+    %resume_slot = arith.constant 4 : index
+    %sent_valid_slot = arith.constant 5 : index
+    %thrown_valid_slot = arith.constant 6 : index
+    %close_requested_slot = arith.constant 7 : index
+    %count = arith.index_cast %words : i64 to index
+
+    %wide = memref.alloc(%count) {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi64>
+    %storage = memref.reinterpret_cast %wide to offset: [0], sizes: [64], strides: [1] : memref<?xi64> to memref<64xi64>
+    memref.store %one, %wide[%refcount_slot] : memref<?xi64>
+    memref.store %layout_generator, %wide[%layout_slot] : memref<?xi64>
+    memref.store %zero, %wide[%state_slot] : memref<?xi64>
+    memref.store %target_id, %wide[%target_slot] {ly.atomic.ordering = "release", ly.atomic.role = "generator.target.publish"} : memref<?xi64>
+    memref.store %zero, %wide[%resume_slot] : memref<?xi64>
+    memref.store %zero, %wide[%sent_valid_slot] : memref<?xi64>
+    memref.store %zero, %wide[%thrown_valid_slot] : memref<?xi64>
+    memref.store %zero, %wide[%close_requested_slot] : memref<?xi64>
+    %frame_lower = arith.constant 8 : index
+    %frame_step = arith.constant 1 : index
+    scf.for %slot = %frame_lower to %count step %frame_step {
+      memref.store %zero, %wide[%slot] : memref<?xi64>
+    }
+    func.return %storage : memref<64xi64>
+  }
+
   func.func @LyGenerator_ResumeBegin(%storage: memref<64xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "types.GeneratorType", ly.runtime.primitive = "resume.begin"} {
     %state_slot = arith.constant 2 : index
     %created = arith.constant 0 : i64
