@@ -245,6 +245,12 @@ ModuleEmitter::ensureGenericSpecialization(
       specialized.varargType = {};
       specialized.callableVarargType = {};
     }
+    if (specialized.paramSpecArgs)
+      concretizeParamSpecCallables(*generic.node, specialized,
+                                   specialized.paramSpecPositionalStart,
+                                   paramSpecShape->positional,
+                                   paramSpecShape->keywords,
+                                   paramSpecForwarderArguments);
     if (specialized.paramSpecKwargs) {
       specialized.kwOnlyDefaults.resize(specialized.kwOnlyTypes.size(), false);
       specialized.paramSpecKwargsType = specialized.kwargType;
@@ -312,6 +318,64 @@ ModuleEmitter::ensureGenericSpecialization(
   else
     emitSpecializedBody();
   return std::make_pair(symbol, specialized.publicCallable);
+}
+
+// ⭐ THE CALLABLE P DESCRIBES TAKES THE CALL'S SHAPE. A parameter annotated
+// `Callable[P, R]` was erased with the packs, so its argument met
+// `Callable[..., R]` -- a target that names no parameter, so a builtin or a
+// class handed to it had no forwarder to become (`call_with(print, "hi")`
+// reached the lowering as "cannot adapt builtins.function"), and the body's
+// `fn(*args)` was checked against nothing. Returns the parameters it typed.
+llvm::SmallVector<unsigned, 2> ModuleEmitter::concretizeParamSpecCallables(
+    const parser::Node &def, FunctionSignature &sig, unsigned declaredCount,
+    llvm::ArrayRef<mlir::Type> packPositional,
+    llvm::ArrayRef<CallKeywordType> packKeywords,
+    llvm::ArrayRef<bool> needsForwarder) {
+  llvm::SmallVector<unsigned, 2> typed;
+  const parser::Node *arguments = ast::node(def, "args");
+  // ⛔ Only for an argument that needs a forwarder, and only with no keyword
+  // in the shape: a program's function is already a callable value, and
+  // `def f(a, b=0)` given `b=` by keyword is not a callable with a
+  // keyword-only `b` -- typing it as one refused every such call. A
+  // forwarder takes positional parameters only.
+  if (!sig.paramSpecArgs || !arguments || !packKeywords.empty() ||
+      !llvm::is_contained(needsForwarder, true))
+    return typed;
+  llvm::SmallVector<mlir::Type, 4> keywordTypes;
+  llvm::SmallVector<mlir::StringAttr, 4> keywordNames;
+  for (const CallKeywordType &member : packKeywords) {
+    keywordTypes.push_back(member.type);
+    keywordNames.push_back(builder.getStringAttr(member.name));
+  }
+  auto spellsCallableOfP = [&](const parser::Node *annotation) {
+    if (!annotation || annotation->kind != "Subscript")
+      return false;
+    const parser::Node *slice = ast::node(*annotation, "slice");
+    const auto *elements =
+        slice && slice->kind == "Tuple" ? ast::nodeList(*slice, "elts")
+                                        : nullptr;
+    if (!elements || elements->size() != 2 || !elements->front() ||
+        elements->front()->kind != "Name")
+      return false;
+    return ast::nameSpelling(*elements->front()) == *sig.paramSpecArgs;
+  };
+  for (auto [index, argument] :
+       llvm::enumerate(positionalArgumentNodes(*arguments))) {
+    if (index >= declaredCount || index >= sig.positionalTypes.size())
+      break;
+    if (index >= needsForwarder.size() || !needsForwarder[index])
+      continue;
+    auto erased =
+        mlir::dyn_cast_if_present<py::CallableType>(sig.positionalTypes[index]);
+    if (!erased || !isGradualCallable(erased) ||
+        !spellsCallableOfP(ast::node(*argument, "annotation")))
+      continue;
+    sig.positionalTypes[index] = py::CallableType::get(
+        &context, packPositional, keywordTypes, {}, {},
+        erased.getResultTypes(), {}, keywordNames, {}, {});
+    typed.push_back(static_cast<unsigned>(index));
+  }
+  return typed;
 }
 
 ModuleEmitter::ParamSpecCallShape
@@ -1322,7 +1386,13 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   // the def statement has not finished executing when the body is emitted, so
   // there is no value there to capture -- which is why the capture walk in
   // emitNestedFunctionDecl finds nothing and drops the name.
-  if (!isLambda)
+  //
+  // ⛔ Not for a METHOD: its name is an attribute of the class, and a class
+  // scope is not visible from the bodies in it, so the spelling reads the
+  // module's binding. `def error(self, msg): return error(msg)` called itself
+  // with the arguments one short.
+  if (!isLambda && !classBodyDefs.contains(&callable) &&
+      !decoratedMethodBodies.contains(&callable))
     if (auto selfName = ast::string(callable, "name");
         selfName && llvm::StringRef(selfName->data(), selfName->size()) !=
                         symbolName &&

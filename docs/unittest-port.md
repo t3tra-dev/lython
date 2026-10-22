@@ -381,8 +381,8 @@ unittest 自身が取り込むもののうち、Lython にないもの。
 | --- | --- | --- |
 | difflib | assertMultiLineEqual などの差分表示 (`ndiff`) | 済 (C-2)。`lib/difflib.py` |
 | pprint | 差分表示の前の整形 (`pformat`) | 済 (C-2)。`lib/pprint.py` |
-| re | assertRegex、assertRaisesRegex、loader のモジュール名の判定 | 部分文字列の比較 |
-| fnmatch | `-k` のパターン | 部分文字列の比較 |
+| re | assertRegex、assertRaisesRegex、loader のモジュール名の判定 | 済 (C-3)。`lib/re/`、エンジンは `lib/_sre.py` |
+| fnmatch | `-k` のパターン | 済 (C-3)。`lib/fnmatch.py` |
 | warnings | assertWarns、runner の警告フィルタ | 無し |
 | logging | assertLogs | 無し |
 | argparse | `unittest.main` のコマンドライン | 手書きの解析 |
@@ -616,9 +616,83 @@ CPython も自分のインタプリタでテストを動かしているので、
        `SequenceMatcher[str]` のメソッドが呼び出しごとに複製されている
        (`tryCallLargeMethod` が型引数のあるクラスを除外する)。B-4 の
        `assertRaises` と同じ根で、次に詰める。
-3. re と fnmatch (assertRegex、assertRaisesRegex、`-k`)。
+3. re と fnmatch (assertRegex、assertRaisesRegex、`-k`) (済、2026-10-23)。
+   - `lib/re/` (`__init__`、`_constants`、`_parser`、`_compiler`、`_casefix`)
+     を CPython 3.14 から移し、C の `_sre` (sre.c と sre_lib.h の照合・探索、
+     Pattern、Match、Scanner、テンプレート) を `lib/_sre.py` に Python で
+     書いた。コンパイラが出すコード列 (`list[int]`) は CPython と同じ。
+     `lib/fnmatch.py` も移した。逸脱は各ファイルの冒頭に書いた。大きいもの:
+     str のパターンだけ (bytes と LOCALE は無い)、フラグは int (RegexFlag は
+     無い)、`Match.group` は 1 つのグループを取り `str | None` を返す、
+     グループが 2 つ以上のパターンの `findall` は TypeError (finditer を
+     使う)、`split` は `list[str | None]`、照合は再帰なので深い繰り返しは
+     RecursionError になりうる、`\N{...}` は拒否。
+   - unittest: assertRegex、assertNotRegex、assertRaisesRegex (文脈管理器の
+     形だけ。文脈は `_AssertRaisesRegexContext` という別のクラスで、
+     assertRaises から re に届かないようにした)。loader の `-k` は
+     fnmatchcase。テストは `tests/python/test_re.py` (39 件)、
+     `test_fnmatch.py`、`test_unittest_regex.py`。
+   - 書いている途中で見つけて直したもの:
+     1. (黙った誤り、退行) 箱で来た int (`ord(c)`、リストの要素) から計算した
+        添字 `xs[ch >> 5]` が `xs[0]` を読んだ。遅延 int の i64 側を、フラグを
+        見ずに使っていた (list / tuple / str の添字、フィールドと global への
+        代入、ctypes)。10/05 の lyc では正しい。`read_value_checked` で読む。
+     2. (拒否、10/05 より前から) ループに入る前と中で 2 つの名前に同じ値を
+        入れ、途中で break するループ (`got = get(); char = got; while
+        True: ...`) を所有権検証が拒否した。refcount 挿入が、どの辺でも同じ
+        値を受け取る 2 つのヘッダ引数を 1 つに畳み、入口の辺の token が 1 つ
+        足りなかった。ループのヘッダでは畳まない。
+     3. (拒否、退行) プログラムの例外クラスを `T | None` のフィールドに持つ
+        クラス (unittest の assertRaises の文脈) が「deallocator が無い」と
+        拒否された。例外クラスの別名の登録が、クラスの deallocator を作る
+        段より後だった。さらに、そのフィールドは manifest に形が無いため
+        lane 継ぎ足しの経路に落ち、with の 2 つの出口の `__exit__` が支配
+        しない値を解放した (10/05 の lyc は黙って None を出していた)。
+        祖先の例外の形で箱に入れる。
+     4. (拒否) メソッドの本体で、メソッドと同じ名前のモジュール関数を呼ぶ
+        (`def error(self, msg): return error(msg)`) と、メソッド自身に
+        解決された。入れ子の def が自分を呼ぶための束縛がメソッドにも
+        かかっていた。
+     5. (拒否) ジェネリックな引数に渡した表示リテラル
+        (`assertEqual(m.groups(), ('a', None))`) が、解いた型でなく自分の
+        型 (`tuple[str, None]`) のままだった。解いた後に型を付け替える。
+        `-> tuple[str, ...]` の関数の `return ('a', 'b')` も拒否されていた。
+     6. (拒否) 関数の値を `str | Callable[...]` の union 引数に渡すと
+        lowering が拒否した (C-2 で開いたままにした件)。
+     7. (遅さ) emit が、インライン展開するメソッドごとに定義モジュールの
+        名前を張り直し、名前ごとにモジュール全体の文を走査していた
+        (`from ._constants import *` の 130 個で 10 倍)。メモ化した。
+   - 開いたままのもの:
+     - コンパイル時間: unittest の 1 ファイルが 7.0 秒から 13.6 秒になった。
+       loader の `-k` (fnmatch) と assertRegex が re を取り込むため。re
+       だけのプログラムは 4.3 秒。re のパーサ (`_parse`) とエンジン
+       (`_match`) は大きな関数で、lowering の unwind cleanup が重い。
+     - (拒否) 例外のフィールドが `str | None` / `int | None` だと箱に
+       入らない (PatternError は property で避けた)。
+     - (拒否) 同じ小さなメソッドを 1 つの関数で 13 回 inline すると、
+       所有権の探索が 20000 状態を超える (test_re は表をループで回す)。
+     - 実行時の % 書式のテンプレート (`spec % value` で spec が引数) は
+       拒否される。
 4. builtin とクラスを Callable の値にする (`addCleanup(log.append, x)`、
-   `assertRaisesCall(TypeError, int, "x")`)。
+   `assertRaisesCall(TypeError, int, "x")`) (済、2026-10-23)。
+   - クラス (プログラムのものと `int` などの組み込み) を Callable の引数・
+     変数・リスト・戻り値・map に渡せる。型検査は「`C(A...)` が R になる」
+     とき `type[C]` を `Callable[[A...], R]` に受け、値は
+     `return C(a0, ...)` の forwarder になる。`Callable[[A], R]` が
+     ジェネリックなら、`__init__` が 1 つのときそこから A と R を解く。
+   - ParamSpec の転送 (`addCleanup(P, 1)`、`assertRaisesCall(ValueError,
+     int, "x")`、関数の `call_with[**P]`) では、`Callable[P, R]` の引数を
+     呼び出しの形の具体的な Callable にしてから forwarder を作る。関数の
+     ParamSpec 転送に `print` を渡す形は、以前から lowering で落ちていた
+     (クラスの行で emit が先に止まり、見えていなかった)。
+   - 呼び出し位置でだけ扱う builtin (`repr`、`ascii`、`format`、`iter`、
+     `next`、`min`、`max`、`sum`、`any`、`all`、`round`、`callable`) も、
+     Callable が期待される位置では名前から forwarder を作る。
+   - テストは `tests/python/test_callable_values.py` と golden 3 件。
+   - 開いたままのもの: ジェネリックな `Callable[[A], R]` に、オーバーロード
+     のある組み込みクラス (`str`、`float`) や builtin 関数 (`len`、`abs`)
+     を渡す形 (A がうまく決まらない)、呼び出し位置の builtin をジェネリック
+     な引数に渡す形、キーワード専用引数のある形の forwarder。
 5. クラスに付ける `@skip`、setUpModule、warnings (assertWarns)、
    logging (assertLogs)、argparse。
 

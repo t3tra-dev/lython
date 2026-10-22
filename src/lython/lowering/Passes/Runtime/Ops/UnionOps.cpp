@@ -14,6 +14,35 @@ RuntimeBundleLowerer::findUnionMemberIndex(py::UnionType unionType,
     if (candidate == member)
       return static_cast<unsigned>(index);
 
+  // ⭐ A FUNCTION OBJECT IS THE UNION'S ONE CALLABLE MEMBER. Its bundle names
+  // the runtime class `builtins.function`, which no `Callable[[...], R]`
+  // member equals or is assignable from as a type, so `re.sub(p, upper, s)`
+  // with `repl: str | Callable[[Match], str]` (and a function handed to a
+  // `Callable | None` parameter) was refused here, after the emitter had
+  // checked the call. Which callable it is was the emitter's question.
+  auto isCallableMember = [](mlir::Type type) {
+    if (mlir::isa<py::CallableType>(type))
+      return true;
+    auto protocol = mlir::dyn_cast<py::ProtocolType>(type);
+    return protocol && protocol.getProtocolName() == "Callable";
+  };
+  auto memberContract = mlir::dyn_cast<py::ContractType>(member);
+  if (isCallableMember(member) ||
+      (memberContract &&
+       memberContract.getContractName() == "builtins.function")) {
+    std::optional<unsigned> callable;
+    for (auto [index, candidate] : llvm::enumerate(unionType.getMemberTypes()))
+      if (isCallableMember(candidate)) {
+        if (callable) {
+          callable.reset();
+          break;
+        }
+        callable = static_cast<unsigned>(index);
+      }
+    if (callable)
+      return callable;
+  }
+
   // ⭐ WITH THE MODULE, when there is one: a source class's bases are in its
   // class op, and without it a subclass is assignable to nothing. An upcast
   // is a retyping that keeps the object's own contract on the bundle, so

@@ -78,6 +78,9 @@ bool bindSolvedInstantiation(const TypeSystem &types,
                              TypeBindingMap &bindings);
 
 int unboundStaticParameterCount(mlir::Type type);
+// `Callable[..., R]`: any arguments, which is also what `Callable[P, R]` is
+// erased to.
+bool isGradualCallable(py::CallableType callable);
 
 std::optional<CallSolution>
 tryCallableApplication(const TypeSystem &types, py::CallableType callable,

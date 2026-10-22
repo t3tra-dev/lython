@@ -318,6 +318,24 @@ RuntimeBundleLowerer::materializePrimitiveI64Object(
       op, bundle);
 }
 
+std::optional<mlir::Value>
+RuntimeBundleLowerer::deferredIntValueChecked(mlir::Operation *op,
+                                              const RuntimeBundle &bundle) {
+  if (!bundle.primitiveI64 || !bundle.primitiveI64->value ||
+      !bundle.primitiveI64->valid || !bundle.deferredObject)
+    return std::nullopt;
+  std::optional<RuntimeSymbol> checked =
+      manifest.primitive("builtins.int", "read_value_checked");
+  if (!checked)
+    return std::nullopt;
+  return RuntimeBundleLowerer::createRuntimeCall(
+             op->getLoc(), *checked,
+             mlir::ValueRange{bundle.primitiveI64->value,
+                              bundle.primitiveI64->valid,
+                              bundle.deferredObject})
+      .getResult(0);
+}
+
 mlir::FailureOr<RuntimeValue>
 RuntimeBundleLowerer::materializePrimitiveI64ObjectAtCurrentInsertion(
     mlir::Operation *op, const RuntimeBundle &bundle) {

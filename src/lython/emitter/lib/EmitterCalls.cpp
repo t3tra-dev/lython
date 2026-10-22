@@ -3742,6 +3742,13 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
                                                expr.range.start, mismatch});
       return emitNone(expr);
     }
+  llvm::SmallVector<bool, 4> forwarded;
+  for (const Value &argument : operands.positional)
+    forwarded.push_back(needsCallableForwarder(argument));
+  llvm::SmallVector<bool, 4> outerForwarded =
+      std::exchange(paramSpecForwarderArguments, forwarded);
+  auto restoreForwarded = llvm::scope_exit(
+      [&] { paramSpecForwarderArguments = std::move(outerForwarded); });
   std::optional<std::pair<std::string, py::CallableType>> specialization =
       ensureGenericSpecialization(expr, generic, resolved,
                                   shape ? &*shape : nullptr);
@@ -3749,12 +3756,39 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
     return emitNone(expr);
   llvm::ArrayRef<mlir::Type> parameterTypes =
       specialization->second.getPositionalTypes();
+  const auto *argumentNodes = ast::nodeList(expr, "args");
+  if (argumentNodes && argumentNodes->size() != operands.positional.size())
+    argumentNodes = nullptr;
   for (auto [index, argument] : llvm::enumerate(operands.positional))
     if (emptyLiterals && emptyLiterals->positional[index] &&
         index < parameterTypes.size()) {
       argument = adoptDeclaredContainer(argument, parameterTypes[index], expr);
       operands.positionalTypes[index] = argument.type;
+    } else if (argumentNodes && index < parameterTypes.size()) {
+      argument = adoptSolvedDisplay(argument, parameterTypes[index],
+                                    (*argumentNodes)[index].get());
+      operands.positionalTypes[index] = argument.type;
     }
+  // A builtin or a class handed to a generic callable parameter becomes its
+  // forwarder only now: the arguments were emitted against `Callable[[A],
+  // R]` -- or the erased `Callable[..., R]` of a `Callable[P, R]` -- and the
+  // specialization is what gave it parameters.
+  for (auto [index, argument] : llvm::enumerate(operands.positional)) {
+    auto target = index < parameterTypes.size()
+                      ? mlir::dyn_cast_if_present<py::CallableType>(
+                            parameterTypes[index])
+                      : py::CallableType();
+    if (!target)
+      continue;
+    std::optional<Value> wrapped =
+        tryWrapBuiltinFunctionValue(argument, target, expr);
+    if (!wrapped)
+      wrapped = tryWrapClassValue(argument, target, expr);
+    if (wrapped) {
+      argument = *wrapped;
+      operands.positionalTypes[index] = argument.type;
+    }
+  }
   Value callee = emitBindingRef(calleeNode, specialization->first,
                                 specialization->second);
   return emitCallableDispatch(expr, callee, operands);

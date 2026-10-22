@@ -762,6 +762,12 @@ set(LYTHON_LEAK_GATE_CASES
     # One value forwarded into two loop lanes: the edge retains for the second
     # lane, and each lane releases what it held.
     one_value_carried_into_two_loop_lanes
+    # And entered with one value in two lanes: the entry edge transfers to
+    # one and retains for the other, and each lane releases what it held.
+    one_value_carried_into_two_loop_lanes_on_entry
+    # A program exception kept in an optional field by a with's `__exit__`
+    # lives in the field's box: stored once, released with its holder.
+    a_program_exception_held_in_an_optional_field
     # A nested generator's captures ride its frame as argument lanes: each
     # cell or captured object is held for the generator's life and given back
     # once.

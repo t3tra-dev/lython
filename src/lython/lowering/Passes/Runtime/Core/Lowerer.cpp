@@ -37,12 +37,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
     return mlir::failure();
   if (mlir::failed(buildGeneratorResumeBodies()))
     return mlir::failure();
-  if (mlir::failed(synthesizeSourceClassDeallocators()))
-    return mlir::failure();
-  // Before the list is settled: the hooks also name the program's exception
-  // classes as released by BaseException's deallocator, and the list reads
-  // those names.
+  // Before the class deallocators and before the list is settled: this also
+  // names the program's exception classes as released by BaseException's
+  // deallocator, and both read those names. ⛔ Not after the deallocators,
+  // where it was: a class holding a program exception in a field
+  // (`self._exception: E | None`, unittest's assertRaises context) had its
+  // deallocator written before the name existed, and the field's release
+  // found no deallocator for the class it named.
   if (mlir::failed(recordSourceTypeObjects()))
+    return mlir::failure();
+  if (mlir::failed(synthesizeSourceClassDeallocators()))
     return mlir::failure();
   // Nothing after this makes a deallocator, so the py-op lowering reads one
   // list instead of walking the module for every slot it releases.

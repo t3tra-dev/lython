@@ -37,7 +37,9 @@ Deviations from CPython:
   assertTupleEqual and assertSetEqual take two arguments of ONE static type,
   so a list is not compared with a tuple through them.
 - assertRaises' callable form is assertRaisesCall (one name cannot be both a
-  context manager factory and a call forwarder here).
+  context manager factory and a call forwarder here); assertRaisesRegex is
+  the context manager form only, and its context is a class of its own
+  (_AssertRaisesRegexContext) so that assertRaises does not reach re.
 - cleanups are stored as closures over their arguments, not as triples.
 - a subtest's params are a dict holding its own keys first and then its
   parent's others, not an _OrderedChainMap over the parent's.
@@ -46,8 +48,8 @@ Deviations from CPython:
   `TestCase.__subclasses__()` whose `__module__` it is, in the order of their
   names -- `dir(module)`'s order -- rather than reading the module's
   namespace, so a TestCase imported into the module is not one of its tests.
-- `-k` matches a substring, not an fnmatch pattern; command-line test names,
-  discovery, `-c` (signals) and `-b` (buffering) are not provided.
+- command-line test names, discovery, `-c` (signals) and `-b` (buffering)
+  are not provided.
 - output is never colored.
 - a stream is an `io.TextIOWrapper | io.StringIO`, not any object with write.
 - a FunctionTestCase compares and hashes as any TestCase does (by class and

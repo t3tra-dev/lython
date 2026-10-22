@@ -736,6 +736,11 @@ RuntimeBundleLowerer::lowerNativeIntGlobalSet(py::GlobalSetOp op,
     mlir::func::CallOp unboxCall = RuntimeBundleLowerer::createRuntimeCall(
         op.getLoc(), *unbox, value.physicalValues());
     raw = unboxCall.getResult(0);
+  } else if (std::optional<mlir::Value> deferred =
+                 RuntimeBundleLowerer::deferredIntValueChecked(op, value)) {
+    // A deferred int has two carriers, its lane and its object, and the flag
+    // chooses between them.
+    raw = *deferred;
   } else if (value.primitiveI64 && value.primitiveI64->value) {
     // No boxed payload to read instead: a primitive-i64 clone lane carries
     // only the (value, valid) pair, so the lane IS the sole carrier and a

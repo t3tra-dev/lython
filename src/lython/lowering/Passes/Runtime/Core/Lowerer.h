@@ -612,6 +612,11 @@ private:
   mlir::FailureOr<RuntimeValue>
   materializePrimitiveI64Object(mlir::Operation *op,
                                 const RuntimeBundle &bundle);
+  // A DEFERRED int's value as an i64 (`read_value_checked`): its lane where
+  // the flag says so, its object's otherwise. Nothing for a bundle with no
+  // object beside its lane.
+  std::optional<mlir::Value> deferredIntValueChecked(mlir::Operation *op,
+                                                     const RuntimeBundle &bundle);
   mlir::FailureOr<RuntimeValue>
   materializePrimitiveI64ObjectAtCurrentInsertion(mlir::Operation *op,
                                                   const RuntimeBundle &bundle);

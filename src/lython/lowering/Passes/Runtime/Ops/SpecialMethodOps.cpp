@@ -436,6 +436,11 @@ mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::rawSequenceIndexValue(
         op->getLoc(), *unbox, index.physicalValues());
     return call.getResult(0);
   }
+  // A deferred int's lane is stale where its flag is false; its object holds
+  // the value then.
+  if (std::optional<mlir::Value> deferred =
+          RuntimeBundleLowerer::deferredIntValueChecked(op, index))
+    return *deferred;
   // No boxed payload to fall back to (primitive-i64 clone lanes carry only
   // the (value, valid) pair): the lane is the sole carrier.
   if (index.primitiveI64 && index.primitiveI64->value &&

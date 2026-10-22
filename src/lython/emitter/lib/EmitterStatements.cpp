@@ -1664,6 +1664,24 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
         if (returnValue->kind == "Dict" && name == "builtins.dict")
           return arguments.size() == 2 && each("keys", arguments[0]) &&
                  each("values", arguments[1]);
+        // `-> tuple[str, ...]` returning `('a', 'b')`: the display infers one
+        // argument per element, which the homogeneous declaration -- one
+        // argument -- never equals, so the commonest tuple return was refused.
+        if (returnValue->kind == "Tuple" && name == "builtins.tuple") {
+          const auto *elements = ast::nodeList(*returnValue, "elts");
+          if (!elements)
+            return false;
+          if (arguments.size() == 1)
+            return each("elts", arguments[0]);
+          if (arguments.size() != elements->size())
+            return false;
+          for (auto [element, wanted] : llvm::zip(*elements, arguments))
+            if (!element || element->kind == "Starred" ||
+                !elementAccepted(
+                    types.widenLiteral(types.inferExpr(element.get())), wanted))
+              return false;
+          return true;
+        }
         return false;
       };
       // ⛔ `object` ANYWHERE IN THE RETURNED TYPE is the inference saying it

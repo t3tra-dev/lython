@@ -485,6 +485,70 @@ bool bindCallableView(const TypeSystem &types, py::CallableType expected,
   return true;
 }
 
+py::CallableType substituteCallable(const TypeSystem &types,
+                                    py::CallableType callable,
+                                    const TypeBindingMap &bindings,
+                                    bool eraseUnbound);
+
+// The callable a class is, read off its one `__init__`: its parameters past
+// the receiver, returning an instance. Nothing for an overloaded constructor
+// (`int`), which only a call's arguments choose between. Trailing parameters
+// with defaults past `arity` are left out, as a call with `arity` arguments
+// leaves them.
+std::optional<py::CallableType> constructorCallable(const TypeSystem &types,
+                                                    mlir::Type instance,
+                                                    unsigned arity) {
+  if (!instance || unboundStaticParameterCount(instance) != 0)
+    return std::nullopt;
+  const py::protocols::Table &table =
+      py::protocols::Table::get(types.getContext());
+  auto candidates =
+      table.methodContractCandidatesWithEvidence(instance, "__init__");
+  if (candidates.size() != 1)
+    return std::nullopt;
+  py::CallableType init = substituteCallable(
+      types, candidates.front().method.signature,
+      candidates.front().typeBindings, /*eraseUnbound=*/false);
+  if (!init || init.getPositionalTypes().empty() ||
+      unboundStaticParameterCount(init) != 0)
+    return std::nullopt;
+  std::size_t count = init.getPositionalTypes().size() - 1;
+  llvm::ArrayRef<mlir::BoolAttr> defaults = init.getPositionalDefaults();
+  while (count > arity && defaults.size() == count + 1 && defaults[count] &&
+         defaults[count].getValue())
+    --count;
+  auto slice = [&](auto list) {
+    return list.size() < count + 1 ? list : list.slice(1, count);
+  };
+  mlir::Type result[] = {instance};
+  return py::CallableType::get(
+      &types.getContext(), slice(init.getPositionalTypes()),
+      init.getKwOnlyTypes(), init.hasVararg() ? init.getVarargType() : nullptr,
+      init.hasKwarg() ? init.getKwargType() : nullptr, result,
+      slice(init.getPositionalNames()), init.getKwOnlyNames(),
+      slice(init.getPositionalDefaults()), init.getKwOnlyDefaults(),
+      init.getVarargName(), init.getKwargName(),
+      init.getPositionalOnlyCount() > 0 ? init.getPositionalOnlyCount() - 1
+                                        : 0);
+}
+
+bool isGradualCallable(py::CallableType callable) {
+  auto isAny = [](mlir::Type type) {
+    auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+    return contract && contract.getContractName() == "typing.Any";
+  };
+  auto onlyArgumentIsAny = [&](mlir::Type type, unsigned index) {
+    auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+    return contract && contract.getArguments().size() > index &&
+           isAny(contract.getArguments()[index]);
+  };
+  return callable && callable.getPositionalTypes().empty() &&
+         callable.getKwOnlyTypes().empty() && callable.hasVararg() &&
+         callable.hasKwarg() && callable.getResultTypes().size() == 1 &&
+         onlyArgumentIsAny(callable.getVarargType(), 0) &&
+         onlyArgumentIsAny(callable.getKwargType(), 1);
+}
+
 bool bindExpectedType(const TypeSystem &types, mlir::Type expected,
                       mlir::Type actual, TypeBindingMap &bindings) {
   // ⭐ A PARAMETER ALREADY BOUND IS STILL A PARAMETER. Substituted first, the
@@ -587,11 +651,49 @@ bool bindExpectedType(const TypeSystem &types, mlir::Type expected,
           mlir::dyn_cast_if_present<py::ContractType>(expected))
     return bindContractView(types, expectedContract, actual, bindings);
   if (auto expectedCallable =
-          mlir::dyn_cast_if_present<py::CallableType>(expected))
+          mlir::dyn_cast_if_present<py::CallableType>(expected)) {
     if (auto actualCallable =
             mlir::dyn_cast_if_present<py::CallableType>(actual))
       return bindCallableView(types, expectedCallable, actualCallable,
                               bindings);
+    // ⭐ A CLASS IS A CALLABLE whose call is its construction: `type[P]`
+    // meets `Callable[[int], P]` when `P(int)` constructs something the
+    // result accepts. The emitter makes the value (tryWrapClassValue).
+    // ⛔ Only a callable with fixed positional parameters and no type
+    // parameter left in them: the construction is asked with those types,
+    // and a variadic or an unbound parameter gives it nothing to ask with.
+    if (auto actualType = mlir::dyn_cast_if_present<py::TypeType>(actual)) {
+      if (!expectedCallable.hasVararg() && !expectedCallable.hasKwarg() &&
+          expectedCallable.getKwOnlyTypes().empty() &&
+          expectedCallable.getResultTypes().size() == 1 &&
+          unboundStaticParameterCount(expectedCallable) == 0)
+        if (mlir::Type instance = types.inferClassInstantiation(
+                actualType.getInstanceType(),
+                expectedCallable.getPositionalTypes(), {}))
+          return bindExpectedType(types,
+                                  expectedCallable.getResultTypes().front(),
+                                  instance, bindings);
+      // `Callable[..., R]` -- which is also what `Callable[P, R]` is erased
+      // to -- takes any class whose instances R accepts; the call that
+      // reaches it says with what (ensureGenericSpecialization makes P the
+      // call's shape, and the call in the body is checked there).
+      if (isGradualCallable(expectedCallable) &&
+          unboundStaticParameterCount(actualType.getInstanceType()) == 0)
+        return bindExpectedType(types,
+                                expectedCallable.getResultTypes().front(),
+                                actualType.getInstanceType(), bindings);
+      // `apply(Point, 3)` with `f: Callable[[A], R]`: A and R are what the
+      // constructor says, when it says one thing.
+      if (unboundStaticParameterCount(expectedCallable) != 0)
+        if (std::optional<py::CallableType> constructor =
+                constructorCallable(
+                    types, actualType.getInstanceType(),
+                    static_cast<unsigned>(
+                        expectedCallable.getPositionalTypes().size())))
+          return bindCallableView(types, expectedCallable, *constructor,
+                                  bindings);
+    }
+  }
 
   return typeAccepts(types, expected, actual);
 }

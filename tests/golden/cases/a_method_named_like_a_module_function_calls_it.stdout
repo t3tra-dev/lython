@@ -1,0 +1,3 @@
+[module error: bad escape]
+module tell 7
+[module error: x] module tell 7
