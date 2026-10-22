@@ -1193,10 +1193,12 @@ bool installPythonExceptionCleanupFrames(
             tryCallSites[call] = *pendingTryMarker;
             pendingTryMarker.reset();
           } else if (isNonUnwindingRefcountHelper(call->getCalledFunction()) ||
-                     isRuntimeMarkerCall(*call, "LyTraceback_Push")) {
+                     isRuntimeMarkerCall(*call, "LyTraceback_Push") ||
+                     isRuntimeMarkerCall(*call, "LyFrame_Set")) {
             // Ownership insertion may schedule releases (and the raise path
-            // its traceback frame) between the marker and the marked call;
-            // they cannot unwind, so the marker stays pending.
+            // its traceback frame, the frame pass the caller's frame) between
+            // the marker and the marked call; they cannot unwind, so the
+            // marker stays pending.
           } else if (!canSkipBetweenTryMarkerAndCall(*call)) {
             pendingTryMarker.reset();
           }

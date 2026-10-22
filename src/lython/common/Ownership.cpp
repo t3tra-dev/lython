@@ -2075,6 +2075,7 @@ bool isNonRaisingRuntimeSymbol(llvm::StringRef name) {
          name == "LyEH_HandledException" || name == "LyEH_ContextIsHandled" ||
          name == "LyEH_TryCallSiteMarker" || name == "LyEH_TryCatchMarker" ||
          name == "LyEH_TryCatchAnchor" || name.starts_with("LyTraceback_") ||
+         name.starts_with("LyFrame_") ||
          name == "LyObject_KeepAlive";
 }
 

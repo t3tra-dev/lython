@@ -679,7 +679,8 @@ ModuleEmitter::methodDefaultCell(const MethodBinding &method, unsigned slot,
   return cellName;
 }
 
-void ModuleEmitter::emitImportedDefaultCells() {
+bool ModuleEmitter::statementHasImportedDefaultCells(
+    const parser::Node &statement) {
   // A def whose cell is written at its statement: one with a default that is
   // not a literal. A generic one registers nothing pending -- its cell is
   // genericDefaultCell's -- so the defs are what is asked, not the map.
@@ -698,63 +699,80 @@ void ModuleEmitter::emitImportedDefaultCells() {
         return true;
     }
   };
+  if (pendingDefaultCells.count(&statement))
+    return true;
+  return (statement.kind == "FunctionDef" ||
+          statement.kind == "AsyncFunctionDef") &&
+         hasTypeParameters(statement) && hasCellDefault(statement);
+}
+
+// ⭐ AN IMPORTED MODULE'S BODY RUNS TOP TO BOTTOM, as CPython runs it: its
+// module globals, the cells of its defs' defaults and its classes'
+// attributes are written in the order the statements are written in. They
+// were three passes -- every global of every module, then the default
+// cells, then every class attribute -- so `_defaultFormatter = Formatter()`
+// below `class PercentStyle: default_format = ...` read the class attribute
+// before it was written ("referenced before assignment").
+// ⛔ Module by module in `sourceModules` order, which is the order the
+// passes already took the modules in: only the order WITHIN a module moves.
+void ModuleEmitter::emitImportedModuleInitializers() {
+  llvm::SmallVector<PendingModuleGlobalInit, 4> globals =
+      std::move(importedModuleGlobalInits);
+  importedModuleGlobalInits.clear();
+  llvm::SmallVector<PendingClassAttrInit, 4> classes =
+      std::move(importedClassAttrInits);
+  importedClassAttrInits.clear();
+  struct Step {
+    const parser::Node *anchor;
+    const PendingModuleGlobalInit *global = nullptr;
+    const PendingClassAttrInit *cls = nullptr;
+    const parser::Node *defaults = nullptr;
+  };
   for (const EmitOptions::SourceModule &source : options.sourceModules) {
     if (!source.moduleNode || source.isStub)
       continue;
-    const auto *body = ast::nodeList(*source.moduleNode, "body");
-    if (!body || llvm::none_of(*body, [&](const parser::NodePtr &statement) {
-          if (!statement)
-            return false;
-          if (pendingDefaultCells.count(statement.get()))
-            return true;
-          return (statement->kind == "FunctionDef" ||
-                  statement->kind == "AsyncFunctionDef") &&
-                 hasTypeParameters(*statement) && hasCellDefault(*statement);
-        }))
-      continue;
-    emitInDefiningModuleScope(source, [&] {
+    // Each kind is queued in declaration order; one walk takes them merged.
+    llvm::SmallVector<Step, 8> steps;
+    for (const PendingModuleGlobalInit &entry : globals)
+      if (entry.value && entry.source == &source)
+        steps.push_back(Step{entry.value, &entry});
+    for (const PendingClassAttrInit &entry : classes)
+      if (entry.classDef && entry.source == &source)
+        steps.push_back(Step{entry.classDef, nullptr, &entry});
+    if (const auto *body = ast::nodeList(*source.moduleNode, "body"))
       for (const parser::NodePtr &statement : *body)
-        if (statement)
-          emitPendingDefaultCells(*statement);
+        if (statement && statementHasImportedDefaultCells(*statement))
+          steps.push_back(
+              Step{statement.get(), nullptr, nullptr, statement.get()});
+    if (steps.empty())
+      continue;
+    llvm::stable_sort(steps, [](const Step &a, const Step &b) {
+      return std::make_pair(a.anchor->range.start.line,
+                            a.anchor->range.start.column) <
+             std::make_pair(b.anchor->range.start.line,
+                            b.anchor->range.start.column);
     });
-  }
-}
-
-void ModuleEmitter::emitImportedClassAttrInitializers() {
-  llvm::SmallVector<PendingClassAttrInit, 4> pending =
-      std::move(importedClassAttrInits);
-  importedClassAttrInits.clear();
-  for (const PendingClassAttrInit &entry : pending) {
-    if (!entry.classDef || !entry.source)
-      continue;
-    emitInDefiningModuleScope(*entry.source, [&] {
-      emitClassAttrInitializers(*entry.classDef, entry.contractName);
-      // CPython runs the hook right after the class body it belongs to, and
-      // the queue is in declaration order, so this is that position.
-      emitInitSubclassHook(*entry.classDef, entry.contractName);
-    });
-  }
-}
-
-void ModuleEmitter::emitImportedModuleGlobalInitializers() {
-  llvm::SmallVector<PendingModuleGlobalInit, 4> pending =
-      std::move(importedModuleGlobalInits);
-  importedModuleGlobalInits.clear();
-  for (const PendingModuleGlobalInit &entry : pending) {
-    if (!entry.value || !entry.source)
-      continue;
-    mlir::Type stored = moduleGlobals.lookup(entry.globalName);
-    if (!stored)
-      continue;
-    emitInDefiningModuleScope(*entry.source, [&] {
-      llvm::SaveAndRestore<std::string> decorating(decoratorSubjectName,
-                                                   entry.decoratorSubject);
-      Value initial = emitExprExpected(entry.value, stored);
-      Value coerced = coerceValue(initial, stored, *entry.value);
-      auto op = py::GlobalSetOp::create(builder, loc(*entry.value),
-                                        builder.getStringAttr(entry.globalName),
-                                        coerced.value);
-      markBoxedModuleGlobal(op);
+    emitInDefiningModuleScope(source, [&] {
+      for (const Step &step : steps) {
+        if (step.defaults) {
+          emitPendingDefaultCells(*step.defaults);
+        } else if (step.cls) {
+          emitClassAttrInitializers(*step.cls->classDef,
+                                    step.cls->contractName);
+          // CPython runs the hook right after the class body it belongs to.
+          emitInitSubclassHook(*step.cls->classDef, step.cls->contractName);
+        } else if (mlir::Type stored =
+                       moduleGlobals.lookup(step.global->globalName)) {
+          llvm::SaveAndRestore<std::string> decorating(
+              decoratorSubjectName, step.global->decoratorSubject);
+          Value initial = emitExprExpected(step.global->value, stored);
+          Value coerced = coerceValue(initial, stored, *step.global->value);
+          auto op = py::GlobalSetOp::create(
+              builder, loc(*step.global->value),
+              builder.getStringAttr(step.global->globalName), coerced.value);
+          markBoxedModuleGlobal(op);
+        }
+      }
     });
   }
 }
@@ -1745,7 +1763,7 @@ mlir::ArrayAttr ModuleEmitter::emitCallableDefaultValues(
   // def of `lib` fell to the provider and evaluated its default at every call:
   // `lib.f()` with `def f(xs: list[int] = [])` printed 1 1 1 where CPython
   // prints 1 2 3. The module being emitted is the def's own; its cells are
-  // written where its other initializers are (emitImportedDefaultCells).
+  // written where its other initializers are (emitImportedModuleInitializers).
   const parser::Node &definingModule =
       activeSourceModuleNode ? *activeSourceModuleNode : moduleNode;
   const parser::Node *defaultCellOwner =

@@ -141,6 +141,11 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     return emitConstant(*expr);
   if (expr->kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(*expr);
+    // ⛔ Before the bindings: the main module's `__name__` and `__file__`
+    // are bound where an imported module's code is emitted too, and
+    // `_srcfile = __file__` in an imported module took the main module's.
+    if (activeSourceModuleNode && (name == "__name__" || name == "__file__"))
+      return emitModuleDunder(*expr, name);
     auto found = values.find(name);
     if (found != values.end()) {
       // A boxed (nonlocal-shared) local binds to its cell instance; the
@@ -227,6 +232,13 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     if (std::optional<std::string> canonical =
             types.lookupCanonicalBinding(name))
       binding = *canonical;
+    // ⭐ A FUNCTION READS ITS MODULE'S `__name__` AND `__file__`, which are
+    // constants here as they are at module scope (EmitterCore.cpp): the
+    // module the body is written in, not the module that calls it. They were
+    // bound only in the main module's own scope, so `def f(): return
+    // __name__` was "unresolved name '__name__'".
+    if (!symbolType && (name == "__name__" || name == "__file__"))
+      return emitModuleDunder(*expr, name);
     if (!symbolType) {
       // `list` read as a value is the list class (a call of it never reaches
       // here: each builtin constructor is its own call path).
@@ -2171,6 +2183,77 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
     if (std::optional<Value> identity = unionClassIdentity(lhs, rhs))
       return *identity;
     if (std::optional<Value> identity = unionClassIdentity(rhs, lhs))
+      return *identity;
+    // ⭐ AN OPTIONAL REFERENCE IS ITS OBJECT ONLY WHILE THE MEMBER IS ACTIVE:
+    // `node.parent is root` with `parent: Logger | None` is an address
+    // comparison under the test that the Logger member is there, and False
+    // where None is. It was refused as "no stable identity", which is the
+    // answer for a value type, not for a reference behind a None.
+    // ⛔ Only unions of references and None, against a reference: a member
+    // that is a value type keeps the refusal below.
+    auto unionReferenceIdentity = [&](Value unionSide,
+                                      Value refSide) -> std::optional<Value> {
+      auto unionType =
+          mlir::dyn_cast_if_present<py::UnionType>(unionSide.value.getType());
+      mlir::Type refType = types.widenLiteral(refSide.type);
+      auto isReference = [&](mlir::Type type) {
+        return mlir::isa_and_nonnull<py::ContractType>(type) &&
+               type != types.intType() && type != types.floatType() &&
+               type != types.strType() && type != types.boolType() &&
+               type != types.contract("builtins.bytes") &&
+               type != types.contract("builtins.complex") &&
+               !py::isPyObjectType(type);
+      };
+      if (!unionType || !isReference(refType))
+        return std::nullopt;
+      llvm::SmallVector<mlir::Type, 4> candidates;
+      for (mlir::Type member : unionType.getMemberTypes()) {
+        if (isNoneTypeLike(member))
+          continue;
+        if (!isReference(member))
+          return std::nullopt;
+        if (py::isAssignableTo(member, refType) ||
+            py::isAssignableTo(refType, member))
+          candidates.push_back(member);
+      }
+      mlir::Type boolType = types.boolType();
+      Value ref = coerceValue(refSide, refType, expr);
+      std::function<mlir::Value(std::size_t)> chain =
+          [&](std::size_t index) -> mlir::Value {
+        if (index == candidates.size())
+          return common::constantBool(builder, loc(expr), false);
+        mlir::Type member = candidates[index];
+        mlir::Value active =
+            py::UnionTestOp::create(builder, loc(expr), builder.getI1Type(),
+                                    unionSide.value,
+                                    mlir::TypeAttr::get(member))
+                .getResult();
+        return emitValueDiamond(
+            loc(expr), active, builder.getI1Type(),
+            [&]() -> mlir::Value {
+              mlir::Value unwrapped =
+                  py::UnionUnwrapOp::create(builder, loc(expr), member,
+                                            unionSide.value)
+                      .getResult();
+              return py::IsOp::create(builder, loc(expr), builder.getI1Type(),
+                                      unwrapped, ref.value)
+                  .getResult();
+            },
+            [&] { return chain(index + 1); });
+      };
+      mlir::Value bit = chain(0);
+      if (negatedIdentity) {
+        auto one = mlir::arith::ConstantIntOp::create(builder, loc(expr), 1, 1);
+        bit = mlir::arith::XOrIOp::create(builder, loc(expr), bit, one);
+      }
+      return Value{
+          py::CastFromPrimOp::create(builder, loc(expr), boolType, bit)
+              .getResult(),
+          boolType};
+    };
+    if (std::optional<Value> identity = unionReferenceIdentity(lhs, rhs))
+      return *identity;
+    if (std::optional<Value> identity = unionReferenceIdentity(rhs, lhs))
       return *identity;
     if (auto lhsType = mlir::dyn_cast_if_present<py::TypeType>(lhs.type))
       if (auto rhsType = mlir::dyn_cast_if_present<py::TypeType>(rhs.type)) {
@@ -6620,6 +6703,22 @@ mlir::Value ModuleEmitter::emitBoolValue(Value value,
                          mlir::FlatSymbolRefAttr::get(&context, "__bool__"),
                          callProtocolFor(inference), value.value);
   return op.getResult();
+}
+
+Value ModuleEmitter::emitModuleDunder(const parser::Node &anchor,
+                                      llvm::StringRef name) {
+  std::string text = sourceName;
+  if (name == "__name__") {
+    text = "__main__";
+    if (activeSourceModuleNode)
+      for (const EmitOptions::SourceModule &source : options.sourceModules)
+        if (source.moduleNode == activeSourceModuleNode)
+          text = source.moduleName;
+  }
+  mlir::Type literalType = types.literal(("\"" + text + "\""));
+  auto constant = py::StrConstantOp::create(builder, loc(anchor), literalType,
+                                            builder.getStringAttr(text));
+  return {constant.getResult(), literalType};
 }
 
 std::string ModuleEmitter::unresolvedNameMessage(llvm::StringRef name) const {

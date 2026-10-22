@@ -57,6 +57,7 @@ void ModuleEmitter::emitStatements(
         emitClassAttrInitializers(*statement);
         emitInitSubclassHook(*statement);
         applyMethodDecorators(*statement);
+        applyClassDecorators(*statement);
       }
       // A skipped module-level def still EXECUTES here in CPython terms:
       // its non-constant defaults evaluate at this spot, once, into their
@@ -644,7 +645,7 @@ void ModuleEmitter::emitPendingDefaultCells(const parser::Node &statement) {
   // A generic function's cells (genericDefaultCell): written here whether or
   // not a specialization exists yet, which is what its readers rely on.
   // A top-level def of the module this statement is run for: the main
-  // module's walk, or an imported module's (emitImportedDefaultCells).
+  // module's walk, or an imported module's (emitImportedModuleInitializers).
   bool mainModuleDef = false;
   const parser::Node &runningModule =
       activeSourceModuleNode ? *activeSourceModuleNode : moduleNode;

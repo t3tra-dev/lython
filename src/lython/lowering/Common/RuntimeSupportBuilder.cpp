@@ -4386,6 +4386,7 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
       support, "LyObject_RetainBoxedPayloadArraySlotRaw",
       "retain_payload_slot_ptr");
   buildTracebackSupport(support);
+  buildFrameSupport(support);
   declareEHSupport(support);
   if (usePythonPersonality(support.triple)) {
     buildEHReadField(support);

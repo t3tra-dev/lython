@@ -1,6 +1,7 @@
 """Unittest main program"""
 
 import sys
+from collections.abc import Callable
 import os
 
 from . import loader, runner, suite
@@ -36,8 +37,18 @@ class TestProgram(object):
                  exit: bool = True, verbosity: int = 1, failfast: bool | None = None,
                  catchbreak: bool | None = None, buffer: bool | None = None,
                  warnings: str | None = None, *, tb_locals: bool = False,
-                 durations: int | None = None) -> None:
+                 durations: int | None = None,
+                 _setUpModule: Callable[[], object] | None = None,
+                 _tearDownModule: Callable[[], object] | None = None) -> None:
         self.module = module
+        # The calling module's setUpModule / tearDownModule, which the
+        # compiler passes here for the `unittest.main()` it sees (CPython
+        # reads them off `sys.modules[module]` when the first test runs).
+        if module is not None:
+            if _setUpModule is not None:
+                suite._module_set_ups[module] = _setUpModule
+            if _tearDownModule is not None:
+                suite._module_tear_downs[module] = _tearDownModule
         if argv is None:
             argv = sys.argv
 
@@ -48,7 +59,14 @@ class TestProgram(object):
         self.buffer = buffer
         self.tb_locals = tb_locals
         self.durations = durations
-        self.warnings = warnings
+        if warnings is None:
+            # even if DeprecationWarnings are ignored by default
+            # print them anyway unless other warnings settings are
+            # specified by the warnings arg (there is no -W option here:
+            # `sys.warnoptions` is always empty)
+            self.warnings = 'default'
+        else:
+            self.warnings = warnings
         self.defaultTest = defaultTest
         self.testRunner = testRunner
         self.testLoader = testLoader

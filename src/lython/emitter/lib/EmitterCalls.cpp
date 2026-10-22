@@ -1,5 +1,6 @@
 #include "Contracts.h"
 #include "AstSynth.h"
+#include "BuiltinMethodKeywords.h"
 #include "EmitterCore.h"
 #include "EmitterPyOps.h"
 #include "EmitterSupport.h"
@@ -1128,6 +1129,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
       }
   if (std::optional<Value> subclasses = tryEmitSubclassesCall(expr))
     return *subclasses;
+  if (std::optional<Value> program = tryEmitTestProgramWithModuleFixtures(expr))
+    return *program;
   if (calleeNode && calleeNode->kind == "Call")
     if (std::optional<Value> curried =
             tryEmitCurriedGenericCall(expr, *calleeNode))
@@ -1294,49 +1297,21 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
   // -- the manifest names a str parameter across TWO physical values
   // (sep_header, sep_bytes), so a keyword can never match one by name.
   //
-  // The table is CPython's argument clinic for the handful of methods that
-  // accept keywords at all: find/index/center/startswith and the rest are
-  // positional-only THERE too, and their refusal here is the same answer.
+  // The table is CPython's argument clinic (BuiltinMethodKeywords.h).
   // Binding runs through the same bindBuiltinArguments the builtin fast paths
   // use, so a gap (`split(maxsplit=1)`, which names no separator) stays
   // refused rather than being invented.
   if (calleeNode && calleeNode->kind == "Attribute")
     if (const auto *methodKeywords = ast::nodeList(expr, "keywords");
         methodKeywords && !methodKeywords->empty()) {
-      struct MethodParameters {
-        llvm::StringLiteral method;
-        llvm::ArrayRef<llvm::StringRef> names;
-        unsigned positionalOnly;
-      };
-      static const llvm::StringRef kSplitNames[] = {"sep", "maxsplit"};
-      static const llvm::StringRef kReplaceNames[] = {"old", "new", "count"};
-      static const llvm::StringRef kSplitlinesNames[] = {"keepends"};
-      static const llvm::StringRef kCodecNames[] = {"encoding", "errors"};
-      // ⛔ `signed` is keyword-only in CPython and is accepted positionally
-      // here: the position is how the manifest's overloads are told apart.
-      static const llvm::StringRef kToBytesNames[] = {"length", "byteorder",
-                                                      "signed"};
-      static const llvm::StringRef kFromBytesNames[] = {"bytes", "byteorder",
-                                                        "signed"};
-      static const MethodParameters kMethodParameters[] = {
-          {llvm::StringLiteral("split"), kSplitNames, 0},
-          {llvm::StringLiteral("rsplit"), kSplitNames, 0},
-          {llvm::StringLiteral("replace"), kReplaceNames, 2},
-          {llvm::StringLiteral("splitlines"), kSplitlinesNames, 0},
-          {llvm::StringLiteral("encode"), kCodecNames, 0},
-          {llvm::StringLiteral("decode"), kCodecNames, 0},
-          {llvm::StringLiteral("to_bytes"), kToBytesNames, 0},
-          {llvm::StringLiteral("from_bytes"), kFromBytesNames, 0},
-      };
       llvm::StringRef methodName =
           ast::string(*calleeNode, "attr").value_or("");
-      for (const MethodParameters &entry : kMethodParameters) {
-        if (methodName != entry.method)
-          continue;
-        std::optional<llvm::SmallVector<const parser::Node *, 4>> bound =
-            bindBuiltinArguments(expr, entry.names, entry.positionalOnly);
-        if (!bound)
-          break;
+      std::optional<BuiltinMethodParameters> entry =
+          builtinMethodParameters(methodName);
+      std::optional<llvm::SmallVector<const parser::Node *, 4>> bound;
+      if (entry)
+        bound = bindBuiltinArguments(expr, entry->names, entry->positionalOnly);
+      if (bound) {
         std::vector<parser::NodePtr> positional;
         const auto *originalArgs = ast::nodeList(expr, "args");
         bool recovered = true;
@@ -1359,15 +1334,15 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
           }
           positional.push_back(std::move(shared));
         }
-        if (!recovered)
-          break;
-        parser::NodePtr rewritten = parser::makeNode("Call", expr.range);
-        if (const parser::Field *func = parser::findField(expr, "func"))
-          rewritten->fields.push_back(*func);
-        parser::addField(*rewritten, "args", std::move(positional));
-        parser::addField(*rewritten, "keywords",
-                         std::vector<parser::NodePtr>{});
-        return emitCall(*rewritten);
+        if (recovered) {
+          parser::NodePtr rewritten = parser::makeNode("Call", expr.range);
+          if (const parser::Field *func = parser::findField(expr, "func"))
+            rewritten->fields.push_back(*func);
+          parser::addField(*rewritten, "args", std::move(positional));
+          parser::addField(*rewritten, "keywords",
+                           std::vector<parser::NodePtr>{});
+          return emitCall(*rewritten);
+        }
       }
     }
 
@@ -3794,6 +3769,62 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
   return emitCallableDispatch(expr, callee, operands);
 }
 
+// ⭐ `unittest.main()` RUNS ITS MODULE'S FIXTURES, which CPython reads off
+// `sys.modules[module]` -- `setUpModule` before the module's first test and
+// `tearDownModule` after its last. A module is not a value here, so the
+// functions are found where the call is written: the calling module's own
+// top-level `setUpModule` / `tearDownModule`, passed to TestProgram as the
+// keywords it registers them under (unittest/main.py).
+// ⛔ Only the main module's: it is the one `unittest.main()`'s default
+// `module='__main__'` names, and an imported module's call would register
+// its fixtures under that name too.
+std::optional<Value>
+ModuleEmitter::tryEmitTestProgramWithModuleFixtures(const parser::Node &expr) {
+  const parser::Node *calleeNode = ast::node(expr, "func");
+  if (!calleeNode || sourceName != mainSourceName)
+    return std::nullopt;
+  auto classValue =
+      mlir::dyn_cast_if_present<py::TypeType>(types.inferExpr(calleeNode));
+  auto program = classValue ? mlir::dyn_cast_if_present<py::ContractType>(
+                                  classValue.getInstanceType())
+                            : py::ContractType();
+  if (!program || program.getContractName() != "unittest.main.TestProgram")
+    return std::nullopt;
+  std::vector<parser::NodePtr> keywords;
+  if (const auto *given = ast::nodeList(expr, "keywords"))
+    for (const parser::NodePtr &keyword : *given) {
+      if (keyword && ast::string(*keyword, "arg").value_or("") ==
+                         std::string_view("_setUpModule"))
+        return std::nullopt; // already passed: this is the rewritten call
+      keywords.push_back(keyword);
+    }
+  bool added = false;
+  for (llvm::StringRef fixture : {"setUpModule", "tearDownModule"})
+    if (moduleFunctionNames.contains(fixture)) {
+      keywords.push_back(synth::keyword(
+          ("_" + fixture).str(), synth::name(fixture, expr.range),
+          expr.range));
+      added = true;
+    }
+  if (!added)
+    return std::nullopt;
+  if (llvm::none_of(keywords, [](const parser::NodePtr &keyword) {
+        return keyword && ast::string(*keyword, "arg").value_or("") ==
+                              std::string_view("_setUpModule");
+      }))
+    keywords.push_back(synth::keyword(
+        "_setUpModule", synth::name("None", expr.range), expr.range));
+  const parser::Field *func = parser::findField(expr, "func");
+  std::vector<parser::NodePtr> arguments;
+  if (const auto *given = ast::nodeList(expr, "args"))
+    arguments = *given;
+  parser::NodePtr call = synth::callWithKeywords(
+      std::get<parser::NodePtr>(func->value), std::move(arguments),
+      std::move(keywords), expr.range);
+  synthesizedIteratorDefs.push_back(call);
+  return emitExpr(call.get());
+}
+
 // ⭐ `hasattr(x, "v")` AND `callable(f)` ARE COMPILE-TIME QUESTIONS HERE. Both
 // names were simply unbound, and both are decided by the same table the rest of
 // the emitter dispatches through -- the attribute either exists on the static
@@ -4011,6 +4042,17 @@ ModuleEmitter::tryEmitHasattrCall(const parser::Node &expr,
         if (valued)
           definers.push_back(candidate);
       }
+    // ⭐ AND WHEN NONE OF THEM DECLARES IT, THE ANSWER IS NO: the walk above
+    // read every subclass the program has. A class with a subclass at all was
+    // refused here -- `@skip` on a test class with a subclass reached the
+    // loader's `hasattr(cls, 'runTest')` and stopped compiling.
+    if (staticClass && definers.empty() && (throughClass || !stored)) {
+      (void)emitExpr(args->front().get());
+      mlir::Type literalType = types.literal("False");
+      auto constant = py::BoolConstantOp::create(
+          builder, loc(expr), literalType, builder.getBoolAttr(false));
+      return Value{constant.getResult(), literalType};
+    }
     if (staticClass && !definers.empty() && (throughClass || !stored)) {
       Value receiver = emitExpr(args->front().get());
       mlir::Value classValue =
@@ -5417,6 +5459,18 @@ ModuleEmitter::classDirNames(llvm::StringRef cls, std::string &why) const {
     for (llvm::StringRef field : {"decorator_list", "keywords", "type_params"})
       if (const auto *list = ast::nodeList(*classDef, field);
           list && !list->empty()) {
+        // ⛔ Only `@dataclass` adds names among the decorators: any other
+        // has to return the class it was given (applyClassDecorators), whose
+        // names are the ones its body spells.
+        if (field == "decorator_list" &&
+            llvm::none_of(*list, [](const parser::NodePtr &decorator) {
+              const parser::Node *named = decorator.get();
+              if (named && named->kind == "Call")
+                named = ast::node(*named, "func");
+              return named && llvm::StringRef(ast::qualifiedName(named))
+                                  .ends_with("dataclass");
+            }))
+          continue;
         why = "'" + shown + "' has " +
               (field == "decorator_list" ? "a decorator"
                : field == "keywords"     ? "a class keyword"

@@ -129,6 +129,11 @@ struct PythonCallSiteRange {
 inline constexpr llvm::StringLiteral kCallSiteDiscriminatorAttr{
     "ly.eh.site_discriminator"};
 
+// Writes the live call stack `_frame` reads, in the functions that can reach
+// a read (Cleanup/Frames.cpp). Runs before the call sites are collected, so
+// what it inserts is located like the call it precedes.
+void installFrameRecords(mlir::ModuleOp module);
+
 void collectPythonCallSiteRanges(
     mlir::ModuleOp module,
     llvm::SmallVectorImpl<PythonCallSiteRange> &callSites);

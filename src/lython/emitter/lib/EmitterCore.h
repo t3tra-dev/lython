@@ -390,7 +390,10 @@ private:
     const EmitOptions::SourceModule *source = nullptr;
   };
   llvm::SmallVector<PendingClassAttrInit, 4> importedClassAttrInits;
-  void emitImportedClassAttrInitializers();
+  // The module globals, default cells and class attributes of every imported
+  // module, each module's in the order its statements are written.
+  void emitImportedModuleInitializers();
+  bool statementHasImportedDefaultCells(const parser::Node &statement);
   // ⭐ AND THE SAME QUESTION ONE LEVEL UP: a module-level CONTAINER constant
   // in an imported module. A constant travels as a literal TYPE, and a
   // container has no literal spelling, so `NAMES = ["a"]` did not resolve from
@@ -409,7 +412,6 @@ private:
   };
   llvm::SmallVector<PendingModuleGlobalInit, 4> importedModuleGlobalInits;
   void collectImportedModuleGlobals();
-  void emitImportedModuleGlobalInitializers();
   // `sys.stdout` / `sys.stderr` that some module the program compiles
   // assigns: each becomes the module global of its name, holding either text
   // stream the runtime has (EmitterGlobals.cpp). Found before anything is
@@ -643,6 +645,9 @@ private:
   parser::NodePtr decoratedMethodApplication(const DecoratedMethod &method,
                                              parser::NodePtr subject);
   void applyMethodDecorators(const parser::Node &classDef);
+  void applyClassDecorators(const parser::Node &classDef);
+  std::optional<Value>
+  tryEmitTestProgramWithModuleFixtures(const parser::Node &expr);
   bool typeDecoratedMethod(DecoratedMethod &method, bool reportFailure);
   void bindDecoratedMethodCell(const DecoratedMethod &method, mlir::Type type);
   // Parsed trees a desugar spliced into a module, alive as long as it is.
@@ -999,6 +1004,9 @@ private:
   // The diagnostic for a name nothing binds: an import's own reason, a
   // builtin this compiler has no value for, or "unresolved name".
   std::string unresolvedNameMessage(llvm::StringRef name) const;
+  // `__name__` or `__file__` of the module the code being emitted is written
+  // in, as a str constant.
+  Value emitModuleDunder(const parser::Node &anchor, llvm::StringRef name);
   // Generic lookup for a callee spelling: the local registration first, then
   // the canonical import binding (imported generics register under their
   // canonical "<module>.<name>" symbol).
@@ -2298,9 +2306,6 @@ private:
   std::optional<std::string> methodDefaultCell(const MethodBinding &method,
                                                unsigned slot,
                                                mlir::Type declared);
-  // Writes the pending cells of every imported module's defs, where CPython
-  // runs the module: before the importer continues.
-  void emitImportedDefaultCells();
   // The cell a METHOD's non-constant default was parked in, per (def node,
   // slot). An inlined method call reads this instead of re-emitting the
   // expression -- which is what made `def add(self, into: list[int] = [])`

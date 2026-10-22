@@ -5,6 +5,8 @@ import difflib
 import pprint
 import re
 import contextlib
+import warnings
+import logging
 import time
 import types
 from collections.abc import Callable, Iterator
@@ -132,31 +134,58 @@ def doModuleCleanups() -> None:
         raise exceptions[0]
 
 
-def skip[T: TestCase](reason: str) -> Callable[[Callable[[T], None]], Callable[[T], None]]:
-    """
-    Unconditionally skip a test.
-    """
-    def decorator(test_item: Callable[[T], None]) -> Callable[[T], None]:
+# The skipped classes, and why: what CPython keeps as `__unittest_skip__` and
+# `__unittest_skip_why__` attributes of the class, found here through
+# issubclass so that a subclass is skipped too, as it inherits them there.
+_skipped_classes: list[tuple[type[TestCase], str]] = []
+
+
+def _class_skip_reason(cls: type[TestCase]) -> str | None:
+    for skipped, why in _skipped_classes:
+        if issubclass(cls, skipped):
+            return why
+    return None
+
+
+class _SkipDecorator:
+    """What skip / skipIf / skipUnless return: it decorates a test method
+    (`__call__`) or a TestCase class (`__ly_decorate_class__`)."""
+
+    def __init__(self, reason: str, active: bool) -> None:
+        self.reason = reason
+        self.active = active
+
+    def __call__[T: TestCase](self, test_item: Callable[[T], None]) -> Callable[[T], None]:
+        if not self.active:
+            return test_item
+        reason = self.reason
         def skip_wrapper(self: T) -> None:
             raise SkipTest(reason)
         return skip_wrapper
-    return decorator
 
-def skipIf[T: TestCase](condition: bool, reason: str) -> Callable[[Callable[[T], None]], Callable[[T], None]]:
+    def __ly_decorate_class__[C: TestCase](self, test_item: type[C]) -> type[C]:
+        if self.active:
+            _skipped_classes.append((test_item, self.reason))
+        return test_item
+
+
+def skip(reason: str) -> _SkipDecorator:
+    """
+    Unconditionally skip a test.
+    """
+    return _SkipDecorator(reason, True)
+
+def skipIf(condition: bool, reason: str) -> _SkipDecorator:
     """
     Skip a test if the condition is true.
     """
-    if condition:
-        return skip(reason)
-    return _id
+    return _SkipDecorator(reason, condition)
 
-def skipUnless[T: TestCase](condition: bool, reason: str) -> Callable[[Callable[[T], None]], Callable[[T], None]]:
+def skipUnless(condition: bool, reason: str) -> _SkipDecorator:
     """
     Skip a test unless the condition is true.
     """
-    if not condition:
-        return skip(reason)
-    return _id
+    return _SkipDecorator(reason, not condition)
 
 def expectedFailure[T: TestCase](test_item: Callable[[T], None]) -> Callable[[T], None]:
     def wrapper(self: T) -> None:
@@ -241,6 +270,197 @@ class _AssertRaisesRegexContext[E: BaseException]:
                 self.raises.msg, '"{}" does not match "{}"'.format(
                     expected_regex.pattern, str(exc_value))))
         return True
+
+
+class _AssertWarnsContext[W: Warning]:
+    """A context manager used to implement TestCase.assertWarns* methods."""
+
+    def __init__(self, expected: type[W], test_case: TestCase,
+                 expected_regex: str | re.Pattern | None = None,
+                 msg: str | None = None) -> None:
+        self.expected = expected
+        self.test_case = test_case
+        self.msg = msg
+        self.obj_name: str | None = None
+        self.expected_regex: re.Pattern | None = None
+        if expected_regex is not None:
+            self.expected_regex = re.compile(expected_regex)
+        self.warnings_manager = warnings.catch_warnings(record=True)
+        self.warnings: list[warnings.WarningMessage] = []
+        self._warning: W | None = None
+        self.filename = ""
+        self.lineno = 0
+
+    @property
+    def warning(self) -> W:
+        w = self._warning
+        if w is None:
+            raise AttributeError("'_AssertWarnsContext' object has no attribute 'warning'")
+        return w
+
+    def _raiseFailure(self, standardMsg: str) -> None:
+        self.test_case.fail(self.test_case._formatMessage(self.msg, standardMsg))
+
+    def __enter__(self) -> _AssertWarnsContext[W]:
+        # The __warningregistry__'s need to be in a pristine state for tests
+        # to work properly.
+        warnings._clear_registries()
+        self.warnings = self.warnings_manager._enter_recording()
+        warnings.simplefilter("always", self.expected)
+        return self
+
+    def __exit__(self, exc_type: type[BaseException] | None, exc_value: BaseException | None,
+                 tb: types.TracebackType | None) -> None:
+        self.warnings_manager.__exit__(exc_type, exc_value, None)
+        if exc_type is not None:
+            # let unexpected exceptions pass through
+            return
+        exc_name = self.expected.__name__
+        first_matching: Warning | None = None
+        for m in self.warnings:
+            w = m.message
+            if not isinstance(w, self.expected):
+                continue
+            if first_matching is None:
+                first_matching = w
+            expected_regex = self.expected_regex
+            if (expected_regex is not None and
+                expected_regex.search(str(w)) is None):
+                continue
+            # store warning for later retrieval
+            self._warning = w
+            self.filename = m.filename
+            self.lineno = m.lineno
+            return
+        # Now we simply try to choose a helpful failure message
+        expected_regex = self.expected_regex
+        if first_matching is not None and expected_regex is not None:
+            self._raiseFailure('"{}" does not match "{}"'.format(
+                     expected_regex.pattern, str(first_matching)))
+        obj_name = self.obj_name
+        if obj_name is not None:
+            self._raiseFailure("{} not triggered by {}".format(exc_name,
+                                                               obj_name))
+        else:
+            self._raiseFailure("{} not triggered".format(exc_name))
+
+
+class _LoggingWatcher:
+    """The records and their formatted output an assertLogs block captured
+    (CPython's is a namedtuple of the two lists)."""
+
+    def __init__(self) -> None:
+        self.records: list[logging.LogRecord] = []
+        self.output: list[str] = []
+
+
+class _CapturingHandler(logging.Handler):
+    """
+    A logging handler capturing all (raw and formatted) logging output.
+    """
+
+    def __init__(self) -> None:
+        logging.Handler.__init__(self)
+        self.watcher = _LoggingWatcher()
+
+    def flush(self) -> None:
+        pass
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.watcher.records.append(record)
+        msg = self.format(record)
+        self.watcher.output.append(msg)
+
+
+class _LogsContext:
+    """What assertLogs and assertNoLogs share: the logger's handlers swapped
+    for a capturing one on entry and put back on exit."""
+
+    LOGGING_FORMAT = "%(levelname)s:%(name)s:%(message)s"
+
+    def __init__(self, test_case: TestCase,
+                 logger_name: str | logging.Logger | None,
+                 level: int | str | None) -> None:
+        self.test_case = test_case
+        self.logger_name = logger_name
+        self.level = logging.INFO
+        if isinstance(level, str):
+            self.level = logging._checkLevel(level)
+        elif level is not None and level != 0:
+            self.level = level
+        self.msg: str | None = None
+        self.logger: logging.Logger = logging.root
+        self.watcher = _LoggingWatcher()
+        self.old_handlers: list[logging.Handler] = []
+        self.old_level = 0
+        self.old_propagate = True
+
+    def _raiseFailure(self, standardMsg: str) -> None:
+        self.test_case.fail(self.test_case._formatMessage(self.msg, standardMsg))
+
+    def _start(self) -> None:
+        logger_name = self.logger_name
+        if isinstance(logger_name, logging.Logger):
+            logger = self.logger = logger_name
+        else:
+            logger = self.logger = logging.getLogger(logger_name)
+        formatter = logging.Formatter(self.LOGGING_FORMAT)
+        handler = _CapturingHandler()
+        handler.setLevel(self.level)
+        handler.setFormatter(formatter)
+        self.watcher = handler.watcher
+        self.old_handlers = logger.handlers[:]
+        self.old_level = logger.level
+        self.old_propagate = logger.propagate
+        logger.handlers = [handler]
+        logger.setLevel(self.level)
+        logger.propagate = False
+
+    def _restore(self) -> None:
+        self.logger.handlers = self.old_handlers
+        self.logger.propagate = self.old_propagate
+        self.logger.setLevel(self.old_level)
+
+
+class _AssertLogsContext(_LogsContext):
+    """A context manager for assertLogs()"""
+
+    def __enter__(self) -> _LoggingWatcher:
+        self._start()
+        return self.watcher
+
+    def __exit__(self, exc_type: type[BaseException] | None, exc_value: BaseException | None,
+                 tb: types.TracebackType | None) -> bool:
+        self._restore()
+        if exc_type is not None:
+            # let unexpected exceptions pass through
+            return False
+        if len(self.watcher.records) == 0:
+            self._raiseFailure(
+                "no logs of level {} or higher triggered on {}"
+                .format(logging.getLevelName(self.level), self.logger.name))
+        return False
+
+
+class _AssertNoLogsContext(_LogsContext):
+    """A context manager for assertNoLogs()"""
+
+    def __enter__(self) -> None:
+        self._start()
+
+    def __exit__(self, exc_type: type[BaseException] | None, exc_value: BaseException | None,
+                 tb: types.TracebackType | None) -> bool:
+        self._restore()
+        if exc_type is not None:
+            # let unexpected exceptions pass through
+            return False
+        if len(self.watcher.records) > 0:
+            self._raiseFailure(
+                "Unexpected logs found: {!r}".format(
+                    self.watcher.output
+                )
+            )
+        return False
 
 
 def _new_child(parent: dict[str, object], params: dict[str, object]) -> dict[str, object]:
@@ -429,6 +649,16 @@ class TestCase(object):
             stopTestRun = None
 
         result.startTest(self)
+        class_skip = _class_skip_reason(type(self))
+        if class_skip is not None:
+            # If the class was skipped.
+            try:
+                _addSkip(result, self, class_skip)
+            finally:
+                result.stopTest(self)
+                if stopTestRun is not None:
+                    stopTestRun()
+            return result
         try:
             outcome = _Outcome(result)
             start_time = time.perf_counter()
@@ -553,6 +783,52 @@ class TestCase(object):
                     when assertRaisesRegex is used as a context manager.
         """
         return _AssertRaisesRegexContext[E](expected_exception, self, expected_regex, msg)
+
+    def assertWarns[W: Warning](self, expected_warning: type[W],
+                                msg: str | None = None) -> _AssertWarnsContext[W]:
+        """Fail unless a warning of class warnClass is triggered
+           in the `with` block this returns the context manager for.
+
+           The context manager keeps a reference to the first matching
+           warning as the 'warning' attribute; similarly, the 'filename'
+           and 'lineno' attributes give you information about the line
+           of Python code from which the warning was triggered.
+        """
+        return _AssertWarnsContext[W](expected_warning, self, None, msg)
+
+    def assertWarnsRegex[W: Warning](self, expected_warning: type[W],
+                                     expected_regex: str | re.Pattern,
+                                     msg: str | None = None) -> _AssertWarnsContext[W]:
+        """Asserts that the message in a triggered warning matches a regexp.
+        Basic functioning is similar to assertWarns() with the addition
+        that only warnings whose messages also match the regular expression
+        are considered successful matches.
+        """
+        return _AssertWarnsContext[W](expected_warning, self, expected_regex, msg)
+
+    def assertLogs(self, logger: str | logging.Logger | None = None,
+                   level: int | str | None = None) -> _AssertLogsContext:
+        """Fail unless a log message of level *level* or higher is emitted
+        on *logger_name* or its children.  If omitted, *level* defaults to
+        INFO and *logger* defaults to the root logger.
+
+        This method must be used as a context manager, and will yield
+        a recording object with two attributes: `output` and `records`.
+        At the end of the context manager, the `output` attribute will
+        be a list of the matching formatted log messages and the
+        `records` attribute will be a list of the corresponding LogRecord
+        objects.
+        """
+        return _AssertLogsContext(self, logger, level)
+
+    def assertNoLogs(self, logger: str | logging.Logger | None = None,
+                     level: int | str | None = None) -> _AssertNoLogsContext:
+        """ Fail unless no log messages of level *level* or higher are emitted
+        on *logger_name* or its children.
+
+        This method must be used as a context manager.
+        """
+        return _AssertNoLogsContext(self, logger, level)
 
     def assertRegex(self, text: str, expected_regex: str | re.Pattern,
                     msg: str | None = None) -> None:

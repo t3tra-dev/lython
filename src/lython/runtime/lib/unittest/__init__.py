@@ -28,7 +28,10 @@ restricted to the well-typed statically compilable surface.
 
 Deviations from CPython:
 - a skipped / expected-failure test is a WRAPPED method, not a function with
-  `__unittest_skip__` attributes on it; class-level @skip is not provided.
+  `__unittest_skip__` attributes on it; a skipped class is recorded in a
+  table of (class, reason) that its subclasses are found in through
+  issubclass, not given attributes. skip / skipIf / skipUnless return a
+  `_SkipDecorator`, which decorates a class through `__ly_decorate_class__`.
   Its docstring is the wrapper's (None), where CPython's skip copies the
   test's through functools.wraps and expectedFailure returns the test itself.
 - assertEqual dispatches on the static type of its arguments (a generic
@@ -43,7 +46,9 @@ Deviations from CPython:
 - cleanups are stored as closures over their arguments, not as triples.
 - a subtest's params are a dict holding its own keys first and then its
   parent's others, not an _OrderedChainMap over the parent's.
-- module fixtures (setUpModule) are not provided, and loadTestsFromModule
+- module fixtures are the setUpModule / tearDownModule of the module that
+  calls unittest.main(), which the compiler passes to TestProgram; the suite
+  finds them by module name rather than in `sys.modules`. loadTestsFromModule
   takes the module's NAME: it finds the TestCase subclasses through
   `TestCase.__subclasses__()` whose `__module__` it is, in the order of their
   names -- `dir(module)`'s order -- rather than reading the module's

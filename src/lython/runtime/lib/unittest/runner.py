@@ -3,6 +3,7 @@
 import io
 import sys
 import time
+import warnings
 
 from . import case
 from . import result
@@ -236,13 +237,18 @@ class TextTestRunner(object):
         result.failfast = self.failfast
         result.buffer = self.buffer
         result.tb_locals = self.tb_locals
-        start_time = time.perf_counter()
-        result.startTestRun()
-        try:
-            test(result)
-        finally:
-            result.stopTestRun()
-        stop_time = time.perf_counter()
+        with warnings.catch_warnings():
+            action = self.warnings
+            if action:
+                # if self.warnings is set, use it to filter all the warnings
+                warnings.simplefilter(action)
+            start_time = time.perf_counter()
+            result.startTestRun()
+            try:
+                test(result)
+            finally:
+                result.stopTestRun()
+            stop_time = time.perf_counter()
         time_taken = stop_time - start_time
         result.printErrors()
         if self.durations is not None:
