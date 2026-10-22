@@ -246,8 +246,11 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
   CPython はフレームのグローバルにある `__unittest` を見る。ここには
   フレームオブジェクトがないので、`traceback.format_tb` の各項目の
   ファイル名で判断する。
-- **差分の表示がない。** difflib と pprint がないので、assertListEqual などは
-  最初に違う要素までしか示さない。
+- **差分の表示は CPython と同じ文になった (2026-10-22、C-2)。** list、tuple、
+  dict、set、frozenset、str の assertEqual は CPython と同じ 6 つのアサーションに
+  振り分け、差分は `difflib.ndiff` と `pprint.pformat` で作る。maxDiff による
+  打ち切りも同じ。assertSequenceEqual / assertTupleEqual / assertSetEqual は
+  同じ静的型の 2 引数をとるので、list と tuple は比べられない。
 
 ## 欠陥 (42 件)
 
@@ -376,8 +379,8 @@ unittest 自身が取り込むもののうち、Lython にないもの。
 
 | モジュール | unittest での用途 | 無いときの代わり |
 | --- | --- | --- |
-| difflib | assertMultiLineEqual などの差分表示 (`ndiff`) | 最初に違う要素だけを示す |
-| pprint | 差分表示の前の整形 (`pformat`) | `repr` |
+| difflib | assertMultiLineEqual などの差分表示 (`ndiff`) | 済 (C-2)。`lib/difflib.py` |
+| pprint | 差分表示の前の整形 (`pformat`) | 済 (C-2)。`lib/pprint.py` |
 | re | assertRegex、assertRaisesRegex、loader のモジュール名の判定 | 部分文字列の比較 |
 | fnmatch | `-k` のパターン | 部分文字列の比較 |
 | warnings | assertWarns、runner の警告フィルタ | 無し |
@@ -528,7 +531,91 @@ CPython も自分のインタプリタでテストを動かしているので、
 ### C. 失敗メッセージと便利機能を CPython に近づける
 
 1. docstring を残すかどうかの判断 (`-v` の 2 行目) (済)。
-2. difflib と pprint (差分の表示)。
+2. difflib と pprint (差分の表示) (済、2026-10-22)。
+   - `lib/difflib.py` (SequenceMatcher、Differ、ndiff、unified_diff、
+     context_diff、restore、get_close_matches、IS_*_JUNK) と `lib/pprint.py`
+     (pformat、pprint、pp、saferepr、isreadable、isrecursive、PrettyPrinter) を
+     CPython 3.14 から移した。逸脱は各ファイルの冒頭に書いた。大きいものは、
+     SequenceMatcher が列を `list[T]` で持つこと、Differ の補助メソッドが
+     ジェネレータでなくリストを返すこと、pprint が値を静的な型で振り分けること
+     (クラスのキーは挿入順のまま)。
+   - unittest の assertEqual は list / tuple / dict / set / frozenset / str を
+     CPython と同じアサーションに振り分け、差分と maxDiff の打ち切りを出す。
+     テストは `tests/python/test_difflib.py`、`test_pprint.py`、
+     `test_unittest_diffs.py` (期待値は CPython 3.14 が返す値)。
+   - 書いている途中で見つけて直したもの。どれも拒否か lowering の失敗で、
+     黙った誤りはない (10 は自分の変更の途中で入れて、コミット前に直した
+     もの)。2 は以前は動いていた退行で、bisect で ab7a29e2 と特定した。
+     1 は手元の古い lyc (main の build、10/05 作成) では動くが、10/01 の
+     コミットでは既に落ちる。入った変更は特定していない。どちらも CI の
+     golden では見えていなかった。
+     1. ジェネレータの中で別のジェネレータを回し、値を変えて yield すると
+        lowering が落ちた ("operand #0 does not dominate this use")。
+        フレームを越えて運ばれる内側のジェネレータでなく、作ったときの値を
+        step に渡していた。
+     2. 1 つの値をループの 2 つの変数に同時に入れると (`a, b = j, j`)、
+        引数から来た側に retain がなく所有権検証が拒否した。ループの
+        後ろ向きの辺でも、同じ token を 2 つの lane に
+        数えていた (emitter の台帳)。
+     3. ジェネレータの frame は 40 語で固定だった。str の lane は 4 語なので、
+        str を 10 個生かすジェネレータや、`yield from` を展開した Differ は
+        状態機械にならず、str を yield するジェネレータの逃げ道はなかった。
+        足りない分は EH の退避領域 (48..64) の後ろに続け、生成時に広く確保する
+        (`LyGenerator_NewWide`)。
+     4. ジェネレータメソッドが、同じクラスの後ろに書いたメソッドを呼べなかった。
+     5. 注釈 `-> Iterator[str]` のあるジェネレータが、本体の yield を型付け
+        できないと None を yield するとされた。
+     6. 関数が返したジェネレータ (`Iterator[str]` 型) を str.join に渡すと
+        lowering が拒否した。
+     7. `Callable | None` の真偽 (`if isjunk:`) と、そこへ渡す lambda。
+     8. `list[object]` などに対する isinstance が拒否され、object からの
+        frozenset の絞り込みが要素型を持たなかった (`pformat([])`)。
+     9. `Sequence[str] = ''` の既定値: lowering の契約、特殊化の選択、
+        ジェネレータの中での展開の 3 か所。
+     10. 自分の変更の途中で入れた 1 件: frame の lane を退避領域の先頭語
+         (48) に置いていて、`unified_diff` の 2 つ目のループが何も yield しな
+         かった (黙った誤り)。コミット前に CPython との比較で見つけて直した。
+     11. 継承クラスで None にしたクラス属性を読む `x is None or ...` で、
+         決まっている右辺を emit して拒否した。
+     12. モジュール定数をテンプレートにした %-書式。
+     13. ライブラリのメソッドが、プログラムのサブクラスで上書きした
+         クラス属性 (`maxDiff = None`) を読めなかった (クラスが後から
+         登録されるのを待つ)。
+     14. 状態機械にしない理由を記録しない経路が 2 つあった。
+     15. lane の同一性を毎回 CFG を辿って調べていて、`yield from` を展開した
+         大きなジェネレータで 5 分以上かかった。関数ごとに 1 回の不動点で
+         求める。
+     16. ランタイムの検証器が、大きさを引数にとる `memref.alloc` の大きさを
+         所有の印として読んでいた。
+     17. 何も作らないジェネレータにも状態機械と finalizer を作っていた
+         (`context_diff` などが unittest のたびにコンパイルされていた)。
+   - 開いたままのもの。
+     - (拒否、10/05 より前から) 1 つの int が range() の開始値とループ変数の
+       初期値の両方に入ると、所有権検証が「1 つ多い token」と言う
+       (`v = lo; for j in range(lo, hi): v = j + 1`)。検証器は 1 つの値を
+       辺の向こうの 1 つの名前にしか追わない。difflib はここを `blo + 0` で
+       避けた。
+     - (拒否) 関数の値を、呼ばれる関数の `Callable | None` 引数に渡すと
+       lowering が拒否する ("union injection cannot map builtins.function")。
+     - (拒否) インライン展開したメソッドの中の内包表記の変数が、型の違う
+       モジュール global と同じ名前だと拒否される (同じ型なら正しい)。
+     - (拒否) ジェネレータの中に `yield from` を何段も重ねる (CPython の
+       Differ そのまま) と、展開した clone が大きすぎて所有権の探索が
+       20000 状態を超える。difflib は補助メソッドをリストにして避けた。
+     - (黙って) `hasattr(obj, "__lt__")` が、`__lt__` を定義しないクラスで
+       False を返す。CPython は object の `__lt__` があるので True。
+     - (遅い拒否) 実ネイティブクラスの束縛メソッドを変数に入れる
+       (`write = stream.write`) と lowering で拒否される。
+     - (遅い拒否) `Sequence[T]` 型のフィールド。
+     - (拒否) 総称関数が別の型引数で自分を呼ぶ (メソッドなら動く)。
+     - (拒否) ジェネレータを `Iterator[T]` で受ける Protocol 型の引数
+       (`restore` は list にしてから回す)。
+     - コンパイル時間: unittest の 1 ファイルが 4.3 秒から 7.0 秒になった。
+       差分の表示で difflib と pprint が入るため。最大は
+       `Differ._fancy_replace` (LLVM IR 49,608 行) で、総称クラス
+       `SequenceMatcher[str]` のメソッドが呼び出しごとに複製されている
+       (`tryCallLargeMethod` が型引数のあるクラスを除外する)。B-4 の
+       `assertRaises` と同じ根で、次に詰める。
 3. re と fnmatch (assertRegex、assertRaisesRegex、`-k`)。
 4. builtin とクラスを Callable の値にする (`addCleanup(log.append, x)`、
    `assertRaisesCall(TypeError, int, "x")`)。
