@@ -2024,6 +2024,8 @@ void declareEHSupport(SupportBuilder &b) {
   declareLLVMExternal(b, "_Unwind_RaiseException", b.i32(), {b.ptr()});
   declareLLVMExternal(b, "_Unwind_DeleteException", {}, {b.ptr()});
   if (usePythonPersonality(b.triple)) {
+    declareLLVMExternal(b, "_Unwind_ForcedUnwind", b.i32(),
+                        {b.ptr(), b.ptr(), b.ptr()});
     // What the personality reads the frame through. All four spell
     // `_Unwind_Ptr` as i64, which is why UnwindABI.h keeps this off 32-bit
     // targets.
@@ -2773,6 +2775,28 @@ void buildRethrowCurrent(SupportBuilder &b) {
                              mlir::TypeRange{}, mlir::ValueRange{});
   emitRaiseCarrier(b);
   mlir::LLVM::UnreachableOp::create(b.builder, b.loc);
+  b.builder.setInsertionPointToEnd(trap);
+  emitLLVMTrap(b);
+}
+
+// LyEH_RecordRethrow(): `LyEH_RethrowCurrent` without the unwind -- what is
+// left of a re-raise whose handler is in the same function, which the
+// exception lowering turns into a branch (`branchLocalRaisesToTheirHandler`).
+void buildRecordRethrow(SupportBuilder &b) {
+  auto fn = beginLLVMFunction(b, "LyEH_RecordRethrow", {}, {});
+  mlir::Block *entry = fn.addEntryBlock(b.builder);
+  mlir::Region &body = fn.getBody();
+  mlir::Block *recorded = b.builder.createBlock(&body);
+  mlir::Block *trap = b.builder.createBlock(&body);
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value pending = mlir::LLVM::LoadOp::create(
+      b.builder, b.loc, b.i1(), b.addrOf("g_current_exception"),
+      /*alignment=*/4);
+  mlir::LLVM::CondBrOp::create(b.builder, b.loc, pending, recorded, trap);
+  b.builder.setInsertionPointToEnd(recorded);
+  mlir::func::CallOp::create(b.builder, b.loc, "end_native_catch_if_active",
+                             mlir::TypeRange{}, mlir::ValueRange{});
+  mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(trap);
   emitLLVMTrap(b);
 }
@@ -3533,10 +3557,9 @@ mlir::FunctionType personalityFunctionType(SupportBuilder &b) {
 // (0 when the range has none), the action the call site names, and the two
 // table bases an action walk needs.
 //
-// ⭐ SHARED, NOT COPIED. The personality answers this for the Itanium unwinder
-// and the fast walk answers it for itself, and the two must reach the same
-// landing pad or a raise means one thing in one phase and another in the next.
-// They agree by CALLING THIS.
+// ⭐ SHARED, NOT COPIED. The personality answers this in each phase of an
+// unwind, and the phases must reach the same landing pad or a raise means one
+// thing in one phase and another in the next. They agree by CALLING THIS.
 //
 // `memo` is a slot in the carrier's table, or null when the carrier is not ours
 // -- the call-site table is read linearly, so what was found for a return
@@ -3933,8 +3956,8 @@ void buildEHActionWalk(SupportBuilder &b) {
 // the predicate has to be ours even though the table format is not.
 //
 // The reading of the tables is `ly_eh_lookup_site` and `ly_eh_action_walk`,
-// which the fast walk calls too -- the two paths reach the same landing pad
-// because they ask the same code, not because they were written to agree.
+// which both phases call -- the search and the cleanup reach the same landing
+// pad because they ask the same code, not because they were written to agree.
 void buildPythonPersonality(SupportBuilder &b) {
   EHDataRegisters regs = ehDataRegisters(b.triple);
   auto fn = b.beginFunction(
@@ -4034,6 +4057,21 @@ void buildPythonPersonality(SupportBuilder &b) {
              mlir::arith::AndIOp::create(b.builder, b.loc, actions,
                                          b.iconst(4)),
              b.iconst(0));
+  // A raise that unwinds in one phase (`unwindInOnePhase`) had no search to
+  // promise a frame: the frame whose action chain takes the exception's class
+  // is the handler, the question the search phase would have asked here.
+  if (unwindInOnePhase(b.triple))
+    isHandlerFrame = b.orBit(
+        isHandlerFrame,
+        mlir::arith::AndIOp::create(
+            b.builder, b.loc, ours,
+            b.call("ly_eh_action_walk", b.i1(),
+                   mlir::ValueRange{
+                       actionStart, action, typeTableBase,
+                       b.call("LyEH_CurrentExceptionClass", b.i64(), {})
+                           .front(),
+                       b.iconst1(false)})
+                .front()));
   mlir::cf::CondBranchOp::create(
       b.builder, b.loc,
       b.orBit(b.cmpi(mlir::arith::CmpIPredicate::eq, action, b.iconst(0)),
@@ -4100,9 +4138,16 @@ void buildEHMemoSlot(SupportBuilder &b) {
 } // namespace
 
 // Hands the unwinder a carrier of our own at the current insertion point. It
-// does not come back: a `_Unwind_RaiseException` that RETURNS means no handler
-// was found anywhere on the stack, which for this compiler is a bug in the
-// driver's own catch-all rather than a program error.
+// does not come back: an unwind that RETURNS means no handler was found
+// anywhere on the stack, which for this compiler is a bug in the driver's own
+// catch-all rather than a program error.
+//
+// ⭐ ONE PHASE WHERE MEASURED (`unwindInOnePhase`). The two-phase search is
+// C++'s: it lets a throw nothing catches terminate with the stack intact. A
+// Python program always has a handler at its entry, so the search only walks
+// every frame a second time, and on Darwin each step asks dyld which image the
+// address is in -- 0.1 us for the program's own, 0.3 us for libunwind's. One
+// phase made a raise across two frames 35-40% faster.
 //
 // ⛔ EMITTED INLINE AT EVERY RAISE rather than called. A function of its own
 // puts one more activation between the raise and the handler, and the unwinder
@@ -4110,9 +4155,41 @@ void buildEHMemoSlot(SupportBuilder &b) {
 // handles this, once to step through it.
 void emitRaiseCarrier(SupportBuilder &b) {
   mlir::Value carrier = b.call("ly_eh_take_carrier", b.ptr(), {}).front();
+  if (unwindInOnePhase(b.triple)) {
+    mlir::Value stop = mlir::LLVM::AddressOfOp::create(
+        b.builder, b.loc, b.ptr(), "ly_eh_forced_stop");
+    mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{b.i32()},
+                               "_Unwind_ForcedUnwind",
+                               mlir::ValueRange{carrier, stop, b.nullPtr()});
+    return;
+  }
   mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{b.i32()},
                              "_Unwind_RaiseException",
                              mlir::ValueRange{carrier});
+}
+
+// The stop function of a one-phase unwind: every frame goes on to its
+// personality, and the end of the stack is the missing catch-all above.
+void buildForcedUnwindStop(SupportBuilder &b) {
+  auto fn = beginLLVMFunction(b, "ly_eh_forced_stop", b.i32(),
+                              {b.i32(), b.i32(), b.i64(), b.ptr(), b.ptr(),
+                               b.ptr()});
+  mlir::Block *entry = fn.addEntryBlock(b.builder);
+  mlir::Block *walk = b.builder.createBlock(&fn.getBody());
+  mlir::Block *end = b.builder.createBlock(&fn.getBody());
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value actions = entry->getArgument(1);
+  mlir::Value atEnd = b.cmpi(
+      mlir::arith::CmpIPredicate::ne,
+      mlir::arith::AndIOp::create(b.builder, b.loc, actions, b.iconst32(16)),
+      b.iconst32(0));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, atEnd, end,
+                                 mlir::ValueRange{}, walk, mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(walk);
+  mlir::LLVM::ReturnOp::create(b.builder, b.loc,
+                               mlir::ValueRange{b.iconst32(0)});
+  b.builder.setInsertionPointToEnd(end);
+  emitLLVMTrap(b);
 }
 
 // ---------------------------------------------------------------------------
@@ -4404,6 +4481,8 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
     buildEHActionWalk(support);
 
     buildPythonPersonality(support);
+    if (unwindInOnePhase(support.triple))
+      buildForcedUnwindStop(support);
   }
   buildCurrentExceptionClassUnchecked(support);
   buildCarrierCleanup(support);
@@ -4420,6 +4499,7 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   buildHandledException(support);
   buildContextIsHandled(support);
   buildRethrowCurrent(support);
+  buildRecordRethrow(support);
   buildTakeCurrentDescriptor(support);
   buildStashCurrentException(support);
   buildUnstashException(support);

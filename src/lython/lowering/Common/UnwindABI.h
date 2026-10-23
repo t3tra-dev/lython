@@ -75,6 +75,15 @@ inline bool usePythonPersonality(const llvm::Triple &triple) {
   }
 }
 
+// Whether a raise unwinds in one phase (`_Unwind_ForcedUnwind`, the Python
+// personality deciding the handler frame on the way) rather than two.
+// ⛔ Not every target with the Python personality: measured and tested on
+// Darwin only. On ELF the C++ personality of `LyRunPythonMain` reads a forced
+// unwind with libstdc++'s rules, which no run here has checked.
+inline bool unwindInOnePhase(const llvm::Triple &triple) {
+  return usePythonPersonality(triple) && triple.isOSDarwin();
+}
+
 // Whether making every frame x29-based buys anything. Darwin's linker can
 // describe such a frame in one word of `__unwind_info` -- nine bits naming the
 // callee-saved pairs it spilled -- and falls back to a DWARF CFI program when
