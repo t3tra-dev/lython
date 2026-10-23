@@ -12,6 +12,7 @@
 // enforced by explicit earliest-boundary rejections and the inter-phase
 // verifiers instead of a ConversionTarget.
 
+#include "Common/ModuleSymbolMemo.h"
 #include "Common/PythonSourceRange.h"
 #include "Common/TypeObjects.h"
 #include "RuntimeClasses.h"
@@ -1070,8 +1071,8 @@ private:
                               bool raiseOnMiss = true,
                               const RuntimeBundle *missingKeyForRepr = nullptr);
   // Both take the iterator bundle by value: they bind results into
-  // `valueBundles` (a DenseMap) mid-lowering, which invalidates references
-  // into the map.
+  // `valueBundles` mid-lowering, and a binding may replace the bundle a
+  // reference would read.
   // Rank-1 memref view over a payload (inline descriptor assembly;
   // borrow-only). The pointer form is the assembly; the word form widens an
   // integer first and is the one to count -- see BoxLayout.cpp.
@@ -1771,9 +1772,9 @@ private:
   mlir::LogicalResult emitTracebackFrame(mlir::Operation *op,
                                          bool stashCurrentException = true);
   mlir::LogicalResult lowerCall(py::CallOp op);
-  // BY VALUE, deliberately: `valueBundles` is a DenseMap and this function
-  // inserts into it on nearly every path, which invalidates any reference into
-  // it -- including the one the caller passes. See the definition.
+  // BY VALUE, deliberately: this function writes `valueBundles` on nearly
+  // every path, and a write may replace the bundle the caller's reference
+  // reads. See the definition.
   mlir::LogicalResult lowerBoundMethodCall(py::CallOp op,
                                            RuntimeBundle receiver,
                                            llvm::StringRef methodName);
@@ -2074,7 +2075,7 @@ private:
   mlir::MLIRContext *context;
   mlir::OpBuilder builder;
   RuntimeManifestIndex manifest;
-  llvm::DenseMap<mlir::Value, RuntimeBundle> valueBundles;
+  ValueBundleTable valueBundles;
   // Contracts whose runtime layout is being expanded right now. A layout that
   // re-enters itself has no finite expansion (CallableABI.cpp).
   mutable llvm::DenseSet<mlir::Type> expandingContracts;
@@ -2225,65 +2226,17 @@ template <typename Step> inline void runToFixpoint(Step &&step) {
   }
 }
 
-// The functions `getOrCreatePrivateFunction` has answered with, kept while the
-// runtime lowering runs: every try marker and traceback push it writes asks
-// for one by name. ⛔ Not the module's symbol list on every ask, which scans
-// every runtime symbol for each one.
-// ⛔ And not kept anywhere a function can disappear unseen: only the runtime
-// lowering installs it, and that pass erases a function only through
-// `eraseLoweredFunction`, which forgets it here as well.
-class PrivateFunctionMemo {
-public:
-  explicit PrivateFunctionMemo(mlir::ModuleOp module)
-      : module(module), previous(active) {
-    active = this;
-  }
-  ~PrivateFunctionMemo() { active = previous; }
-  PrivateFunctionMemo(const PrivateFunctionMemo &) = delete;
-  PrivateFunctionMemo &operator=(const PrivateFunctionMemo &) = delete;
-
-  // The memo of `module`, if one is installed on this thread.
-  static PrivateFunctionMemo *of(mlir::ModuleOp module) {
-    return active && active->module == module ? active : nullptr;
-  }
-  mlir::func::FuncOp find(llvm::StringRef name) const {
-    return functions.lookup(name);
-  }
-  void remember(mlir::func::FuncOp function) {
-    functions[function.getSymName()] = function;
-  }
-  void forget(mlir::Operation *op) {
-    auto function = mlir::dyn_cast<mlir::func::FuncOp>(op);
-    if (!function)
-      return;
-    auto found = functions.find(function.getSymName());
-    if (found != functions.end() && found->second == function)
-      functions.erase(found);
-  }
-
-private:
-  mlir::ModuleOp module;
-  PrivateFunctionMemo *previous;
-  llvm::StringMap<mlir::func::FuncOp> functions;
-  static inline thread_local PrivateFunctionMemo *active = nullptr;
-};
-
 inline mlir::func::FuncOp
 getOrCreatePrivateFunction(mlir::ModuleOp module, mlir::OpBuilder &builder,
                            llvm::StringRef name, mlir::FunctionType type) {
-  PrivateFunctionMemo *memo = PrivateFunctionMemo::of(module);
-  if (memo)
-    if (mlir::func::FuncOp known = memo->find(name))
-      return known;
-  auto function = module.lookupSymbol<mlir::func::FuncOp>(name);
+  auto function = lookupModuleSymbol<mlir::func::FuncOp>(module, name);
   if (!function) {
     mlir::OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToEnd(module.getBody());
     function = mlir::func::FuncOp::create(builder, module.getLoc(), name, type);
     function.setPrivate();
+    rememberModuleSymbol(module, function);
   }
-  if (memo)
-    memo->remember(function);
   return function;
 }
 

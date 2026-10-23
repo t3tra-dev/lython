@@ -445,7 +445,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBindingRef(py::BindingRefOp op) {
     return mlir::success();
   }
 
-  if (auto function = module.lookupSymbol<mlir::func::FuncOp>(op.getBinding()))
+  if (auto function = lookupModuleSymbol<mlir::func::FuncOp>(module, op.getBinding()))
     return RuntimeBundleLowerer::lowerFunctionBindingRef(op, function);
 
   return op.emitError() << "unresolved runtime binding '" << op.getBinding()
@@ -461,7 +461,7 @@ RuntimeBundleLowerer::lowerFunctionBindingRef(py::BindingRefOp op,
     if (std::optional<std::string> cloneName =
             RuntimeBundleLowerer::primitiveI64CloneFor(function.getSymName())) {
       if (mlir::func::FuncOp clone =
-              module.lookupSymbol<mlir::func::FuncOp>(*cloneName))
+              lookupModuleSymbol<mlir::func::FuncOp>(module, *cloneName))
         targetFunction = clone;
     }
   }
@@ -757,8 +757,8 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
   if (!inputBundle)
     return op->emitError()
            << "aliasing contract view input has no lowered runtime bundle";
-  // Copy before inserting: operator[] can rehash valueBundles and invalidate
-  // inputBundle (which points into it).
+  // Copy before binding: the binding may replace the bundle inputBundle
+  // points at.
   RuntimeBundle source = *inputBundle;
   builder.setInsertionPoint(op);
   mlir::FailureOr<RuntimeBundle> viewed = RuntimeBundleLowerer::aliasViewBundle(

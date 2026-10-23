@@ -48,8 +48,7 @@ std::uint64_t alignTo(std::uint64_t value, std::uint64_t align) {
 py::ClassOp lookupClassForContract(mlir::ModuleOp module,
                                    llvm::StringRef contract) {
   auto lookup = [&](llvm::StringRef name) -> py::ClassOp {
-    return mlir::dyn_cast_or_null<py::ClassOp>(
-        mlir::SymbolTable::lookupSymbolIn(module.getOperation(), name));
+    return lookupModuleSymbol<py::ClassOp>(module, name);
   };
   if (py::ClassOp classOp = lookup(contract))
     return classOp;

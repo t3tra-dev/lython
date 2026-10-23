@@ -38,7 +38,7 @@ public:
       return;
     }
 
-    PrivateFunctionMemo privateFunctions(module);
+    ModuleSymbolMemo symbols(module);
     if (mlir::failed(RuntimeBundleLowerer(module).lowerModule()))
       signalPassFailure();
   }

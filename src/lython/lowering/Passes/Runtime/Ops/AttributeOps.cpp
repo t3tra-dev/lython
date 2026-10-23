@@ -464,7 +464,7 @@ mlir::LogicalResult
 RuntimeBundleLowerer::clearBoxedFieldSlot(mlir::Operation *op, mlir::Value body,
                                           unsigned boxWord,
                                           llvm::StringRef slotName) {
-  auto releaseBoxed = module.lookupSymbol<mlir::func::FuncOp>(
+  auto releaseBoxed = lookupModuleSymbol<mlir::func::FuncOp>(module, 
       "LyObject_ReleaseBoxedPayloadArraySlotRaw");
   if (!releaseBoxed)
     return op->emitError() << "runtime support has no "
@@ -543,7 +543,7 @@ RuntimeBundleLowerer::storeOptionalBoxedField(mlir::Operation *op,
                                                      /*ownsPayload=*/true);
   if (mlir::failed(words))
     return mlir::failure();
-  auto releaseBoxed = module.lookupSymbol<mlir::func::FuncOp>(
+  auto releaseBoxed = lookupModuleSymbol<mlir::func::FuncOp>(module, 
       "LyObject_ReleaseBoxedPayloadArraySlotRaw");
   if (!releaseBoxed)
     return op->emitError() << "runtime support has no "
@@ -674,7 +674,7 @@ RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(mlir::Operation *op,
   if (mlir::failed(words))
     return mlir::failure();
 
-  auto releaseBoxed = module.lookupSymbol<mlir::func::FuncOp>(
+  auto releaseBoxed = lookupModuleSymbol<mlir::func::FuncOp>(module, 
       "LyObject_ReleaseBoxedPayloadArraySlotRaw");
   if (!releaseBoxed)
     return op->emitError() << "runtime support has no "
@@ -3268,7 +3268,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
   if (!assignable && !value->functionTarget.empty() &&
       mlir::isa<py::CallableType>(fieldTypes[*fieldIndex])) {
     if (mlir::func::FuncOp target =
-            module.lookupSymbol<mlir::func::FuncOp>(value->functionTarget))
+            lookupModuleSymbol<mlir::func::FuncOp>(module, value->functionTarget))
       if (py::CallableType declared = callableTypeOf(target))
         assignable =
             py::isAssignableTo(declared, fieldTypes[*fieldIndex], op);
@@ -3946,8 +3946,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerExceptionFieldAttrGet(
     if (bound == valueBundles.end() || bound->second.physicalValues().empty())
       return op.emitError() << "exception field load produced no bundle";
     // Copy before building: createRuntimeCall may declare the callee, and the
-    // assignment below can rehash valueBundles, so neither the iterator nor
-    // the ArrayRef into the bundle may be held across those steps.
+    // assignment below replaces this bundle, so the ArrayRef into it may not
+    // be held across those steps.
     llvm::SmallVector<mlir::Value, 4> boxedValues(
         bound->second.physicalValues().begin(),
         bound->second.physicalValues().end());

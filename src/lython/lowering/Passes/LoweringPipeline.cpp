@@ -6,6 +6,7 @@
 #include "Common/LoweringPipeline.h"
 
 #include "Common/Instrumentation.h"
+#include "Common/ModuleSymbolMemo.h"
 #include "Common/RuntimeLibrary.h"
 #include "Common/RuntimeSupport.h"
 #include "Common/TypeObjects.h"
@@ -937,6 +938,7 @@ LogicalResult runLoweringPipeline(ModuleOp module,
     }
     {
       PerfScope perf("lowering.type-objects");
+      ModuleSymbolMemo symbols(module);
       unsigned pointerBits = type_objects::pointerBitsOf(module);
       if (failed(type_objects::patchStaticClassWords(module, *staticClassWords,
                                                      pointerBits)))

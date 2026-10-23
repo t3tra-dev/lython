@@ -117,10 +117,21 @@ private:
 void installFrameRecords(mlir::ModuleOp module) {
   llvm::SmallVector<mlir::LLVM::LLVMFuncOp, 64> functions;
   llvm::StringMap<mlir::LLVM::LLVMFuncOp> bySymbol;
-  module.walk([&](mlir::LLVM::LLVMFuncOp function) {
-    functions.push_back(function);
-    bySymbol[function.getSymName()] = function;
+  llvm::SmallVector<mlir::LLVM::AddressOfOp, 64> addresses;
+  bool anyRead = false;
+  module.walk([&](mlir::Operation *op) {
+    if (auto function = mlir::dyn_cast<mlir::LLVM::LLVMFuncOp>(op)) {
+      functions.push_back(function);
+      bySymbol[function.getSymName()] = function;
+    } else if (auto address = mlir::dyn_cast<mlir::LLVM::AddressOfOp>(op)) {
+      addresses.push_back(address);
+    } else if (auto call = mlir::dyn_cast<mlir::LLVM::CallOp>(op)) {
+      if (std::optional<llvm::StringRef> callee = call.getCallee())
+        anyRead |= isFrameRead(*callee);
+    }
   });
+  if (!anyRead)
+    return;
 
   // ⭐ WHO CAN REACH A READ. A direct call reaches what its callee reaches;
   // an indirect call reaches whatever a function whose address is taken
@@ -131,11 +142,10 @@ void installFrameRecords(mlir::ModuleOp module) {
   // function that handed it over is missing from the stack, as a C function
   // is missing from CPython's.
   llvm::DenseSet<mlir::Operation *> addressTaken;
-  module.walk([&](mlir::LLVM::AddressOfOp address) {
+  for (mlir::LLVM::AddressOfOp address : addresses)
     if (auto found = bySymbol.find(address.getGlobalName());
         found != bySymbol.end())
       addressTaken.insert(found->second);
-  });
   llvm::DenseSet<mlir::Operation *> reaches;
   bool indirectReaches = false;
   auto callReaches = [&](mlir::LLVM::CallOp call) {
@@ -147,29 +157,47 @@ void installFrameRecords(mlir::ModuleOp module) {
     auto found = bySymbol.find(*callee);
     return found != bySymbol.end() && reaches.contains(found->second);
   };
-  bool anyRead = false;
-  module.walk([&](mlir::LLVM::CallOp call) {
-    if (std::optional<llvm::StringRef> callee = call.getCallee())
-      anyRead |= isFrameRead(*callee);
-  });
-  if (!anyRead)
-    return;
-  for (bool changed = true; changed;) {
-    changed = false;
-    for (mlir::LLVM::LLVMFuncOp function : functions) {
-      if (reaches.contains(function) || function.isExternal())
-        continue;
-      bool reached = false;
-      function.walk([&](mlir::LLVM::CallOp call) {
-        if (!reached && callReaches(call))
-          reached = true;
-      });
-      if (!reached)
-        continue;
-      reaches.insert(function);
-      changed = true;
-      if (addressTaken.contains(function))
-        indirectReaches = true;
+  // Callers of each function, and the functions that call indirectly, from
+  // one walk; the set then grows from the readers up.
+  // ⛔ Not a fixpoint that walks every function again until nothing changes:
+  // one walk of the module per level of the deepest call chain.
+  llvm::DenseMap<mlir::Operation *, llvm::SmallVector<mlir::Operation *, 4>>
+      callers;
+  llvm::SmallVector<mlir::Operation *, 16> indirectCallers;
+  llvm::SmallVector<mlir::Operation *, 64> worklist;
+  for (mlir::LLVM::LLVMFuncOp function : functions) {
+    if (function.isExternal())
+      continue;
+    bool reads = false;
+    bool indirect = false;
+    function.walk([&](mlir::LLVM::CallOp call) {
+      std::optional<llvm::StringRef> callee = call.getCallee();
+      if (!callee) {
+        indirect = true;
+        return;
+      }
+      if (isFrameRead(*callee)) {
+        reads = true;
+        return;
+      }
+      if (auto found = bySymbol.find(*callee); found != bySymbol.end())
+        callers[found->second].push_back(function);
+    });
+    if (indirect)
+      indirectCallers.push_back(function);
+    if (reads)
+      worklist.push_back(function);
+  }
+  while (!worklist.empty()) {
+    mlir::Operation *function = worklist.pop_back_val();
+    if (!reaches.insert(function).second)
+      continue;
+    for (mlir::Operation *caller : callers.lookup(function))
+      if (!reaches.contains(caller))
+        worklist.push_back(caller);
+    if (!indirectReaches && addressTaken.contains(function)) {
+      indirectReaches = true;
+      worklist.append(indirectCallers.begin(), indirectCallers.end());
     }
   }
 

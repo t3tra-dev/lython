@@ -8,6 +8,7 @@
 #include "mlir/IR/Value.h"
 #include "mlir/IR/ValueRange.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
@@ -178,13 +179,13 @@ struct RuntimeBundle {
   std::string binding;
   std::optional<std::string> literalText;
   std::string functionTarget;
-  llvm::SmallVector<RuntimeValue, 4> closureValues;
-  llvm::SmallVector<RuntimeCallableAlternative, 4> callableAlternatives;
+  llvm::SmallVector<RuntimeValue, 0> closureValues;
+  llvm::SmallVector<RuntimeCallableAlternative, 0> callableAlternatives;
   std::shared_ptr<RuntimeBundle> boundMethodReceiver;
   std::string boundMethodName;
   std::string generatorTarget;
-  llvm::SmallVector<RuntimeValue, 8> generatorSources;
-  llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> generatorSourceBundles;
+  llvm::SmallVector<RuntimeValue, 0> generatorSources;
+  llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 0> generatorSourceBundles;
   std::optional<RuntimePrimitiveI64Evidence> primitiveI64;
   // A float's value as an f64 lane, with the same validity contract as
   // `primitiveI64`. A bundle carrying it and no physical values is a LAZY
@@ -213,9 +214,9 @@ struct RuntimeBundle {
   RuntimeObjectEvidence objectEvidence;
   llvm::StringMap<std::shared_ptr<RuntimeBundle>> fieldBundles;
   std::shared_ptr<RuntimeBundle> boxedObject;
-  llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> sequenceElementBundles;
-  llvm::SmallVector<RuntimeValue, 8> sequenceElements;
-  llvm::SmallVector<std::int64_t, 8> sequenceIndices;
+  llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 0> sequenceElementBundles;
+  llvm::SmallVector<RuntimeValue, 0> sequenceElements;
+  llvm::SmallVector<std::int64_t, 0> sequenceIndices;
   std::uint64_t sequenceCapacity = 0;
   // True when sequenceElements is COMPLETE compile-time evidence of the
   // container's contents (literals and straight-line growth). False for
@@ -235,11 +236,11 @@ struct RuntimeBundle {
   //     a.append(3)              # evidence arm: stored at the element count
   //     print(a)                 # [1, 3, None]; CPython [1, 2, 3]
   bool sharedWithHolder = false;
-  llvm::SmallVector<std::string, 8> mappingKeys;
-  llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> mappingKeyBundles;
-  llvm::SmallVector<RuntimeValue, 8> mappingValues;
-  llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> mappingValueBundles;
-  llvm::SmallVector<mlir::Value, 8> mappingPresent;
+  llvm::SmallVector<std::string, 0> mappingKeys;
+  llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 0> mappingKeyBundles;
+  llvm::SmallVector<RuntimeValue, 0> mappingValues;
+  llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 0> mappingValueBundles;
+  llvm::SmallVector<mlir::Value, 0> mappingPresent;
   std::uint64_t mappingCapacity = 0;
   // True when the mapping evidence is COMPLETE compile-time knowledge of the
   // dict's contents; false for runtime-mode dicts (loop-built).
@@ -280,6 +281,52 @@ struct RuntimeBundle {
   void setObjectLogicalOwnership(bool ownsObject);
   RuntimeBundle
   withObjectOwnership(ownership::OwnershipKind ownership) const;
+};
+
+// The bundle of each lowered value, held out of line.
+// ⛔ Not a DenseMap of bundles: a bundle is 5 KB, a DenseMap keeps one in
+// every bucket, empty ones included, and moves them all when it grows -- 2.8
+// GB and a tenth of the phase for a unittest file.
+class ValueBundleTable {
+  using Table = llvm::DenseMap<mlir::Value, std::unique_ptr<RuntimeBundle>>;
+
+public:
+  struct Entry {
+    mlir::Value first;
+    RuntimeBundle &second;
+  };
+  class iterator {
+  public:
+    explicit iterator(Table::iterator at) : at(at) {}
+    struct Arrow {
+      Entry entry;
+      Entry *operator->() { return &entry; }
+    };
+    Entry operator*() const { return {at->first, *at->second}; }
+    Arrow operator->() const { return {**this}; }
+    bool operator==(const iterator &other) const { return at == other.at; }
+    bool operator!=(const iterator &other) const { return at != other.at; }
+
+  private:
+    Table::iterator at;
+  };
+
+  RuntimeBundle &operator[](mlir::Value value) {
+    std::unique_ptr<RuntimeBundle> &slot = table[value];
+    if (!slot)
+      slot = std::make_unique<RuntimeBundle>();
+    return *slot;
+  }
+  iterator find(mlir::Value value) { return iterator(table.find(value)); }
+  iterator end() { return iterator(table.end()); }
+  std::size_t count(mlir::Value value) const { return table.count(value); }
+  const RuntimeBundle *lookup(mlir::Value value) const {
+    auto found = table.find(value);
+    return found == table.end() ? nullptr : found->second.get();
+  }
+
+private:
+  Table table;
 };
 
 struct CallableLogicalEntryArgs {

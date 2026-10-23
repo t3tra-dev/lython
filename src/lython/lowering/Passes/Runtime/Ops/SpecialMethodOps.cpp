@@ -116,7 +116,7 @@ mlir::LogicalResult RuntimeBundleLowerer::pinProbeOperandLiveness(
     std::string pinName =
         ("__ly_probe_pin$" + sanitized + "$" + llvm::Twine(inputTypes.size()))
             .str();
-    auto pinFn = module.lookupSymbol<mlir::func::FuncOp>(pinName);
+    auto pinFn = lookupModuleSymbol<mlir::func::FuncOp>(module, pinName);
     mlir::OpBuilder::InsertionGuard guard(builder);
     if (!pinFn) {
       mlir::OpBuilder moduleBuilder(context);
@@ -161,7 +161,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerReceiverMethodResult(
     if (std::optional<std::string> methodSymbol =
             RuntimeBundleLowerer::classMethodSymbol(classOp, methodName)) {
       mlir::func::FuncOp target =
-          module.lookupSymbol<mlir::func::FuncOp>(*methodSymbol);
+          lookupModuleSymbol<mlir::func::FuncOp>(module, *methodSymbol);
       if (!target)
         return op->emitError()
                << "source class method @" << *methodSymbol << " is not defined";

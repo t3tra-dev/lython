@@ -1,4 +1,5 @@
 #include "Common/TypeObjects.h"
+#include "Common/ModuleSymbolMemo.h"
 
 #include "Contracts.h"
 #include "ExceptionTaxonomy.h"
@@ -79,18 +80,19 @@ mlir::LogicalResult defineOne(mlir::ModuleOp module, const Definition &definitio
   mlir::OpBuilder builder(context);
   mlir::Location loc = module.getLoc();
   std::string symbol = symbolFor(definition.qualifiedName);
-  if (auto existing = module.lookupSymbol<mlir::LLVM::GlobalOp>(symbol)) {
+  if (auto existing = lookupModuleSymbol<mlir::LLVM::GlobalOp>(module, symbol)) {
     if (!declaresOnly(existing))
       return mlir::success();
+    forgetModuleSymbol(module, existing);
     existing.erase();
-  } else if (module.lookupSymbol(symbol)) {
+  } else if (lookupModuleSymbol(module, symbol)) {
     return module.emitError() << "'" << symbol
                               << "' names something that is not a type object";
   }
 
   std::string nameSymbol = nameSymbolFor(definition.qualifiedName);
   builder.setInsertionPointToStart(module.getBody());
-  if (!module.lookupSymbol(nameSymbol)) {
+  if (!lookupModuleSymbol(module, nameSymbol)) {
     std::string text = definition.name + '\0';
     mlir::LLVM::GlobalOp::create(
         builder, loc,
@@ -133,9 +135,9 @@ mlir::LogicalResult defineOne(mlir::ModuleOp module, const Definition &definitio
     // ⛔ Not for a hook nothing calls. Its slots would be the only thing
     // naming every arm -- str's repr with its escape tables in a program
     // that prints one str -- and a slot no hook reads is never called.
-    auto caller = module.lookupSymbol<mlir::LLVM::LLVMFuncOp>(hook.name);
+    auto caller = lookupModuleSymbol<mlir::LLVM::LLVMFuncOp>(module, hook.name);
     if (slot && caller && !caller.isExternal() &&
-        module.lookupSymbol(slot.getValue()))
+        lookupModuleSymbol(module, slot.getValue()))
       appendImageAddress(fields, slot.getValue());
     else
       appendImageWord(fields, 0);
@@ -258,15 +260,15 @@ std::optional<llvm::StringRef> qualifiedNameOf(llvm::StringRef symbol) {
 
 void declare(mlir::ModuleOp module, llvm::StringRef qualifiedName) {
   std::string symbol = symbolFor(qualifiedName);
-  if (module.lookupSymbol(symbol))
+  if (lookupModuleSymbol(module, symbol))
     return;
   mlir::OpBuilder builder(module.getContext());
   builder.setInsertionPointToStart(module.getBody());
-  mlir::LLVM::GlobalOp::create(builder, module.getLoc(),
-                               declarationType(module.getContext()),
-                               /*isConstant=*/true,
-                               mlir::LLVM::Linkage::External, symbol,
-                               mlir::Attribute());
+  auto global = mlir::LLVM::GlobalOp::create(
+      builder, module.getLoc(), declarationType(module.getContext()),
+      /*isConstant=*/true, mlir::LLVM::Linkage::External, symbol,
+      mlir::Attribute());
+  rememberModuleSymbol(module, global);
 }
 
 mlir::Value classWord(mlir::OpBuilder &builder, mlir::Location loc,
@@ -446,7 +448,7 @@ mlir::LogicalResult defineSlotHooks(mlir::ModuleOp module) {
   mlir::Type i64 = builder.getI64Type();
   mlir::Type i1 = builder.getI1Type();
   for (const SlotHook &hook : kSlotHooks) {
-    auto function = module.lookupSymbol<mlir::LLVM::LLVMFuncOp>(hook.name);
+    auto function = lookupModuleSymbol<mlir::LLVM::LLVMFuncOp>(module, hook.name);
     if (!function && hook.calledByRuntime) {
       // Its only callers are in the runtime: `(ptr, i64) -> i1`.
       builder.setInsertionPointToEnd(module.getBody());
@@ -649,7 +651,7 @@ mlir::LogicalResult patchStaticClassWords(mlir::ModuleOp module,
                                           unsigned pointerBits) {
   mlir::OpBuilder builder(module.getContext());
   for (const auto &item : words.globals) {
-    auto global = module.lookupSymbol<mlir::LLVM::GlobalOp>(item.getKey());
+    auto global = lookupModuleSymbol<mlir::LLVM::GlobalOp>(module, item.getKey());
     // Erased as unused since it was recorded.
     if (!global)
       continue;

@@ -28,6 +28,8 @@
 // future consumer that tried to write through it would fault rather than silently
 // corrupt every other occurrence of the same literal.
 
+#include "Common/ModuleSymbolMemo.h"
+
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -75,17 +77,17 @@ inline mlir::Value internReadOnlyBlock(mlir::ModuleOp module,
     // Why any symbol and not just a memref.global: a name taken by some other op
     // is still taken, and defining it twice fails the module's symbol-table
     // verifier rather than reusing anything.
-    mlir::Operation *existing = module.lookupSymbol(name);
+    mlir::Operation *existing = lookupModuleSymbol(module, name);
     if (!existing) {
       mlir::OpBuilder::InsertionGuard guard(builder);
       builder.setInsertionPointToStart(module.getBody());
-      mlir::memref::GlobalOp::create(builder, loc, name,
-                                     builder.getStringAttr("private"),
-                                     globalType, elements,
-                                     /*constant=*/true,
-                                     alignment ? builder.getI64IntegerAttr(
-                                                     alignment)
-                                               : mlir::IntegerAttr());
+      auto created = mlir::memref::GlobalOp::create(
+          builder, loc, name, builder.getStringAttr("private"), globalType,
+          elements,
+          /*constant=*/true,
+          alignment ? builder.getI64IntegerAttr(alignment)
+                    : mlir::IntegerAttr());
+      rememberModuleSymbol(module, created);
       break;
     }
     auto reusable = mlir::dyn_cast<mlir::memref::GlobalOp>(existing);

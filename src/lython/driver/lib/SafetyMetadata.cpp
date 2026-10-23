@@ -457,15 +457,6 @@ static LogicalResult verifyLLVMIRSafetyMetadataPreserved(
   return failure(failedAny);
 }
 
-LogicalResult
-verifyLLVMIRSafetyMetadataAttached(llvm::Module &llvmModule,
-                                   const LLVMSafetyProfile &profile,
-                                   llvm::raw_ostream &diag) {
-  return verifyLLVMIRSafetyMetadataPreserved(
-      llvmModule, profile, "LLVM IR safety metadata verifier",
-      LLVMSafetyContractCoverage::RequireEveryContract, diag);
-}
-
 static void emitLLVMSafetyVerifierError(llvm::Instruction &inst,
                                         llvm::StringRef msg,
                                         llvm::raw_ostream &diag) {

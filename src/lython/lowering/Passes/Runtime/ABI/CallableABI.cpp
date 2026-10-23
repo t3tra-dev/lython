@@ -601,7 +601,7 @@ RuntimeBundleLowerer::selectCallableProtocolSpecialization(
           RuntimeBundleLowerer::callableProtocolSpecializationFor(targetName,
                                                                   sources)) {
     if (mlir::func::FuncOp clone =
-            module.lookupSymbol<mlir::func::FuncOp>(*cloneName))
+            lookupModuleSymbol<mlir::func::FuncOp>(module, *cloneName))
       return clone;
     return op.emitError() << "protocol specialization clone @" << *cloneName
                           << " for callable target " << targetName
@@ -802,7 +802,7 @@ RuntimeBundleLowerer::foldUnprovenPrimitiveI64Speculations() {
     // A marker without a resolvable clone cannot be shown safe, so it folds.
     mlir::func::FuncOp clone;
     if (cloneRef)
-      clone = module.lookupSymbol<mlir::func::FuncOp>(cloneRef.getAttr());
+      clone = lookupModuleSymbol<mlir::func::FuncOp>(module, cloneRef.getAttr());
     if (isSpeculablePrimitiveI64Clone(clone))
       continue;
 
@@ -842,7 +842,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildPrimitiveI64CallableClones() {
   for (mlir::func::FuncOp original : originals) {
     std::string originalName = original.getSymName().str();
     std::string cloneName = (original.getSymName() + "__lyrt_prim_i64").str();
-    if (module.lookupSymbol<mlir::func::FuncOp>(cloneName)) {
+    if (lookupModuleSymbol<mlir::func::FuncOp>(module, cloneName)) {
       primitiveI64CallableClones[originalName] = cloneName;
       continue;
     }
@@ -922,7 +922,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableProtocolArgumentABIs() {
       return mlir::WalkResult::advance();
 
     mlir::func::FuncOp target =
-        module.lookupSymbol<mlir::func::FuncOp>(binding.getBinding());
+        lookupModuleSymbol<mlir::func::FuncOp>(module, binding.getBinding());
     if (!target || target.isDeclaration())
       return mlir::WalkResult::advance();
 
@@ -974,7 +974,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableProtocolArgumentABIs() {
 
   for (auto &entry : accumulators) {
     mlir::func::FuncOp original =
-        module.lookupSymbol<mlir::func::FuncOp>(entry.getKey());
+        lookupModuleSymbol<mlir::func::FuncOp>(module, entry.getKey());
     if (!original || original.isDeclaration())
       continue;
 
@@ -985,7 +985,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableProtocolArgumentABIs() {
       std::string cloneName =
           protocolSpecializationName(entry.getKey(), ordinal);
       mlir::func::FuncOp clone =
-          module.lookupSymbol<mlir::func::FuncOp>(cloneName);
+          lookupModuleSymbol<mlir::func::FuncOp>(module, cloneName);
       if (!clone) {
         mlir::OpBuilder::InsertionGuard guard(builder);
         builder.setInsertionPointAfter(original);
@@ -1707,7 +1707,8 @@ mlir::LogicalResult RuntimeBundleLowerer::seedCallableEntryArgumentBundles(
             alternative.closureValues.push_back(*closure);
           }
           if (evidenceSet.alternatives.size() == 1)
-            bundle.closureValues = alternative.closureValues;
+            bundle.closureValues.assign(alternative.closureValues.begin(),
+                                        alternative.closureValues.end());
           bundle.callableAlternatives.push_back(std::move(alternative));
         }
       }
@@ -1729,7 +1730,9 @@ mlir::LogicalResult RuntimeBundleLowerer::seedCallableEntryArgumentBundles(
              << "vararg aggregate evidence logical argument has no object "
                 "runtime bundle";
     RuntimeBundle &bundle = found->second;
-    bundle.sequenceIndices = aggregateEvidence->varargElementIndices;
+    bundle.sequenceIndices.assign(
+        aggregateEvidence->varargElementIndices.begin(),
+        aggregateEvidence->varargElementIndices.end());
     for (mlir::Type elementType : aggregateEvidence->varargElementTypes) {
       mlir::FailureOr<RuntimeValue> element = appendHiddenObject(elementType);
       if (mlir::failed(element))
@@ -1753,7 +1756,8 @@ mlir::LogicalResult RuntimeBundleLowerer::seedCallableEntryArgumentBundles(
              << "kwarg aggregate evidence logical argument has no object "
                 "runtime bundle";
     RuntimeBundle &bundle = found->second;
-    bundle.mappingKeys = aggregateEvidence->kwargKeys;
+    bundle.mappingKeys.assign(aggregateEvidence->kwargKeys.begin(),
+                             aggregateEvidence->kwargKeys.end());
     for (mlir::Type valueType : aggregateEvidence->kwargValueTypes) {
       mlir::FailureOr<RuntimeValue> value = appendHiddenObject(valueType);
       if (mlir::failed(value))

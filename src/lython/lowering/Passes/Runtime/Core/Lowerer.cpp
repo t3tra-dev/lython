@@ -151,8 +151,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
   classIndex.reset();
   llvm::SmallVector<py::ClassOp, 8> classOps;
   module.walk([&](py::ClassOp classOp) { classOps.push_back(classOp); });
-  for (py::ClassOp classOp : classOps)
+  for (py::ClassOp classOp : classOps) {
+    forgetModuleSymbol(module, classOp);
     classOp->erase();
+  }
   return mlir::success();
 }
 

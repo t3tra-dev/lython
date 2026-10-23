@@ -315,7 +315,7 @@ void RuntimeBundleLowerer::demoteMutableContainerArgumentEvidence(
     const RuntimeBundle *pack = RuntimeBundleLowerer::bundleFor(packValue);
     if (!pack || pack->kind != RuntimeBundle::Kind::Aggregate)
       return;
-    // Copy: demotion writes into valueBundles and would invalidate `pack`.
+    // Copy: demotion writes into valueBundles and may replace `pack`.
     llvm::SmallVector<mlir::Value, 8> operands(pack->aggregateOperands.begin(),
                                                pack->aggregateOperands.end());
     for (mlir::Value operand : operands) {
@@ -724,12 +724,10 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
 mlir::FailureOr<RuntimeBundle>
 RuntimeBundleLowerer::materializePayloadObjectBundle(
     mlir::Operation *op, const RuntimeBundle &valueRef, bool slotWordOnly) {
-  // Copies: this function inserts into `valueBundles` and then keeps reading its
-  // operand bundles, and the caller's arguments are references INTO that
-  // DenseMap -- an insertion that rehashes moves the entry and every later read
-  // is freed memory. Found as a live defect on `lowerBoundMethodCall`'s receiver
-  // (see CallableOps.cpp); these are the rest of the same audit. Neither of
-  // these keys is ever rewritten here, so the copy changes nothing else.
+  // Copies: this function writes `valueBundles` and then keeps reading its
+  // operand bundles, which the caller's arguments refer to. The table no
+  // longer moves a bundle when it grows (ValueBundleTable), but nothing here
+  // proves a write never replaces one of these, and a copy reads the same.
   RuntimeBundle value = valueRef;
   const RuntimeBundle *concrete =
       RuntimeBundleLowerer::concreteObjectForOwnership(value);

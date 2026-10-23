@@ -575,8 +575,8 @@ mlir::LogicalResult RuntimeBundleLowerer::spliceControlFlowBlockArgumentEdges(
     llvm::ArrayRef<mlir::Type> physicalTypes, bool primitiveIntLane) {
   mlir::Block *block = argument.getOwner();
 
-  // Bundles are copied by VALUE: nested block-argument lowering inserts into
-  // valueBundles, and a rehash would dangle any held pointer.
+  // Bundles are copied by VALUE: nested block-argument lowering writes
+  // valueBundles, and may replace a bundle a held pointer reads.
   llvm::SmallVector<RuntimeBundle, 4> sourceBundles;
 
   auto appendPhysicalBranchOperands =
@@ -1150,8 +1150,8 @@ RuntimeBundleLowerer::lowerRuntimeValueSelect(mlir::arith::SelectOp select) {
   if (!truePtr || !falsePtr)
     return select.emitError()
            << "select operand has no lowered runtime bundle";
-  // Copies: binding the result below inserts into valueBundles and a rehash
-  // would dangle the lookups.
+  // Copies: binding the result below writes valueBundles, and may replace
+  // a bundle the lookups read.
   RuntimeBundle trueBundle = *truePtr;
   RuntimeBundle falseBundle = *falsePtr;
 

@@ -7,12 +7,10 @@ using namespace ctypes;
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerStaticCtypesCall(
     py::CallOp op, const RuntimeBundle &callableRef) {
-  // Copies: this function inserts into `valueBundles` and then keeps reading its
-  // operand bundles, and the caller's arguments are references INTO that
-  // DenseMap -- an insertion that rehashes moves the entry and every later read
-  // is freed memory. Found as a live defect on `lowerBoundMethodCall`'s receiver
-  // (see CallableOps.cpp); these are the rest of the same audit. Neither of
-  // these keys is ever rewritten here, so the copy changes nothing else.
+  // Copies: this function writes `valueBundles` and then keeps reading its
+  // operand bundles, which the caller's arguments refer to. The table no
+  // longer moves a bundle when it grows (ValueBundleTable), but nothing here
+  // proves a write never replaces one of these, and a copy reads the same.
   RuntimeBundle callable = callableRef;
   if (mlir::failed(requireEmptyAggregate(op, op.getKwnames(), "kw names")) ||
       mlir::failed(requireEmptyAggregate(op, op.getKwvalues(), "kw values")))
@@ -398,7 +396,7 @@ RuntimeBundleLowerer::lowerStaticCtypesCall(
                   "because this target links a function by its signature";
       }
       std::string placeholder = "__ly_symbol_address_" + symbol.symbolName;
-      if (!module.lookupSymbol<mlir::func::FuncOp>(placeholder)) {
+      if (!lookupModuleSymbol<mlir::func::FuncOp>(module, placeholder)) {
         mlir::OpBuilder::InsertionGuard guard(builder);
         builder.setInsertionPointToEnd(module.getBody());
         auto fn = mlir::func::FuncOp::create(

@@ -115,7 +115,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableAggregateEvidenceABIs() {
       return mlir::WalkResult::advance();
 
     mlir::func::FuncOp target =
-        module.lookupSymbol<mlir::func::FuncOp>(binding.getBinding());
+        lookupModuleSymbol<mlir::func::FuncOp>(module, binding.getBinding());
     if (!target || target.isDeclaration())
       return mlir::WalkResult::advance();
     auto required = requirements.find(target.getSymName());

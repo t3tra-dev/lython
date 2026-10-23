@@ -2,6 +2,7 @@
 #include "Common/TypeObjects.h"
 
 #include "Common/Instrumentation.h"
+#include "Common/ModuleSymbolMemo.h"
 
 #include "Common/LibcPrototypes.h"
 
@@ -113,6 +114,7 @@ void importSymbol(mlir::ModuleOp target, mlir::Operation &op) {
   if (mlir::Operation *existing = target.lookupSymbol(symbol.getName())) {
     if (isSymbolDeclaration(op))
       return;
+    forgetModuleSymbol(target, existing);
     existing->erase();
   }
 

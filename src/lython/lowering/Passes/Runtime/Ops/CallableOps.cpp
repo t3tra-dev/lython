@@ -414,8 +414,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRuntimeListInsert(
 }
 
 // ⭐ THE RECEIVER ARRIVES BY VALUE. It used to be a reference, and the caller's
-// reference points INTO `valueBundles` -- a DenseMap this function inserts into
-// on nearly every path (`bindRetainedEvidenceValue`, `assignObjectBundle`, every
+// reference points INTO `valueBundles` -- then a DenseMap of bundles, which
+// this function inserts into on nearly every path (`bindRetainedEvidenceValue`, `assignObjectBundle`, every
 // evidence demotion). An insertion that rehashes moves the entry, and every use
 // of `receiver` after it read freed memory:
 //
@@ -444,7 +444,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRuntimeListInsert(
 // ⛔ Why NOT copy at each use site instead: the hazard is every path in a
 // 600-line function, and it is silent -- freed memory can also read back as a
 // PLAUSIBLE bundle, which is a wrong answer rather than a diagnostic. One copy
-// at the boundary retires the whole class.
+// at the boundary retires the whole class. The table no longer moves a bundle
+// when it grows (ValueBundleTable); a write that replaces this one still
+// would change what a reference reads.
 mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     py::CallOp op, RuntimeBundle receiver, llvm::StringRef methodName) {
   if (RuntimeBundleLowerer::isJsProxyBundle(receiver))

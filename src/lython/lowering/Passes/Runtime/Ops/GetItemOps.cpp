@@ -397,7 +397,7 @@ bool valueIsFrameOwnedProduct(mlir::ModuleOp module, mlir::Value value,
   if (!result)
     return false;
   if (auto call = mlir::dyn_cast<mlir::func::CallOp>(result.getOwner())) {
-    auto callee = module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+    auto callee = lookupModuleSymbol<mlir::func::FuncOp>(module, call.getCallee());
     return callee &&
            ownership::callResultGroupIsOwned(callee, result.getResultNumber());
   }
@@ -498,7 +498,7 @@ bool frameKeepsOwnedSourceOf(mlir::ModuleOp module, mlir::Operation *op,
       if (ownership::underlyingObjectValue(userCall.getOperand(index)) != head)
         continue;
       if (ownership::functionConsumesOperandAt(
-              module.lookupSymbol<mlir::func::FuncOp>(userCall.getCallee()),
+              lookupModuleSymbol<mlir::func::FuncOp>(module, userCall.getCallee()),
               index))
         return false;
     }
@@ -1491,12 +1491,10 @@ mlir::FailureOr<bool>
 RuntimeBundleLowerer::lowerDictEvidenceGetItem(
     py::GetItemOp op, const RuntimeBundle &containerRef,
     const RuntimeBundle &indexRef) {
-  // Copies: this function inserts into `valueBundles` and then keeps reading its
-  // operand bundles, and the caller's arguments are references INTO that
-  // DenseMap -- an insertion that rehashes moves the entry and every later read
-  // is freed memory. Found as a live defect on `lowerBoundMethodCall`'s receiver
-  // (see CallableOps.cpp); these are the rest of the same audit. Neither of
-  // these keys is ever rewritten here, so the copy changes nothing else.
+  // Copies: this function writes `valueBundles` and then keeps reading its
+  // operand bundles, which the caller's arguments refer to. The table no
+  // longer moves a bundle when it grows (ValueBundleTable), but nothing here
+  // proves a write never replaces one of these, and a copy reads the same.
   RuntimeBundle container = containerRef;
   RuntimeBundle index = indexRef;
   if (container.contractName() != "builtins.dict" ||

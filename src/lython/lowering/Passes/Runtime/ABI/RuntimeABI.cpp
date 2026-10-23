@@ -284,7 +284,7 @@ normalizeRuntimeValueOwnership(mlir::Type contract,
 
 mlir::func::FuncOp findObjectStorageReleaseToZero(mlir::ModuleOp module) {
   mlir::func::FuncOp releaseToZero =
-      module.lookupSymbol<mlir::func::FuncOp>(kReleaseStorageToZeroName);
+      lookupModuleSymbol<mlir::func::FuncOp>(module, kReleaseStorageToZeroName);
   if (!releaseToZero)
     return {};
   mlir::FunctionType type = releaseToZero.getFunctionType();
@@ -1268,7 +1268,7 @@ static mlir::FailureOr<mlir::Value> materializeStaticDeadPhysicalValue(
   std::string name =
       (objectHeader ? "__ly_dead_header_" : "__ly_dead_payload_") +
       typeSymbolComponent(globalType);
-  if (!module.lookupSymbol<mlir::memref::GlobalOp>(name)) {
+  if (!lookupModuleSymbol<mlir::memref::GlobalOp>(module, name)) {
     mlir::Attribute initialValue =
         deadMemRefInitialValue(builder, globalType, objectHeader);
     if (!initialValue)
@@ -1719,7 +1719,7 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
     std::string baseName = sourceClassDeallocatorName(contract);
     std::string functionName = baseName;
     for (unsigned suffix = 1;
-         module.lookupSymbol<mlir::func::FuncOp>(functionName); ++suffix)
+         lookupModuleSymbol<mlir::func::FuncOp>(module, functionName); ++suffix)
       functionName = baseName + "_" + std::to_string(suffix);
 
     mlir::OpBuilder::InsertionGuard guard(builder);
@@ -1777,7 +1777,7 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
     if (std::optional<std::string> finalizer =
             RuntimeBundleLowerer::classMethodSymbol(plan.classOp,
                                                     "__ly_finalize__")) {
-      auto finalize = module.lookupSymbol<mlir::func::FuncOp>(*finalizer);
+      auto finalize = lookupModuleSymbol<mlir::func::FuncOp>(module, *finalizer);
       if (!finalize || finalize.getFunctionType().getInputs() !=
                            plan.function.getFunctionType().getInputs())
         return plan.classOp.emitError()
@@ -1828,7 +1828,7 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
         boxedFields ? plan.function.addBlock() : deallocBlock;
     builder.setInsertionPointToStart(deallocBlock);
     if (boxedFields) {
-      auto releaseSlot = module.lookupSymbol<mlir::func::FuncOp>(
+      auto releaseSlot = lookupModuleSymbol<mlir::func::FuncOp>(module, 
           "LyObject_ReleaseBoxedPayloadArraySlotRaw");
       if (!releaseSlot)
         return module.emitError() << "source class deallocators require "
@@ -2003,7 +2003,7 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeByteBackedObject(
             read = cast.getSource();
           if (auto global = read.getDefiningOp<mlir::memref::GetGlobalOp>())
             if (mlir::Operation *image =
-                    module.lookupSymbol(global.getNameAttr()))
+                    lookupModuleSymbol(module, global.getName()))
               image->setAttr("ly.class_of",
                              builder.getStringAttr("builtins.str"));
           mlir::func::CallOp call =
@@ -2181,7 +2181,7 @@ mlir::FailureOr<std::string> RuntimeBundleLowerer::slotFunction(
                                            mlir::func::FuncOp)>
         body) {
   std::string name = ("__ly_slot." + hookName + "." + arm).str();
-  if (module.lookupSymbol(name))
+  if (lookupModuleSymbol(module, name))
     return name;
   mlir::OpBuilder builder(context);
   builder.setInsertionPointToEnd(module.getBody());
@@ -2193,7 +2193,7 @@ mlir::FailureOr<std::string> RuntimeBundleLowerer::slotFunction(
     return mlir::failure();
   // What the hook says of its results its slots say too: the refcount planner
   // reads an owned str off the function that returns it.
-  auto hook = module.lookupSymbol<mlir::func::FuncOp>(hookName);
+  auto hook = lookupModuleSymbol<mlir::func::FuncOp>(module, hookName);
   if (hook)
     for (llvm::StringRef attr :
          {"ly.ownership.owned_results", "ly.runtime.result_contract"})
@@ -2266,7 +2266,7 @@ mlir::LogicalResult RuntimeBundleLowerer::recordUnreachableSlots(
 // runtime lowering. No hook writes or removes a call to LyObject_New.
 bool RuntimeBundleLowerer::objectInstancesAreMade() {
   if (!objectInstancesAreMadeAnswer) {
-    auto objectNew = module.lookupSymbol<mlir::func::FuncOp>("LyObject_New");
+    auto objectNew = lookupModuleSymbol<mlir::func::FuncOp>(module, "LyObject_New");
     objectInstancesAreMadeAnswer =
         objectNew && !mlir::SymbolTable::symbolKnownUseEmpty(objectNew, module);
   }
@@ -2291,7 +2291,7 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
   const type_objects::SlotHook *slotHook = type_objects::slotHookNamed(hookName);
   if (!slotHook)
     return module.emitError() << hookName << " has no slot word (TypeObjects.h)";
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(hookName))
+  if (auto existing = lookupModuleSymbol<mlir::func::FuncOp>(module, hookName))
     if (!existing.isExternal())
       return mlir::success();
 
@@ -2400,7 +2400,7 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
                                                   sourceClassMethodName);
       if (!symbol)
         return;
-      auto function = module.lookupSymbol<mlir::func::FuncOp>(*symbol);
+      auto function = lookupModuleSymbol<mlir::func::FuncOp>(module, *symbol);
       if (!function || function.isExternal() || !conforms(function))
         return;
       std::optional<std::string> runtimeClass =
@@ -2578,7 +2578,7 @@ void RuntimeBundleLowerer::stampBoxedStrHookResult(llvm::StringRef hookName) {
 // Demand-driven: the external declaration merged in from the manifest is what
 // asks for the definition, and an unused public hook is not eliminated.
 bool RuntimeBundleLowerer::boxedHookIsDemanded(llvm::StringRef hookName) {
-  auto existing = module.lookupSymbol<mlir::func::FuncOp>(hookName);
+  auto existing = lookupModuleSymbol<mlir::func::FuncOp>(module, hookName);
   return existing && existing.isExternal();
 }
 
@@ -2885,7 +2885,7 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassHashAdapters() {
         RuntimeBundleLowerer::classMethodSymbol(classOp, "__hash__");
     if (!symbol)
       return;
-    auto method = module.lookupSymbol<mlir::func::FuncOp>(*symbol);
+    auto method = lookupModuleSymbol<mlir::func::FuncOp>(module, *symbol);
     if (!method || method.isExternal())
       return;
     mlir::FunctionType type = method.getFunctionType();
@@ -2916,7 +2916,7 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassHashAdapters() {
   for (Pending &entry : pending) {
     std::string adapterName =
         ("__ly_hash_adapter$" + entry.classOp.getSymName()).str();
-    if (module.lookupSymbol<mlir::func::FuncOp>(adapterName))
+    if (lookupModuleSymbol<mlir::func::FuncOp>(module, adapterName))
       continue;
     builder.setInsertionPointToEnd(module.getBody());
     mlir::FunctionType methodType = entry.method.getFunctionType();
@@ -3021,7 +3021,7 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeLengthTruthAdapters() {
   mlir::Location loc = module.getLoc();
   auto adapterFor = [&](llvm::StringRef name, llvm::StringRef contract,
                         mlir::FunctionType sourceType) -> mlir::func::FuncOp {
-    if (module.lookupSymbol<mlir::func::FuncOp>(name))
+    if (lookupModuleSymbol<mlir::func::FuncOp>(module, name))
       return mlir::func::FuncOp();
     builder.setInsertionPointToEnd(module.getBody());
     auto adapter = mlir::func::FuncOp::create(
@@ -3082,7 +3082,7 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeLengthTruthAdapters() {
         RuntimeBundleLowerer::classMethodSymbol(classOp, "__len__");
     if (!symbol)
       return;
-    auto method = module.lookupSymbol<mlir::func::FuncOp>(*symbol);
+    auto method = lookupModuleSymbol<mlir::func::FuncOp>(module, *symbol);
     std::optional<std::string> runtimeClass =
         RuntimeBundleLowerer::runtimeClassForClass(classOp);
     if (!method || method.isExternal() || !runtimeClass ||
@@ -3149,7 +3149,7 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
   const type_objects::SlotHook *slotHook = type_objects::slotHookNamed(hookName);
   if (!slotHook)
     return module.emitError() << hookName << " has no slot word (TypeObjects.h)";
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(hookName))
+  if (auto existing = lookupModuleSymbol<mlir::func::FuncOp>(module, hookName))
     if (!existing.isExternal())
       return mlir::success();
 
@@ -3269,7 +3269,7 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
                                                   sourceClassMethodName);
       if (!symbol)
         return;
-      auto function = module.lookupSymbol<mlir::func::FuncOp>(*symbol);
+      auto function = lookupModuleSymbol<mlir::func::FuncOp>(module, *symbol);
       if (!function || function.isExternal() || !conforms(function))
         return;
       std::optional<std::string> runtimeClass =

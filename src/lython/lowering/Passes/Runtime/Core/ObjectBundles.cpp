@@ -403,12 +403,10 @@ mlir::FailureOr<RuntimeBundle>
 RuntimeBundleLowerer::materializeObjectBundleForStorage(
     mlir::Operation *op, const RuntimeBundle &bundleRef,
     mlir::Type storageContract, llvm::StringRef purpose) {
-  // Copies: this function inserts into `valueBundles` and then keeps reading its
-  // operand bundles, and the caller's arguments are references INTO that
-  // DenseMap -- an insertion that rehashes moves the entry and every later read
-  // is freed memory. Found as a live defect on `lowerBoundMethodCall`'s receiver
-  // (see CallableOps.cpp); these are the rest of the same audit. Neither of
-  // these keys is ever rewritten here, so the copy changes nothing else.
+  // Copies: this function writes `valueBundles` and then keeps reading its
+  // operand bundles, which the caller's arguments refer to. The table no
+  // longer moves a bundle when it grows (ValueBundleTable), but nothing here
+  // proves a write never replaces one of these, and a copy reads the same.
   RuntimeBundle bundle = bundleRef;
   if (!bundle.isObjectLike())
     return op->emitError() << purpose << " requires an object bundle";
@@ -731,7 +729,7 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
     if (!value)
       return op->emitError() << "provider default value has no symbol";
     auto provider =
-        module.lookupSymbol<mlir::func::FuncOp>(value.getValue());
+        lookupModuleSymbol<mlir::func::FuncOp>(module, value.getValue());
     if (!provider)
       return op->emitError() << "default provider '" << value.getValue()
                              << "' is missing from the module";
