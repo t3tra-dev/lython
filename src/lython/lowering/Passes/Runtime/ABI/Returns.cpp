@@ -208,10 +208,7 @@ mlir::LogicalResult RuntimeBundleLowerer::bundleRuntimeResults(
 }
 
 const RuntimeBundle *RuntimeBundleLowerer::bundleFor(mlir::Value value) const {
-  auto found = valueBundles.find(value);
-  if (found == valueBundles.end())
-    return nullptr;
-  return &found->second;
+  return valueBundles.lookup(value);
 }
 
 mlir::Value RuntimeBundleLowerer::materializeByteBuffer(mlir::Location loc,

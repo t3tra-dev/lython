@@ -127,6 +127,7 @@ ASAN_OPTIONS=detect_leaks=0:detect_container_overflow=0:allow_user_poisoning=0 \
 - `LYTHON_OWNERSHIP_MUTATE=drop:N|dup:N|dropretain:N` — refcount 挿入の後で、プログラムの関数の N 番目の release を消す / 二重にする / retain を消す。所有権検証器が何を捕まえるかを測るため (候補数を stderr と remark に出す)。`DriverTest.EveryDroppedOrDoubledReleaseIsRefused` がこれで検証器の検出力を守る
 - `LYTHON_ABLATE_OWNERSHIP_HANDOFF=1` / `LYTHON_ABLATE_RETAIN_MINTED_RESOURCES=1` — 所有権検証器で、合流引数への引き継ぎをやめて元の資源の探索で名前を付け替えて追う / どの資源も覆わない値への retain を資源にしない (旧来の検証器。同じバイナリで判定を比べるため)
 - `LYTHON_ABLATE_IMPORT_SCOPE_MEMO=1` / `LYTHON_VERIFY_IMPORT_SCOPE_MEMO=1` — 取り込んだモジュールの import の束縛を、記録して再生せず毎回読む / 毎回読んで再生と照合し、違えば abort する
+- `LYTHON_ABLATE_SYMBOL_MEMO=1` / `LYTHON_VERIFY_SYMBOL_MEMO=1` — runtime lowering と type-objects フェーズで、モジュールのシンボル検索の答えを覚えず毎回モジュールを線形に引く / 覚えた答えを毎回引き直して照合し、違えば abort する (`lowering/Common/ModuleSymbolMemo.h`)
 - `LYTHON_NUM_THREADS=N` — 実行時: 大きい行列積の fork-join ワーカー数 (デフォルト 4、1 で逐次)
 
 ## アーキテクチャ

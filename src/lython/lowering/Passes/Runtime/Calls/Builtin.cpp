@@ -11,7 +11,7 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::emitSourceClassReprCall(
       RuntimeBundleLowerer::classMethodSymbol(classOp, "__repr__");
   if (!symbol)
     return false;
-  auto function = module.lookupSymbol<mlir::func::FuncOp>(*symbol);
+  auto function = lookupModuleSymbol<mlir::func::FuncOp>(module, *symbol);
   if (!function || function.isExternal())
     return false;
   // The compiled method takes the instance's physical values (self box and
@@ -95,7 +95,7 @@ mlir::LogicalResult RuntimeBundleLowerer::emitBoxedReprHookCall(
            << header->getType();
 
   mlir::func::FuncOp hook =
-      module.lookupSymbol<mlir::func::FuncOp>("__ly_repr_boxed_by_contract");
+      lookupModuleSymbol<mlir::func::FuncOp>(module, "__ly_repr_boxed_by_contract");
   if (!hook) {
     // Declaring the hook is what requests its generation at the end of the
     // pass (the same declaration a merged container __repr__ carries).

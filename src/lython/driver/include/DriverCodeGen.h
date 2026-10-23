@@ -102,11 +102,6 @@ void collectLLVMSafetyContracts(mlir::ModuleOp module,
 void collectLinkedLLVMSafetyContracts(llvm::Module &llvmModule,
                                       LLVMSafetyProfile &profile);
 
-mlir::LogicalResult
-verifyLLVMIRSafetyMetadataAttached(llvm::Module &llvmModule,
-                                   const LLVMSafetyProfile &profile,
-                                   llvm::raw_ostream &diag);
-
 mlir::LogicalResult verifyPostCoroLLVMThreadSafe(
     llvm::Module &llvmModule, const LLVMSafetyProfile &profile,
     llvm::raw_ostream &diag,

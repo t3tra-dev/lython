@@ -889,7 +889,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorClaimFunction(
     mlir::Operation *op, const GeneratorResumeLane &lane) {
   std::string name =
       "__ly_generator_claim_" + generatorLaneSymbolComponent(lane.contract);
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(name))
+  if (auto existing = lookupModuleSymbol<mlir::func::FuncOp>(module, name))
     return existing;
   mlir::OpBuilder::InsertionGuard guard(builder);
   mlir::Location loc = op->getLoc();
@@ -1001,7 +1001,7 @@ mlir::FailureOr<mlir::func::FuncOp>
 RuntimeBundleLowerer::getOrCreateGeneratorSpanStoreFunction(
     mlir::Operation *op, const GeneratorResumeLane &lane, llvm::StringRef name,
     bool transferring) {
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(name))
+  if (auto existing = lookupModuleSymbol<mlir::func::FuncOp>(module, name))
     return existing;
   mlir::OpBuilder::InsertionGuard guard(builder);
   mlir::Location loc = op->getLoc();
@@ -1108,7 +1108,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorFrameLoadFunction(
     mlir::Operation *op, const GeneratorResumeLane &lane) {
   std::string name = "__ly_generator_frame_load_" +
                      generatorLaneSymbolComponent(lane.contract);
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(name))
+  if (auto existing = lookupModuleSymbol<mlir::func::FuncOp>(module, name))
     return existing;
   mlir::OpBuilder::InsertionGuard guard(builder);
   mlir::Location loc = op->getLoc();
@@ -1213,7 +1213,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorArgumentLoadFunction(
     mlir::Operation *op, const GeneratorResumeLane &lane) {
   std::string name = "__ly_generator_arg_load_" +
                      generatorLaneSymbolComponent(lane.contract);
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(name))
+  if (auto existing = lookupModuleSymbol<mlir::func::FuncOp>(module, name))
     return existing;
   mlir::OpBuilder::InsertionGuard guard(builder);
   mlir::Location loc = op->getLoc();
@@ -2093,7 +2093,7 @@ RuntimeBundleLowerer::inlineOneYieldFrom(mlir::func::FuncOp clone,
   if (!binding)
     return false;
   auto target =
-      module.lookupSymbol<mlir::func::FuncOp>(binding.getBinding());
+      lookupModuleSymbol<mlir::func::FuncOp>(module, binding.getBinding());
   if (!target || target.isDeclaration() ||
       !target->hasAttr(kGeneratorBodyResultAttr))
     return false;
@@ -2404,7 +2404,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
   for (auto &entry : generatorResumeClones) {
     GeneratorResumeInfo &info = entry.second;
     mlir::func::FuncOp clone =
-        module.lookupSymbol<mlir::func::FuncOp>(info.cloneName);
+        lookupModuleSymbol<mlir::func::FuncOp>(module, info.cloneName);
     if (!clone)
       return module.emitError()
              << "generator resume clone " << info.cloneName << " is missing";
@@ -3145,11 +3145,11 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFullFunction(
     mlir::Operation *op, GeneratorResumeInfo &info) {
   if (!info.stepFullName.empty()) {
     if (auto existing =
-            module.lookupSymbol<mlir::func::FuncOp>(info.stepFullName))
+            lookupModuleSymbol<mlir::func::FuncOp>(module, info.stepFullName))
       return existing;
   }
   mlir::func::FuncOp clone =
-      module.lookupSymbol<mlir::func::FuncOp>(info.cloneName);
+      lookupModuleSymbol<mlir::func::FuncOp>(module, info.cloneName);
   if (!clone)
     return op->emitError() << "generator resume clone " << info.cloneName
                            << " is not defined";
@@ -3541,7 +3541,7 @@ mlir::FailureOr<mlir::func::FuncOp>
 RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
     mlir::Operation *op, GeneratorResumeInfo &info) {
   if (!info.stepName.empty()) {
-    if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(info.stepName))
+    if (auto existing = lookupModuleSymbol<mlir::func::FuncOp>(module, info.stepName))
       return existing;
   }
   mlir::FailureOr<mlir::func::FuncOp> full =
@@ -3770,7 +3770,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorAdvanceFunction(
     mlir::Operation *op, GeneratorResumeInfo &info) {
   if (!info.advanceName.empty()) {
     if (auto existing =
-            module.lookupSymbol<mlir::func::FuncOp>(info.advanceName))
+            lookupModuleSymbol<mlir::func::FuncOp>(module, info.advanceName))
       return existing;
   }
   mlir::FailureOr<mlir::func::FuncOp> step =
@@ -3924,7 +3924,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
     mlir::Operation *op, GeneratorResumeInfo &info) {
   if (!info.throwName.empty()) {
     if (auto existing =
-            module.lookupSymbol<mlir::func::FuncOp>(info.throwName))
+            lookupModuleSymbol<mlir::func::FuncOp>(module, info.throwName))
       return existing;
   }
   mlir::FailureOr<mlir::func::FuncOp> advance =
@@ -4152,7 +4152,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
     mlir::Operation *op, GeneratorResumeInfo &info) {
   if (!info.closeName.empty()) {
     if (auto existing =
-            module.lookupSymbol<mlir::func::FuncOp>(info.closeName))
+            lookupModuleSymbol<mlir::func::FuncOp>(module, info.closeName))
       return existing;
   }
   mlir::FailureOr<mlir::func::FuncOp> step =
@@ -4467,11 +4467,11 @@ RuntimeBundleLowerer::getOrCreateGeneratorFinalizeFunction(
     GeneratorResumeInfo &info) {
   if (!info.finalizeName.empty()) {
     if (auto existing =
-            module.lookupSymbol<mlir::func::FuncOp>(info.finalizeName))
+            lookupModuleSymbol<mlir::func::FuncOp>(module, info.finalizeName))
       return existing;
   }
   mlir::func::FuncOp clone =
-      module.lookupSymbol<mlir::func::FuncOp>(info.cloneName);
+      lookupModuleSymbol<mlir::func::FuncOp>(module, info.cloneName);
   if (!clone)
     return module.emitError()
            << "generator resume clone " << info.cloneName << " is missing";
@@ -4641,7 +4641,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorFinalizeFunction(
 // prints for a generator object. An id the program never made answers "".
 mlir::LogicalResult RuntimeBundleLowerer::generateGeneratorQualnames() {
   auto hook =
-      module.lookupSymbol<mlir::func::FuncOp>("__ly_generator_qualname");
+      lookupModuleSymbol<mlir::func::FuncOp>(module, "__ly_generator_qualname");
   if (!hook || !hook.isDeclaration())
     return mlir::success();
   llvm::SmallVector<llvm::StringRef, 8> targets;
@@ -4680,7 +4680,7 @@ mlir::LogicalResult RuntimeBundleLowerer::generateGeneratorQualnames() {
 mlir::LogicalResult RuntimeBundleLowerer::generateGeneratorDropHook() {
   if (generatorResumeClones.empty())
     return mlir::success();
-  auto decref = module.lookupSymbol<mlir::func::FuncOp>("LyGenerator_DecRef");
+  auto decref = lookupModuleSymbol<mlir::func::FuncOp>(module, "LyGenerator_DecRef");
   if (!decref || decref.isDeclaration())
     return mlir::success();
 
@@ -4965,7 +4965,7 @@ RuntimeBundleLowerer::getOrCreateStoredGeneratorDriver(
   if (mlir::failed(driver))
     return mlir::failure();
   std::string name = driver->getSymName().str() + "_stored";
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(name))
+  if (auto existing = lookupModuleSymbol<mlir::func::FuncOp>(module, name))
     return existing;
   unsigned skipped = RuntimeBundleLowerer::generatorArgumentPhysicalCount(info);
   mlir::FunctionType driverType = driver->getFunctionType();
@@ -5116,7 +5116,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorDispatch(mlir::Operation *op,
                << "': one resume cannot hand back both";
       continue;
     }
-    auto body = module.lookupSymbol<mlir::func::FuncOp>(target);
+    auto body = lookupModuleSymbol<mlir::func::FuncOp>(module, target);
     bool mayBeHere = false;
     if (body) {
       body.walk([&](py::YieldValueOp yield) {
@@ -5174,7 +5174,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorDispatch(mlir::Operation *op,
       stream << "->" << returnType;
     symbol += "$" + llvm::utohexstr(llvm::xxh3_64bits(text));
   }
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(symbol))
+  if (auto existing = lookupModuleSymbol<mlir::func::FuncOp>(module, symbol))
     return existing;
 
   llvm::SmallVector<mlir::func::FuncOp, 8> drivers;
@@ -5413,7 +5413,7 @@ RuntimeBundleLowerer::getOrCreateBoxedGeneratorDriver(
   if (mlir::failed(stored))
     return mlir::failure();
   std::string name = stored->getSymName().str() + "_boxed";
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(name))
+  if (auto existing = lookupModuleSymbol<mlir::func::FuncOp>(module, name))
     return existing;
   const GeneratorResumeLane &lane = info.valueLane;
   unsigned width = static_cast<unsigned>(

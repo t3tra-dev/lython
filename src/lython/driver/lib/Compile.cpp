@@ -27,44 +27,61 @@ LogicalResult translateToVerifiedLLVMIR(ModuleOp module,
                                         VerifiedLLVMModule &out,
                                         llvm::raw_ostream &diag) {
   LLVMSafetyProfile safetyProfile;
-  if (!options.releaseMode)
-    collectLLVMSafetyContracts(module, safetyProfile);
-  py::installFrameRecords(module);
   llvm::SmallVector<py::PythonCallSiteRange, 16> pythonCallSites;
-  py::collectPythonCallSiteRanges(module, pythonCallSites);
   llvm::DenseMap<std::int64_t, unsigned> tryInlineDepths;
-  py::collectPythonTryInlineDepths(module, tryInlineDepths);
   llvm::SmallVector<std::string, 4> ctypesSymbols;
-  py::collectCtypesForeignSymbols(module, ctypesSymbols);
-  attachPythonDebugInfo(module);
+  {
+    PerfScope perf("translate-to-llvm.collect");
+    if (!options.releaseMode)
+      collectLLVMSafetyContracts(module, safetyProfile);
+    py::installFrameRecords(module);
+    py::collectPythonCallSiteRanges(module, pythonCallSites);
+    py::collectPythonTryInlineDepths(module, tryInlineDepths);
+    py::collectCtypesForeignSymbols(module, ctypesSymbols);
+  }
+  {
+    PerfScope perf("translate-to-llvm.debug-info");
+    attachPythonDebugInfo(module);
+  }
   // Translation folds constant struct GEPs into byte offsets with the
   // module's layout, so the target's has to be there first (see the same
   // step in RuntimeLibrary.cpp).
   stampTargetDataLayout(module, options);
 
   auto llvmContext = std::make_unique<llvm::LLVMContext>();
-  auto llvmModule = mlir::translateModuleToLLVMIR(module, *llvmContext);
+  std::unique_ptr<llvm::Module> llvmModule;
+  {
+    PerfScope perf("translate-to-llvm.translate");
+    // ⛔ Not verified here as well when the module is verified below, after
+    // the exception frames are installed: the same check twice.
+    llvmModule = mlir::translateModuleToLLVMIR(
+        module, *llvmContext, "LLVMDialectModule",
+        /*disableVerification=*/!options.releaseMode);
+  }
   if (!llvmModule) {
     diag << "Failed to translate to LLVM IR\n";
     return failure();
   }
-  py::installJsHostEntryPoints(
-      *llvmModule, codeGenTripleForTarget(py::TensorLoweringTarget{}, options));
-  py::internalizePythonFunctions(*llvmModule);
-  dumpLLVMForPass(irDump, "pre-eh-llvm", *llvmModule);
-  py::markCLibraryDeclarationsNonUnwinding(*llvmModule, ctypesSymbols);
-  py::installPythonExceptionCleanupFrames(
-      *llvmModule, codeGenTripleForTarget(py::TensorLoweringTarget{}, options),
-      pythonCallSites, tryInlineDepths);
-  py::installArmStreamingCompatibleMemoryRoutines(*llvmModule);
+  {
+    PerfScope perf("translate-to-llvm.exception-frames");
+    py::installJsHostEntryPoints(
+        *llvmModule,
+        codeGenTripleForTarget(py::TensorLoweringTarget{}, options));
+    py::internalizePythonFunctions(*llvmModule);
+    dumpLLVMForPass(irDump, "pre-eh-llvm", *llvmModule);
+    py::markCLibraryDeclarationsNonUnwinding(*llvmModule, ctypesSymbols);
+    py::installPythonExceptionCleanupFrames(
+        *llvmModule,
+        codeGenTripleForTarget(py::TensorLoweringTarget{}, options),
+        pythonCallSites, tryInlineDepths);
+    py::installArmStreamingCompatibleMemoryRoutines(*llvmModule);
+  }
   dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);
-  if (!options.releaseMode &&
-      failed(verifyLLVMIRSafetyMetadataAttached(*llvmModule, safetyProfile,
-                                                diag)))
-    return failure();
-  if (!options.releaseMode &&
-      failed(verifyPostCoroLLVMThreadSafe(*llvmModule, safetyProfile, diag)))
-    return failure();
+  if (!options.releaseMode) {
+    PerfScope perf("translate-to-llvm.verify");
+    if (failed(verifyPostCoroLLVMThreadSafe(*llvmModule, safetyProfile, diag)))
+      return failure();
+  }
 
   out.llvmContext = std::move(llvmContext);
   out.llvmModule = std::move(llvmModule);

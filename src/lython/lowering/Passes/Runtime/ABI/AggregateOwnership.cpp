@@ -215,7 +215,7 @@ RuntimeBundleLowerer::retainAggregateSlot(mlir::Operation *op,
       concrete->physicalValues().size() == 1 &&
       mlir::isa<mlir::MemRefType>(
           concrete->physicalValues().front().getType())) {
-    auto retainRaw = module.lookupSymbol<mlir::func::FuncOp>(
+    auto retainRaw = lookupModuleSymbol<mlir::func::FuncOp>(module, 
         "__ly_handle_retain_raw");
     if (!retainRaw)
       return op->emitError()

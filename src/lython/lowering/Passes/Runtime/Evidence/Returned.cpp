@@ -41,7 +41,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedValueSummaries() {
       return std::nullopt;
 
     mlir::func::FuncOp target =
-        module.lookupSymbol<mlir::func::FuncOp>(binding.getBinding());
+        lookupModuleSymbol<mlir::func::FuncOp>(module, binding.getBinding());
     py::CallableType callable = callableTypeOf(target);
     if (!callable)
       return std::nullopt;
@@ -143,7 +143,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedCallableSummaries() {
         return;
       }
       mlir::func::FuncOp target =
-          module.lookupSymbol<mlir::func::FuncOp>(binding.getBinding());
+          lookupModuleSymbol<mlir::func::FuncOp>(module, binding.getBinding());
       if (!target || !target->hasAttr("callable_type")) {
         invalid = true;
         return;
@@ -359,7 +359,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedStaticObjectSummaries() {
       return std::nullopt;
 
     mlir::func::FuncOp target =
-        module.lookupSymbol<mlir::func::FuncOp>(binding.getBinding());
+        lookupModuleSymbol<mlir::func::FuncOp>(module, binding.getBinding());
     py::CallableType callable = callableTypeOf(target);
     if (!callable)
       return std::nullopt;

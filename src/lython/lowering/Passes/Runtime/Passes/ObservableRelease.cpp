@@ -42,7 +42,8 @@ namespace {
 
 class ObservableRelease {
 public:
-  explicit ObservableRelease(mlir::ModuleOp module) : module(module) {
+  explicit ObservableRelease(mlir::ModuleOp module)
+      : module(module), symbols(module) {
     module.walk([&](py::ClassOp classOp) { classes.push_back(classOp); });
     for (py::ClassOp classOp : classes)
       if (auto bases = classOp->getAttrOfType<mlir::ArrayAttr>("base_names"))
@@ -99,8 +100,7 @@ private:
 
   py::ClassOp lookup(llvm::StringRef contract) {
     auto find = [&](llvm::StringRef name) -> py::ClassOp {
-      return mlir::dyn_cast_or_null<py::ClassOp>(
-          mlir::SymbolTable::lookupSymbolIn(module.getOperation(), name));
+      return mlir::dyn_cast_or_null<py::ClassOp>(symbols.lookup(name));
     };
     if (py::ClassOp classOp = find(contract))
       return classOp;
@@ -159,6 +159,9 @@ private:
   }
 
   mlir::ModuleOp module;
+  // ⛔ Not a lookup per question: this asks for a class by name for every
+  // type it meets, and nothing adds or erases a symbol while it asks.
+  mlir::SymbolTable symbols;
   llvm::SmallVector<py::ClassOp, 32> classes;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<py::ClassOp, 2>>
       subclasses;

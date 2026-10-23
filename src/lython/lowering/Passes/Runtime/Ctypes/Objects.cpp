@@ -639,7 +639,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCtypesCallbackConstruction(
       RuntimeBundleLowerer::primitiveI64CloneFor(target.functionTarget);
   // A clone now also carries floats; the callback ABI is the int one.
   if (clone)
-    if (auto cloneFunction = module.lookupSymbol<mlir::func::FuncOp>(*clone))
+    if (auto cloneFunction = lookupModuleSymbol<mlir::func::FuncOp>(module, *clone))
       if (py::CallableType callable = callableTypeOf(cloneFunction))
         if (runtimeContractName(callable.getResultTypes().front()) !=
                 "builtins.int" ||
@@ -690,7 +690,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCtypesCallbackConstruction(
 
   // The clone takes one logical int per callback parameter.
   if (mlir::func::FuncOp cloneFunction =
-          module.lookupSymbol<mlir::func::FuncOp>(*clone)) {
+          lookupModuleSymbol<mlir::func::FuncOp>(module, *clone)) {
     py::CallableType callableType = callableTypeOf(cloneFunction);
     if (!callableType ||
         callableType.getPositionalTypes().size() != argCodes.size())

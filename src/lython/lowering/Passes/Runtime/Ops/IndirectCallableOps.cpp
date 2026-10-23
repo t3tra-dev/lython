@@ -535,7 +535,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
   // followed reported a function object with zero handles for a bundle that
   // had one; it needed three callers and two function-valued globals to grow
   // the map far enough, which is why every smaller spelling of the same
-  // program was fine.
+  // program was fine. The table no longer moves a bundle when it grows
+  // (ValueBundleTable); the copy stays because a write can still replace it.
   RuntimeBundle callable = callableRef;
   if (op.getNumResults() != 1)
     return op.emitError()
@@ -573,7 +574,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
         return op.emitError() << "indirect callable has no closure evidence "
                                  "alternative for "
                               << targetName;
-      selectedCallable.closureValues = alternative->closureValues;
+      selectedCallable.closureValues.assign(alternative->closureValues.begin(),
+                                alternative->closureValues.end());
     }
 
     builder.setInsertionPoint(op);
@@ -593,7 +595,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
                    RuntimeBundleLowerer::primitiveI64CloneFor(targetName)) {
       if (RuntimeBundleLowerer::allSourcesHavePrimitiveI64Evidence(sources)) {
         if (mlir::func::FuncOp clone =
-                module.lookupSymbol<mlir::func::FuncOp>(*cloneName)) {
+                lookupModuleSymbol<mlir::func::FuncOp>(module, *cloneName)) {
           if (mlir::failed(
                   RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
                       op, target, targetName, clone, sources, result)))
@@ -798,7 +800,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
         return op.emitError() << "indirect callable has no closure evidence "
                                  "alternative for "
                               << targetName;
-      selectedCallable.closureValues = alternative->closureValues;
+      selectedCallable.closureValues.assign(alternative->closureValues.begin(),
+                                alternative->closureValues.end());
     }
     if (selectedCallable.closureValues.empty()) {
       builder.setInsertionPoint(operation);
@@ -826,7 +829,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
                    RuntimeBundleLowerer::primitiveI64CloneFor(targetName)) {
       if (RuntimeBundleLowerer::allSourcesHavePrimitiveI64Evidence(sources)) {
         if (mlir::func::FuncOp clone =
-                module.lookupSymbol<mlir::func::FuncOp>(*cloneName)) {
+                lookupModuleSymbol<mlir::func::FuncOp>(module, *cloneName)) {
           if (mlir::failed(
                   RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
                       op, target, targetName, clone, sources, targetResult)))

@@ -435,10 +435,28 @@ void attachPythonDebugInfo(ModuleOp module) {
         ArrayRef<Attribute>{}, ArrayRef<LLVM::DINodeAttr>{});
 
     function->setLoc(scopedPythonDebugLoc(function.getLoc(), subprogram));
+    // A function's ops share a few hundred locations; each is asked once.
+    struct Scoped {
+      bool fromSource;
+      Location loc;
+    };
+    llvm::DenseMap<Location, Scoped> scoped;
     function.walk([&](Operation *op) {
       if (op == function.getOperation())
         return;
-      if (!py::findPythonSourceLoc(op->getLoc()))
+      Location loc = op->getLoc();
+      auto found = scoped.find(loc);
+      if (found == scoped.end()) {
+        bool fromSource = py::findPythonSourceLoc(loc).has_value();
+        found = scoped
+                    .try_emplace(loc, Scoped{fromSource,
+                                             fromSource
+                                                 ? scopedPythonDebugLoc(
+                                                       loc, subprogram)
+                                                 : loc})
+                    .first;
+      }
+      if (!found->second.fromSource)
         return;
       if (auto number = op->getAttrOfType<IntegerAttr>(
               py::kCallSiteDiscriminatorAttr)) {
@@ -450,7 +468,7 @@ void attachPythonDebugInfo(ModuleOp module) {
                 static_cast<unsigned>(number.getInt()))));
         return;
       }
-      op->setLoc(scopedPythonDebugLoc(op->getLoc(), subprogram));
+      op->setLoc(found->second.loc);
     });
   });
 }

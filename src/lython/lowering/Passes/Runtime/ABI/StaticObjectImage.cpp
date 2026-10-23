@@ -31,7 +31,7 @@ mlir::Value RuntimeBundleLowerer::materializeStaticObjectAddress(
                      llvm::utohexstr(llvm::xxh3_64bits(key), true) + "_" +
                      std::to_string(words.size()) + "_" +
                      std::to_string(tail.size());
-  if (!module.lookupSymbol(name)) {
+  if (!lookupModuleSymbol(module, name)) {
     mlir::OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToStart(module.getBody());
     auto global = mlir::LLVM::GlobalOp::create(

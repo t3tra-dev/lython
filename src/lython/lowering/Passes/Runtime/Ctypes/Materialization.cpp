@@ -402,7 +402,7 @@ mlir::FailureOr<mlir::func::FuncOp> getOrCreateNativeDeclaration(
     return true;
   };
 
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(name)) {
+  if (auto existing = lookupModuleSymbol<mlir::func::FuncOp>(module, name)) {
     if (existing.getFunctionType() != type)
       return op->emitError() << "native symbol '" << name
                              << "' was already declared with incompatible type";

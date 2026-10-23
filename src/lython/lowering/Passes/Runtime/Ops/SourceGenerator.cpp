@@ -138,7 +138,7 @@ RuntimeBundleLowerer::emitSourceGeneratorResumeDispatch(
     bool useCurrentInsertionPoint,
     std::optional<RuntimePrimitiveI64Evidence> sentI64Evidence) {
   mlir::func::FuncOp target =
-      module.lookupSymbol<mlir::func::FuncOp>(iterator.generatorTarget);
+      lookupModuleSymbol<mlir::func::FuncOp>(module, iterator.generatorTarget);
   if (!target)
     return op->emitError() << "source generator target '"
                            << iterator.generatorTarget << "' is not defined";
@@ -359,7 +359,7 @@ RuntimeBundleLowerer::emitSourceGeneratorResumeDispatch(
                  << "source generator yield from call delegation requires a "
                     "static source generator binding";
         mlir::func::FuncOp callTarget =
-            module.lookupSymbol<mlir::func::FuncOp>(binding.getBinding());
+            lookupModuleSymbol<mlir::func::FuncOp>(module, binding.getBinding());
         if (!callTarget || !callTarget->hasAttr("ly.generator.body_result"))
           return yieldFrom.emitError()
                  << "source generator yield from call delegation requires a "
@@ -1086,17 +1086,15 @@ RuntimeBundleLowerer::emitSourceGeneratorResumeDispatch(
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerSourceGeneratorNext(
     py::NextOp op, const RuntimeBundle &iteratorRef) {
-  // Copies: this function inserts into `valueBundles` and then keeps reading its
-  // operand bundles, and the caller's arguments are references INTO that
-  // DenseMap -- an insertion that rehashes moves the entry and every later read
-  // is freed memory. Found as a live defect on `lowerBoundMethodCall`'s receiver
-  // (see CallableOps.cpp); these are the rest of the same audit. Neither of
-  // these keys is ever rewritten here, so the copy changes nothing else.
+  // Copies: this function writes `valueBundles` and then keeps reading its
+  // operand bundles, which the caller's arguments refer to. The table no
+  // longer moves a bundle when it grows (ValueBundleTable), but nothing here
+  // proves a write never replaces one of these, and a copy reads the same.
   RuntimeBundle iterator = iteratorRef;
-  // The receiver reference aliases valueBundles storage, and the element
-  // bundle insertions below can rehash the map out from under it; the copy
-  // that must survive them is taken up front (a re-lookup would need the
-  // receiver's key value, which this function never sees).
+  // The receiver reference aliases valueBundles storage, which the element
+  // bundle bindings below may replace; the copy that must survive them is
+  // taken up front (a re-lookup would need the receiver's key value, which
+  // this function never sees).
   RuntimeBundle iteratorState = iterator;
   auto resumeInfo = generatorResumeClones.find(iterator.generatorTarget);
   mlir::FailureOr<SourceGeneratorResumeResult> yieldedOr =

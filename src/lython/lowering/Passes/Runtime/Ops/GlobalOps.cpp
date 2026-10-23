@@ -15,7 +15,7 @@ mlir::LLVM::GlobalOp
 RuntimeBundleLowerer::nativeGlobalCell(mlir::Operation *op,
                                        llvm::StringRef name) {
   std::string symbol = ("__ly_module_global_" + name).str();
-  if (auto existing = module.lookupSymbol<mlir::LLVM::GlobalOp>(symbol))
+  if (auto existing = lookupModuleSymbol<mlir::LLVM::GlobalOp>(module, symbol))
     return existing;
   mlir::OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToEnd(module.getBody());
@@ -79,21 +79,25 @@ RuntimeBundleLowerer::moduleObjectGlobalCell(mlir::Operation *op,
                                              mlir::Type cellType) {
   std::string symbol =
       ("__ly_module_global_obj_" + name + "_" + suffix).str();
-  if (auto existing = module.lookupSymbol<mlir::LLVM::GlobalOp>(symbol))
+  if (auto existing = lookupModuleSymbol<mlir::LLVM::GlobalOp>(module, symbol))
     return existing;
   mlir::OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToEnd(module.getBody());
-  if (!mlir::isa<mlir::LLVM::LLVMPointerType>(cellType))
-    return mlir::LLVM::GlobalOp::create(
+  if (!mlir::isa<mlir::LLVM::LLVMPointerType>(cellType)) {
+    auto global = mlir::LLVM::GlobalOp::create(
         builder, module.getLoc(), cellType, /*isConstant=*/false,
         mlir::LLVM::Linkage::Internal, symbol, builder.getI64IntegerAttr(0),
         /*alignment=*/8);
+    rememberModuleSymbol(module, global);
+    return global;
+  }
   // A null pointer is not an integer attribute, so the initial value has to
   // come from a body rather than from `getI64IntegerAttr(0)`.
   auto global = mlir::LLVM::GlobalOp::create(
       builder, module.getLoc(), cellType, /*isConstant=*/false,
       mlir::LLVM::Linkage::Internal, symbol, mlir::Attribute(),
       /*alignment=*/8);
+  rememberModuleSymbol(module, global);
   mlir::OpBuilder::InsertionGuard initGuard(builder);
   builder.setInsertionPointToEnd(
       builder.createBlock(&global.getInitializerRegion()));
@@ -345,7 +349,7 @@ RuntimeBundleLowerer::lowerObjectGlobalGet(py::GlobalGetOp op) {
   mlir::Value unbound = mlir::arith::CmpIOp::create(
       builder, loc, mlir::arith::CmpIPredicate::eq, bound, zero);
   mlir::func::FuncOp raise =
-      module.lookupSymbol<mlir::func::FuncOp>("__ly_raise_static_message");
+      lookupModuleSymbol<mlir::func::FuncOp>(module, "__ly_raise_static_message");
   if (!raise)
     return op.emitError() << "runtime manifest raise helper is missing";
   auto guard = mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{},
