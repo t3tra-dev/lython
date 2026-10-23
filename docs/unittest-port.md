@@ -867,8 +867,6 @@ CPython も自分のインタプリタでテストを動かしているので、
       - 開いたまま:
         - (拒否、base でも) ハンドラが return する `try` の中で束縛した
           `object` 型の値 (slot が `object` を持てない)。
-        - (拒否、base でも) `SystemExit.code` (int / str / None を返す
-          primitive が要る)。
         - (拒否) `dict[K, C | None]` の `pop`、`Iterable[object] | None` の
           引数、protocol 型の引数をさらに関数へ渡す形、`isinstance` で
           絞った list を合流する変数に入れる形 (所有権検査)。
@@ -878,6 +876,22 @@ CPython も自分のインタプリタでテストを動かしているので、
         - argparse は custom action が `setattr` でなく `namespace._set` を
           使う必要がある (Namespace に `__setattr__` が無い)。
         - コンパイル時間: argparse を import するプログラムは 10〜13 秒。
+    6. **小さな残り (2026-10-23)**。いずれも golden が base で赤。
+      - `if self.w:` で Optional のフィールドを絞る。名前の `if x:` と同じ
+        く真の腕だけ (偽の腕は空文字列もあるので union のまま)。
+      - `SystemExit.code` は `args` から計算する (CPython と同じく、引数
+        なしで None、1 個でその値、2 個以上で tuple)。`sys.exit()` /
+        `sys.exit(str)` / `sys.exit(None)` は `raise SystemExit(code)` に
+        書き換える (manifest の `sys.exit` は int だけ)。
+        `SystemExit(None)` は 0 で黙って終わる (以前は "None" を出して 1)。
+      - `contextlib.nullcontext` を manifest から `lib/contextlib.py` の
+        ジェネリッククラスに移した。`nullcontext(5)` は int で入る。
+        ジェネリッククラスの引数を省いたとき、その引数のデフォルト値の型で
+        型引数を決める (`nullcontext()` は `nullcontext[None]`)。組み込み名
+        として `nullcontext` が見えていたのも消した (CPython に無い)。
+      - コンテナのスロットから読んだ bool はスロットの箱のままで、bool の
+        モジュールグローバルや `bool | int` の合流がそれを拒否した
+        (`b: bool = (True, 1)[0]`)。要素の型で読むときは要素の ABI に戻す。
 
 ### D. テストを移す
 

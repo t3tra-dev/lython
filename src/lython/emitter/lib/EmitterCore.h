@@ -2027,7 +2027,11 @@ private:
                                 params,
                             parser::SourceRange range,
                             std::function<std::vector<parser::NodePtr>()> body,
-                            bool returnsStr = false);
+                            parser::NodePtr returns = nullptr);
+  // `sys.exit()` / `sys.exit(None or str)` as `raise SystemExit(code)`.
+  std::optional<Value> tryEmitSysExit(const parser::Node &call);
+  // `e.code` of a SystemExit, computed from its `args`.
+  std::optional<Value> tryEmitSystemExitCode(const parser::Node &expr);
   // `__name__` of a function value the static type does not name.
   std::string functionNameDispatcher(mlir::Type callable,
                                      parser::SourceRange range);

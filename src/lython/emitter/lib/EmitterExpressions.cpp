@@ -3431,6 +3431,8 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
     return *doc;
   if (std::optional<Value> name = tryEmitFunctionValueNameRead(expr))
     return *name;
+  if (std::optional<Value> code = tryEmitSystemExitCode(expr))
+    return *code;
   if (std::optional<std::string_view> dynamicName = ast::string(expr, "attr");
       dynamicName && *dynamicName == "__name__")
     if (std::optional<Value> answered = tryEmitDynamicClassName(expr))

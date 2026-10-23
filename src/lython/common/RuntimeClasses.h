@@ -27,7 +27,6 @@ inline constexpr std::string_view kRuntimeClasses[] = {
     "builtins.BaseException",
     "builtins.function",
     "builtins.str_iterator",
-    "contextlib.nullcontext",
     "types.CoroutineType",
     "builtins.list",
     "builtins.tuple",

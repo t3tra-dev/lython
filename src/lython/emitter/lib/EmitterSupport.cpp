@@ -1392,6 +1392,28 @@ optionalBranchTypeNarrowing(const parser::Node &test, TypeSystem &types,
     }
   }
 
+  // ⭐ AND A FIELD'S TRUTHINESS, as a name's: `if self.w:` proves `self.w`
+  // is not None on its true side, which is how an optional field is guarded
+  // as often as with `is not None`. It read the union in the body.
+  // ⛔ A field of a name and nothing deeper, as the None arm above; the
+  // false side stays the union, as the name's does.
+  if (test.kind == "Attribute")
+    if (const parser::Node *owner = ast::node(test, "value");
+        owner && owner->kind == "Name")
+      if (auto attr = ast::string(test, "attr")) {
+        mlir::Type fieldType = types.widenLiteral(types.inferExpr(&test));
+        mlir::Type payload =
+            fieldType ? removeNoneFromType(fieldType, types) : mlir::Type{};
+        if (payload && payload != fieldType) {
+          BranchTypeNarrowing narrowing;
+          narrowing.isMemberPath = true;
+          narrowing.name = std::string(ast::nameSpelling(*owner)) + "." +
+                           std::string(*attr);
+          narrowing.trueType = payload;
+          return narrowing;
+        }
+      }
+
   // ⭐ `isinstance(self.a, B)` PROVES SOMETHING ABOUT A FIELD, the same way
   // `self.a is None` does, and it is the other half of the same gap: the
   // analysis takes a NAME for its subject, so a field read reached it as
