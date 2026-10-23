@@ -973,6 +973,12 @@ bool branchLocalRaisesToTheirHandler(llvm::Module &module) {
   llvm::Function *record = module.getFunction("LyEH_RecordException");
   if (!record)
     return false;
+  // A re-raise -- the end of a `finally`, a `with` whose `__exit__` did not
+  // swallow, an `except` no arm of which matched -- has its exception
+  // recorded already; what is left of it without the unwind is ending the
+  // native catch it was raised from.
+  llvm::Function *rethrow = module.getFunction("LyEH_RethrowCurrent");
+  llvm::Function *recordRethrow = module.getFunction("LyEH_RecordRethrow");
   bool changed = false;
   for (llvm::Function &function : module)
     for (llvm::BasicBlock &block : function) {
@@ -980,11 +986,17 @@ bool branchLocalRaisesToTheirHandler(llvm::Module &module) {
       if (!invoke)
         continue;
       llvm::Function *callee = invoke->getCalledFunction();
-      if (!callee || callee->getFunctionType() != record->getFunctionType())
+      if (!callee)
         continue;
-      if (callee != module.getFunction("LyEH_ThrowException") &&
-          !(isPythonRuntimeRaiseCall(callee) && isThinRaiseWrapper(*callee)))
+      llvm::Function *recorder = record;
+      if (callee == rethrow && recordRethrow) {
+        recorder = recordRethrow;
+      } else if (callee->getFunctionType() != record->getFunctionType() ||
+                 (callee != module.getFunction("LyEH_ThrowException") &&
+                  !(isPythonRuntimeRaiseCall(callee) &&
+                    isThinRaiseWrapper(*callee)))) {
         continue;
+      }
       auto *pad = invoke->getUnwindDest()->getLandingPadInst();
       if (!pad || !pad->getMetadata("ly.catch"))
         continue;
@@ -996,7 +1008,7 @@ bool branchLocalRaisesToTheirHandler(llvm::Module &module) {
         continue;
       invoke->getNormalDest()->removePredecessor(&block);
       invoke->setNormalDest(dispatch);
-      invoke->setCalledFunction(record);
+      invoke->setCalledFunction(recorder);
       changed = true;
     }
   return changed;
