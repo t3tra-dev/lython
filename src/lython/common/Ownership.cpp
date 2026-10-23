@@ -1648,11 +1648,19 @@ classifyOwnershipConditionBranch(mlir::Operation *op,
                                   /*inactiveSuccessor=*/0};
 }
 
+// ⛔ The buckets are kept up to date here and in `unionValues`, not dropped
+// and rebuilt: the lowering tracks values it creates one at a time between
+// queries, and each new value cleared every bucket so that the next
+// `namesOf` re-walked every value of the module -- 70% of
+// block-argument-releases on test_argparse.
 void AliasAnalysis::track(mlir::Value value) {
   if (value && !parent.contains(value)) {
     parent[value] = value;
+    trackedIndex[value] = tracked.size();
     tracked.push_back(value);
-    invalidateAliasBuckets();
+    // A new value is a class of its own, and the last in `tracked`.
+    if (!aliasBucketsDirty)
+      aliasBuckets[value].push_back(value);
   }
 }
 
@@ -1673,7 +1681,26 @@ void AliasAnalysis::unionValues(mlir::Value lhs, mlir::Value rhs) {
   mlir::Value rhsRoot = find(rhs);
   if (lhsRoot != rhsRoot) {
     parent[rhsRoot] = lhsRoot;
-    invalidateAliasBuckets();
+    if (aliasBucketsDirty)
+      return;
+    // Both classes have a bucket listed in `tracked` order; the merge keeps
+    // that order, which is what a rebuild would list.
+    auto rhsBucket = aliasBuckets.find(rhsRoot);
+    auto lhsBucket = aliasBuckets.find(lhsRoot);
+    if (rhsBucket == aliasBuckets.end() || lhsBucket == aliasBuckets.end()) {
+      invalidateAliasBuckets();
+      return;
+    }
+    llvm::SmallVector<mlir::Value, 8> merged;
+    merged.reserve(lhsBucket->second.size() + rhsBucket->second.size());
+    std::merge(lhsBucket->second.begin(), lhsBucket->second.end(),
+               rhsBucket->second.begin(), rhsBucket->second.end(),
+               std::back_inserter(merged),
+               [&](mlir::Value left, mlir::Value right) {
+                 return trackedIndex.lookup(left) < trackedIndex.lookup(right);
+               });
+    lhsBucket->second = std::move(merged);
+    aliasBuckets.erase(rhsBucket);
   }
 }
 
@@ -1738,9 +1765,11 @@ bool AliasAnalysis::splitByFunction(
       part->givenSymbols = table;
     }
     part->parent[value] = find(value);
+    part->trackedIndex[value] = part->tracked.size();
     part->tracked.push_back(value);
   }
   parent.shrink_and_clear();
+  trackedIndex.shrink_and_clear();
   tracked = {};
   aliasBuckets.shrink_and_clear();
   aliasBucketsDirty = true;

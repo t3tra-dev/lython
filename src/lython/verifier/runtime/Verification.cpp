@@ -575,10 +575,16 @@ public:
     return "verify lowered call ownership contracts";
   }
 
+  explicit LLVMCallOwnershipVerifierPass(bool pathSensitive)
+      : pathSensitive(pathSensitive) {}
+
   void runOnOperation() final {
-    if (mlir::failed(verifyLLVMCallOwnership(getOperation())))
+    if (mlir::failed(verifyLLVMCallOwnership(getOperation(), pathSensitive)))
       signalPassFailure();
   }
+
+private:
+  bool pathSensitive;
 };
 
 } // namespace
@@ -601,8 +607,9 @@ createOwnershipVerifierPass() {
 }
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createLLVMCallOwnershipVerifierPass() {
-  return std::make_unique<lowering::LLVMCallOwnershipVerifierPass>();
+createLLVMCallOwnershipVerifierPass(bool pathSensitive) {
+  return std::make_unique<lowering::LLVMCallOwnershipVerifierPass>(
+      pathSensitive);
 }
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
@@ -621,7 +628,8 @@ mlir::LogicalResult verifyOwnership(mlir::ModuleOp module) {
   return mlir::success();
 }
 
-mlir::LogicalResult verifyLLVMCallOwnership(mlir::ModuleOp module) {
+mlir::LogicalResult verifyLLVMCallOwnership(mlir::ModuleOp module,
+                                            bool pathSensitive) {
   {
     PerfScope perf("llvm-call-ownership.func-contract-shapes");
     if (mlir::failed(lowering::verifyOwnershipContractShapes(module)))
@@ -639,7 +647,7 @@ mlir::LogicalResult verifyLLVMCallOwnership(mlir::ModuleOp module) {
   }
   {
     PerfScope perf("llvm-call-ownership.func-call-contracts");
-    return lowering::verifyFuncCallOwnershipContracts(module);
+    return lowering::verifyFuncCallOwnershipContracts(module, pathSensitive);
   }
 }
 

@@ -285,3 +285,42 @@ count and at `LYTHON_COMPILE_THREADS=1` (the sequential path).
 `LYTHON_ABLATE_PARALLEL_UNWIND_CLEANUP=1` keeps the three phases and runs them
 on one thread with the shared analyses, as before.
 
+
+### Buckets kept, the walk once, the join census (2026-10-23)
+
+The bucket invalidation above was worked around for the unwind step by the
+split. It is now gone at the root: `track` adds a new value to its own bucket
+and `unionValues` merges two buckets in `tracked` order, so a bucket lists what
+a rebuild would. Block-argument releases went from 1.65 s to 0.37 s on
+test_argparse, and refcount insertion as a whole from 2.70 s to 1.62 s.
+
+The path walk now runs once, in phase 13. The pre-cleanup run checks the
+contracts only (0.79 s to 0.11 s). The walk at phase 13 sees the IR that is
+lowered, with more of it in the unwind model, because canonicalization hoists
+calls out of region ops. `LYTHON_VERIFY_OWNERSHIP_BEFORE_CLEANUP=1` walks the
+pre-cleanup IR as well.
+
+Refcount elision builds its alias analysis only when there is an adjacent pair
+to ask about (0.25 s to 0.12 s).
+
+Ownership phases on test_argparse, Release, four threads: 4.97 s before, 3.36 s
+after. LLVM IR and exit status were byte-identical over 1,248 programs (golden
+cases and errors, tests/python, examples) against the previous binary.
+
+**The join census** (`LYTHON_TRACE_OWNERSHIP_JOINS=1`, same corpus, one thread)
+counts the distinct states the walk takes into each block entry. A dataflow
+walk with one state per block entry would refuse every entry reached by two.
+
+| what tells two states apart | resources | block entries |
+| --- | --- | --- |
+| anything | 24,961 (5.3%) | 1,912,696 |
+| the same entity, not just a rename | 9,056 (1.9%) | 1,127,412 |
+| … once retains parked in a holder are the holder's | 4,111 (0.9%) | 70,724 |
+
+That is out of 469,909 resources and 17.2 M block entries. The renames are the
+block arguments the walk follows a token onto. In a dataflow walk each
+destination argument is a resource of its own, as refcount insertion already
+models it (`edgeTokenClaims`). The smallest of the remainder are a retain
+parked in a named slot (`delete_item.py`) and a merge-borrow retain
+(`cond_reassign.py`). The merge-borrow retain is again the rename seen from the
+lender's side.
