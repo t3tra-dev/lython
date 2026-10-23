@@ -39,8 +39,9 @@
 // ⛔ Not a slot function or a slot hook: the type object's hook calls a slot
 // through a pointer with the hook's own lowered type, which nothing here
 // rewrites.
-// ⛔ Not a thin raise wrapper: the exception lowering redirects a call to one
-// to `LyEH_RecordException` only when the two types are the same.
+// ⭐ A thin raise wrapper is narrowed like the runtime's own functions: the
+// exception lowering redirects a call to one to `LyEH_RecordException` only
+// when the two types are the same.
 
 #include "Passes/Runtime/Cleanup/Transforms.h"
 
@@ -501,7 +502,18 @@ unsigned narrowMemRefCalls(mlir::ModuleOp module, NarrowingScope scope) {
         forced.insert(function.getSymNameAttr());
       continue;
     }
-    if (!ownCalls || isThinRaiseWrapper(function))
+    // A thin raise wrapper takes the triple as `LyEH_ThrowException` does,
+    // which the native runtime defines narrow: the exception lowering
+    // redirects a call to one to `LyEH_RecordException` only when the two
+    // types are the same.
+    // ⛔ Not left wide: that was right while the runtime was, and since it
+    // is not, every raise caught in its own function went through the
+    // unwinder again -- 8x slower, and nothing failed.
+    if (isThinRaiseWrapper(function)) {
+      forced.insert(function.getSymNameAttr());
+      continue;
+    }
+    if (!ownCalls)
       continue;
     // Every one is followed; only those with a narrowable memref change.
     followed[function.getSymNameAttr()] = function;

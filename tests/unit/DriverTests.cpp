@@ -1281,6 +1281,45 @@ TEST(DriverTest, TheNativeRuntimeTakesAViewAsAPointerAndASize) {
   EXPECT_EQ(write->getArg(2)->getType(), llvm::Type::getInt64Ty(context));
 }
 
+// A raise caught in its own function becomes a branch to the handler: the
+// raise records the exception (`LyEH_RecordException`) instead of unwinding
+// to a landing pad in the same frame.
+TEST(DriverTest, ARaiseCaughtInItsOwnFunctionIsABranch) {
+  CompileResult result = compileSource("bad = 0\n"
+                                       "for i in range(10):\n"
+                                       "    try:\n"
+                                       "        if i % 3 == 0:\n"
+                                       "            raise ValueError(\"bad\")\n"
+                                       "    except ValueError:\n"
+                                       "        bad += 1\n"
+                                       "print(bad)\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  ASSERT_TRUE(mlir::succeeded(lython::driver::configureLLVMModuleCodeGenTarget(
+      *result.verified.llvmModule,
+      lython::driver::detectTensorLoweringTarget(
+          lython::driver::DriverOptions{}),
+      lython::driver::DriverOptions{}, diag)))
+      << diagnostics;
+  ASSERT_TRUE(mlir::succeeded(py::runtime_library::linkEmbeddedNativeRuntime(
+      *result.verified.llvmModule)));
+  llvm::Function *main = result.verified.llvmModule->getFunction("__main__");
+  ASSERT_NE(main, nullptr);
+  unsigned recorded = 0;
+  unsigned raised = 0;
+  for (llvm::BasicBlock &block : *main)
+    for (llvm::Instruction &instruction : block)
+      if (auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+        if (llvm::Function *callee = call->getCalledFunction()) {
+          recorded += callee->getName() == "LyEH_RecordException";
+          raised += callee->getName() == "LyValueError_Raise" ||
+                    callee->getName() == "LyEH_ThrowException";
+        }
+  EXPECT_EQ(recorded, 1u);
+  EXPECT_EQ(raised, 0u);
+}
+
 // A module global's pointer cell holds a pointer.
 //
 // A module-level object is parked in one i64 cell per stored word: a bound
