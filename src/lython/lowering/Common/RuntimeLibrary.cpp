@@ -600,6 +600,14 @@ mlir::LogicalResult linkEmbeddedNativeRuntime(llvm::Module &llvmModule) {
         return mlir::failure();
       }
 
+  if (llvmModule.getModuleFlag(kPropagatesByReturnFlag)) {
+    std::string problems;
+    llvm::raw_string_ostream diag(problems);
+    if (!py::verifyPropagationChecked(llvmModule, diag)) {
+      llvm::errs() << problems;
+      return mlir::failure();
+    }
+  }
   py::branchLocalRaisesToTheirHandler(llvmModule);
   py::flushAssertionMessages(llvmModule);
   for (const std::string &symbol : ctypesSymbols)

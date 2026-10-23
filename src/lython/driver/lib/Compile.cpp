@@ -4,6 +4,7 @@
 #include "Common/Instrumentation.h"
 #include "Common/LoweringPipeline.h"
 #include "Common/RuntimeSupport.h"
+#include "Common/UnwindABI.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Support/LogicalResult.h"
@@ -13,6 +14,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <cstdlib>
 #include <memory>
 #include <utility>
 
@@ -70,10 +72,18 @@ LogicalResult translateToVerifiedLLVMIR(ModuleOp module,
     py::internalizePythonFunctions(*llvmModule);
     dumpLLVMForPass(irDump, "pre-eh-llvm", *llvmModule);
     py::markCLibraryDeclarationsNonUnwinding(*llvmModule, ctypesSymbols);
-    py::installPythonExceptionCleanupFrames(
-        *llvmModule,
-        codeGenTripleForTarget(py::TensorLoweringTarget{}, options),
-        pythonCallSites, tryInlineDepths);
+    llvm::Triple target =
+        codeGenTripleForTarget(py::TensorLoweringTarget{}, options);
+    // LYTHON_ABLATE_RETURN_PROPAGATION=1 builds the exception edges as
+    // invokes where they would otherwise be returns.
+    const char *ablation = std::getenv("LYTHON_ABLATE_RETURN_PROPAGATION");
+    bool ablated = ablation && *ablation && llvm::StringRef(ablation) != "0";
+    if (py::runtime_library::propagateByReturn(target) && !ablated)
+      py::installPythonErrorReturns(*llvmModule, target, pythonCallSites,
+                                    tryInlineDepths);
+    else
+      py::installPythonExceptionCleanupFrames(*llvmModule, target,
+                                              pythonCallSites, tryInlineDepths);
     py::installArmStreamingCompatibleMemoryRoutines(*llvmModule);
   }
   dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);

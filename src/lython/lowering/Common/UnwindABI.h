@@ -84,6 +84,23 @@ inline bool unwindInOnePhase(const llvm::Triple &triple) {
   return usePythonPersonality(triple) && triple.isOSDarwin();
 }
 
+// The raise primitives come in two forms: one that unwinds, and one -- named
+// with `kReturningRaiseSuffix` -- that sets `kPropagatingFlag` and returns, for
+// a program whose functions propagate an exception by return
+// (`propagateByReturn`; Cleanup/EH.cpp, `installPythonErrorReturns`).
+inline constexpr llvm::StringLiteral kReturningRaiseSuffix{"$ret"};
+inline constexpr llvm::StringLiteral kPropagatingFlag{"LyEH_Propagating"};
+// On a module whose functions propagate by return.
+inline constexpr llvm::StringLiteral kPropagatesByReturnFlag{
+    "lython.eh.returns"};
+
+// Whether a program's functions propagate an exception by return
+// (`installPythonErrorReturns`) rather than through the unwinder. Every
+// target does: checked on Darwin (arm64, and x86_64 under Rosetta), Linux
+// aarch64 (every golden, in a container), Windows (under Wine, where the
+// unwinder hung on a raise in a loop) and WASI (wasmtime).
+inline bool propagateByReturn(const llvm::Triple &) { return true; }
+
 // Whether making every frame x29-based buys anything. Darwin's linker can
 // describe such a frame in one word of `__unwind_info` -- nine bits naming the
 // callee-saved pairs it spilled -- and falls back to a DWARF CFI program when
