@@ -514,7 +514,8 @@ mlir::Value buildMemRef1D(SupportBuilder &b, mlir::Type memrefType,
 // chain node's payload -- `nodeMember(node, kNodePayload)` is one).
 // Emits the raise of a Lython `_Unwind_Exception` at the current insertion
 // point (RuntimeSupportBuilder.cpp). Inline at every raise on purpose.
-void emitRaiseCarrier(SupportBuilder &b);
+std::string raiseSymbol(llvm::StringRef name, bool returns);
+void emitRaiseCarrier(SupportBuilder &b, bool returns = false);
 
 void storeExceptionTriple(SupportBuilder &b, mlir::Value parts,
                           mlir::ValueRange triple);

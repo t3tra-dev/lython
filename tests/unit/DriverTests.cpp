@@ -14,6 +14,7 @@
 #include "Common/LibcPrototypes.h"
 #include "Common/RuntimeSupport.h"
 #include "Common/SupportBuilder.h"
+#include "Common/UnwindABI.h"
 #include "Runtime/ABI/BoxLayout.h"
 
 #include "embedded.h"
@@ -26,6 +27,7 @@
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "Common/UnwindABI.h"
 #include "PlatformConstants.h"
@@ -72,6 +74,28 @@ struct CompileResult {
   bool succeeded = false;
   lython::driver::VerifiedLLVMModule verified;
   std::string diagnostics;
+};
+
+// The exception edges as invokes into landing pads -- the scheme
+// LYTHON_ABLATE_RETURN_PROPAGATION still builds, and the one the runtime's
+// entry and the JS exports raise through -- for the tests of that scheme.
+class InvokeScheme {
+public:
+  InvokeScheme() {
+    if (const char *value = std::getenv("LYTHON_ABLATE_RETURN_PROPAGATION"))
+      saved = value;
+    ::setenv("LYTHON_ABLATE_RETURN_PROPAGATION", "1", /*overwrite=*/1);
+  }
+  ~InvokeScheme() {
+    if (saved)
+      ::setenv("LYTHON_ABLATE_RETURN_PROPAGATION", saved->c_str(),
+               /*overwrite=*/1);
+    else
+      ::unsetenv("LYTHON_ABLATE_RETURN_PROPAGATION");
+  }
+
+private:
+  std::optional<std::string> saved;
 };
 
 CompileResult compileSource(llvm::StringRef source,
@@ -1285,6 +1309,7 @@ TEST(DriverTest, TheNativeRuntimeTakesAViewAsAPointerAndASize) {
 // raise records the exception (`LyEH_RecordException`) instead of unwinding
 // to a landing pad in the same frame.
 TEST(DriverTest, ARaiseCaughtInItsOwnFunctionIsABranch) {
+  InvokeScheme scheme;
   CompileResult result = compileSource("bad = 0\n"
                                        "for i in range(10):\n"
                                        "    try:\n"
@@ -1324,6 +1349,7 @@ TEST(DriverTest, ARaiseCaughtInItsOwnFunctionIsABranch) {
 // here -- is a branch as well: it ends the native catch it was raised from
 // (`LyEH_RecordRethrow`) instead of unwinding to a landing pad in the frame.
 TEST(DriverTest, AReRaiseCaughtInItsOwnFunctionIsABranch) {
+  InvokeScheme scheme;
   CompileResult result = compileSource("done = 0\n"
                                        "bad = 0\n"
                                        "for i in range(10):\n"
@@ -1366,6 +1392,79 @@ TEST(DriverTest, AReRaiseCaughtInItsOwnFunctionIsABranch) {
         }
   EXPECT_GE(recorded, 1u);
   EXPECT_EQ(unwoundToOwnHandler, 0u);
+}
+
+// An exception leaves a function by return: the raising function
+// and its caller have no landing pad, and each call that may come back with
+// the exception propagating is followed at once by a test of the flag.
+TEST(DriverTest, AnExceptionLeavesAFunctionByReturn) {
+  CompileResult result = compileSource("def risky(i: int) -> int:\n"
+                                       "    if i % 3 == 0:\n"
+                                       "        raise ValueError(\"bad\")\n"
+                                       "    return i\n"
+                                       "bad = 0\n"
+                                       "for i in range(10):\n"
+                                       "    try:\n"
+                                       "        risky(i)\n"
+                                       "    except ValueError:\n"
+                                       "        bad += 1\n"
+                                       "print(bad)\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  llvm::Module &module = *result.verified.llvmModule;
+  if (!py::runtime_library::propagateByReturn(
+          llvm::Triple(module.getTargetTriple())))
+    GTEST_SKIP() << "this target still unwinds";
+  EXPECT_NE(module.getModuleFlag(py::runtime_library::kPropagatesByReturnFlag),
+            nullptr);
+  for (llvm::StringRef name : {"_ZN8__main__5riskyE", "__main__"}) {
+    llvm::Function *function = module.getFunction(name);
+    ASSERT_NE(function, nullptr) << name.str();
+    unsigned tested = 0;
+    for (llvm::BasicBlock &block : *function)
+      for (llvm::Instruction &instruction : block) {
+        EXPECT_FALSE(llvm::isa<llvm::InvokeInst>(instruction) ||
+                     llvm::isa<llvm::LandingPadInst>(instruction))
+            << name.str() << ": " << instruction.getOpcodeName();
+        auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+        tested += load && load->getPointerOperand()->getName() ==
+                              py::runtime_library::kPropagatingFlag;
+      }
+    EXPECT_GE(tested, 1u) << name.str();
+  }
+}
+
+// A call that may come back with an exception propagating and carries on
+// without testing for it is refused once the runtime is linked.
+TEST(DriverTest, ACallThatIgnoresAPropagatingExceptionIsRefused) {
+  llvm::LLVMContext context;
+  llvm::Module module("ignores", context);
+  auto *voidType = llvm::Type::getVoidTy(context);
+  auto *raises = llvm::Function::Create(
+      llvm::FunctionType::get(voidType, false),
+      llvm::GlobalValue::ExternalLinkage,
+      ("LyEH_RethrowCurrent" + py::runtime_library::kReturningRaiseSuffix)
+          .str(),
+      module);
+  llvm::IRBuilder<> body(llvm::BasicBlock::Create(context, "entry", raises));
+  body.CreateRetVoid();
+  auto *caller = llvm::Function::Create(
+      llvm::FunctionType::get(llvm::Type::getInt32Ty(context), false),
+      llvm::GlobalValue::ExternalLinkage, "carries_on", module);
+  auto *effect = new llvm::GlobalVariable(
+      module, llvm::Type::getInt32Ty(context), /*isConstant=*/false,
+      llvm::GlobalValue::ExternalLinkage, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0), "effect");
+  llvm::IRBuilder<> builder(llvm::BasicBlock::Create(context, "entry", caller));
+  builder.CreateCall(raises);
+  // Work the raise should have skipped -- returning at once would have handed
+  // the exception to the caller instead.
+  builder.CreateStore(builder.getInt32(1), effect);
+  builder.CreateRet(builder.getInt32(0));
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  EXPECT_FALSE(py::verifyPropagationChecked(module, diag));
+  EXPECT_NE(diagnostics.find("carries_on calls LyEH_RethrowCurrent"),
+            std::string::npos)
+      << diagnostics;
 }
 
 // A module global's pointer cell holds a pointer.
@@ -1810,6 +1909,7 @@ TEST(DriverTest, RepeatedCompileIsStable) {
 // ids -- and `LyEH_Personality` reads it as exactly that. A clause naming
 // anything else would be dereferenced as if its first word were a class id.
 TEST(DriverTest, EveryLandingPadClauseIsAPythonClassOrCatchAll) {
+  InvokeScheme scheme;
   CompileResult result = compileSource("def boom() -> int:\n"
                                        "    raise ValueError('x')\n"
                                        "\n"
@@ -1890,6 +1990,7 @@ TEST(DriverTest, ShapesThatHandleMoreThanTheyNameStayCatchAll) {
 // `LyType_IsSubtype` answers true for everything against it, so naming it is
 // the same decision a catch-all makes, reached one call earlier.
 TEST(DriverTest, ABareExceptNamesBaseException) {
+  InvokeScheme scheme;
   CompileResult result = compileSource("def boom() -> int:\n"
                                        "    raise ValueError('x')\n"
                                        "\n"
@@ -1921,6 +2022,7 @@ TEST(DriverTest, ABareExceptNamesBaseException) {
 // A tuple of classes is one arm, and every class in it has to reach the table:
 // the one left out is an exception the personality walks past.
 TEST(DriverTest, EveryClassOfATupleArmReachesTheTypeTable) {
+  InvokeScheme scheme;
   CompileResult result = compileSource("def boom() -> int:\n"
                                        "    raise KeyError('x')\n"
                                        "\n"
@@ -1947,6 +2049,7 @@ TEST(DriverTest, EveryClassOfATupleArmReachesTheTypeTable) {
 // the same question -- the pass that names it here and the support builder that
 // defines it. A target that cannot have the Python one keeps the C++ ABI's.
 TEST(DriverTest, ThePersonalityIsTheOneTheTargetCanHave) {
+  InvokeScheme scheme;
   CompileResult result = compileSource("try:\n"
                                        "    raise ValueError('x')\n"
                                        "except ValueError:\n"

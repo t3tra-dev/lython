@@ -240,6 +240,8 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.TheNativeRuntimeTakesAViewAsAPointerAndASize"
     "DriverTest.ARaiseCaughtInItsOwnFunctionIsABranch"
     "DriverTest.AReRaiseCaughtInItsOwnFunctionIsABranch"
+    "DriverTest.AnExceptionLeavesAFunctionByReturn"
+    "DriverTest.ACallThatIgnoresAPropagatingExceptionIsRefused"
     "DriverTest.AModuleGlobalsPointerCellHoldsAPointer"
     "DriverTest.AParkedExceptionIsReachedByPointer"
     "DriverTest.ManifestWordOffsetsMatchTheRuntimeStructs"

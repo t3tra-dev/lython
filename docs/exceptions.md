@@ -3,7 +3,7 @@
 Python の例外がどう投げられ、どう捕まえられるか。何に費用がかかっているか。
 これからどうするか。
 
-## 1. いまの仕組み
+## 1. unwinder の方式 (2026-10-24 の P2 まで。いまは境界と `LYTHON_ABLATE_RETURN_PROPAGATION` だけ。§5)
 
 - **伝播は Itanium の unwinder だけを借りる。** 例外オブジェクトはランタイムの
   `g_current_parts` に置き、`_Unwind_RaiseException`/`_Unwind_ForcedUnwind` に
@@ -72,20 +72,62 @@ Python の例外がどう投げられ、どう捕まえられるか。何に費�
 | 内側の合わない `except` を通る | 0.250 s | 0.924 s | 0.029 s |
 | 呼んだ関数から raise | 0.154 s | 0.640 s | 0.280 s |
 
-## 5. 残り: 関数を跨ぐ raise (P2)
+## 5. P2: 例外を戻り値で伝える (2026-10-24、全ターゲット)
 
-- **Itanium のままでは下げきれない。** 2 フレームを跨ぐ raise は CPython の約 2 倍のまま
-  である。1 段でも、unwind の開始と各 cleanup からの再開のたびに、共有キャッシュの
-  照会が入る。
-- **下げるなら、Lython の関数どうしの伝播を戻り値に変える** (失敗フラグを分岐で確かめる)。
-  - unwinder を残すのは C のフレームを跨ぐ境界だけ: ctypes コールバック、シグナル
-    ハンドラ。
-  - 代償として、例外の起きない経路に、投げうる呼び出しごとに 1 分岐が増える。
-    `ly.eh.cannot_raise` の推論で減らせる。
-  - 切り替える前に、コーパスとベンチマークで測る。
-- **デバッガとの連携は伝播の方式によらず保てる。**
-  - unwind 表、フレームポインタ、行テーブルはそのまま出す (lldb のバックトレースと
-    プロファイラ用)。
-  - raise を 1 つの `noinline` の入口に集める。
-  - lldb のコマンドを用意する: `ly-exc` (現在の例外と Python の traceback)、
-    `ly-bt` (Python 単位のバックトレース)。CPython の `Tools/gdb/libpython.py` と同じ形。
+### 仕組み
+
+`installPythonErrorReturns` (Cleanup/EH.cpp) が、例外の辺を invoke ではなく分岐で作る。
+
+- **raise。** プリミティブは戻り値版 (`LyEH_ThrowException$ret` など、
+  `kReturningRaiseSuffix`) に置き換える。戻り値版は例外を記録し、`LyEH_Propagating`
+  を立てて戻る。
+- **呼び出しの後。** 伝播中の例外を抱えて戻りうる呼び出しのすぐ後で、フラグを確かめる。
+  - try の marker が付いた呼び出し: その try のハンドラへ分岐する。フラグを下ろし、
+    このフレームを traceback に積む。catch pad がしていたことと同じである。
+  - それ以外: 関数から戻る。cleanup pad が積んでいたフレームは積んでから戻る。
+- **try の構造は invoke を作っていたものをそのまま使う。** 例外の辺での所有権の解放、
+  ハンドラ、dispatch の連鎖、traceback は同じコードで、分岐で辿り着くだけである。
+- **境界は unwinder のまま。**
+  - `LyRunPythonMain` は `__main__` の後でフラグを見る。立っていれば
+    `LyEH_RethrowCurrent` で投げ直し、既存の landing pad が報告する。
+  - JS の export (`LyJs_Dispatch`/`LyJs_Release`) は `LyEH_RaisePending` で同じことをする。
+- **安全網。** リンク後に `verifyPropagationChecked` が確かめる。フラグを抱えて戻りうる
+  関数を呼んだ後は、すぐにフラグを確かめるか、そのまま戻るかのどちらかでなければならない。
+  そうでない呼び出しがあればコンパイルを止める。
+- **追わなくてよいもの:**
+  - 解放 (`__del__` の例外はその場で "Exception ignored" になる)。
+  - 例外を記録するだけの関数。
+  - ポインタ越しの呼び出し (Python に届くのは slot hook からだけ)。
+- `LYTHON_ABLATE_RETURN_PROPAGATION=1` で invoke の方式に戻せる (比較用)。
+
+### 測定 (macOS arm64、AOT、同じバイナリで比較)
+
+| | invoke | 戻り値 | CPython |
+|---|---|---|---|
+| 呼んだ関数から raise | 0.274 s | **0.017 s** | 0.151 s |
+| ベンチマーク exceptions | 0.273 s | **0.027 s** | 0.145 s |
+
+- **例外の起きない経路は、10 本の長いベンチマークの幾何平均で 2% 遅い。**
+  - 大半は ±1% に収まる。
+  - nbody は 17% 遅い。小さなランタイム関数 1 つの inline cost が 220 から 230 になり、
+    閾値 225 を跨いだためである (`-Rpass-missed=inline`)。
+  - generators は 4〜5% 遅い。
+  - ⛔ inline の閾値を上げたり `inlinehint` を付けたりはしない。nbody が戻る代わりに
+    sort が 19% 遅くなった。崖が動くだけである。
+- **実行ファイルは 1〜9% 小さい** (landing pad と LSDA がない)。
+
+### ターゲットごとの確認
+
+| ターゲット | 確認したこと | 結果 |
+|---|---|---|
+| macOS arm64 | 両スイート、リーク検査 | 違いなし |
+| macOS x86_64 (Rosetta) | 例外のベンチマーク | 同じ出力 |
+| Linux aarch64 / x86_64 (podman) | 全 golden を invoke と戻り値の両方で | 両方式で同じ |
+| Windows (Wine) | 例外関係の golden | invoke は 3 件がハング。戻り値は全件通る |
+| WASI (wasmtime) | 例外のベンチマーク | 同じ出力、2〜3 倍速い |
+
+### デバッガ
+
+- unwind 表、フレームポインタ、行テーブルは変わらない。
+- raise を止めるなら `b LyEH_ThrowException$ret` (戻り値の方式)。
+- 未着手: lldb の `ly-exc` / `ly-bt` コマンド。

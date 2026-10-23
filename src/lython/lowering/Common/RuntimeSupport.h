@@ -144,6 +144,16 @@ inline constexpr llvm::StringLiteral kTryInlineDepthsAttr{
     "ly.try.inline_depths"};
 void collectPythonTryInlineDepths(
     mlir::ModuleOp module, llvm::DenseMap<std::int64_t, unsigned> &depths);
+// Builds the try structure's exception edges as branches on the propagation
+// flag instead of invokes (`propagateByReturn`).
+bool installPythonErrorReturns(
+    llvm::Module &module, const llvm::Triple &triple,
+    llvm::ArrayRef<PythonCallSiteRange> callSites,
+    const llvm::DenseMap<std::int64_t, unsigned> &tryInlineDepths);
+// Every call to a function that may return with an exception propagating is
+// followed by a test of it, in a module built by `installPythonErrorReturns`
+// and linked with the runtime. Says which are not.
+bool verifyPropagationChecked(llvm::Module &module, llvm::raw_ostream &diag);
 bool installPythonExceptionCleanupFrames(
     llvm::Module &module, const llvm::Triple &triple,
     llvm::ArrayRef<PythonCallSiteRange> callSites,

@@ -2059,6 +2059,16 @@ void declareEHSupport(SupportBuilder &b) {
   };
   boolGlobal("g_current_exception");
   boolGlobal("g_native_catch_active");
+  // An exception on its way out by return (`kReturningRaiseSuffix`): every
+  // caller of a function that may set it checks it after the call.
+  // ⛔ Not `g_current_exception`, which stays set while a handler runs.
+  {
+    auto global = mlir::LLVM::GlobalOp::create(
+        b.builder, b.loc, b.i1(), /*isConstant=*/false,
+        mlir::LLVM::Linkage::External, kPropagatingFlag,
+        b.builder.getIntegerAttr(b.i1(), 0), /*alignment=*/1);
+    global.setDsoLocal(true);
+  }
   // The last carrier a catch handed back, waiting to be raised again. One slot,
   // not a pool: a second live carrier means an exception raised while another
   // is in flight, which is rare enough to pay malloc for and simple enough that
@@ -2352,15 +2362,15 @@ void buildRecordException(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-void buildThrowException(SupportBuilder &b) {
+void buildThrowException(SupportBuilder &b, bool returns) {
   auto fn = b.beginFunction(
-      "LyEH_ThrowException",
+      raiseSymbol("LyEH_ThrowException", returns),
       b.builder.getFunctionType(exceptionTripleTypes(b.builder), {}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::func::CallOp::create(b.builder, b.loc, "LyEH_RecordException",
                              mlir::TypeRange{}, entry->getArguments());
-  emitRaiseCarrier(b);
+  emitRaiseCarrier(b, returns);
   // The raise does not return; the trailing return only satisfies the
   // verifier, which is why this is not `llvm.unreachable`.
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
@@ -2759,8 +2769,9 @@ void buildContextIsHandled(SupportBuilder &b) {
 
 // LyEH_RethrowCurrent(): rethrows the still-stored payload with a fresh C++
 // carrier (the previous catch scope is closed first).
-void buildRethrowCurrent(SupportBuilder &b) {
-  auto fn = beginLLVMFunction(b, "LyEH_RethrowCurrent", {}, {});
+void buildRethrowCurrent(SupportBuilder &b, bool returns) {
+  auto fn = beginLLVMFunction(
+      b, raiseSymbol("LyEH_RethrowCurrent", returns), {}, {});
   mlir::Block *entry = fn.addEntryBlock(b.builder);
   mlir::Region &body = fn.getBody();
   mlir::Block *rethrow = b.builder.createBlock(&body);
@@ -2773,10 +2784,40 @@ void buildRethrowCurrent(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(rethrow);
   mlir::func::CallOp::create(b.builder, b.loc, "end_native_catch_if_active",
                              mlir::TypeRange{}, mlir::ValueRange{});
-  emitRaiseCarrier(b);
-  mlir::LLVM::UnreachableOp::create(b.builder, b.loc);
+  emitRaiseCarrier(b, returns);
+  if (returns)
+    mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+  else
+    mlir::LLVM::UnreachableOp::create(b.builder, b.loc);
   b.builder.setInsertionPointToEnd(trap);
   emitLLVMTrap(b);
+}
+
+// LyEH_RaisePending(): at an entry the host calls (a JS export), an exception
+// that came back by return (`propagateByReturn`) goes on through the
+// unwinder, which is how the host has always been told of one.
+void buildRaisePending(SupportBuilder &b) {
+  auto fn = beginLLVMFunction(b, "LyEH_RaisePending", {}, {});
+  mlir::Block *entry = fn.addEntryBlock(b.builder);
+  mlir::Region &body = fn.getBody();
+  mlir::Block *raise = b.builder.createBlock(&body);
+  mlir::Block *none = b.builder.createBlock(&body);
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value propagating = mlir::LLVM::LoadOp::create(
+      b.builder, b.loc, b.i1(), b.addrOf(kPropagatingFlag), /*alignment=*/1);
+  mlir::LLVM::CondBrOp::create(b.builder, b.loc, propagating, raise, none);
+  b.builder.setInsertionPointToEnd(raise);
+  mlir::LLVM::StoreOp::create(
+      b.builder, b.loc,
+      mlir::LLVM::ConstantOp::create(b.builder, b.loc, b.i1(),
+                                     b.builder.getIntegerAttr(b.i1(), 0))
+          .getResult(),
+      b.addrOf(kPropagatingFlag), /*alignment=*/1);
+  mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
+                             "LyEH_RethrowCurrent", mlir::ValueRange{});
+  mlir::LLVM::UnreachableOp::create(b.builder, b.loc);
+  b.builder.setInsertionPointToEnd(none);
+  mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
 // LyEH_RecordRethrow(): `LyEH_RethrowCurrent` without the unwind -- what is
@@ -3252,6 +3293,8 @@ void buildRunPythonMain(SupportBuilder &b) {
   mlir::Region &body = fn.getBody();
   mlir::Block *run = b.builder.createBlock(&body);
   mlir::Block *ok = b.builder.createBlock(&body);
+  mlir::Block *bridge = b.builder.createBlock(&body);
+  mlir::Block *done = b.builder.createBlock(&body);
   mlir::Block *nullEntry = b.builder.createBlock(&body);
   mlir::Block *landing = b.builder.createBlock(&body);
   mlir::Block *native = b.builder.createBlock(&body);
@@ -3280,7 +3323,26 @@ void buildRunPythonMain(SupportBuilder &b) {
                                mlir::ValueRange{}, landing,
                                mlir::ValueRange{});
 
+  // A program that propagates by return (`propagateByReturn`) comes back
+  // here with its exception still on its way: it is raised once more through
+  // the unwinder, into the landing pad below that reports it.
   b.builder.setInsertionPointToEnd(ok);
+  mlir::Value propagating = mlir::LLVM::LoadOp::create(
+      b.builder, b.loc, b.i1(), b.addrOf(kPropagatingFlag), /*alignment=*/1);
+  mlir::LLVM::CondBrOp::create(b.builder, b.loc, propagating, bridge, done);
+  b.builder.setInsertionPointToEnd(bridge);
+  mlir::LLVM::StoreOp::create(
+      b.builder, b.loc,
+      mlir::LLVM::ConstantOp::create(b.builder, b.loc, b.i1(),
+                                     b.builder.getIntegerAttr(b.i1(), 0))
+          .getResult(),
+      b.addrOf(kPropagatingFlag), /*alignment=*/1);
+  mlir::LLVM::InvokeOp::create(b.builder, b.loc, mlir::TypeRange{},
+                               b.builder.getAttr<mlir::FlatSymbolRefAttr>(
+                                   "LyEH_RethrowCurrent"),
+                               mlir::ValueRange{}, done, mlir::ValueRange{},
+                               landing, mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(done);
   mlir::LLVM::ReturnOp::create(b.builder, b.loc,
                                mlir::ValueRange{b.iconst32(0)});
 
@@ -4153,7 +4215,20 @@ void buildEHMemoSlot(SupportBuilder &b) {
 // puts one more activation between the raise and the handler, and the unwinder
 // pays for an activation twice -- once to ask its personality whether it
 // handles this, once to step through it.
-void emitRaiseCarrier(SupportBuilder &b) {
+std::string raiseSymbol(llvm::StringRef name, bool returns) {
+  return returns ? (name + kReturningRaiseSuffix).str() : name.str();
+}
+
+void emitRaiseCarrier(SupportBuilder &b, bool returns) {
+  if (returns) {
+    mlir::LLVM::StoreOp::create(
+        b.builder, b.loc,
+        mlir::LLVM::ConstantOp::create(b.builder, b.loc, b.i1(),
+                                       b.builder.getIntegerAttr(b.i1(), 1))
+            .getResult(),
+        b.addrOf(kPropagatingFlag), /*alignment=*/1);
+    return;
+  }
   mlir::Value carrier = b.call("ly_eh_take_carrier", b.ptr(), {}).front();
   if (unwindInOnePhase(b.triple)) {
     mlir::Value stop = mlir::LLVM::AddressOfOp::create(
@@ -4489,7 +4564,8 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   buildTakeCarrier(support);
   buildEndNativeCatchIfActive(support);
   buildRecordException(support);
-  buildThrowException(support);
+  buildThrowException(support, /*returns=*/false);
+  buildThrowException(support, /*returns=*/true);
   buildBeginCatch(support);
   buildBorrowCurrentException(support);
   buildCurrentExceptionClass(support);
@@ -4498,8 +4574,10 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   buildDiscardCurrentExceptionPlain(support);
   buildHandledException(support);
   buildContextIsHandled(support);
-  buildRethrowCurrent(support);
+  buildRethrowCurrent(support, /*returns=*/false);
+  buildRethrowCurrent(support, /*returns=*/true);
   buildRecordRethrow(support);
+  buildRaisePending(support);
   buildTakeCurrentDescriptor(support);
   buildStashCurrentException(support);
   buildUnstashException(support);

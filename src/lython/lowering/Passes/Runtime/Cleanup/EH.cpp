@@ -2,6 +2,7 @@
 #include "Mangling.h"
 #include "Common/RuntimeSupport.h"
 #include "Common/LibcPrototypes.h"
+#include "Common/TypeObjects.h"
 #include "Common/UnwindABI.h"
 
 #include "Native.h"
@@ -10,6 +11,7 @@
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/ADT/SmallVector.h"
@@ -20,6 +22,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/IntrinsicsWebAssembly.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Path.h"
 
@@ -1159,18 +1162,30 @@ void collectPythonCallSiteRanges(
   }
 }
 
-bool installPythonExceptionCleanupFrames(
-    llvm::Module &module, const llvm::Triple &triple,
-    llvm::ArrayRef<PythonCallSiteRange> callSiteList,
-    const llvm::DenseMap<std::int64_t, unsigned> &tryInlineDepths) {
-  const CallSiteIndex callSites(callSiteList);
+namespace {
+
+// The try structure the lowering left in the functions `scanned` accepts: the
+// handler each `LyEH_TryCatchMarker` names, the call each
+// `LyEH_TryCallSiteMarker` guards, the anchors, and every call met.
+struct TryStructure {
   llvm::SmallVector<llvm::CallInst *, 16> calls;
   llvm::SmallVector<llvm::CallInst *, 8> anchors;
   llvm::SmallVector<llvm::CallInst *, 16> callSiteMarkers;
   llvm::DenseMap<std::int64_t, PythonCatchTarget> catchTargets;
   llvm::DenseMap<llvm::CallInst *, PendingPythonTryCallMarker> tryCallSites;
+};
+
+TryStructure
+collectTryStructure(llvm::Module &module,
+                    llvm::function_ref<bool(llvm::Function &)> scanned) {
+  TryStructure found;
+  auto &calls = found.calls;
+  auto &anchors = found.anchors;
+  auto &callSiteMarkers = found.callSiteMarkers;
+  auto &catchTargets = found.catchTargets;
+  auto &tryCallSites = found.tryCallSites;
   for (llvm::Function &function : module) {
-    if (!isPythonDebugFunction(&function))
+    if (!scanned(function))
       continue;
     for (llvm::BasicBlock &block : function) {
       std::optional<PendingPythonTryCallMarker> pendingTryMarker;
@@ -1220,6 +1235,26 @@ bool installPythonExceptionCleanupFrames(
     }
   }
 
+  return found;
+}
+
+} // namespace
+
+bool installPythonExceptionCleanupFrames(
+    llvm::Module &module, const llvm::Triple &triple,
+    llvm::ArrayRef<PythonCallSiteRange> callSiteList,
+    const llvm::DenseMap<std::int64_t, unsigned> &tryInlineDepths) {
+  const CallSiteIndex callSites(callSiteList);
+  TryStructure found = collectTryStructure(
+      module, [](llvm::Function &function) {
+        return isPythonDebugFunction(&function);
+      });
+  auto &calls = found.calls;
+  auto &anchors = found.anchors;
+  auto &callSiteMarkers = found.callSiteMarkers;
+  auto &catchTargets = found.catchTargets;
+  auto &tryCallSites = found.tryCallSites;
+
   bool changed = false;
   for (llvm::CallInst *anchor : anchors)
     changed |= rewriteTryCatchAnchor(*anchor);
@@ -1246,6 +1281,298 @@ bool installPythonExceptionCleanupFrames(
   for (llvm::CallInst *marker : callSiteMarkers)
     marker->eraseFromParent();
   return changed;
+}
+
+namespace {
+
+llvm::GlobalVariable *propagatingFlag(llvm::Module &module) {
+  if (llvm::GlobalVariable *flag = module.getGlobalVariable(
+          py::runtime_library::kPropagatingFlag))
+    return flag;
+  return new llvm::GlobalVariable(
+      module, llvm::Type::getInt1Ty(module.getContext()), /*isConstant=*/false,
+      llvm::GlobalValue::ExternalLinkage, /*Initializer=*/nullptr,
+      py::runtime_library::kPropagatingFlag);
+}
+
+// A call through a pointer reaches Python code only from a slot hook, whose
+// slots are the classes' methods; every other one is a C function a ctypes
+// declaration names, or a kernel the parallel dispatch hands a body to.
+// ⛔ Not "any call through a pointer": the stack guard calls libc's `raise`
+// that way, and treating it as a Python raise had every function of the
+// runtime's entry test for one.
+bool callsPythonThroughPointers(const llvm::Function &function) {
+  return llvm::any_of(py::type_objects::kSlotHooks,
+                      [&](const py::type_objects::SlotHook &hook) {
+                        return hook.name == function.getName();
+                      });
+}
+
+// The functions that may return with an exception propagating: one that calls
+// a raise primitive, calls one of these, or calls a method through a slot --
+// unless the lowering proved nothing escapes it (`nounwind`).
+// ⛔ Not an invoke: only the runtime's entry (`LyRunPythonMain`) still has
+// one, and it tests the flag after it.
+// What never lets an exception out, whatever it calls: a release (a
+// finalizer's exception is reported where it is raised, as CPython's
+// "Exception ignored"), and the half of a raise that only records it.
+// ⛔ Not left to the walk: the release hook calls its slots through a pointer,
+// and every DecRef in the program and the runtime reaches it.
+bool neverPropagates(llvm::StringRef name) {
+  return py::ownership::isNonRaisingRuntimeSymbol(name) ||
+         name == "LyEH_RecordException" || name == "LyEH_RecordRethrow" ||
+         llvm::any_of(py::type_objects::kSlotHooks,
+                      [&](const py::type_objects::SlotHook &hook) {
+                        return hook.calledByRuntime && hook.name == name;
+                      });
+}
+
+// `linked`: the raise primitives are already the returning forms, and the
+// unwinding ones left in a pre-lowered runtime module unwind as they always
+// did, without setting the flag.
+bool startsPropagation(const llvm::Function *callee, bool linked) {
+  if (linked)
+    return callee->getName().ends_with(
+        py::runtime_library::kReturningRaiseSuffix);
+  return isPythonRuntimeRaiseCall(callee);
+}
+
+llvm::DenseSet<const llvm::Function *> mayReturnRaised(llvm::Module &module,
+                                                       bool linked) {
+  llvm::DenseSet<const llvm::Function *> raised;
+  for (bool grew = true; grew;) {
+    grew = false;
+    for (llvm::Function &function : module) {
+      if (function.isDeclaration() || function.doesNotThrow() ||
+          neverPropagates(function.getName()) || raised.contains(&function))
+        continue;
+      bool raises = false;
+      for (llvm::BasicBlock &block : function) {
+        for (llvm::Instruction &instruction : block) {
+          auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+          if (!call || call->isInlineAsm())
+            continue;
+          const llvm::Function *callee = call->getCalledFunction();
+          if (!callee) {
+            raises = callsPythonThroughPointers(function);
+          } else if (!callee->isIntrinsic() &&
+                     (startsPropagation(callee, linked) ||
+                      raised.contains(callee))) {
+            raises = true;
+          }
+          if (raises)
+            break;
+        }
+        if (raises)
+          break;
+      }
+      if (raises) {
+        raised.insert(&function);
+        grew = true;
+      }
+    }
+  }
+  return raised;
+}
+
+// The exports `installJsHostEntryPoints` writes for the JS host.
+bool isHostEntryPoint(const llvm::Function &function) {
+  return function.getName() == "LyJs_Dispatch" ||
+         function.getName() == "LyJs_Release";
+}
+
+// Whether `call` can come back with an exception propagating.
+bool mayComeBackRaised(const llvm::CallInst &call,
+                       const llvm::DenseSet<const llvm::Function *> &raised) {
+  if (call.isInlineAsm())
+    return false;
+  const llvm::Function *callee = call.getCalledFunction();
+  if (!callee)
+    return callsPythonThroughPointers(*call.getFunction());
+  if (callee->isIntrinsic())
+    return false;
+  return isPythonRuntimeRaiseCall(callee) || raised.contains(callee);
+}
+
+// Splits after `call` and branches on the flag: to a block of its own when an
+// exception propagates, to the rest of the block otherwise.
+llvm::BasicBlock *branchOnPropagation(llvm::CallInst &call,
+                                      llvm::GlobalVariable *flag) {
+  llvm::BasicBlock *block = call.getParent();
+  llvm::Function *function = block->getParent();
+  llvm::LLVMContext &context = function->getContext();
+  llvm::BasicBlock *rest =
+      block->splitBasicBlock(std::next(call.getIterator()), "py.ret.cont");
+  llvm::BasicBlock *raised =
+      llvm::BasicBlock::Create(context, "py.ret.raised", function, rest);
+  block->getTerminator()->eraseFromParent();
+  llvm::IRBuilder<> builder(block);
+  llvm::LoadInst *propagating = builder.CreateAlignedLoad(
+      llvm::Type::getInt1Ty(context), flag, llvm::Align(1), "py.propagating");
+  propagating->setDebugLoc(call.getDebugLoc());
+  llvm::MDBuilder weights(context);
+  builder.CreateCondBr(propagating, raised, rest,
+                       weights.createUnlikelyBranchWeights());
+  return raised;
+}
+
+} // namespace
+
+// ⭐ AN EXCEPTION GOES OUT BY RETURN. The raise primitives' returning forms
+// (`kReturningRaiseSuffix`) record the exception and set `kPropagatingFlag`;
+// every call that may come back with it set is followed by a test of it. One
+// the lowering guarded with a try's marker goes to that try's handler -- which
+// clears the flag and records this frame, as the catch pad did. Any other
+// leaves the function, recording the frame as the cleanup pad did when the
+// call was one the pad covered.
+//
+// The try structure is the one the invokes were built from; this only builds
+// the edges differently. So the ownership releases on the exception edges, the
+// handlers, the dispatch chains and the traceback pushes are the same code,
+// reached by a branch.
+//
+// ⛔ Not the Itanium unwinder: on Darwin it asks dyld which image holds every
+// frame it steps through, twice per raise -- 83% of a raise across two frames
+// (docs/exceptions.md). A branch on a byte costs that in a call that does not
+// raise, and nothing in one that does.
+// ⛔ Every function, not only the program's: a manifest body that called a
+// raise and carried on would run past it, which the unwinder never let happen.
+// `verifyPropagationChecked` holds the linked module to that.
+bool installPythonErrorReturns(
+    llvm::Module &module, const llvm::Triple &triple,
+    llvm::ArrayRef<PythonCallSiteRange> callSiteList,
+    const llvm::DenseMap<std::int64_t, unsigned> &tryInlineDepths) {
+  (void)triple;
+  const CallSiteIndex callSites(callSiteList);
+  TryStructure found = collectTryStructure(
+      module,
+      [](llvm::Function &function) { return !function.isDeclaration(); });
+  llvm::DenseSet<const llvm::Function *> raised =
+      mayReturnRaised(module, /*linked=*/false);
+  llvm::GlobalVariable *flag = propagatingFlag(module);
+  llvm::LLVMContext &context = module.getContext();
+
+  for (llvm::CallInst *anchor : found.anchors)
+    rewriteTryCatchAnchor(*anchor);
+  for (llvm::CallInst *call : found.calls) {
+    if (!mayComeBackRaised(*call, raised))
+      continue;
+    llvm::Function *function = call->getFunction();
+    llvm::Function *callee = call->getCalledFunction();
+    auto *debugLoc =
+        llvm::dyn_cast_or_null<llvm::DILocation>(call->getDebugLoc().get());
+    // What the pads recorded: not a raise's own frame, which its lowering
+    // pushed, and not the plumbing between a generator's clones.
+    bool recordsFrame = debugLoc && isPythonDebugFunction(function) &&
+                        mayTransferToPythonTryHandler(callee) &&
+                        !isPythonRuntimeRaiseCall(callee) &&
+                        !isGeneratorInternalEdge(*call);
+    const PythonCallSiteRange *site =
+        debugLoc ? matchCallSiteRange(*call, callSites, *debugLoc) : nullptr;
+    // The runtime's primitives; a wrapper the module defines is converted as
+    // any other function, its own call to the primitive included.
+    if (callee && callee->isDeclaration() && isPythonRuntimeRaiseCall(callee))
+      call->setCalledFunction(module.getOrInsertFunction(
+          (callee->getName() + py::runtime_library::kReturningRaiseSuffix)
+              .str(),
+          callee->getFunctionType()));
+
+    // An entry the host calls answers it as it always has: the exception goes
+    // on through the unwinder (`LyEH_RaisePending`).
+    // ⛔ Not every function the module exports: the boxed hooks are public for
+    // the runtime, and an exception from a `__repr__` has to come back to the
+    // program's own handler by return.
+    if (isHostEntryPoint(*function)) {
+      llvm::IRBuilder<> after(call->getNextNode());
+      after.CreateCall(module.getOrInsertFunction(
+          "LyEH_RaisePending",
+          llvm::FunctionType::get(llvm::Type::getVoidTy(context), false)));
+      continue;
+    }
+
+    llvm::BasicBlock *catchBlock = nullptr;
+    unsigned tryDepth = 0;
+    if (auto marked = found.tryCallSites.find(call);
+        marked != found.tryCallSites.end())
+      if (auto target = found.catchTargets.find(marked->second.id);
+          target != found.catchTargets.end()) {
+        catchBlock = target->second.block;
+        tryDepth = tryInlineDepths.lookup(marked->second.id);
+      }
+
+    llvm::BasicBlock *raisedBlock = branchOnPropagation(*call, flag);
+    llvm::IRBuilder<> builder(raisedBlock);
+    if (catchBlock) {
+      builder.CreateAlignedStore(llvm::ConstantInt::getFalse(context), flag,
+                                 llvm::Align(1));
+      if (recordsFrame)
+        emitTracebackPush(builder, module, site, *debugLoc, tryDepth);
+      builder.CreateBr(catchBlock);
+      continue;
+    }
+    if (recordsFrame)
+      emitTracebackPush(builder, module, site, *debugLoc);
+    llvm::Type *result = function->getReturnType();
+    if (result->isVoidTy())
+      builder.CreateRetVoid();
+    else
+      builder.CreateRet(llvm::PoisonValue::get(result));
+  }
+  for (auto &entry : found.catchTargets)
+    if (entry.second.marker)
+      entry.second.marker->eraseFromParent();
+  for (llvm::CallInst *marker : found.callSiteMarkers)
+    marker->eraseFromParent();
+  module.addModuleFlag(llvm::Module::Error,
+                       py::runtime_library::kPropagatesByReturnFlag, 1);
+  return true;
+}
+
+bool verifyPropagationChecked(llvm::Module &module, llvm::raw_ostream &diag) {
+  llvm::DenseSet<const llvm::Function *> raised =
+      mayReturnRaised(module, /*linked=*/true);
+  // A returning raise primitive sets the flag; its body is a definition here,
+  // so it is in `raised` by the call it makes -- or not, by its store. Count
+  // the store.
+  for (llvm::Function &function : module)
+    if (function.getName().ends_with(py::runtime_library::kReturningRaiseSuffix))
+      raised.insert(&function);
+  bool ok = true;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration())
+      continue;
+    for (llvm::BasicBlock &block : function)
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (!call || call->isInlineAsm())
+          continue;
+        const llvm::Function *callee = call->getCalledFunction();
+        if (callee && (callee->isIntrinsic() || !raised.contains(callee)))
+          continue;
+        if (!callee)
+          continue;
+        const llvm::Instruction *next = call->getNextNode();
+        // Tested, or handed straight on to the caller.
+        auto *load = llvm::dyn_cast_or_null<llvm::LoadInst>(next);
+        bool tested = load && load->getPointerOperand()->getName() ==
+                                  py::runtime_library::kPropagatingFlag;
+        bool handedOn =
+            llvm::isa_and_nonnull<llvm::ReturnInst>(next) &&
+            raised.contains(&function);
+        auto *bridge = llvm::dyn_cast_or_null<llvm::CallInst>(next);
+        handedOn |= bridge && bridge->getCalledFunction() &&
+                    bridge->getCalledFunction()->getName() ==
+                        "LyEH_RaisePending";
+        if (tested || handedOn)
+          continue;
+        diag << "error: " << function.getName() << " calls "
+             << callee->getName()
+             << ", which may return with an exception propagating, and "
+                "carries on without testing for it\n";
+        ok = false;
+      }
+  }
+  return ok;
 }
 
 namespace {

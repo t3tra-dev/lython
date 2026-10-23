@@ -3655,21 +3655,21 @@ void buildStarPop(SupportBuilder &b) {
 // The shared "throw the pending token" tail for the star rethrow paths
 // (a func-level function: its callers are func-level; the raise never returns,
 // the trailing return only satisfies the verifier).
-void buildStarThrowPending(SupportBuilder &b) {
-  auto fn = b.beginFunction("star_throw_pending",
+void buildStarThrowPending(SupportBuilder &b, bool returns) {
+  auto fn = b.beginFunction(raiseSymbol("star_throw_pending", returns),
                             b.builder.getFunctionType({}, {}),
                             /*isPrivate=*/true);
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   b.call("end_native_catch_if_active", mlir::TypeRange{}, {});
-  emitRaiseCarrier(b);
+  emitRaiseCarrier(b, returns);
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
 // void LyEH_StarRethrowResidual(): nothing was collected — the leftover
 // slice rethrows with its original traceback and chain.
-void buildStarRethrowResidual(SupportBuilder &b) {
-  auto fn = b.beginFunction("LyEH_StarRethrowResidual",
+void buildStarRethrowResidual(SupportBuilder &b, bool returns) {
+  auto fn = b.beginFunction(raiseSymbol("LyEH_StarRethrowResidual", returns),
                             b.builder.getFunctionType({b.ptr()}, {}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
@@ -3677,14 +3677,14 @@ void buildStarRethrowResidual(SupportBuilder &b) {
   b.call("LyEH_UnstashException", mlir::TypeRange{},
          mlir::ValueRange{starFrameSlot(b, frame, kStarResidual)});
   b.call("free", mlir::TypeRange{}, mlir::ValueRange{frame});
-  b.call("star_throw_pending", mlir::TypeRange{}, {});
+  b.call(raiseSymbol("star_throw_pending", returns), mlir::TypeRange{}, {});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
 // void LyEH_StarRethrowSoleCollected(): exactly one clause raise and no
 // residual — that exception continues as itself (context intact).
-void buildStarRethrowSoleCollected(SupportBuilder &b) {
-  auto fn = b.beginFunction("LyEH_StarRethrowSoleCollected",
+void buildStarRethrowSoleCollected(SupportBuilder &b, bool returns) {
+  auto fn = b.beginFunction(raiseSymbol("LyEH_StarRethrowSoleCollected", returns),
                             b.builder.getFunctionType({b.ptr()}, {}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
@@ -3696,7 +3696,7 @@ void buildStarRethrowSoleCollected(SupportBuilder &b) {
          mlir::ValueRange{b.loadPtrVal(starFrameSlot(b, frame, kStarResidual)),
                           b.loadI64(starFrameSlot(b, frame, kStarPresent))});
   b.call("free", mlir::TypeRange{}, mlir::ValueRange{frame});
-  b.call("star_throw_pending", mlir::TypeRange{}, {});
+  b.call(raiseSymbol("star_throw_pending", returns), mlir::TypeRange{}, {});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
@@ -3704,11 +3704,11 @@ void buildStarRethrowSoleCollected(SupportBuilder &b) {
 // were wrapped into a fresh group (star_combine). The residual node donates its
 // traceback and chain to the combined exception; collected nodes hand their
 // member references to the group and die.
-void buildStarThrowCombined(SupportBuilder &b) {
+void buildStarThrowCombined(SupportBuilder &b, bool returns) {
   llvm::SmallVector<mlir::Type, 3> triple = exceptionTripleTypes(b.builder);
   llvm::SmallVector<mlir::Type, 4> inputs{b.ptr()};
   inputs.append(triple.begin(), triple.end());
-  auto fn = b.beginFunction("LyEH_StarThrowCombined",
+  auto fn = b.beginFunction(raiseSymbol("LyEH_StarThrowCombined", returns),
                             b.builder.getFunctionType(inputs, {}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
@@ -3807,7 +3807,8 @@ void buildStarThrowCombined(SupportBuilder &b) {
   b.call("free", mlir::TypeRange{}, mlir::ValueRange{frame});
   // `star_throw_pending` does not return; the trailing return only satisfies
   // the verifier, which is why this is not `llvm.unreachable`.
-  mlir::func::CallOp::create(b.builder, b.loc, "star_throw_pending",
+  mlir::func::CallOp::create(b.builder, b.loc,
+                             raiseSymbol("star_throw_pending", returns),
                              mlir::TypeRange{}, mlir::ValueRange{});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
@@ -4052,10 +4053,12 @@ void buildTracebackSupport(SupportBuilder &b) {
   buildStarCollectedCount(b);
   buildStarNodesPtr(b);
   buildStarPop(b);
-  buildStarThrowPending(b);
-  buildStarRethrowResidual(b);
-  buildStarRethrowSoleCollected(b);
-  buildStarThrowCombined(b);
+  for (bool returns : {false, true}) {
+    buildStarThrowPending(b, returns);
+    buildStarRethrowResidual(b, returns);
+    buildStarRethrowSoleCollected(b, returns);
+    buildStarThrowCombined(b, returns);
+  }
   buildStarDiscardSplit(b);
 }
 

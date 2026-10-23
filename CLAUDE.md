@@ -129,6 +129,7 @@ ASAN_OPTIONS=detect_leaks=0:detect_container_overflow=0:allow_user_poisoning=0 \
 - `LYTHON_ABLATE_IMPORT_SCOPE_MEMO=1` / `LYTHON_VERIFY_IMPORT_SCOPE_MEMO=1` — 取り込んだモジュールの import の束縛を、記録して再生せず毎回読む / 毎回読んで再生と照合し、違えば abort する
 - `LYTHON_ABLATE_SYMBOL_MEMO=1` / `LYTHON_VERIFY_SYMBOL_MEMO=1` — runtime lowering と type-objects フェーズで、モジュールのシンボル検索の答えを覚えず毎回モジュールを線形に引く / 覚えた答えを毎回引き直して照合し、違えば abort する (`lowering/Common/ModuleSymbolMemo.h`)
 - `LYTHON_ABLATE_BARE_POINTER_ABI=1` / `LYTHON_VERIFY_BARE_POINTER_ABI=1` / `LYTHON_TRACE_BARE_POINTER_ABI=1` — memref の受け渡し (静的形状は 1 ポインタ、rank 1 の動的形状はポインタと大きさ、`Passes/Runtime/Cleanup/MemRefCallABI.cpp`) を、プログラム内の private 関数どうしではやめて従来の記述子で渡す (ネイティブランタイムとの境界は事前コンパイルしたランタイムの ABI なので外れない) / すべての解放と、先頭と判定した受け渡しで、記述子の確保ポインタと整列ポインタが一致することを実行時に確かめ、違えばその箇所を出して abort する / 記述子のまま残した引数・結果を stderr に出す
+- `LYTHON_ABLATE_RETURN_PROPAGATION=1` — Python の例外を戻り値 (`LyEH_Propagating` のフラグと呼び出し後の分岐) ではなく、従来の invoke と unwinder で伝える。比較用 (docs/exceptions.md)
 - `LYTHON_NUM_THREADS=N` — 実行時: 大きい行列積の fork-join ワーカー数 (デフォルト 4、1 で逐次)
 
 ## アーキテクチャ
