@@ -101,10 +101,49 @@ private:
       sourceModuleTypeAliasMemo;
   const std::vector<std::pair<std::string, mlir::Type>> &
   sourceModuleTypeAliases(const EmitOptions::SourceModule &source);
+  // An imported module's top-level defs and classes by name, first one
+  // first. `bindSourceModuleName` scanned the module's statements for each
+  // name it bound, and every method body inlined from a module binds that
+  // module's imports again. Keyed like `moduleConstantMemo`, by the
+  // statements' first node and count, which outlive the compile's readings of
+  // them.
+  struct TopLevelDefinitions {
+    llvm::StringMap<const parser::Node *> functions;
+    llvm::StringMap<const parser::Node *> classes;
+    // `alias = other` (moduleAliasTarget's answer), and the modules an
+    // `import M as member` publishes under each member, in statement order.
+    llvm::StringMap<std::string_view> aliasTargets;
+    llvm::StringMap<llvm::SmallVector<std::string_view, 1>> importedMembers;
+  };
+  llvm::DenseMap<std::pair<const void *, unsigned>, TopLevelDefinitions>
+      topLevelDefinitionMemo;
+  const TopLevelDefinitions &
+  topLevelDefinitions(const std::vector<parser::NodePtr> &body);
+  // The first of `sourceModuleTypeAliases` under each name, for the reader
+  // that asks about one name at a time: searching the list once per imported
+  // name was the largest single line of the emitter on test_argparse.
+  llvm::StringMap<llvm::StringMap<mlir::Type>> sourceModuleTypeAliasIndex;
+  const llvm::StringMap<mlir::Type> &
+  sourceModuleTypeAliasesByName(const EmitOptions::SourceModule &source);
+  // What binding each imported module's imports wrote, replayed by the next
+  // binding of the same module (`bindModuleImportScope`). Valid while no
+  // signature memo was dropped and no module global was added since, the two
+  // things a reading consults that change during emission.
+  struct ImportScopeMemo {
+    std::shared_ptr<TypeSystem::FrameRecord> record;
+    unsigned generation = 0;
+    std::size_t moduleGlobalCount = 0;
+  };
+  llvm::DenseMap<const parser::Node *, ImportScopeMemo> importScopeMemo;
+  unsigned importScopeGeneration = 0;
+  void bindModuleImportStatements(const parser::Node &sourceModule,
+                                  bool diagnoseUnsupported);
   void forgetImportedSignatures() {
+    ++importScopeGeneration;
     importedSignatures.clear();
     sourceLocalSignatures.clear();
     sourceModuleTypeAliasMemo.clear();
+    sourceModuleTypeAliasIndex.clear();
   }
   // The host's global functions (Window's methods), and the spellings the
   // program imported them by.
@@ -234,6 +273,18 @@ private:
   // base's own (EmitterClasses.cpp).
   void collectDeclaredAncestors(llvm::StringRef cls,
                                 llvm::StringSet<> &out) const;
+  // The ancestors above, per class, and the answers of `subclassRedeclares`
+  // per table, class and name. Asked for every method call -- each answer
+  // walked every class and rebuilt both ancestor sets -- they were a third of
+  // the emitter on test_argparse. Dropped by every write to the tables they
+  // read (`forgetDeclarationMemos`).
+  mutable llvm::StringMap<llvm::StringSet<>> declaredAncestorMemo;
+  mutable llvm::StringMap<bool> redeclarationMemo;
+  const llvm::StringSet<> &declaredAncestors(llvm::StringRef cls) const;
+  void forgetDeclarationMemos() {
+    declaredAncestorMemo.clear();
+    redeclarationMemo.clear();
+  }
   // The one gate every method dispatch goes through: emits the diagnostic and
   // returns true when the receiver's static class cannot answer the call
   // (EmitterClasses.cpp).

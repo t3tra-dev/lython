@@ -1839,7 +1839,8 @@ TypeSystem::ScopeIsolation::ScopeIsolation(ScopeIsolation &&other) noexcept
       savedCanonicalBindings(std::move(other.savedCanonicalBindings)),
       savedClasses(std::move(other.savedClasses)),
       savedTypeParameters(std::move(other.savedTypeParameters)),
-      savedModuleNames(std::move(other.savedModuleNames)) {
+      savedModuleNames(std::move(other.savedModuleNames)),
+      savedUnderlay(std::move(other.savedUnderlay)) {
   other.owner = nullptr;
 }
 
@@ -1854,6 +1855,7 @@ TypeSystem::ScopeIsolation::operator=(ScopeIsolation &&other) noexcept {
   savedClasses = std::move(other.savedClasses);
   savedTypeParameters = std::move(other.savedTypeParameters);
   savedModuleNames = std::move(other.savedModuleNames);
+  savedUnderlay = std::move(other.savedUnderlay);
   other.owner = nullptr;
   return *this;
 }
@@ -1868,6 +1870,7 @@ void TypeSystem::ScopeIsolation::reset() {
   owner->scopedClasses = std::move(savedClasses);
   owner->scopedTypeParameters = std::move(savedTypeParameters);
   owner->scopedModuleNames = std::move(savedModuleNames);
+  owner->underlay = std::move(savedUnderlay);
   owner = nullptr;
 }
 
@@ -1904,6 +1907,8 @@ TypeSystem::ScopeIsolation TypeSystem::isolateScopes() const {
   isolation.savedClasses = std::move(scopedClasses);
   isolation.savedTypeParameters = std::move(scopedTypeParameters);
   isolation.savedModuleNames = std::move(scopedModuleNames);
+  isolation.savedUnderlay = std::move(underlay);
+  underlay.reset();
   scopedModuleNames.clear();
   scopes.clear();
   scopedCanonicalBindings.clear();
@@ -2594,6 +2599,8 @@ void TypeSystem::popScope() const {
     scopedClasses.pop_back();
     scopedTypeParameters.pop_back();
     scopedModuleNames.pop_back();
+    if (scopes.empty())
+      underlay.reset();
   }
 }
 
@@ -2655,16 +2662,100 @@ void TypeSystem::bindCanonicalSymbol(llvm::StringRef name,
 void TypeSystem::bindAnnotationAlias(llvm::StringRef name,
                                      llvm::StringRef target) {
   annotationAliases[name] = target.str();
+  ++aliasEpoch;
+  logAliasWrite({false, name.str(), {}, target.str()});
 }
 
 void TypeSystem::bindAnnotationTypeAlias(llvm::StringRef name,
                                          mlir::Type type) {
-  if (type)
-    annotationTypeAliases[name] = type;
+  if (!type)
+    return;
+  annotationTypeAliases[name] = type;
+  ++aliasEpoch;
+  logAliasWrite({true, name.str(), type, {}});
 }
 
 void TypeSystem::unbindAnnotationTypeAlias(llvm::StringRef name) {
   annotationTypeAliases.erase(name);
+  ++aliasEpoch;
+  logAliasWrite({true, name.str(), {}, {}});
+}
+
+bool TypeSystem::atFreshIsolatedFrame() const {
+  return scopes.size() == 1 && !underlay && scopes.back().empty() &&
+         scopedCanonicalBindings.back().empty() &&
+         scopedClasses.back().empty() && scopedTypeParameters.back().empty() &&
+         scopedModuleNames.back().empty();
+}
+
+void TypeSystem::captureFrame(FrameRecord &record) const {
+  record.symbols = scopes.back();
+  record.canonical = scopedCanonicalBindings.back();
+  record.classes = scopedClasses.back();
+  record.typeParameters = scopedTypeParameters.back();
+  record.moduleNames = scopedModuleNames.back();
+}
+
+void TypeSystem::replayFrame(std::shared_ptr<const FrameRecord> shared) {
+  const FrameRecord &record = *shared;
+  underlay = std::move(shared);
+  // ⛔ Not applied again when no alias was written since it last was: the
+  // tables already say what the record says.
+  if (record.appliedAt != aliasEpoch) {
+    for (const auto &entry : record.aliasWrites) {
+      const AliasWrite &write = entry.getValue();
+      if (!write.typeAlias)
+        annotationAliases[write.name] = write.target;
+      else if (write.type)
+        annotationTypeAliases[write.name] = write.type;
+      else
+        annotationTypeAliases.erase(write.name);
+    }
+    ++aliasEpoch;
+    record.appliedAt = aliasEpoch;
+  }
+  if (!aliasRecords.empty())
+    for (const auto &entry : record.aliasWrites)
+      logAliasWrite(entry.getValue());
+}
+
+std::string TypeSystem::compareFrame(const FrameRecord &replayed) const {
+  std::string key;
+  auto sameTypes = [&](const llvm::StringMap<mlir::Type> &left,
+                       const llvm::StringMap<mlir::Type> &right) {
+    for (const auto &entry : left) {
+      auto other = right.find(entry.getKey());
+      if (other == right.end() || other->second != entry.getValue()) {
+        key = entry.getKey().str();
+        return false;
+      }
+    }
+    for (const auto &entry : right)
+      if (!left.count(entry.getKey())) {
+        key = entry.getKey().str() + " (replay only)";
+        return false;
+      }
+    return true;
+  };
+  if (!sameTypes(scopes.back(), replayed.symbols))
+    return "symbols: " + key;
+  if (!sameTypes(scopedClasses.back(), replayed.classes))
+    return "classes";
+  if (!sameTypes(scopedTypeParameters.back(), replayed.typeParameters))
+    return "type parameters";
+  if (scopedCanonicalBindings.back().size() != replayed.canonical.size())
+    return "canonical bindings";
+  for (const auto &entry : scopedCanonicalBindings.back()) {
+    auto other = replayed.canonical.find(entry.getKey());
+    if (other == replayed.canonical.end() || other->second != entry.getValue())
+      return "canonical bindings";
+  }
+  if (scopedModuleNames.back().size() != replayed.moduleNames.size())
+    return "module names";
+  for (const auto &entry : scopedModuleNames.back())
+    if (!replayed.moduleNames.contains(entry.getKey()))
+      return "module names";
+  return {};
 }
 
 // ⭐ WHAT MAKES AN ASSIGNMENT A TYPE ALIAS. Only the shapes an annotation can
@@ -2732,6 +2823,10 @@ TypeSystem::scopedTypeAlias(llvm::StringRef name) const {
        it != e; ++it)
     if (auto found = it->find(name); found != it->end())
       return found->second;
+  if (underlay)
+    if (auto found = underlay->typeParameters.find(name);
+        found != underlay->typeParameters.end())
+      return found->second;
   if (auto alias = annotationTypeAliases.find(name);
       alias != annotationTypeAliases.end())
     return alias->second;
@@ -2751,6 +2846,10 @@ std::optional<mlir::Type> TypeSystem::lookupSymbol(llvm::StringRef name) const {
     if (found != it->end())
       return found->second;
   }
+  if (underlay)
+    if (auto found = underlay->symbols.find(name);
+        found != underlay->symbols.end())
+      return found->second;
   auto found = symbols.find(name);
   if (found == symbols.end())
     return std::nullopt;
@@ -2762,6 +2861,8 @@ bool TypeSystem::namesClassInScope(llvm::StringRef name) const {
     if (scopes[level - 1].count(name))
       return level - 1 < scopedClasses.size() &&
              scopedClasses[level - 1].count(name);
+  if (underlay && underlay->symbols.count(name))
+    return underlay->classes.count(name) != 0;
   return classes.count(name) != 0;
 }
 
@@ -2776,6 +2877,13 @@ TypeSystem::lookupCanonicalBinding(llvm::StringRef name) const {
       return scopedCanonical->second;
     if (scopeIt->find(name) != scopeIt->end() ||
         scopeIt->find(root) != scopeIt->end())
+      return std::nullopt;
+  }
+  if (underlay) {
+    if (auto found = underlay->canonical.find(name);
+        found != underlay->canonical.end())
+      return found->second;
+    if (underlay->symbols.count(name) || underlay->symbols.count(root))
       return std::nullopt;
   }
   auto found = canonicalBindings.find(name);
@@ -3012,6 +3120,10 @@ std::optional<mlir::Type> TypeSystem::lookupClass(llvm::StringRef name) const {
     if (found != it->end())
       return found->second;
   }
+  if (underlay)
+    if (auto found = underlay->classes.find(name);
+        found != underlay->classes.end())
+      return found->second;
   auto found = classes.find(name);
   if (found == classes.end())
     return std::nullopt;
@@ -3095,6 +3207,12 @@ bool TypeSystem::isImportedModuleName(llvm::StringRef name) const {
     if (scopedModuleNames[level].contains(name))
       return true;
     if (scopes[level].count(name) || scopedCanonicalBindings[level].count(name))
+      return false;
+  }
+  if (underlay) {
+    if (underlay->moduleNames.contains(name))
+      return true;
+    if (underlay->symbols.count(name) || underlay->canonical.count(name))
       return false;
   }
   return importedModuleLocalNames.contains(name);
@@ -3423,6 +3541,10 @@ mlir::Type TypeSystem::annotationTypeForName(llvm::StringRef rawName) const {
     if (found != it->end())
       return found->second;
   }
+  if (underlay)
+    if (auto found = underlay->typeParameters.find(name);
+        found != underlay->typeParameters.end())
+      return found->second;
   // ⭐ A MODULE-LEVEL TYPE ALIAS. Without it the fallback at the end of this
   // function invented a contract out of the spelling: `Name = str` gave
   // `!py.contract<"builtins.Name">`, which no manifest declares, and the

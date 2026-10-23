@@ -67,11 +67,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
     pyOps.push_back(op);
   });
   for (mlir::Operation *op : pyOps) {
-    if (llvm::is_contained(erase, op) || loweredAheadOfWalk.contains(op))
+    if (erase.contains(op) || loweredAheadOfWalk.contains(op))
       continue;
     if (mlir::failed(ensureOperationOperandBundles(op)))
       return mlir::failure();
-    if (llvm::is_contained(erase, op))
+    if (erase.contains(op))
       continue;
     if (mlir::failed(lowerPyOp(op)))
       return mlir::failure();
