@@ -858,6 +858,20 @@ ModuleEmitter::sourceModuleTypeAliases(
   return sourceModuleTypeAliasMemo[source.moduleName] = std::move(aliases);
 }
 
+const llvm::StringMap<mlir::Type> &
+ModuleEmitter::sourceModuleTypeAliasesByName(
+    const EmitOptions::SourceModule &source) {
+  if (auto found = sourceModuleTypeAliasIndex.find(source.moduleName);
+      found != sourceModuleTypeAliasIndex.end())
+    return found->second;
+  // ⛔ Read before the entry exists: reading the aliases may bind a module
+  // that asks for this index, and may drop the memos.
+  llvm::StringMap<mlir::Type> byName;
+  for (const auto &[alias, aliased] : sourceModuleTypeAliases(source))
+    byName.try_emplace(alias, aliased);
+  return sourceModuleTypeAliasIndex[source.moduleName] = std::move(byName);
+}
+
 bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
                                               llvm::StringRef localName,
                                               unsigned namespaceDepth) {
@@ -1415,6 +1429,54 @@ ModuleEmitter::importedModuleBindingReason(llvm::StringRef name) const {
   return {};
 }
 
+const ModuleEmitter::TopLevelDefinitions &
+ModuleEmitter::topLevelDefinitions(const std::vector<parser::NodePtr> &body) {
+  std::pair<const void *, unsigned> key{
+      body.empty() ? nullptr : body.front().get(),
+      static_cast<unsigned>(body.size())};
+  auto [entry, inserted] = topLevelDefinitionMemo.try_emplace(key);
+  if (!inserted)
+    return entry->second;
+  for (const parser::NodePtr &statement : body) {
+    if (!statement)
+      continue;
+    if (statement->kind == "Assign") {
+      const auto *targets = ast::nodeList(*statement, "targets");
+      const parser::Node *value = ast::node(*statement, "value");
+      if (targets && targets->size() == 1 && targets->front() &&
+          targets->front()->kind == "Name" && value && value->kind == "Name" &&
+          ast::nameSpelling(*value) != ast::nameSpelling(*targets->front()))
+        entry->second.aliasTargets.try_emplace(
+            llvm::StringRef(ast::nameSpelling(*targets->front())),
+            ast::nameSpelling(*value));
+      continue;
+    }
+    if (statement->kind == "Import") {
+      if (const auto *names = ast::nodeList(*statement, "names"))
+        for (const parser::NodePtr &alias : *names) {
+          if (!alias)
+            continue;
+          std::optional<std::string_view> imported =
+              ast::string(*alias, "name");
+          std::optional<std::string_view> member = importAliasLocalName(*alias);
+          if (imported && member)
+            entry->second.importedMembers[llvm::StringRef(*member)].push_back(
+                *imported);
+        }
+      continue;
+    }
+    bool function = isTopLevelFunction(*statement);
+    if (!function && !isTopLevelClass(*statement))
+      continue;
+    std::optional<std::string_view> name = ast::string(*statement, "name");
+    if (!name)
+      continue;
+    (function ? entry->second.functions : entry->second.classes)
+        .try_emplace(llvm::StringRef(*name), statement.get());
+  }
+  return entry->second;
+}
+
 bool ModuleEmitter::bindSourceModuleName(llvm::StringRef module,
                                          llvm::StringRef exportedName,
                                          llvm::StringRef localName,
@@ -1448,12 +1510,9 @@ bool ModuleEmitter::bindSourceModuleName(llvm::StringRef module,
   const std::vector<parser::NodePtr> &flattened =
       staticModuleStatements(types, *rawBody);
   const std::vector<parser::NodePtr> *body = &flattened;
-  for (const parser::NodePtr &statement : *body) {
-    if (!statement || !isTopLevelFunction(*statement))
-      continue;
-    std::optional<std::string_view> name = ast::string(*statement, "name");
-    if (!name || llvm::StringRef(*name) != exportedName)
-      continue;
+  const TopLevelDefinitions &definitions = topLevelDefinitions(*body);
+  if (const parser::Node *statement =
+          definitions.functions.lookup(exportedName)) {
     // ⛔ See bindSourceModuleNamespace: read later, with the imports bound.
     if (importedSignatureScopes.count(module.str()))
       return true;
@@ -1467,27 +1526,25 @@ bool ModuleEmitter::bindSourceModuleName(llvm::StringRef module,
     types.bindCanonicalSymbol(localName, canonical, sig.publicCallable);
     return true;
   }
-  for (const parser::NodePtr &statement : *body) {
-    if (!statement || !isTopLevelClass(*statement))
-      continue;
-    std::optional<std::string_view> name = ast::string(*statement, "name");
-    if (!name || llvm::StringRef(*name) != exportedName)
-      continue;
+  if (definitions.classes.count(exportedName)) {
     types.bindClass(localName,
-                    types.contract(sourceModuleClassSymbol(module, *name)));
+                    types.contract(sourceModuleClassSymbol(module, exportedName)));
     return true;
   }
   // `from m import Pair` for `Pair = tuple[int, str]` there.
   // ⛔ Not `main = TestProgram`: a name standing for a class is the class as a
   // value too, which the alias path below binds.
-  for (const auto &[alias, aliased] : sourceModuleTypeAliases(*source)) {
-    if (alias != exportedName || moduleAliasTarget(*body, alias))
-      continue;
-    if (types.inTypeParameterScope())
-      types.bindLocalTypeParameter(localName, aliased);
-    else
-      types.bindAnnotationTypeAlias(localName, aliased);
-    return true;
+  if (!definitions.aliasTargets.count(exportedName)) {
+    const llvm::StringMap<mlir::Type> &typeAliases =
+        sourceModuleTypeAliasesByName(*source);
+    if (auto found = typeAliases.find(exportedName);
+        found != typeAliases.end()) {
+      if (types.inTypeParameterScope())
+        types.bindLocalTypeParameter(localName, found->second);
+      else
+        types.bindAnnotationTypeAlias(localName, found->second);
+      return true;
+    }
   }
   if (std::optional<mlir::Type> literal =
           sourceModuleLiteralConstant(types, *body, exportedName)) {
@@ -1501,31 +1558,19 @@ bool ModuleEmitter::bindSourceModuleName(llvm::StringRef module,
     return true;
   }
   if (aliasDepth < kMaxAliasDepth)
-    if (std::optional<std::string_view> aliased =
-            moduleAliasTarget(*body, exportedName))
-      if (bindSourceModuleName(module, llvm::StringRef(*aliased), localName,
-                               aliasDepth + 1))
+    if (auto aliased = definitions.aliasTargets.find(exportedName);
+        aliased != definitions.aliasTargets.end())
+      if (bindSourceModuleName(module, llvm::StringRef(aliased->second),
+                               localName, aliasDepth + 1))
         return true;
   // `import posixpath as path` publishes a module as the member `path`, so
   // `from os import *` (whose __all__ lists "path") binds a whole namespace
   // here, not a single value.
-  for (const parser::NodePtr &statement : *body) {
-    if (!statement || statement->kind != "Import")
-      continue;
-    const auto *names = ast::nodeList(*statement, "names");
-    if (!names)
-      continue;
-    for (const parser::NodePtr &alias : *names) {
-      if (!alias)
-        continue;
-      std::optional<std::string_view> imported = ast::string(*alias, "name");
-      std::optional<std::string_view> member = importAliasLocalName(*alias);
-      if (!imported || !member || llvm::StringRef(*member) != exportedName)
-        continue;
-      if (bindSourceModuleNamespace(llvm::StringRef(*imported), localName))
+  if (auto members = definitions.importedMembers.find(exportedName);
+      members != definitions.importedMembers.end())
+    for (std::string_view imported : members->second)
+      if (bindSourceModuleNamespace(llvm::StringRef(imported), localName))
         return true;
-    }
-  }
   if (bindSourceModuleReexport(*source, exportedName, localName))
     return true;
   return false;
@@ -1991,8 +2036,98 @@ void ModuleEmitter::bindSourceModuleLocals(llvm::StringRef moduleName,
                                 moduleGlobals[method.globalName]);
 }
 
+// ⭐ BOUND ONCE PER MODULE, REPLAYED AFTER. Every method body inlined from an
+// imported module binds that module's imports again, into a fresh isolated
+// scope, and the reading is the same each time: on test_argparse those
+// readings were more than half of the emitter. The first reading records what
+// it wrote -- the scope's names and the global annotation aliases -- and the
+// next one copies that.
+// ⛔ Only from a fresh isolated frame, and not when diagnosing: a reading that
+// starts from other names, or that reports, is not the one recorded. Nor
+// while a module's signatures are being read: that reading leaves the module's
+// defs out to break an import cycle, so it binds less than another.
+// ⛔ Not with the js host module: its binding writes emitter state
+// (`jsHostFunctionAliases`) the record does not hold.
+// LYTHON_ABLATE_IMPORT_SCOPE_MEMO=1 reads every time;
+// LYTHON_VERIFY_IMPORT_SCOPE_MEMO=1 reads every time and aborts where the
+// reading differs from the replay.
 void ModuleEmitter::bindModuleImportScope(const parser::Node &sourceModule,
                                           bool diagnoseUnsupported) {
+  static const bool ablate =
+      std::getenv("LYTHON_ABLATE_IMPORT_SCOPE_MEMO") != nullptr;
+  static const bool verify =
+      std::getenv("LYTHON_VERIFY_IMPORT_SCOPE_MEMO") != nullptr;
+  if (ablate || diagnoseUnsupported || !types.atFreshIsolatedFrame() ||
+      !importedSignatureScopes.empty() ||
+      lookupSourceModule(py::kJsHostModule))
+    return bindModuleImportStatements(sourceModule, diagnoseUnsupported);
+  auto found = importScopeMemo.find(&sourceModule);
+  if (found != importScopeMemo.end() &&
+      found->second.generation == importScopeGeneration &&
+      found->second.moduleGlobalCount == moduleGlobals.size()) {
+    if (!verify) {
+      types.replayFrame(found->second.record);
+      return;
+    }
+    // What a reading leaves, against what the replay leaves, from the same
+    // alias tables.
+    TypeSystem::AliasTables before = types.aliasTables();
+    TypeSystem::FrameRecord fresh;
+    types.startRecordingAliasWrites(fresh);
+    bindModuleImportStatements(sourceModule, diagnoseUnsupported);
+    types.stopRecordingAliasWrites();
+    std::string differs = types.compareFrame(*found->second.record);
+    TypeSystem::AliasTables read = types.aliasTables();
+    types.restoreAliasTables(before);
+    found->second.record->appliedAt = ~std::uint64_t{0};
+    {
+      auto isolation = types.isolateScopes();
+      auto scope = types.pushScope();
+      types.replayFrame(found->second.record);
+    }
+    TypeSystem::AliasTables replayed = types.aliasTables();
+    types.restoreAliasTables(read);
+    if (differs.empty()) {
+      bool same = read.aliases.size() == replayed.aliases.size() &&
+                  read.typeAliases.size() == replayed.typeAliases.size();
+      for (const auto &entry : read.aliases)
+        same = same && replayed.aliases.lookup(entry.getKey()) ==
+                           entry.getValue();
+      for (const auto &entry : read.typeAliases)
+        same = same && replayed.typeAliases.lookup(entry.getKey()) ==
+                           entry.getValue();
+      if (!same)
+        differs = "annotation aliases";
+    }
+    if (!differs.empty()) {
+      llvm::StringRef name = "<module>";
+      for (const EmitOptions::SourceModule &source : options.sourceModules)
+        if (source.moduleNode == &sourceModule)
+          name = source.moduleName;
+      llvm::errs() << "import scope memo: the replay of " << name
+                   << " differs from a fresh reading in its " << differs
+                   << "\n";
+      std::abort();
+    }
+    return;
+  }
+  ImportScopeMemo memo;
+  memo.record = std::make_shared<TypeSystem::FrameRecord>();
+  memo.generation = importScopeGeneration;
+  types.startRecordingAliasWrites(*memo.record);
+  bindModuleImportStatements(sourceModule, diagnoseUnsupported);
+  types.stopRecordingAliasWrites();
+  // ⛔ Checked after the reading: it may drop the signature memos, and what it
+  // read then is not what the next reading reads.
+  if (memo.generation != importScopeGeneration)
+    return;
+  memo.moduleGlobalCount = moduleGlobals.size();
+  types.captureFrame(*memo.record);
+  importScopeMemo[&sourceModule] = std::move(memo);
+}
+
+void ModuleEmitter::bindModuleImportStatements(
+    const parser::Node &sourceModule, bool diagnoseUnsupported) {
   const auto *rawBody = ast::nodeList(sourceModule, "body");
   if (!rawBody)
     return;
@@ -2212,6 +2347,7 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
         continue;
       std::string qualified =
           sourceModuleClassSymbol(source.moduleName, *name);
+      forgetDeclarationMemos();
       auto &bases = declaredClassBases[qualified];
       declaredClassRank.try_emplace(qualified, importedClassRanks++);
       if (const auto *baseNodes = ast::nodeList(*statement, "bases"))

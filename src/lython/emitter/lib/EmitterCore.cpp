@@ -281,6 +281,7 @@ void ModuleEmitter::resolveTopLevelBaseSpellings() {
     const auto *baseNodes = ast::nodeList(*statement, "bases");
     if (!baseNodes)
       continue;
+    forgetDeclarationMemos();
     auto &bases = declaredClassBases[*name];
     bool changed = false;
     // ⭐ AND A BARE NAME THAT IS AN IMPORT, which the dotted repair below left
@@ -389,6 +390,7 @@ void ModuleEmitter::collectTopLevelBindings() {
       // through -- moving `class B` up flipped the same program to a refusal.
       // Whether a hierarchy has an override is a property of the module, not
       // of where in it the question is asked.
+      forgetDeclarationMemos();
       auto &bases = declaredClassBases[*name];
       declaredClassRank.try_emplace(*name,
                                     (1u << 30) + mainModuleClassRanks++);
@@ -583,6 +585,7 @@ void ModuleEmitter::markExcInfoCallsInsideHandlers(const parser::Node &node,
 
 void ModuleEmitter::recordClassBodyDeclarations(llvm::StringRef name,
                                                 const parser::Node &classDef) {
+  forgetDeclarationMemos();
   auto &methods = declaredClassMethods[name];
   auto &attributes = declaredClassAttributes[name];
   auto &readable = declaredClassReadableNames[name];

@@ -2145,7 +2145,25 @@ private:
   // Set while the generator state machine flattens a clone's tries
   // (TryOps.cpp, HandlerReturn): their handlers answer from the text.
   bool loweringGeneratorCloneTries = false;
-  llvm::SmallVector<mlir::Operation *, 32> erase;
+  // The ops lowered away, in the order they were, with their membership
+  // indexed: the py-op walk asks "already erased?" once per op, and a linear
+  // search of the list was two seconds of test_argparse's lowering.
+  // ⛔ Not a SetVector: an op may be listed twice, and `eraseLoweredPyOps`
+  // erases it at the position of its LAST listing (it walks in reverse).
+  struct EraseList {
+    llvm::SmallVector<mlir::Operation *, 32> ops;
+    llvm::DenseSet<mlir::Operation *> members;
+    void push_back(mlir::Operation *op) {
+      ops.push_back(op);
+      members.insert(op);
+    }
+    bool contains(mlir::Operation *op) const { return members.contains(op); }
+    auto begin() const { return ops.begin(); }
+    auto end() const { return ops.end(); }
+    auto rbegin() const { return ops.rbegin(); }
+    auto rend() const { return ops.rend(); }
+  };
+  EraseList erase;
 };
 
 // Peels class-upcast / refine / protocol-view wrappers off a value: the

@@ -1334,10 +1334,30 @@ bool ModuleEmitter::fieldEverStored(llvm::StringRef cls,
 bool ModuleEmitter::subclassRedeclares(
     const llvm::StringMap<llvm::StringSet<>> &declarations,
     llvm::StringRef receiverClass, llvm::StringRef name) const {
+  std::string key = (llvm::Twine(reinterpret_cast<std::uintptr_t>(&declarations)) +
+                     "\x1f" + receiverClass + "\x1f" + name)
+                        .str();
+  if (auto found = redeclarationMemo.find(key);
+      found != redeclarationMemo.end())
+    return found->second;
+  bool redeclared = false;
   for (const auto &entry : declaredClassBases)
-    if (candidateRedeclares(declarations, receiverClass, entry.getKey(), name))
-      return true;
-  return false;
+    if (candidateRedeclares(declarations, receiverClass, entry.getKey(), name)) {
+      redeclared = true;
+      break;
+    }
+  redeclarationMemo[key] = redeclared;
+  return redeclared;
+}
+
+const llvm::StringSet<> &
+ModuleEmitter::declaredAncestors(llvm::StringRef cls) const {
+  if (auto found = declaredAncestorMemo.find(cls);
+      found != declaredAncestorMemo.end())
+    return found->second;
+  llvm::StringSet<> ancestors;
+  collectDeclaredAncestors(cls, ancestors);
+  return declaredAncestorMemo[cls] = std::move(ancestors);
 }
 
 // ⭐ A declaration the subclass reaches WITHOUT going through the receiver
@@ -1396,12 +1416,10 @@ bool ModuleEmitter::candidateRedeclares(
     llvm::StringRef name) const {
   if (candidate == receiverClass)
     return false;
-  llvm::StringSet<> candidateAncestors;
-  collectDeclaredAncestors(candidate, candidateAncestors);
+  const llvm::StringSet<> &candidateAncestors = declaredAncestors(candidate);
   if (!candidateAncestors.contains(receiverClass))
     return false;
-  llvm::StringSet<> receiverAncestors;
-  collectDeclaredAncestors(receiverClass, receiverAncestors);
+  const llvm::StringSet<> &receiverAncestors = declaredAncestors(receiverClass);
   llvm::SmallVector<llvm::StringRef, 8> reachable{candidate};
   for (const auto &ancestor : candidateAncestors)
     reachable.push_back(ancestor.getKey());

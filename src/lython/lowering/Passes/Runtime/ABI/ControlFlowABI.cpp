@@ -217,7 +217,7 @@ mlir::LogicalResult RuntimeBundleLowerer::ensureValueBundle(mlir::Operation *op,
   if (!definition || !definition->getDialect() ||
       definition->getDialect()->getNamespace() != "py")
     return mlir::success();
-  if (llvm::is_contained(erase, definition))
+  if (erase.contains(definition))
     return mlir::success();
   // ⭐ WHAT RUNS BEFORE IT IN ITS BLOCK IS LOWERED BEFORE IT. This lowers a
   // definition out of the walk's order -- a loop header asks for the value
@@ -240,7 +240,7 @@ mlir::LogicalResult RuntimeBundleLowerer::ensureValueBundle(mlir::Operation *op,
       if (sibling.getDialect() &&
           sibling.getDialect()->getNamespace() == "py" &&
           !loweredAheadOfWalk.contains(&sibling) &&
-          !llvm::is_contained(erase, &sibling) &&
+          !erase.contains(&sibling) &&
           (sibling.getNumResults() == 0 ||
            llvm::any_of(sibling.getResults(), [&](mlir::Value result) {
              return !valueBundles.count(result);
@@ -248,13 +248,13 @@ mlir::LogicalResult RuntimeBundleLowerer::ensureValueBundle(mlir::Operation *op,
         earlier.push_back(&sibling);
     }
     for (mlir::Operation *sibling : earlier) {
-      if (llvm::is_contained(erase, sibling))
+      if (erase.contains(sibling))
         continue;
       loweredAheadOfWalk.insert(sibling);
       if (mlir::failed(
               RuntimeBundleLowerer::ensureOperationOperandBundles(sibling)))
         return mlir::failure();
-      if (llvm::is_contained(erase, sibling))
+      if (erase.contains(sibling))
         continue;
       if (mlir::failed(RuntimeBundleLowerer::lowerPyOp(sibling)))
         return mlir::failure();
@@ -264,7 +264,7 @@ mlir::LogicalResult RuntimeBundleLowerer::ensureValueBundle(mlir::Operation *op,
           RuntimeBundleLowerer::ensureOperationOperandBundles(definition)))
     return mlir::failure();
   if (valueBundles.find(value) != valueBundles.end() ||
-      llvm::is_contained(erase, definition))
+      erase.contains(definition))
     return mlir::success();
   return RuntimeBundleLowerer::lowerPyOp(definition);
 }

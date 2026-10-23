@@ -12,6 +12,9 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 
+#include <cstdint>
+#include <memory>
+
 #include <functional>
 #include <optional>
 #include <string>
@@ -204,6 +207,28 @@ public:
   // defining module's environment with this: a plain pushScope would only
   // shadow, so an unbound name in the imported body could silently resolve
   // to a use-site local instead of being diagnosed.
+  // What one binding pass wrote: the innermost scope's names and the global
+  // annotation aliases it set or dropped, in order. ModuleEmitter keeps one
+  // per imported module so that binding a module's imports again -- once per
+  // method body inlined from it -- is a copy rather than a second reading.
+  struct AliasWrite {
+    bool typeAlias = false; // annotationTypeAliases, else annotationAliases
+    std::string name;
+    mlir::Type type;        // null with typeAlias: the alias was dropped
+    std::string target;
+  };
+  struct FrameRecord {
+    llvm::StringMap<mlir::Type> symbols;
+    llvm::StringMap<std::string> canonical;
+    llvm::StringMap<mlir::Type> classes;
+    llvm::StringMap<mlir::Type> typeParameters;
+    llvm::StringSet<> moduleNames;
+    // The last write to each alias, keyed by table and name: what replaying
+    // the whole sequence would leave.
+    llvm::StringMap<AliasWrite> aliasWrites;
+    // The alias epoch these writes were last applied at (replayFrame).
+    mutable std::uint64_t appliedAt = ~std::uint64_t{0};
+  };
   class ScopeIsolation {
   public:
     ScopeIsolation() = default;
@@ -225,6 +250,7 @@ public:
     llvm::SmallVector<llvm::StringMap<mlir::Type>, 8> savedClasses;
     llvm::SmallVector<llvm::StringMap<mlir::Type>, 8> savedTypeParameters;
     llvm::SmallVector<llvm::StringSet<>, 8> savedModuleNames;
+    std::shared_ptr<const FrameRecord> savedUnderlay;
   };
 
   explicit TypeSystem(mlir::MLIRContext &context);
@@ -336,6 +362,36 @@ public:
 
   Scope pushScope() const;
   ScopeIsolation isolateScopes() const;
+  // Only one scope deep, and empty: the frame a binding pass starts from.
+  bool atFreshIsolatedFrame() const;
+  // Logs alias writes into `record` too, until the matching stop. Nested
+  // recordings each see the writes of everything inside them.
+  void startRecordingAliasWrites(FrameRecord &record) {
+    aliasRecords.push_back(&record);
+  }
+  void stopRecordingAliasWrites() { aliasRecords.pop_back(); }
+  void captureFrame(FrameRecord &record) const;
+  // ⭐ UNDER the innermost frame, not copied into it: the frame reads what it
+  // does not bind itself from the record, as an outer frame would be read.
+  // Copying was slower than reading again -- the frames of a module that
+  // imports argparse hold thousands of names, replayed ten thousand times.
+  void replayFrame(std::shared_ptr<const FrameRecord> record);
+  // Why a replay and a fresh reading differ, or empty when they agree.
+  std::string compareFrame(const FrameRecord &replayed) const;
+  // The annotation alias tables, for the memo's verify mode to compare what
+  // a replay leaves with what a reading leaves.
+  struct AliasTables {
+    llvm::StringMap<std::string> aliases;
+    llvm::StringMap<mlir::Type> typeAliases;
+  };
+  AliasTables aliasTables() const {
+    return {annotationAliases, annotationTypeAliases};
+  }
+  void restoreAliasTables(const AliasTables &tables) {
+    annotationAliases = tables.aliases;
+    annotationTypeAliases = tables.typeAliases;
+    ++aliasEpoch;
+  }
   void bindLocalSymbol(llvm::StringRef name, mlir::Type type) const;
   // Monomorphization: the ground type a specialization solved for a type
   // parameter, visible to ANNOTATIONS in the specialized body (`out:
@@ -679,6 +735,17 @@ private:
   // after it, and `def path(): ...; path()` in the program was refused as
   // "module 'path' is not a value".
   mutable llvm::SmallVector<llvm::StringSet<>, 8> scopedModuleNames;
+  llvm::SmallVector<FrameRecord *, 2> aliasRecords;
+  // A replayed frame below scope 0 (replayFrame); dropped with scope 0.
+  mutable std::shared_ptr<const FrameRecord> underlay;
+  // Counts the writes to the annotation alias tables.
+  std::uint64_t aliasEpoch = 0;
+  void logAliasWrite(const AliasWrite &write) {
+    for (FrameRecord *record : aliasRecords)
+      record->aliasWrites[(llvm::Twine(write.typeAlias ? 'T' : 'A') + "." +
+                           write.name)
+                              .str()] = write;
+  }
   void noteModuleNameInScope(llvm::StringRef name);
   void forgetModuleNameInScope(llvm::StringRef name) const;
   // Signatures resolved by registerModule's pre-pass, keyed by function
