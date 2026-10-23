@@ -373,10 +373,12 @@ mlir::Value loadTracebackSize(SupportBuilder &b) {
                                     /*alignment=*/8);
 }
 
-// LyTraceback_Push(file view: ptr/offset/size/stride via two descriptor arg
-// groups, i32 line, i32 col, i32 endLine, i32 endCol, i32 hasMarker): pushes
+// LyTraceback_Push(file view, name view -- each written as its five words,
+// `spellsDescriptorAt` -- i32 line, i32 col, i32 endLine, i32 endCol, i32 hasMarker): pushes
 // a frame with copied names and an optional caret range.
 void buildTracebackPush(SupportBuilder &b) {
+  b.spellsDescriptorAt(0);
+  b.spellsDescriptorAt(5);
   auto fn = b.beginFunction(
       "LyTraceback_Push",
       b.builder.getFunctionType({b.ptr(), b.ptr(), b.i64(), b.i64(), b.i64(),
@@ -917,11 +919,12 @@ void buildTracebackFrameNameLen(SupportBuilder &b, llvm::StringRef symbol,
       });
 }
 
-// void LyTraceback_FrameFileCopy(i64 index, memref<?xi8> dest, i64 len) at the
-// lowered ABI (index, alloc, aligned, offset, size, stride, len), and the same
-// for the function name.
+// void LyTraceback_FrameFileCopy(i64 index, memref<?xi8> dest, i64 len), the
+// view written as its five words (`spellsDescriptorAt`), and the same for the
+// function name.
 void buildTracebackFrameNameCopy(SupportBuilder &b, llvm::StringRef symbol,
                                  std::int32_t field) {
+  b.spellsDescriptorAt(1);
   auto fn = b.beginFunction(
       symbol, b.builder.getFunctionType({b.i64(), b.ptr(), b.ptr(), b.i64(),
                                          b.i64(), b.i64(), b.i64()},
@@ -1097,6 +1100,7 @@ void buildTracebackExcLineLen(SupportBuilder &b) {
 }
 
 void buildTracebackExcLineCopy(SupportBuilder &b) {
+  b.spellsDescriptorAt(0);
   auto fn = b.beginFunction(
       "LyTraceback_ExcLineCopy",
       b.builder.getFunctionType(
@@ -1428,7 +1432,8 @@ void buildSetCurrentSuppress(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-// LyEH_SetCurrentCause(exception triple as expanded descriptors): record the
+// LyEH_SetCurrentCause(exception triple, each part written as its five words,
+// `spellsDescriptorAt`): record the
 // raised exception's explicit __cause__. `raise X from e` where `e` is the
 // exception just stashed as __context__ shares that node; otherwise a fresh
 // node retains the cause object (the call borrows its operands).
@@ -1441,6 +1446,9 @@ void buildSetCurrentCause(SupportBuilder &b) {
     inputs.push_back(b.i64());
     inputs.push_back(b.i64());
   }
+  b.spellsDescriptorAt(0, 3);
+  b.spellsDescriptorAt(5, 2);
+  b.spellsDescriptorAt(10);
   auto fn = b.beginFunction("LyEH_SetCurrentCause",
                             b.builder.getFunctionType(inputs, {}));
   mlir::Block *entry = fn.addEntryBlock();

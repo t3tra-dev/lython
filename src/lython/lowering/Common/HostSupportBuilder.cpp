@@ -12,20 +12,21 @@
 // live) because they are not cleanly module-owned:
 //  - LyHost_WriteBytes is also called by builtins.mlir's print path, which
 //    must link into every program whether or not _io is imported;
-//  - the FILE*/buffer wrappers take the post-expansion memref descriptor ABI
-//    and lean on support-private helpers (copy_i8_memref) that the manifest
+//  - the FILE*/buffer wrappers read memref descriptors word by word
+//    (`spellsDescriptorAt`) and lean on support-private helpers (copy_i8_memref) that the manifest
 //    lowering path cannot see.
 
 namespace py::runtime_library {
 namespace {
 
 
-// LyHost_WriteBytes(i32 fd, memref<?xi8> descriptor, i64 len) at the lowered
-// ABI (fd, alloc ptr, aligned ptr, offset, size, stride, len): the raw
-// pointer extraction from the descriptor is the irreducibly-llvm part of the
+// LyHost_WriteBytes(i32 fd, memref<?xi8> descriptor, i64 len), the view
+// written as its five words (`spellsDescriptorAt`): the raw pointer
+// extraction from the descriptor is the irreducibly-llvm part of the
 // print path; everything above it (print semantics, the end="\n"
 // terminator) lives in builtins.mlir.
 void buildHostWriteBytes(SupportBuilder &b) {
+  b.spellsDescriptorAt(1);
   auto fn = b.beginFunction(
       "LyHost_WriteBytes",
       b.builder.getFunctionType({b.i32(), b.ptr(), b.ptr(), b.i64(), b.i64(),
@@ -104,8 +105,9 @@ void buildHostArgvSupport(SupportBuilder &b) {
   }
 
   {
-    // LyHost_ArgvCopy(i64 index, memref<?xi8> dest, i64 len) at the lowered
-    // ABI (index, alloc, aligned, offset, size, stride, len).
+    // LyHost_ArgvCopy(i64 index, memref<?xi8> dest, i64 len), the view
+    // written as its five words (`spellsDescriptorAt`).
+    b.spellsDescriptorAt(1);
     auto fn = b.beginFunction(
         "LyHost_ArgvCopy",
         b.builder.getFunctionType({b.i64(), b.ptr(), b.ptr(), b.i64(),
@@ -131,6 +133,8 @@ void buildHostFileSupport(SupportBuilder &b) {
   {
     // i64 LyHost_FOpen(memref<?xi8> path, i64 path_len, memref<?xi8> mode,
     // i64 mode_len): NUL-terminate both views, fopen, 0 on failure.
+    b.spellsDescriptorAt(0);
+    b.spellsDescriptorAt(6);
     auto fn = b.beginFunction(
         "LyHost_FOpen",
         b.builder.getFunctionType({b.ptr(), b.ptr(), b.i64(), b.i64(),
@@ -174,6 +178,7 @@ void buildHostFileSupport(SupportBuilder &b) {
   {
     // i64 LyHost_FRead(i64 file, memref<?xi8> dest, i64 offset, i64 max):
     // fread into dest[offset..offset+max); returns the byte count.
+    b.spellsDescriptorAt(1);
     auto fn = b.beginFunction(
         "LyHost_FRead",
         b.builder.getFunctionType({b.i64(), b.ptr(), b.ptr(), b.i64(),
@@ -215,6 +220,7 @@ void buildHostFileSupport(SupportBuilder &b) {
 
   {
     // i64 LyHost_FWrite(i64 file, memref<?xi8> bytes, i64 len).
+    b.spellsDescriptorAt(1);
     auto fn = b.beginFunction(
         "LyHost_FWrite",
         b.builder.getFunctionType({b.i64(), b.ptr(), b.ptr(), b.i64(),
@@ -369,6 +375,7 @@ void buildHostBufferSupport(SupportBuilder &b) {
 
   {
     // void LyHost_BufferCopyIn(i64 buffer, i64 at, memref<?xi8> src, i64 len).
+    b.spellsDescriptorAt(2);
     auto fn = b.beginFunction(
         "LyHost_BufferCopyIn",
         b.builder.getFunctionType({b.i64(), b.i64(), b.ptr(), b.ptr(),
@@ -388,6 +395,7 @@ void buildHostBufferSupport(SupportBuilder &b) {
   {
     // void LyHost_BufferCopyOut(i64 buffer, i64 at, memref<?xi8> dest,
     // i64 len).
+    b.spellsDescriptorAt(2);
     auto fn = b.beginFunction(
         "LyHost_BufferCopyOut",
         b.builder.getFunctionType({b.i64(), b.i64(), b.ptr(), b.ptr(),

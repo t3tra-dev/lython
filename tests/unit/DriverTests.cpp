@@ -1233,6 +1233,54 @@ TEST(DriverTest, AStaticShapeHandleCrossesACallAsOnePointer) {
   EXPECT_EQ(make->getReturnType(), ptr);
 }
 
+// A str crosses a call between the program's own functions as its header's
+// pointer, then its bytes' pointer and their count -- not two five-word
+// descriptors.
+TEST(DriverTest, AStrCrossesACallAsPointersAndASize) {
+  CompileResult result = compileSource("def shout(s: str) -> str:\n"
+                                       "    return s + \"!\"\n"
+                                       "print(shout(\"hey\"))\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  llvm::Function *shout =
+      result.verified.llvmModule->getFunction("_ZN8__main__5shoutE");
+  ASSERT_NE(shout, nullptr);
+  llvm::LLVMContext &context = result.verified.llvmModule->getContext();
+  auto *ptr = llvm::PointerType::getUnqual(context);
+  auto *i64 = llvm::Type::getInt64Ty(context);
+  ASSERT_EQ(shout->arg_size(), 3u);
+  EXPECT_EQ(shout->getArg(0)->getType(), ptr);
+  EXPECT_EQ(shout->getArg(1)->getType(), ptr);
+  EXPECT_EQ(shout->getArg(2)->getType(), i64);
+  EXPECT_EQ(shout->getReturnType(),
+            llvm::StructType::get(context, {ptr, ptr, i64}));
+}
+
+// The native runtime takes a byte view the way the program passes one: the
+// runtime's own function, linked in, takes the pointer and the count.
+TEST(DriverTest, TheNativeRuntimeTakesAViewAsAPointerAndASize) {
+  CompileResult result = compileSource("print(\"native\")\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  ASSERT_TRUE(mlir::succeeded(lython::driver::configureLLVMModuleCodeGenTarget(
+      *result.verified.llvmModule,
+      lython::driver::detectTensorLoweringTarget(
+          lython::driver::DriverOptions{}),
+      lython::driver::DriverOptions{}, diag)))
+      << diagnostics;
+  ASSERT_TRUE(mlir::succeeded(py::runtime_library::linkEmbeddedNativeRuntime(
+      *result.verified.llvmModule)));
+  llvm::Function *write =
+      result.verified.llvmModule->getFunction("LyHost_WriteBytes");
+  ASSERT_NE(write, nullptr);
+  ASSERT_FALSE(write->isDeclaration());
+  llvm::LLVMContext &context = result.verified.llvmModule->getContext();
+  // fd, the bytes' pointer and count, the length to write.
+  ASSERT_EQ(write->arg_size(), 4u);
+  EXPECT_EQ(write->getArg(1)->getType(), llvm::PointerType::getUnqual(context));
+  EXPECT_EQ(write->getArg(2)->getType(), llvm::Type::getInt64Ty(context));
+}
+
 // A module global's pointer cell holds a pointer.
 //
 // A module-level object is parked in one i64 cell per stored word: a bound

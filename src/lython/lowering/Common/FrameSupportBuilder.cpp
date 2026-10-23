@@ -210,9 +210,10 @@ void buildFrameTextLen(SupportBuilder &b) {
                                mlir::ValueRange{b.iconst(0)});
 }
 
-// void LyFrame_TextCopy(i64 level, i64 field, memref<?xi8> dest, i64 len) at
-// the lowered ABI (level, field, alloc, aligned, offset, size, stride, len).
+// void LyFrame_TextCopy(i64 level, i64 field, memref<?xi8> dest, i64 len),
+// the view written as its five words (`spellsDescriptorAt`).
 void buildFrameTextCopy(SupportBuilder &b) {
+  b.spellsDescriptorAt(2);
   auto fn = b.beginFunction(
       "LyFrame_TextCopy",
       b.builder.getFunctionType({b.i64(), b.i64(), b.ptr(), b.ptr(), b.i64(),
