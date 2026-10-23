@@ -1210,6 +1210,29 @@ TEST(DriverTest, EveryCallIntoTheEHRuntimeMatchesItsDefinition) {
   }
 }
 
+// A static-shape handle crosses a call between the program's own functions as
+// one pointer: the int `n` is its handle plus its two unboxed lanes, and the
+// instance comes back as a pointer, not a five-word descriptor.
+TEST(DriverTest, AStaticShapeHandleCrossesACallAsOnePointer) {
+  CompileResult result = compileSource("class P:\n"
+                                       "    def __init__(self, x: int) -> None:\n"
+                                       "        self.x = x\n"
+                                       "def make(n: int) -> P:\n"
+                                       "    return P(n + 1)\n"
+                                       "print(make(41).x)\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  llvm::Function *make =
+      result.verified.llvmModule->getFunction("_ZN8__main__4makeE");
+  ASSERT_NE(make, nullptr);
+  llvm::LLVMContext &context = result.verified.llvmModule->getContext();
+  auto *ptr = llvm::PointerType::getUnqual(context);
+  ASSERT_EQ(make->arg_size(), 3u);
+  EXPECT_EQ(make->getArg(0)->getType(), ptr);
+  EXPECT_EQ(make->getArg(1)->getType(), llvm::Type::getInt64Ty(context));
+  EXPECT_EQ(make->getArg(2)->getType(), llvm::Type::getInt1Ty(context));
+  EXPECT_EQ(make->getReturnType(), ptr);
+}
+
 // A module global's pointer cell holds a pointer.
 //
 // A module-level object is parked in one i64 cell per stored word: a bound

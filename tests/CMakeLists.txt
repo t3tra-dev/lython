@@ -235,6 +235,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.EveryClassOfATupleArmReachesTheTypeTable"
     "DriverTest.ThePersonalityIsTheOneTheTargetCanHave"
     "DriverTest.EveryCallIntoTheEHRuntimeMatchesItsDefinition"
+    "DriverTest.AStaticShapeHandleCrossesACallAsOnePointer"
     "DriverTest.AModuleGlobalsPointerCellHoldsAPointer"
     "DriverTest.AParkedExceptionIsReachedByPointer"
     "DriverTest.ManifestWordOffsetsMatchTheRuntimeStructs"

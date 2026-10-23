@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mlir/IR/BuiltinOps.h"
+#include "llvm/ADT/StringRef.h"
 
 namespace py::lowering::runtime::cleanup {
 
@@ -22,5 +23,17 @@ unsigned markCannotRaiseFunctions(mlir::ModuleOp module);
 
 // Gives every converted function so marked LLVM's `nounwind`.
 void markCannotRaiseNoUnwind(mlir::ModuleOp module);
+
+// On the casts between a static-shape memref and the pointer that carries it
+// across a call (StaticMemRefABI.cpp).
+inline constexpr llvm::StringLiteral kBarePointerCastAttr{"ly.abi.bare_pointer"};
+// On such a cast whose memref the analysis found at its allocation's start:
+// LYTHON_VERIFY_BARE_POINTER_ABI=1 checks it there.
+inline constexpr llvm::StringLiteral kBarePointerAtStartAttr{
+    "ly.abi.at_start"};
+
+// Passes and returns the static-shape memrefs of every private function that
+// is only called directly as a pointer. Answers how many functions changed.
+unsigned passStaticMemRefsBare(mlir::ModuleOp module);
 
 } // namespace py::lowering::runtime::cleanup

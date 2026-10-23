@@ -14,6 +14,10 @@
 #include "Passes/Runtime/Arch/Arm/AppleAMX.h"
 #include "Passes/Runtime/Arch/Arm/ArmSME.h"
 #include "Passes/Runtime/Cleanup/Transforms.h"
+
+#include <atomic>
+#include <cstdlib>
+#include <string>
 #include "Passes/Runtime/Ctypes/CallbackThunks.h"
 #include "Passes/Runtime/Js/Host.h"
 #include "Passes/Runtime/Common/ContractRewrite.h"
@@ -31,6 +35,10 @@
 #include "mlir/Conversion/ConvertToLLVM/ToLLVMInterface.h"
 #include "mlir/Conversion/ConvertToLLVM/ToLLVMPass.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
+#include "mlir/Conversion/LLVMCommon/MemRefBuilder.h"
+#include "mlir/Interfaces/CallInterfaces.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
+#include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/SymbolTable.h"
@@ -345,6 +353,114 @@ namespace {
 // ⛔ And not convert-func-to-llvm ahead of it, which does take a table: a
 // second conversion orders the argument materializations differently and
 // gives them the function's location instead of their first use's.
+// The casts StaticMemRefABI.cpp puts on each side of a call that carries a
+// static-shape memref as a pointer: the aligned pointer one way, a descriptor
+// rebuilt from it the other.
+class BarePointerCastLowering
+    : public ConvertOpToLLVMPattern<UnrealizedConversionCastOp> {
+public:
+  BarePointerCastLowering(const LLVMTypeConverter &converter, bool verify)
+      : ConvertOpToLLVMPattern(converter), verify(verify) {}
+
+  LogicalResult
+  matchAndRewrite(UnrealizedConversionCastOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (!op->hasAttr(lowering::runtime::cleanup::kBarePointerCastAttr) ||
+        op->getNumOperands() != 1 || op->getNumResults() != 1)
+      return failure();
+    Location loc = op.getLoc();
+    if (auto memref = dyn_cast<MemRefType>(op.getResult(0).getType())) {
+      Value descriptor = MemRefDescriptor::fromStaticShape(
+          rewriter, loc, *getTypeConverter(), memref, adaptor.getInputs()[0]);
+      rewriter.replaceOp(op, descriptor);
+      return success();
+    }
+    MemRefDescriptor descriptor(adaptor.getInputs()[0]);
+    Value aligned = descriptor.alignedPtr(rewriter, loc);
+    if (verify &&
+        op->hasAttr(lowering::runtime::cleanup::kBarePointerAtStartAttr)) {
+      std::string site = "a static-shape memref passed as a pointer is not "
+                         "at the start of its allocation: ";
+      // The call may have been converted to `llvm.call` already, and the
+      // function to `llvm.func`.
+      Operation *user = op->hasOneUse() ? *op->getUsers().begin() : nullptr;
+      auto call = dyn_cast_or_null<CallOpInterface>(user);
+      auto callee = call ? dyn_cast_or_null<SymbolRefAttr>(
+                               call.getCallableForCallee())
+                         : SymbolRefAttr();
+      if (callee)
+        site += ("argument of " + callee.getRootReference().getValue()).str();
+      else if (auto function = op->getParentOfType<FunctionOpInterface>())
+        site += ("result of " + SymbolTable::getSymbolName(function).getValue())
+                    .str();
+      Value label = LLVM::createGlobalString(
+          loc, rewriter,
+          ("__ly_abi_label." + llvm::Twine(labels.fetch_add(1))).str(), site,
+          LLVM::Linkage::Internal);
+      LLVM::CallOp::create(
+          rewriter, loc, TypeRange{}, kBarePointerCheck,
+          ValueRange{descriptor.allocatedPtr(rewriter, loc), aligned, label});
+    }
+    rewriter.replaceOp(op, aligned);
+    return success();
+  }
+
+  static constexpr StringLiteral kBarePointerCheck{
+      "__ly_abi_check_bare_pointer"};
+
+private:
+  bool verify;
+  mutable std::atomic<unsigned> labels{0};
+};
+
+// Aborts unless the allocated pointer is the aligned one, or the placeholder
+// a global's descriptor carries there.
+void defineBarePointerCheck(ModuleOp module) {
+  if (module.lookupSymbol(BarePointerCastLowering::kBarePointerCheck))
+    return;
+  MLIRContext *context = module.getContext();
+  OpBuilder builder(context);
+  Location loc = module.getLoc();
+  auto ptr = LLVM::LLVMPointerType::get(context);
+  auto voidType = LLVM::LLVMVoidType::get(context);
+  builder.setInsertionPointToEnd(module.getBody());
+  if (!module.lookupSymbol("abort"))
+    LLVM::LLVMFuncOp::create(builder, loc, "abort",
+                             LLVM::LLVMFunctionType::get(voidType, {}));
+  // `cf.assert`'s lowering may have declared it already, returning nothing.
+  auto puts = module.lookupSymbol<LLVM::LLVMFuncOp>("puts");
+  if (!puts)
+    puts = LLVM::LLVMFuncOp::create(
+        builder, loc, "puts",
+        LLVM::LLVMFunctionType::get(builder.getI32Type(), {ptr}));
+  auto check = LLVM::LLVMFuncOp::create(
+      builder, loc, BarePointerCastLowering::kBarePointerCheck,
+      LLVM::LLVMFunctionType::get(voidType, {ptr, ptr, ptr}),
+      LLVM::Linkage::Internal);
+  Block *entry = check.addEntryBlock(builder);
+  Block *held = builder.createBlock(&check.getBody());
+  Block *broken = builder.createBlock(&check.getBody());
+  builder.setInsertionPointToStart(entry);
+  Value allocated = entry->getArgument(0);
+  Value same = LLVM::ICmpOp::create(builder, loc, LLVM::ICmpPredicate::eq,
+                                    allocated, entry->getArgument(1));
+  Value placeholder = LLVM::IntToPtrOp::create(
+      builder, loc, ptr,
+      LLVM::ConstantOp::create(builder, loc, builder.getI64Type(),
+                               builder.getI64IntegerAttr(0xdeadbeef))
+          .getResult());
+  Value global = LLVM::ICmpOp::create(builder, loc, LLVM::ICmpPredicate::eq,
+                                      allocated, placeholder);
+  Value fine = LLVM::OrOp::create(builder, loc, same, global);
+  LLVM::CondBrOp::create(builder, loc, fine, held, broken);
+  builder.setInsertionPointToStart(held);
+  LLVM::ReturnOp::create(builder, loc, ValueRange{});
+  builder.setInsertionPointToStart(broken);
+  LLVM::CallOp::create(builder, loc, puts, ValueRange{entry->getArgument(2)});
+  LLVM::CallOp::create(builder, loc, TypeRange{}, "abort", ValueRange{});
+  LLVM::UnreachableOp::create(builder, loc);
+}
+
 class SymbolTableConvertToLLVM
     : public PassWrapper<SymbolTableConvertToLLVM, OperationPass<ModuleOp>> {
 public:
@@ -391,11 +507,20 @@ public:
       iface->populateConvertToLLVMConversionPatterns(*target, *typeConverter,
                                                      collected);
     }
+    collected.add<BarePointerCastLowering>(*typeConverter,
+                                           verifyBarePointers);
+    target->addDynamicallyLegalOp<UnrealizedConversionCastOp>(
+        [](UnrealizedConversionCastOp op) {
+          return !op->hasAttr(
+              lowering::runtime::cleanup::kBarePointerCastAttr);
+        });
     patterns = std::make_shared<FrozenRewritePatternSet>(std::move(collected));
     return success();
   }
 
   void runOnOperation() override {
+    if (verifyBarePointers)
+      defineBarePointerCheck(getOperation());
     // Built for this module: the collection fills itself on first use.
     symbolTables->invalidateSymbolTable(getOperation());
     ConversionConfig config;
@@ -406,6 +531,12 @@ public:
   }
 
 private:
+  // LYTHON_VERIFY_BARE_POINTER_ABI=1 checks every static-shape memref passed
+  // as a pointer (StaticMemRefABI.cpp).
+  bool verifyBarePointers = [] {
+    const char *value = std::getenv("LYTHON_VERIFY_BARE_POINTER_ABI");
+    return value && *value && StringRef(value) != "0";
+  }();
   std::shared_ptr<SymbolTableCollection> symbolTables;
   std::shared_ptr<ConversionTarget> target;
   std::shared_ptr<LLVMTypeConverter> typeConverter;
@@ -874,6 +1005,10 @@ LogicalResult runLoweringPipeline(ModuleOp module,
       }
       return WalkResult::advance();
     });
+    {
+      PerfScope perf("lowering.static-memref-abi");
+      lowering::runtime::cleanup::passStaticMemRefsBare(module);
+    }
     if (failed(runPhase("convert-to-llvm", [&](PassManager &pm) {
           mlir::ConvertVectorToLLVMPassOptions vectorOptions;
           vectorOptions.reassociateFPReductions = true;
