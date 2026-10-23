@@ -704,6 +704,52 @@ LogicalResult runLoweringPipeline(ModuleOp module,
     return failure();
   dumpMLIRForPass(irDump, "refcount-elision", module);
 
+  // LYTHON_OWNERSHIP_MUTATE=<kind>:<n> breaks the n-th refcount call of the
+  // program's own functions, after insertion, so that what the ownership
+  // verifier catches can be measured: `drop` erases a release, `dropretain`
+  // a retain, `dup` releases twice. It prints how many candidates there were.
+  if (const char *mutate = ::getenv("LYTHON_OWNERSHIP_MUTATE")) {
+    llvm::StringRef spec(mutate);
+    auto [kind, ordinal] = spec.split(':');
+    unsigned target = 0;
+    ordinal.getAsInteger(10, target);
+    mlir::SymbolTable symbols(module);
+    llvm::SmallVector<mlir::func::CallOp, 64> candidates;
+    module.walk([&](mlir::func::FuncOp function) {
+      if (!function->hasAttr("ly.function.name"))
+        return;
+      function.walk([&](mlir::func::CallOp call) {
+        auto callee = symbols.lookup<mlir::func::FuncOp>(call.getCallee());
+        if (!callee || call.getNumOperands() == 0)
+          return;
+        bool release = callee->hasAttr("ly.runtime.deallocator") &&
+                       py::ownership::functionReleasesOperandAt(callee, 0);
+        bool retain = py::ownership::functionRetainsOperandAt(callee, 0);
+        if (kind == "dropretain" ? retain : release)
+          candidates.push_back(call);
+      });
+    });
+    llvm::errs() << "[mutate] " << kind << " candidates=" << candidates.size()
+                 << "\n";
+    // Also as a remark, for a test that reads the context's diagnostics.
+    mlir::emitRemark(module.getLoc())
+        << "ownership mutation candidates=" << candidates.size();
+    if (target < candidates.size()) {
+      mlir::func::CallOp victim = candidates[target];
+      llvm::errs() << "[mutate] " << kind << " @" << victim.getCallee()
+                   << " in @"
+                   << victim->getParentOfType<mlir::func::FuncOp>().getSymName()
+                   << " at " << victim.getLoc() << "\n";
+      if (kind == "dup") {
+        mlir::OpBuilder builder(victim);
+        builder.setInsertionPointAfter(victim);
+        builder.clone(*victim.getOperation());
+      } else {
+        victim.erase();
+      }
+    }
+  }
+
   // ⭐ THE BODIES NOBODY CAN REACH ARE EMPTIED, NOT REMOVED. The merged
   // manifest brings ~1500 functions into a module whose program uses a few
   // hundred; every verifier and every conversion after this point walked all
