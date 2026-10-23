@@ -3,6 +3,7 @@
 
 #include "Common/Instrumentation.h"
 #include "Common/ModuleSymbolMemo.h"
+#include "Passes/Runtime/Cleanup/Transforms.h"
 
 #include "Common/LibcPrototypes.h"
 
@@ -335,10 +336,22 @@ parseEmbeddedNativeRuntimeModule(const embedded::Module &entry,
 }
 
 mlir::LogicalResult lowerNativeRuntimeModule(mlir::ModuleOp module) {
+  {
+    mlir::PassManager pm(module.getContext());
+    pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(mlir::createCSEPass());
+    if (mlir::failed(pm.run(module)))
+      return mlir::failure();
+  }
+  // The program calls these by the convention it gives every declaration
+  // (MemRefCallABI.cpp). ⛔ Not before the canonicalizer above: it folds a
+  // narrow cast and its inverse back into the descriptor.
+  py::lowering::runtime::cleanup::narrowExpandedDescriptors(module);
+  py::lowering::runtime::cleanup::narrowMemRefCalls(
+      module, {/*declarations=*/false, /*publicDefinitions=*/true});
   mlir::PassManager pm(module.getContext());
-  pm.addPass(mlir::createCanonicalizerPass());
-  pm.addPass(mlir::createCSEPass());
   pm.addPass(mlir::createConvertFuncToLLVMPass());
+  pm.addPass(py::lowering::runtime::cleanup::createLowerNarrowCastsPass());
   pm.addPass(mlir::createSCFToControlFlowPass());
   pm.addPass(mlir::memref::createExpandStridedMetadataPass());
   // Aligned, as the program's own lowering is (LoweringPipeline.cpp,
@@ -567,6 +580,25 @@ mlir::LogicalResult linkEmbeddedNativeRuntime(llvm::Module &llvmModule) {
     llvm::errs() << "error: failed to link the native runtime\n";
     return mlir::failure();
   }
+  // ⭐ EVERY CALL READS ITS ARGUMENTS WHERE ITS CALLEE WRITES THEM. The
+  // program and the runtime are lowered apart and each passes a memref the
+  // way MemRefCallABI.cpp decides; a disagreement links, because LLVM's
+  // verifier accepts a direct call whose type is not its callee's, and then
+  // reads the wrong registers.
+  for (llvm::Function &function : llvmModule)
+    for (llvm::BasicBlock &block : function)
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        auto *callee = call ? llvm::dyn_cast<llvm::Function>(
+                                  call->getCalledOperand())
+                            : nullptr;
+        if (!callee || call->getFunctionType() == callee->getFunctionType())
+          continue;
+        llvm::errs() << "error: " << function.getName() << " calls "
+                     << callee->getName() << " as " << *call->getFunctionType()
+                     << ", but it is " << *callee->getFunctionType() << "\n";
+        return mlir::failure();
+      }
 
   py::branchLocalRaisesToTheirHandler(llvmModule);
   py::flushAssertionMessages(llvmModule);

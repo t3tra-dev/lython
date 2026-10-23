@@ -236,6 +236,8 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.ThePersonalityIsTheOneTheTargetCanHave"
     "DriverTest.EveryCallIntoTheEHRuntimeMatchesItsDefinition"
     "DriverTest.AStaticShapeHandleCrossesACallAsOnePointer"
+    "DriverTest.AStrCrossesACallAsPointersAndASize"
+    "DriverTest.TheNativeRuntimeTakesAViewAsAPointerAndASize"
     "DriverTest.AModuleGlobalsPointerCellHoldsAPointer"
     "DriverTest.AParkedExceptionIsReachedByPointer"
     "DriverTest.ManifestWordOffsetsMatchTheRuntimeStructs"

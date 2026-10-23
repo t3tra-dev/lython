@@ -26,8 +26,9 @@
 namespace py::runtime_library {
 namespace {
 
-// A memref<?xT> parameter at the lowered ABI: (allocated, aligned, offset,
-// size, stride). Only three of the five words are ever needed here.
+// A memref<?xT> parameter written as its five words (allocated, aligned,
+// offset, size, stride), which callers pass as the aligned pointer and the
+// size (`spellsDescriptorAt`). Only three of the five are read here.
 struct View {
   mlir::Value aligned;
   mlir::Value offset;
@@ -35,6 +36,7 @@ struct View {
 };
 
 void appendMemRef(SupportBuilder &b, llvm::SmallVectorImpl<mlir::Type> &types) {
+  b.spellsDescriptorAt(types.size());
   types.append({b.ptr(), b.ptr(), b.i64(), b.i64(), b.i64()});
 }
 

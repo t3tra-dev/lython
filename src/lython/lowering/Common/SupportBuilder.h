@@ -326,8 +326,23 @@ struct SupportBuilder {
     auto fn = mlir::func::FuncOp::create(builder, loc, name, type);
     fn.setVisibility(isPrivate ? mlir::SymbolTable::Visibility::Private
                                : mlir::SymbolTable::Visibility::Public);
+    if (!spelledDescriptors.empty()) {
+      fn->setAttr("ly.abi.expanded_descriptors",
+                  builder.getDenseI64ArrayAttr(spelledDescriptors));
+      spelledDescriptors.clear();
+    }
     return fn;
   }
+
+  // Says that the next function begun spells a memref descriptor out as its
+  // five words from parameter `first`: of a static shape of `staticSize`
+  // elements, or -1 for a dynamic one. The program passes it narrow
+  // (MemRefCallABI.cpp), which the function is rewritten to take.
+  void spellsDescriptorAt(unsigned first, std::int64_t staticSize = -1) {
+    spelledDescriptors.push_back(first);
+    spelledDescriptors.push_back(staticSize);
+  }
+  llvm::SmallVector<std::int64_t, 8> spelledDescriptors;
 
   // Terminates a trap block: abort() then a poison return (abort is noreturn,
   // so the return is dead but keeps the block well-formed without dropping to
