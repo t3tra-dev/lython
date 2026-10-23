@@ -264,6 +264,9 @@ struct TrackedResource {
   // release interface): their uses are entity uses, never release operands.
   llvm::SmallVector<mlir::Value, 4> views;
   std::optional<own::OwnershipCondition> condition;
+  // Walked from a hand-off (OwnershipHandoffs): `producer` is the first op of
+  // the block whose arguments took the token.
+  bool handedOver = false;
 };
 
 // IS THIS CONSUMING CALL SOMEBODY ELSE'S DISCHARGE RATHER THAN THIS TOKEN'S?
@@ -662,7 +665,8 @@ public:
   // per block entry would refuse exactly the blocks reached by more than one
   // (outside the exceptional flag), so this measures what such a walk would
   // newly refuse before one is written.
-  void reportJoins(llvm::StringRef function) const {
+  void reportJoins(llvm::StringRef function, llvm::StringRef producer,
+                   bool conditional) const {
     llvm::DenseMap<mlir::Block *, llvm::SmallVector<unsigned, 2>> entries;
     for (auto [index, state] : llvm::enumerate(states))
       if (state.block && state.start == &state.block->front())
@@ -720,7 +724,8 @@ public:
                  << " core=" << coreDivergent << " max=" << maxStates;
     for (auto &field : fields)
       llvm::errs() << " " << field.getKey() << "=" << field.getValue();
-    llvm::errs() << "\n";
+    llvm::errs() << " producer=" << producer
+                 << (conditional ? " conditional" : "") << "\n";
   }
 
 private:
@@ -2770,13 +2775,107 @@ collectUnwindAmbiguousRetainOperands(mlir::func::FuncOp function,
 }
 
 
+// ⭐ A TOKEN HANDED TO A BLOCK ARGUMENT IS THE ARGUMENT'S RESOURCE from there
+// on, walked once for the function rather than once per resource that hands
+// it over. Following the token onto the argument under the walk of whoever
+// produced it walked every merge downstream once per producer upstream: an
+// accumulator rebound in N branches (`if v is not None: total += len(v)`)
+// is forwarded through every later join on the arm that does not rebind it,
+// so N producers each walked to the end of the function -- 5.1 M states and
+// 81 s for N = 800. Refcount insertion models the merge the same way
+// (`edgeTokenClaims`: the destination argument takes the token).
+//
+// Shared only between hand-offs whose walk would answer alike: the state's
+// visited key, plus what about the producer the rules still read. The
+// reference is NOT carried: a block argument denotes no single increment (the
+// reference map answers "no claim" for one), and carrying the producer's made
+// two producers' hand-offs to one argument two walks.
+//
+// LYTHON_ABLATE_OWNERSHIP_HANDOFF=1 follows the token under the producer's
+// walk, as before.
+struct OwnershipHandoff {
+  TrackedResource resource;
+  AffinePathState state;
+};
+
+class OwnershipHandoffs {
+public:
+  static bool disabled() {
+    static const bool off =
+        std::getenv("LYTHON_ABLATE_OWNERSHIP_HANDOFF") != nullptr;
+    return off;
+  }
+
+  // False when an equivalent hand-off was already taken.
+  bool offer(const TrackedResource &from, AffinePathState state) {
+    std::size_t key = dedupBucket(llvm::hash_combine(
+        pathStateDedupKey(state), from.ownsReference, from.hasOwnNamedRelease,
+        from.condition.has_value()));
+    llvm::SmallVector<unsigned, 1> &bucket = buckets[key];
+    for (unsigned index : bucket) {
+      const OwnershipHandoff &seen = taken[index];
+      if (seen.resource.ownsReference == from.ownsReference &&
+          seen.resource.hasOwnNamedRelease == from.hasOwnNamedRelease &&
+          seen.resource.condition.has_value() == from.condition.has_value() &&
+          samePathState(seen.state, state)) {
+        if (ownershipPathTraceEnabled())
+          llvm::errs() << "[ownership-path] hand-off of " << from.producerLabel
+                       << " to ^bb" << blockOrdinal(state.block)
+                       << " joins the one already taken from "
+                       << seen.resource.producerLabel << "\n";
+        return false;
+      }
+    }
+    bucket.push_back(static_cast<unsigned>(taken.size()));
+    if (ownershipPathTraceEnabled())
+      llvm::errs() << "[ownership-path] hand-off of " << from.producerLabel
+                   << " to ^bb"
+                   << blockOrdinal(state.block) << " retained="
+                   << state.retained << " exceptional=" << state.exceptional
+                   << "\n";
+    // The pre-rename names a hand-off keeps are the latest ones, which is what
+    // a release through a pre-rename name is written with (the loop entry's,
+    // the merge's own). ⛔ Not every generation: they accumulated over a chain
+    // of hand-offs, and every edge searched them -- quadratic in the number
+    // of joins. Dropping an old name can only miss crediting a release, which
+    // is reported as a leak, never accepted.
+    constexpr std::size_t kHandedOverPreviousNames = 16;
+    if (state.previous.size() > kHandedOverPreviousNames)
+      state.previous.erase(state.previous.begin(),
+                           state.previous.end() - kHandedOverPreviousNames);
+    OwnershipHandoff handoff{from, std::move(state)};
+    TrackedResource &resource = handoff.resource;
+    resource.producer = firstOperation(handoff.state.block);
+    resource.values = handoff.state.group;
+    resource.views = handoff.state.views;
+    resource.reference = {};
+    resource.handedOver = true;
+    taken.push_back(handoff);
+    pending.push_back(std::move(handoff));
+    return true;
+  }
+
+  std::optional<OwnershipHandoff> next() {
+    if (pending.empty())
+      return std::nullopt;
+    return pending.pop_back_val();
+  }
+
+private:
+  llvm::SmallVector<OwnershipHandoff, 8> taken;
+  llvm::DenseMap<std::size_t, llvm::SmallVector<unsigned, 1>> buckets;
+  llvm::SmallVector<OwnershipHandoff, 8> pending;
+};
+
 mlir::LogicalResult verifyResourceOnCFGPaths(
     FuncContractCache &contracts, TrackedResource &resource,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
     own::AliasAnalysis &aliases, const own::ReferenceMap &references,
     OwnershipWalkCache &walk,
     bool modelMayRaiseUnwindExits,
-    const llvm::DenseSet<mlir::Value> &ambiguousRetainRoots) {
+    const llvm::DenseSet<mlir::Value> &ambiguousRetainRoots,
+    OwnershipHandoffs *handoffs = nullptr,
+    const AffinePathState *handedOver = nullptr) {
   llvm::SmallVector<AffinePathState, 16> worklist;
   VisitedAffineStates visited;
   static const bool traceJoins = ::getenv("LYTHON_TRACE_OWNERSHIP_JOINS");
@@ -2784,7 +2883,8 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
     if (traceJoins)
       if (auto function =
               resource.producer->getParentOfType<mlir::func::FuncOp>())
-        visited.reportJoins(function.getSymName());
+        visited.reportJoins(function.getSymName(), resource.producerLabel,
+                            resource.condition.has_value());
   });
   AffineTokenState initialToken = resource.condition
                                       ? AffineTokenState::Conditional
@@ -2798,7 +2898,7 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
   initial.views = resource.views;
   if (resource.condition && resource.condition->tag)
     initial.conditionTag.push_back(resource.condition->tag);
-  worklist.push_back(std::move(initial));
+  worklist.push_back(handedOver ? *handedOver : std::move(initial));
 
   // ⛔ A DEFECT ONCE reached through this cap (it no longer reproduces as of
   // 2026-10-23, for int or str elements), and the cap was the symptom rather
@@ -2988,8 +3088,39 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
       next.conditionTag = remapGroupForSuccessor(op, index, successor,
                                                  state.conditionTag, aliases);
       next.trail = state.trail;
+      // The whole group moved onto the successor's arguments with its token
+      // and nothing lent against it: the arguments' walk takes over.
+      if (handoffs && !OwnershipHandoffs::disabled() && renamed &&
+          fullyMapped && nextToken == AffineTokenState::Owned &&
+          next.borrowedRetains.empty() && !next.group.empty() &&
+          llvm::all_of(next.group, [&](mlir::Value value) {
+            auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
+            return argument && argument.getOwner() == successor;
+          })) {
+        handoffs->offer(resource, std::move(next));
+        continue;
+      }
       worklist.push_back(std::move(next));
     }
+  };
+  // Does `producer dominates op` excuse this op? The excuse is for an op that
+  // names the NEXT iteration's value through an alias. ⛔ A hand-off's
+  // producer is its block's first op, which does not dominate past the next
+  // join, while the walk carries the group's own names across it; an op
+  // using one of those names is this token's, dominated or not -- excusing
+  // it hid a doubled release after a merge borrow
+  // (a_short_circuit_on_an_object_inside_a_generator.py, LYTHON_OWNERSHIP_
+  // MUTATE=dup:30).
+  auto excusedByDominance = [&](mlir::Operation *op,
+                                const AffinePathState &state) {
+    if (releasedUseDominanceDisabled() ||
+        walk.producerDominates(resource.producer, op))
+      return false;
+    if (resource.handedOver)
+      for (mlir::Value operand : op->getOperands())
+        if (llvm::is_contained(state.group, operand))
+          return false;
+    return true;
   };
   constexpr unsigned kMaxAffineStates = 20000;
   // States the chain summary stood for without making them, counted against
@@ -3233,8 +3364,7 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
           // producer does not dominate is naming a value this resource's
           // release never touched -- the loop-carried argument an element
           // token was minted from, on the exit edge of the loop.
-          if (!releasedUseDominanceDisabled() &&
-              !walk.producerDominates(resource.producer, ret))
+          if (excusedByDominance(ret, state))
             break;
           return ret.emitError()
                  << "released owned resource from " << resource.producerLabel
@@ -3482,8 +3612,7 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
           // discharge it reported "released or transferred more than once" for
           // a program whose refcounts balance (checked with the leak gate at
           // 200k iterations: net 0).
-          if (consumes && !releasedUseDominanceDisabled() &&
-              !walk.producerDominates(resource.producer, op))
+          if (consumes && excusedByDominance(op, state))
             consumes = false;
           if (consumes) {
             if (outstanding() == 0 && resource.condition) {
@@ -3531,9 +3660,7 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
           if (mentionsTracked &&
               (groupContainsOperand(op, state.group, aliases) ||
                groupContainsOperand(op, state.views, aliases)) &&
-              outstanding() == 0 &&
-              (releasedUseDominanceDisabled() ||
-               walk.producerDominates(resource.producer, op)))
+              outstanding() == 0 && !excusedByDominance(op, state))
             return call.emitError()
                    << "released owned resource from " << resource.producerLabel
                    << " is used after release (by call to '"
@@ -3734,9 +3861,7 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
         }
       } else if (state.token == AffineTokenState::Released && mentionsTracked &&
                  groupContainsOperand(op, state.group, aliases) &&
-                 outstanding() == 0 &&
-                 (releasedUseDominanceDisabled() ||
-                  walk.producerDominates(resource.producer, op))) {
+                 outstanding() == 0 && !excusedByDominance(op, state)) {
         return op->emitError()
                << "released owned resource from " << resource.producerLabel
                << " is used after release";
@@ -3915,6 +4040,110 @@ collectTrackedResources(mlir::ModuleOp module, mlir::SymbolTable &symbols,
   return resources;
 }
 
+// ⭐ A RETAIN OF A VALUE NO RESOURCE COVERS MINTS A TOKEN, and that token is a
+// resource of its own from the retain on. The producers above are calls with
+// owned results and marked locals; a value read out of a slot or selected by
+// an `scf.if` is neither, and the retain that makes it owned was counted by
+// nobody. So nothing checked its releases: a doubled release of a str read
+// from a list was accepted (LYTHON_OWNERSHIP_MUTATE=dup over
+// a_conditional_expression_that_narrows.py: 13 of 39 positions), and so was a
+// dropped retain -- the "counts what is present" blind spot.
+//
+// Not a retain that parks the token in a holder (`aggregate_retain` other than
+// the emitter's acquisition `:py.incref`): the holder's release discharges it.
+// Not a merge borrow: the destination argument's walk owns that token. Not one
+// of an entry argument: the borrowed walk counts those. And not a retain that
+// another such retain of the same value dominates: the first one's walk counts
+// it, as a walk counts every retain of what it tracks; two walks of one value
+// would each read the other's release as a second consume.
+//
+// LYTHON_ABLATE_RETAIN_MINTED_RESOURCES=1 leaves them untracked, as before.
+void appendRetainMintedResources(
+    llvm::SmallVectorImpl<TrackedResource> &resources,
+    llvm::ArrayRef<BorrowedEntryResource> borrowed,
+    mlir::func::FuncOp function, FuncContractCache &contracts,
+    own::AliasAnalysis &aliases) {
+  static const bool disabled =
+      std::getenv("LYTHON_ABLATE_RETAIN_MINTED_RESOURCES") != nullptr;
+  if (disabled || function.isDeclaration())
+    return;
+  llvm::DenseSet<mlir::Value> covered;
+  for (const TrackedResource &resource : resources) {
+    for (mlir::Value value : resource.values)
+      covered.insert(aliases.find(value));
+    for (mlir::Value value : resource.views)
+      covered.insert(aliases.find(value));
+  }
+  for (const BorrowedEntryResource &resource : borrowed)
+    for (mlir::Value value : resource.values)
+      covered.insert(aliases.find(value));
+  for (mlir::BlockArgument argument : function.getArguments())
+    covered.insert(aliases.find(argument));
+
+  llvm::DenseMap<mlir::Value, llvm::SmallVector<mlir::func::CallOp, 2>>
+      retainsByRoot;
+  llvm::SmallVector<mlir::Value, 8> roots;
+  function.walk([&](mlir::func::CallOp call) {
+    if (isBlockArgMergeBorrowRetain(call))
+      return;
+    if (auto label =
+            call->getAttrOfType<mlir::StringAttr>(own::kAggregateRetainAttr))
+      if (!label.getValue().ends_with(":py.incref"))
+        return;
+    auto cached = contracts.lookup(call.getCallee());
+    if (mlir::failed(cached) || !*cached)
+      return;
+    for (unsigned offset : (*cached)->contract.retainArgs.values) {
+      if (offset >= call.getNumOperands())
+        continue;
+      mlir::Value root = aliases.find(call.getOperand(offset));
+      if (covered.contains(root))
+        continue;
+      // ⛔ Not an object this function allocates: its construction's own
+      // token is not tracked here either (an inline-built instance stored to
+      // a module global), and a walk of the retain alone read that token's
+      // discharge as its own release (id_answers_what_is_answers.py).
+      llvm::SmallVector<mlir::Value, 8> names;
+      aliases.namesOf(root, names);
+      if (llvm::any_of(names, [](mlir::Value name) {
+            mlir::Operation *definer = name.getDefiningOp();
+            return definer &&
+                   mlir::isa<mlir::memref::AllocOp, mlir::memref::AllocaOp,
+                             mlir::memref::ViewOp>(definer);
+          })) {
+        covered.insert(root);
+        continue;
+      }
+      auto [entry, inserted] = retainsByRoot.try_emplace(root);
+      if (inserted)
+        roots.push_back(root);
+      entry->second.push_back(call);
+    }
+  });
+  if (roots.empty())
+    return;
+  mlir::DominanceInfo dominance(function);
+  for (mlir::Value root : roots) {
+    llvm::SmallVector<mlir::func::CallOp, 2> &calls = retainsByRoot[root];
+    for (mlir::func::CallOp call : calls) {
+      if (llvm::any_of(calls, [&](mlir::func::CallOp other) {
+            return other != call &&
+                   dominance.properlyDominates(other.getOperation(),
+                                               call.getOperation());
+          }))
+        continue;
+      llvm::SmallVector<mlir::Value, 4> group;
+      for (unsigned offset : (*contracts.lookup(call.getCallee()))
+                                 ->contract.retainArgs.values)
+        if (offset < call.getNumOperands() &&
+            aliases.find(call.getOperand(offset)) == root)
+          group.push_back(call.getOperand(offset));
+      appendTrackedResource(resources, function, call.getOperation(),
+                            /*offset=*/0, std::move(group));
+    }
+  }
+}
+
 mlir::LogicalResult verifyFunctionAffineOwnership(
     mlir::ModuleOp module, mlir::SymbolTable &symbols,
     mlir::func::FuncOp function,
@@ -3934,6 +4163,8 @@ mlir::LogicalResult verifyFunctionAffineOwnership(
       references);
   llvm::SmallVector<BorrowedEntryResource, 8> borrowedEntryResources =
       collectBorrowedEntryResources(function, deallocators);
+  appendRetainMintedResources(resources, borrowedEntryResources, function,
+                              contracts, aliases);
 
   if (isSingleBlockStraightLineFunction(function) &&
       borrowedEntryResources.empty()) {
@@ -3963,10 +4194,17 @@ mlir::LogicalResult verifyFunctionAffineOwnership(
   // are the same for all of them, and a per-resource cache would rebuild the
   // operand inverse once per resource (the very quadratic term being removed).
   OwnershipWalkCache walk(function, contracts, aliases, handlerEntries);
+  OwnershipHandoffs handoffs;
   for (TrackedResource &resource : resources)
     if (mlir::failed(verifyResourceOnCFGPaths(
             contracts, resource, deallocators, aliases, references, walk,
-            modelMayRaiseUnwindExits, ambiguousRetainRoots)))
+            modelMayRaiseUnwindExits, ambiguousRetainRoots, &handoffs)))
+      return mlir::failure();
+  while (std::optional<OwnershipHandoff> handoff = handoffs.next())
+    if (mlir::failed(verifyResourceOnCFGPaths(
+            contracts, handoff->resource, deallocators, aliases, references,
+            walk, modelMayRaiseUnwindExits, ambiguousRetainRoots, &handoffs,
+            &handoff->state)))
       return mlir::failure();
 
   for (BorrowedEntryResource &resource : borrowedEntryResources)

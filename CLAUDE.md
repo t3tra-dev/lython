@@ -124,6 +124,8 @@ ASAN_OPTIONS=detect_leaks=0:detect_container_overflow=0:allow_user_poisoning=0 \
 - `LYTHON_TRACE_REPR_CLOSURE=1` — 箱詰めの値のフック (repr / str / eq / hash / lt / release) の分岐を絞る根拠 (プログラムが持ち得るクラスの閉包) を stderr に出す。開いた (全分岐を残した) ときはその型と op の位置を出す。`LYTHON_ABLATE_REPR_CLOSURE=1` で常に全分岐を残す (release は例外の系統を常に残す)
 - `LYTHON_VERIFY_OWNERSHIP_BEFORE_CLEANUP=1` — 所有権の経路検査を post-cleanup の後だけでなく、挿入直後 (pre-cleanup) にも走らせる。挿入の欠陥か cleanup の欠陥かを分けるため。既定では pre-cleanup は契約だけを検査する
 - `LYTHON_TRACE_OWNERSHIP_JOINS=1` — 所有権の経路検査で、資源ごとに、同じブロックの入口へ何通りの状態で着いたかとその差 (token / retained / parked / borrowed / slot / group) を stderr に出す。合流点で状態を 1 つにまとめる検査に替えたとき新たに拒否される箇所の見積もり。`LYTHON_COMPILE_THREADS=1` と使う
+- `LYTHON_OWNERSHIP_MUTATE=drop:N|dup:N|dropretain:N` — refcount 挿入の後で、プログラムの関数の N 番目の release を消す / 二重にする / retain を消す。所有権検証器が何を捕まえるかを測るため (候補数を stderr と remark に出す)。`DriverTest.EveryDroppedOrDoubledReleaseIsRefused` がこれで検証器の検出力を守る
+- `LYTHON_ABLATE_OWNERSHIP_HANDOFF=1` / `LYTHON_ABLATE_RETAIN_MINTED_RESOURCES=1` — 所有権検証器で、合流引数への引き継ぎをやめて元の資源の探索で名前を付け替えて追う / どの資源も覆わない値への retain を資源にしない (旧来の検証器。同じバイナリで判定を比べるため)
 - `LYTHON_NUM_THREADS=N` — 実行時: 大きい行列積の fork-join ワーカー数 (デフォルト 4、1 で逐次)
 
 ## アーキテクチャ

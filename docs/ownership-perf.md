@@ -324,3 +324,71 @@ models it (`edgeTokenClaims`). The smallest of the remainder are a retain
 parked in a named slot (`delete_item.py`) and a merge-borrow retain
 (`cond_reassign.py`). The merge-borrow retain is again the rename seen from the
 lender's side.
+
+### Hand-offs and retain-minted tokens (2026-10-23)
+
+The join census showed that most of the verifier's divergent states were one
+token followed onto a block argument under its producer's walk. That walk also
+made long functions quadratic. An accumulator rebound in N branches is
+forwarded through every later join on the arm that does not rebind it, so N
+producers each walked to the end of the function: 5.1 M states and 81 s at
+N = 800, and refused past about N = 2,500 at the 20,000-state cap.
+
+**Hand-offs.** When the whole group moves onto a successor's arguments with its
+token, and nothing is lent against it, the producer's walk stops at that edge.
+The arguments become a resource of their own (`OwnershipHandoffs`), walked
+once for the function however many producers hand over to it. Refcount
+insertion already models a merge this way (`edgeTokenClaims`). A hand-off keeps
+the latest 16 pre-rename names, because carrying every generation made each
+edge search a list as long as the chain of joins. For a hand-off,
+`producerDominates` no longer excuses an op that uses one of the group's own
+names. Its producer is the block's first op, which does not dominate past the
+next join, and excusing such an op hid a doubled release.
+
+Results:
+
+| N branches | verifier before | verifier after |
+| --- | --- | --- |
+| 800 | 81 s | 0.08 s |
+| 3,000 | refused | 0.56 s |
+
+`big1500.py` compiles in 7.3 s and prints CPython's answer.
+
+**Retain-minted tokens.** Some values are covered by no resource: a value read
+out of a slot, or one selected by an `scf.if`. A retain of such a value minted
+a token that no walk tracked, so a doubled release of it was accepted. That
+retain is now a resource of its own from the retain on. A retain dominated by
+another retain of the same value is counted by the first one's walk.
+
+Values excluded from this:
+
+- values an entry argument covers;
+- merge borrows, and retains that park a token in a holder;
+- objects the function allocates itself, whose construction token is untracked
+  there too (`id_answers_what_is_answers.py` read that token's discharge as
+  its own release).
+
+**Measured with LYTHON_OWNERSHIP_MUTATE.** Each golden case and example was
+compiled with one release dropped, one release doubled, or one retain dropped,
+at four positions per kind, under the old verifier and the new one.
+
+| mutation | runs | old refuses | new refuses |
+| --- | --- | --- | --- |
+| release dropped | 3,364 | 1,732 | 1,881 |
+| release doubled | 3,364 | 1,382 | 1,608 |
+| retain dropped | 2,633 | 122 | 122 |
+
+The new verifier refused every mutation the old one refused. Without mutation,
+the accept/refuse verdict was identical over the 1,248 corpus programs.
+
+**Still open.**
+
+- A dropped retain removes the only trace of its token. Catching it needs every
+  release to be attributed to some token.
+- A doubled release is still paid for by a token parked in a container: the
+  rule that lets a value read back out of a container be released
+  (`spendOutstanding`).
+- In refcount insertion, `UnwindCleanupAnalysis::reachSetAvoiding` builds one
+  forward set per consume, and `releaseOwnedGroupByLiveness` builds a
+  dominance tree per group. Both are quadratic on a long function: 3 + 3 s and
+  7 s at N = 3,000.

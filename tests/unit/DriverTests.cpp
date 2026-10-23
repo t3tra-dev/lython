@@ -3545,3 +3545,38 @@ TEST(DriverTest, ALiteralsElementsAreBuiltWithNoUnwindEdges) {
   EXPECT_EQ(few.cleanups, many.cleanups);
   EXPECT_EQ(few.invokes, many.invokes);
 }
+
+// What: every release of this program, dropped or doubled in turn after
+// refcount insertion (LYTHON_OWNERSHIP_MUTATE), is refused by the ownership
+// verifier -- none of the broken programs compiles.
+TEST(DriverTest, EveryDroppedOrDoubledReleaseIsRefused) {
+  const char *source =
+      "class P:\n"
+      "    def __init__(self, n: str, v: int) -> None:\n"
+      "        self.n = n\n"
+      "        self.v = v\n"
+      "    def __repr__(self) -> str:\n"
+      "        return \"P(\" + self.n + \",\" + repr(self.v) + \")\"\n"
+      "print([P(\"a\", 1), P(\"b\", 2)])\n"
+      "print(repr(P(\"c\", 3)))\n"
+      "print([P(\"d\", 4)])\n";
+  auto mutated = [&](const std::string &spec) {
+    ::setenv("LYTHON_OWNERSHIP_MUTATE", spec.c_str(), /*overwrite=*/1);
+    CompileResult result = compileSource(source);
+    ::unsetenv("LYTHON_OWNERSHIP_MUTATE");
+    return result;
+  };
+  for (const char *kind : {"drop", "dup"}) {
+    CompileResult counted = mutated(std::string(kind) + ":1000000");
+    ASSERT_TRUE(counted.succeeded) << counted.diagnostics;
+    std::size_t at = counted.diagnostics.find("candidates=");
+    ASSERT_NE(at, std::string::npos) << counted.diagnostics;
+    unsigned candidates =
+        std::stoul(counted.diagnostics.substr(at + std::strlen("candidates=")));
+    ASSERT_GT(candidates, 0u);
+    for (unsigned index = 0; index < candidates; ++index) {
+      std::string spec = std::string(kind) + ":" + std::to_string(index);
+      EXPECT_FALSE(mutated(spec).succeeded) << spec << " was accepted";
+    }
+  }
+}
