@@ -721,9 +721,19 @@ LogicalResult runLoweringPipeline(ModuleOp module,
     lowering::runtime::cleanup::stripUnreachableManifestBodies(module);
   }
 
+  // The contracts are checked here, as insertion left them; the walk over
+  // each function's paths runs once, in phase 13, on the IR that is lowered.
+  // ⛔ Not walked here as well: cleanup only folds and hoists, so whatever the
+  // walk would refuse here it refuses there, on more of the program -- calls
+  // that canonicalization hoists out of a region op are outside the unwind
+  // model until then. Walking both was 0.55 s of test_argparse's compile.
+  // LYTHON_VERIFY_OWNERSHIP_BEFORE_CLEANUP=1 walks here too, to tell an
+  // insertion defect from a cleanup one.
   if (failed(runVerifierPhase(
           "pre-cleanup-llvm-call-verifier", [&](PassManager &pm) {
-            pm.addPass(createLLVMCallOwnershipVerifierPass());
+            pm.addPass(createLLVMCallOwnershipVerifierPass(
+                /*pathSensitive=*/::getenv(
+                    "LYTHON_VERIFY_OWNERSHIP_BEFORE_CLEANUP") != nullptr));
           })))
     return failure();
   dumpMLIRForPass(irDump, "pre-cleanup-llvm-call-verifier", module);

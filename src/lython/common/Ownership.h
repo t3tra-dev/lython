@@ -723,6 +723,9 @@ private:
   // Every tracked value, in the order it was first seen: the order a bucket
   // lists its names in.
   llvm::SmallVector<mlir::Value, 0> tracked;
+  // Each tracked value's position in `tracked`, which keeps a merged bucket
+  // in that order.
+  llvm::DenseMap<mlir::Value, unsigned> trackedIndex;
   llvm::DenseMap<mlir::Value, llvm::SmallVector<mlir::Value, 8>> aliasBuckets;
   bool aliasBucketsDirty = true;
   // The table `build` resolved callees with: the caller's, or its own when the

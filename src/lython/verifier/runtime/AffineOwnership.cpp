@@ -24,6 +24,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/Process.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringMap.h"
@@ -655,6 +656,72 @@ public:
   }
 
   unsigned size() const { return static_cast<unsigned>(states.size()); }
+
+  // LYTHON_TRACE_OWNERSHIP_JOINS: how many distinct states reached each block
+  // entry, and which fields told them apart. A dataflow walk with one state
+  // per block entry would refuse exactly the blocks reached by more than one
+  // (outside the exceptional flag), so this measures what such a walk would
+  // newly refuse before one is written.
+  void reportJoins(llvm::StringRef function) const {
+    llvm::DenseMap<mlir::Block *, llvm::SmallVector<unsigned, 2>> entries;
+    for (auto [index, state] : llvm::enumerate(states))
+      if (state.block && state.start == &state.block->front())
+        entries[state.block].push_back(static_cast<unsigned>(index));
+    unsigned blocks = 0, divergent = 0, hardDivergent = 0, coreDivergent = 0,
+             maxStates = 0;
+    llvm::StringMap<unsigned> fields;
+    for (auto &[block, indices] : entries) {
+      ++blocks;
+      maxStates = std::max<unsigned>(maxStates, indices.size());
+      if (indices.size() < 2)
+        continue;
+      const AffinePathState &first = states[indices.front()];
+      bool differs = false, hard = false, core = false;
+      for (unsigned index : llvm::drop_begin(indices)) {
+        const AffinePathState &other = states[index];
+        bool pair = false;
+        auto note = [&](bool same, llvm::StringRef name) {
+          if (!same) {
+            ++fields[name];
+            pair = true;
+          }
+        };
+        note(first.token == other.token, "token");
+        note(first.retained == other.retained, "retained");
+        note(first.parkedUnnamed == other.parkedUnnamed &&
+                 first.parkedOps == other.parkedOps,
+             "parked");
+        note(first.borrowedRetains == other.borrowedRetains, "borrowed");
+        note(first.slotParents == other.slotParents, "slot");
+        // Hard: the same entity, differing in more than its name. A rename
+        // onto a block argument is the next resource in a dataflow walk.
+        bool sameEntity = own::sameEntityRoot(first.group, other.group);
+        hard |= pair && sameEntity;
+        // Core: what is left once a retain parked in a holder is the
+        // holder's -- the token, the retains this walk itself holds, and
+        // the borrows outstanding.
+        core |= sameEntity &&
+                (first.token != other.token ||
+                 first.retained - first.parkedUnnamed !=
+                     other.retained - other.parkedUnnamed ||
+                 first.borrowedRetains != other.borrowedRetains);
+        note(sameEntity, "group");
+        differs |= pair;
+        if (first.exceptional != other.exceptional)
+          ++fields["exceptional"];
+      }
+      divergent += differs;
+      hardDivergent += hard;
+      coreDivergent += core;
+    }
+    llvm::errs() << "[ownership-joins] " << function << " states="
+                 << states.size() << " blocks=" << blocks
+                 << " divergent=" << divergent << " hard=" << hardDivergent
+                 << " core=" << coreDivergent << " max=" << maxStates;
+    for (auto &field : fields)
+      llvm::errs() << " " << field.getKey() << "=" << field.getValue();
+    llvm::errs() << "\n";
+  }
 
 private:
   llvm::SmallVector<AffinePathState, 32> states;
@@ -2712,6 +2779,13 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
     const llvm::DenseSet<mlir::Value> &ambiguousRetainRoots) {
   llvm::SmallVector<AffinePathState, 16> worklist;
   VisitedAffineStates visited;
+  static const bool traceJoins = ::getenv("LYTHON_TRACE_OWNERSHIP_JOINS");
+  auto reportJoins = llvm::make_scope_exit([&] {
+    if (traceJoins)
+      if (auto function =
+              resource.producer->getParentOfType<mlir::func::FuncOp>())
+        visited.reportJoins(function.getSymName());
+  });
   AffineTokenState initialToken = resource.condition
                                       ? AffineTokenState::Conditional
                                       : AffineTokenState::Owned;
@@ -2726,10 +2800,11 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
     initial.conditionTag.push_back(resource.condition->tag);
   worklist.push_back(std::move(initial));
 
-  // ⛔ KNOWN DEFECT reached through this cap, and the cap is the symptom rather
+  // ⛔ A DEFECT ONCE reached through this cap (it no longer reproduces as of
+  // 2026-10-23, for int or str elements), and the cap was the symptom rather
   // than the cause. A CONDITIONAL REBIND together with an APPEND in the same
-  // loop grows `retained` by one per explored trip, so no state ever repeats
-  // and the walk runs to the cap instead of converging:
+  // loop grew `retained` by one per explored trip, so no state ever repeated
+  // and the walk ran to the cap instead of converging:
   //
   //     xs = [3, 1, 4]
   //     best = xs[0]
@@ -4154,12 +4229,15 @@ mlir::LogicalResult verifyGeneratorResumeFrames(mlir::ModuleOp module) {
 }
 
 mlir::LogicalResult
-verifyFuncCallOwnershipContractsImpl(mlir::ModuleOp module) {
+verifyFuncCallOwnershipContractsImpl(mlir::ModuleOp module,
+                                     bool pathSensitive) {
   {
     py::PerfScope perf("func-call-ownership.generator-frames");
     if (mlir::failed(verifyGeneratorResumeFrames(module)))
       return mlir::failure();
   }
+  if (!pathSensitive)
+    return mlir::success();
   llvm::SmallVector<own::RuntimeDeallocator, 8> deallocators;
   {
     py::PerfScope perf("func-call-ownership.collect-deallocators");
@@ -4182,8 +4260,9 @@ verifyFuncCallOwnershipContractsImpl(mlir::ModuleOp module) {
 
 } // namespace
 
-mlir::LogicalResult verifyFuncCallOwnershipContracts(mlir::ModuleOp module) {
-  return verifyFuncCallOwnershipContractsImpl(module);
+mlir::LogicalResult verifyFuncCallOwnershipContracts(mlir::ModuleOp module,
+                                                     bool pathSensitive) {
+  return verifyFuncCallOwnershipContractsImpl(module, pathSensitive);
 }
 
 } // namespace py::lowering

@@ -122,6 +122,8 @@ ASAN_OPTIONS=detect_leaks=0:detect_container_overflow=0:allow_user_poisoning=0 \
 - `LYTHON_TRACE_METHOD_CALLS=1` — 大きなメソッドを呼び出し点に複製せず、記号として呼んだ呼び出しを stderr に出す。メソッド自身の本体を呼んだもの (`exact`: 受け手が構築された値か、サブクラスのないクラス) と、受け手のクラスが分からない呼び出しのために `self` を exact とみなさない本体を出したもの (`open`) を区別する。`LYTHON_CALLED_METHOD_NODES=N` は、呼び出しに切り替えるメソッドの大きさ (AST ノード数、既定 100) を変える。0 にすると、呼べるメソッドはすべて呼ぶ。コーパス全体で呼び出しの経路を試すときに使う。`LYTHON_ABLATE_METHOD_CALLS=1` で、従来どおりすべて複製する
 - `LYTHON_ABLATE_PRECOMPILED_RUNTIME=1` — ビルド時にホスト向けに事前コンパイルして lyc に埋め込んだネイティブランタイム (`LythonNativeRuntimeBitcode`) を使わず、コンパイルのたびに下げる。両者が同じモジュールであることを `lyc.precompiled_runtime_is_the_lowered_runtime` が検査する
 - `LYTHON_TRACE_REPR_CLOSURE=1` — 箱詰めの値のフック (repr / str / eq / hash / lt / release) の分岐を絞る根拠 (プログラムが持ち得るクラスの閉包) を stderr に出す。開いた (全分岐を残した) ときはその型と op の位置を出す。`LYTHON_ABLATE_REPR_CLOSURE=1` で常に全分岐を残す (release は例外の系統を常に残す)
+- `LYTHON_VERIFY_OWNERSHIP_BEFORE_CLEANUP=1` — 所有権の経路検査を post-cleanup の後だけでなく、挿入直後 (pre-cleanup) にも走らせる。挿入の欠陥か cleanup の欠陥かを分けるため。既定では pre-cleanup は契約だけを検査する
+- `LYTHON_TRACE_OWNERSHIP_JOINS=1` — 所有権の経路検査で、資源ごとに、同じブロックの入口へ何通りの状態で着いたかとその差 (token / retained / parked / borrowed / slot / group) を stderr に出す。合流点で状態を 1 つにまとめる検査に替えたとき新たに拒否される箇所の見積もり。`LYTHON_COMPILE_THREADS=1` と使う
 - `LYTHON_NUM_THREADS=N` — 実行時: 大きい行列積の fork-join ワーカー数 (デフォルト 4、1 で逐次)
 
 ## アーキテクチャ

@@ -38,13 +38,12 @@ bool hasAggregateOwnershipMarker(mlir::func::CallOp call) {
 }
 
 void elideAdjacentRefcountPairs(mlir::ModuleOp module) {
-  own::AliasAnalysis aliases;
-  aliases.build(module);
   // ⛔ Not `module.lookupSymbol`: it scans the module, and this asks once per
   // call in the program.
   mlir::SymbolTable symbols(module);
 
-  llvm::SmallVector<mlir::Operation *, 8> erase;
+  llvm::SmallVector<std::pair<mlir::func::CallOp, mlir::func::CallOp>, 8>
+      candidates;
   module.walk([&](mlir::func::FuncOp function) {
     for (mlir::Block &block : function) {
       for (auto it = block.begin(), e = block.end(); it != e;) {
@@ -60,16 +59,24 @@ void elideAdjacentRefcountPairs(mlir::ModuleOp module) {
           continue;
         if (hasAggregateOwnershipMarker(release))
           continue;
-        if (!sameHeaderOperand(aliases, retain, release))
-          continue;
         if (retain.getResultTypes().empty() &&
-            release.getResultTypes().empty()) {
-          erase.push_back(retain.getOperation());
-          erase.push_back(release.getOperation());
-        }
+            release.getResultTypes().empty())
+          candidates.emplace_back(retain, release);
       }
     }
   });
+  // ⛔ The alias analysis is built only when there is a pair to ask about:
+  // building it walks the whole module, and most programs have no pair.
+  if (candidates.empty())
+    return;
+  own::AliasAnalysis aliases;
+  aliases.build(module);
+  llvm::SmallVector<mlir::Operation *, 8> erase;
+  for (auto [retain, release] : candidates)
+    if (sameHeaderOperand(aliases, retain, release)) {
+      erase.push_back(retain.getOperation());
+      erase.push_back(release.getOperation());
+    }
 
   for (mlir::Operation *op : llvm::reverse(erase))
     op->erase();

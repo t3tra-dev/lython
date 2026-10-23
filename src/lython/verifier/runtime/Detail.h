@@ -20,6 +20,7 @@ using py::verifier::walkVerifyOperations;
 mlir::LogicalResult verifyOwnershipContractShapes(mlir::ModuleOp module);
 mlir::LogicalResult verifyLLVMOwnershipContractShapes(mlir::ModuleOp module);
 mlir::LogicalResult verifyLLVMCallOwnershipContracts(mlir::ModuleOp module);
-mlir::LogicalResult verifyFuncCallOwnershipContracts(mlir::ModuleOp module);
+mlir::LogicalResult verifyFuncCallOwnershipContracts(mlir::ModuleOp module,
+                                                     bool pathSensitive);
 
 } // namespace py::lowering

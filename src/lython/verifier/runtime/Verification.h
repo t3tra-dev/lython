@@ -38,7 +38,10 @@ preserveLoweredSafetyContracts(mlir::ModuleOp module,
                                const LoweredSafetyContracts &contracts);
 
 mlir::LogicalResult verifyOwnership(mlir::ModuleOp module);
-mlir::LogicalResult verifyLLVMCallOwnership(mlir::ModuleOp module);
+// `pathSensitive` false checks the contracts alone, without the affine walk
+// over each function's paths.
+mlir::LogicalResult verifyLLVMCallOwnership(mlir::ModuleOp module,
+                                            bool pathSensitive = true);
 // One frame-ownership token per SSA value. Runs in the verifier phase between the
 // pass that MINTS tokens (runtime-lowering) and the one that consumes them
 // (refcount-insertion), because that is where the property has to hold. This is
@@ -50,7 +53,7 @@ mlir::LogicalResult verifyRuntimeManifestCompleteness(mlir::ModuleOp module);
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createOwnershipVerifierPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createLLVMCallOwnershipVerifierPass();
+createLLVMCallOwnershipVerifierPass(bool pathSensitive = true);
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createOwnedTokenUniquenessVerifierPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
