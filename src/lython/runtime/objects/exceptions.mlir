@@ -1709,6 +1709,16 @@ module attributes {
     func.return
   }
 
+  // `SystemExit(None)`: a code that is None, which exits 0 in silence where
+  // the message ("None") would have been printed with status 1. The slot's
+  // "None" is INT64_MIN, a biased value no i64 code produces.
+  func.func private @__ly_systemexit_set_code_none(%header: memref<3xi64>) attributes {ly.runtime.contract = "builtins.SystemExit", ly.runtime.primitive = "set_code_none"} {
+    %code_slot = arith.constant 5 : i64
+    %none = arith.constant -9223372036854775808 : i64
+    func.call @__ly_exc_ext_set(%header, %code_slot, %none) : (memref<3xi64>, i64, i64) -> ()
+    func.return
+  }
+
   func.func private @__ly_systemexit_set_code_i64(%header: memref<3xi64>, %value: i64) attributes {ly.runtime.contract = "builtins.SystemExit", ly.runtime.primitive = "set_code_i64"} {
     %one = arith.constant 1 : i64
     %code_slot = arith.constant 5 : i64

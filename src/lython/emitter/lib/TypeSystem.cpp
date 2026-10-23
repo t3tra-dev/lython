@@ -1971,7 +1971,6 @@ void TypeSystem::seedBuiltins() {
       table.freeFunctionContract("_io.open")
           .value_or(contract("builtins.function")));
   builtinCanonicalBindings["open"] = "_io.open";
-  bindClass("nullcontext", contract("contextlib.nullcontext"));
   bindClass("range", contract("builtins.range"));
   bindClass("slice", contract("builtins.slice"));
 }
@@ -2879,6 +2878,39 @@ mlir::Type TypeSystem::solveGenericClassInstantiation(
       if (formal.first == keyword.name)
         bindExpectedType(*this, formal.second, widenLiteral(keyword.type),
                          bindings);
+  // A parameter the call leaves out takes its default, and so does the type
+  // it is annotated with: `nullcontext()` is a `nullcontext[None]`, as the
+  // object CPython builds holds None. Only for what the arguments left open,
+  // so a supplied argument always decides.
+  if (const parser::Node *arguments =
+          tmpl->second.initNode ? ast::node(*tmpl->second.initNode, "args")
+                                : nullptr) {
+    llvm::SmallVector<const parser::Node *, 8> params;
+    for (llvm::StringRef list : {"posonlyargs", "args"})
+      if (const auto *nodes = ast::nodeList(*arguments, list))
+        for (const parser::NodePtr &param : *nodes)
+          params.push_back(param.get());
+    const auto *defaults = ast::nodeList(*arguments, "defaults");
+    std::size_t firstDefault =
+        defaults ? params.size() - std::min(params.size(), defaults->size())
+                 : params.size();
+    for (std::size_t index = std::max<std::size_t>(firstDefault, 1);
+         index < params.size(); ++index) {
+      // `formals` skips the receiver, so parameter `index` is formal
+      // `index - 1`.
+      std::size_t formal = index - 1;
+      if (formal < positional.size() || formal >= formals.size() ||
+          llvm::any_of(keywords, [&](const CallKeywordType &keyword) {
+            return keyword.name == formals[formal].first;
+          }))
+        continue;
+      const parser::Node *value =
+          (*defaults)[index - firstDefault].get();
+      if (mlir::Type type = value ? widenLiteral(inferExpr(value))
+                                  : mlir::Type{})
+        bindExpectedType(*this, formals[formal].second, type, bindings);
+    }
+  }
 
   llvm::SmallVector<mlir::Type, 4> arguments;
   for (const std::string &param : tmpl->second.params) {
@@ -4295,6 +4327,13 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
                 simple = qualifiedName.drop_front(dot + 1);
               return literal("\"" + simple.str() + "\"");
             }
+        // `e.code` of a SystemExit is computed from `args` as an object
+        // (EmitterDocstrings.cpp, tryEmitSystemExitCode).
+        if (*attr == "code" && objectType &&
+            py::isAssignableTo(widenLiteral(objectType),
+                                           contract("builtins.SystemExit"),
+                                           nullptr))
+          return object();
         // A class that defines `__getattribute__` answers every read on an
         // instance with it, as the emitter calls it (EmitterExpressions.cpp,
         // emitAttribute).

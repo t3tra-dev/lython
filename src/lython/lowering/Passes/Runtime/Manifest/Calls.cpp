@@ -1157,7 +1157,19 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
         // comparison happened to answer right anyway, which is what makes
         // the pattern worth naming rather than just fixing.
         std::string codeContract = payload->contractName();
-        if (codeContract == "builtins.int" || codeContract == "builtins.bool") {
+        if (codeContract == "types.NoneType") {
+          std::optional<RuntimeSymbol> setNone =
+              manifest.primitive("builtins.SystemExit", "set_code_none");
+          if (!setNone)
+            return op.emitError()
+                   << "runtime manifest has no SystemExit set_code_none";
+          RuntimeBundleLowerer::createRuntimeCall(
+              loc, *setNone,
+              mlir::ValueRange{adaptOperand(
+                  instance->physicalValues()[0],
+                  setNone->function.getFunctionType().getInput(0))});
+        } else if (codeContract == "builtins.int" ||
+                   codeContract == "builtins.bool") {
           std::optional<RuntimeSymbol> setCode = manifest.primitive(
               "builtins.SystemExit",
               codeContract == "builtins.int" ? "set_code" : "set_code_bool");

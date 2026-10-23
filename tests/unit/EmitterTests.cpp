@@ -2144,43 +2144,51 @@ TEST(EmitterTest, AGenericMethodHasABodyOnlyWhereItIsCalled) {
 // What: `@contextmanager` on a function with spelled-out parameters compiles,
 // and so does one with *args or **kwargs, whose packs the generator takes as
 // values; one that also has positional-only parameters is refused by name.
+// Through the driver, because `import contextlib` resolves lib/contextlib.py.
 TEST(EmitterTest, AContextManagerFunctionHandsItsParametersOnByName) {
-  mlir::MLIRContext spelled(testRegistry());
-  lython::emitter::EmitResult accepted = emitSource(
-      "from contextlib import contextmanager\n"
-      "from typing import Iterator\n"
-      "@contextmanager\n"
-      "def tag(name: str, *, depth: int = 0) -> Iterator[int]:\n"
-      "    yield len(name) + depth\n"
-      "with tag(\"a\", depth=1) as n:\n"
-      "    print(n)\n",
-      spelled);
-  EXPECT_TRUE(accepted.ok());
+  lython::driver::DriverOptions native;
+  native.targetTriple = llvm::sys::getDefaultTargetTriple();
+  auto emits = [&](const char *source, std::string &diagnostics) {
+    mlir::MLIRContext context(testRegistry());
+    mlir::OwningOpRef<mlir::ModuleOp> module;
+    llvm::raw_string_ostream diag(diagnostics);
+    return mlir::succeeded(lython::driver::emitMLIRFromSource(
+        source, "main.py", "<lython-no-import-dir>", native, context, module,
+        diag));
+  };
+  std::string spelled;
+  EXPECT_TRUE(emits("from contextlib import contextmanager\n"
+                    "from typing import Iterator\n"
+                    "@contextmanager\n"
+                    "def tag(name: str, *, depth: int = 0) -> Iterator[int]:\n"
+                    "    yield len(name) + depth\n"
+                    "with tag(\"a\", depth=1) as n:\n"
+                    "    print(n)\n",
+                    spelled))
+      << spelled;
 
-  mlir::MLIRContext starred(testRegistry());
-  lython::emitter::EmitResult packed = emitSource(
-      "import contextlib\n"
-      "from typing import Iterator\n"
-      "@contextlib.contextmanager\n"
-      "def sub(*labels: str, **params: int) -> Iterator[int]:\n"
-      "    yield len(labels) + len(params)\n"
-      "with sub(\"a\", i=1) as n:\n"
-      "    print(n)\n",
-      starred);
-  EXPECT_TRUE(packed.ok());
+  std::string packed;
+  EXPECT_TRUE(emits("import contextlib\n"
+                    "from typing import Iterator\n"
+                    "@contextlib.contextmanager\n"
+                    "def sub(*labels: str, **params: int) -> Iterator[int]:\n"
+                    "    yield len(labels) + len(params)\n"
+                    "with sub(\"a\", i=1) as n:\n"
+                    "    print(n)\n",
+                    packed))
+      << packed;
 
-  mlir::MLIRContext positionalOnly(testRegistry());
-  lython::emitter::EmitResult refused = emitSource(
-      "import contextlib\n"
-      "from typing import Iterator\n"
-      "@contextlib.contextmanager\n"
-      "def sub(a: int, /, **params: int) -> Iterator[int]:\n"
-      "    yield a\n",
-      positionalOnly);
-  EXPECT_FALSE(refused.ok());
-  EXPECT_TRUE(reportsDiagnostic(
-      refused, "@contextmanager on 'sub' is not supported with both "
-               "positional-only parameters and *args or **kwargs"));
+  std::string refused;
+  EXPECT_FALSE(emits("import contextlib\n"
+                     "from typing import Iterator\n"
+                     "@contextlib.contextmanager\n"
+                     "def sub(a: int, /, **params: int) -> Iterator[int]:\n"
+                     "    yield a\n",
+                     refused));
+  EXPECT_NE(refused.find("@contextmanager on 'sub' is not supported with both "
+                         "positional-only parameters and *args or **kwargs"),
+            std::string::npos)
+      << refused;
 }
 
 TEST(EmitterTest, WhatAClassDefiningGetattributeCannotDoIsRefused) {

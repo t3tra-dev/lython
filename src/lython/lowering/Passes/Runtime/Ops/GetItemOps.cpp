@@ -144,6 +144,16 @@ mlir::LogicalResult RuntimeBundleLowerer::bindEvidenceObjectResult(
       return mlir::failure();
     bound = std::move(*widened);
     bound.setObjectLogicalOwnership(/*ownsObject=*/false);
+  } else if (mlir::isa<py::ContractType>(resultValue.getType()) &&
+             !boolReadAsInt()) {
+    // ⭐ AND A MEMBER-TYPED READ GETS THE MEMBER'S LANES: `{"k": False}["k"]` is
+    // a bool, and the slot holds the bool's box. Every consumer that names
+    // the ABI -- a module global's cell, a union join -- refused the box
+    // ("the global stores 'i1'"). The int read keeps the box, which its own
+    // consumer unboxes (above).
+    if (mlir::failed(
+            RuntimeBundleLowerer::canonicalizeSlotElementBundle(op, bound)))
+      return mlir::failure();
   }
   valueBundles[resultValue] = std::move(bound);
   return mlir::success();
@@ -182,6 +192,14 @@ mlir::LogicalResult RuntimeBundleLowerer::bindSelectedEvidenceObjectResult(
     if (mlir::failed(widened))
       return mlir::failure();
     bundle = std::move(*widened);
+  } else if (auto resultContract =
+                 mlir::dyn_cast<py::ContractType>(resultValue.getType());
+             resultContract && bundle.kind == RuntimeBundle::Kind::Object &&
+             bundle.objectValue.contract == resultContract) {
+    // The member read, as in `bindEvidenceObjectResult`.
+    if (mlir::failed(
+            RuntimeBundleLowerer::canonicalizeSlotElementBundle(op, bundle)))
+      return mlir::failure();
   }
   bundle.setObjectLogicalOwnership(/*ownsObject=*/false);
   valueBundles[resultValue] = std::move(bundle);

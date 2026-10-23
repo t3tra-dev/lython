@@ -1129,6 +1129,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
       }
   if (std::optional<Value> subclasses = tryEmitSubclassesCall(expr))
     return *subclasses;
+  if (std::optional<Value> exited = tryEmitSysExit(expr))
+    return *exited;
   // ⛔ A METHOD OF A CLASS THAT DEFINES `__getattribute__` IS NOT CALLED
   // DIRECTLY: CPython looks `obj.m` up through that method first, and what it
   // answers is what is called. Calling the method the class declares would

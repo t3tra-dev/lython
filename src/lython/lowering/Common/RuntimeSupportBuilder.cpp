@@ -3377,14 +3377,23 @@ void buildRunPythonMain(SupportBuilder &b) {
                              mlir::TypeRange{}, mlir::ValueRange{});
   mlir::func::CallOp::create(b.builder, b.loc, "LyTraceback_Clear",
                              mlir::TypeRange{}, mlir::ValueRange{});
-  mlir::Value hasCode =
-      b.cmpi(mlir::arith::CmpIPredicate::ne, exitCodeBiased, b.iconst(0));
+  // A code of None (`__ly_systemexit_set_code_none`) is no code: CPython
+  // exits 0 in silence for `SystemExit(None)` as for `SystemExit()`.
+  mlir::Value noneCode =
+      b.cmpi(mlir::arith::CmpIPredicate::eq, exitCodeBiased,
+             b.iconst(std::numeric_limits<std::int64_t>::min()));
+  mlir::Value hasCode = mlir::arith::AndIOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::ne, exitCodeBiased, b.iconst(0)),
+      mlir::arith::XOrIOp::create(b.builder, b.loc, noneCode, b.iconst1(true)));
   mlir::LLVM::CondBrOp::create(b.builder, b.loc, hasCode, exitWithStatus,
                                systemExitArgs);
 
   b.builder.setInsertionPointToEnd(systemExitArgs);
-  mlir::Value hasArgument =
-      b.cmpi(mlir::arith::CmpIPredicate::ne, payloadBlock, b.iconst(0));
+  mlir::Value hasArgument = mlir::arith::AndIOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::ne, payloadBlock, b.iconst(0)),
+      mlir::arith::XOrIOp::create(b.builder, b.loc, noneCode, b.iconst1(true)));
   mlir::LLVM::CondBrOp::create(b.builder, b.loc, hasArgument, exitWithMessage,
                                exitSilently);
 

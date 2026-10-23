@@ -4,6 +4,7 @@
 #include "EmitterCore.h"
 #include "Mangling.h"
 #include "EmitterPyOps.h"
+#include "EmitterSupport.h"
 #include "PyProtocols.h"
 #include "TypeInference.h"
 
@@ -320,7 +321,7 @@ std::string ModuleEmitter::docDispatcher(
     llvm::ArrayRef<std::pair<std::string, mlir::Type>> params,
     parser::SourceRange range,
     std::function<std::vector<parser::NodePtr>()> body,
-    bool returnsStr) {
+    parser::NodePtr returns) {
   if (auto found = computedLookupDispatchers.find(key);
       found != computedLookupDispatchers.end())
     return found->second;
@@ -333,9 +334,9 @@ std::string ModuleEmitter::docDispatcher(
   llvm::SmallVector<const parser::Node *, 2> paramNodes;
   parser::NodePtr def = synth::functionDef(
       symbol, synthParams, {}, {},
-      returnsStr ? synth::name("str", range)
-                 : synth::binOp(synth::name("str", range), "BitOr",
-                                synth::noneConstant(range), range),
+      returns ? returns
+              : synth::binOp(synth::name("str", range), "BitOr",
+                             synth::noneConstant(range), range),
       {}, range, &paramNodes);
   synthesizedIteratorDefs.push_back(def);
   for (auto [node, param] : llvm::zip(paramNodes, params))
@@ -523,7 +524,7 @@ std::string ModuleEmitter::functionNameDispatcher(mlir::Type callable,
             range));
         return body;
       },
-      /*returnsStr=*/true);
+      synth::name("str", range));
 }
 
 // `f.__name__` where `f` holds a function the static type does not name:
@@ -556,6 +557,119 @@ ModuleEmitter::tryEmitFunctionValueNameRead(const parser::Node &expr) {
   std::string symbol = functionNameDispatcher(callable, expr.range);
   parser::NodePtr call = synth::call(synth::name(symbol, expr.range),
                                      {*subject}, expr.range);
+  synthesizedIteratorDefs.push_back(call);
+  return emitExpr(call.get());
+}
+
+// `sys.exit(code)` is `raise SystemExit(code)`, for a code that is not an int
+// (the manifest's own `sys.exit` takes the int): no argument, None or a str.
+// The None arm is spelled out because the construction records a None code
+// only off an argument typed None (Manifest/Calls.cpp, set_code_none).
+std::optional<Value> ModuleEmitter::tryEmitSysExit(const parser::Node &call) {
+  const parser::Node *callee = ast::node(call, "func");
+  if (!callee)
+    return std::nullopt;
+  std::string canonical;
+  if (callee->kind == "Name") {
+    canonical = types.lookupCanonicalBinding(ast::nameSpelling(*callee))
+                    .value_or("");
+  } else if (callee->kind == "Attribute") {
+    const parser::Node *owner = ast::node(*callee, "value");
+    if (owner && owner->kind == "Name" &&
+        types.isImportedModuleName(ast::nameSpelling(*owner)) &&
+        !values.count(ast::nameSpelling(*owner)))
+      canonical = types.lookupCanonicalBinding(ast::nameSpelling(*owner))
+                      .value_or(std::string(ast::nameSpelling(*owner))) +
+                  "." + std::string(ast::string(*callee, "attr").value_or(""));
+  }
+  if (canonical != "sys.exit")
+    return std::nullopt;
+  const auto *args = ast::nodeList(call, "args");
+  const auto *keywords = ast::nodeList(call, "keywords");
+  if ((keywords && !keywords->empty()) || (args && args->size() > 1))
+    return std::nullopt;
+  parser::SourceRange range = call.range;
+  parser::NodePtr argument =
+      args && !args->empty() ? (*args)[0] : synth::noneConstant(range);
+  mlir::Type argumentType =
+      types.widenLiteral(types.inferExpr(argument.get()));
+  if (argumentType == types.intType() || argumentType == types.boolType())
+    return std::nullopt;
+  mlir::Type codeType = types.join({types.intType(), types.strType(),
+                                    types.none()});
+  std::string symbol = docDispatcher(
+      "sysexit", "__lysysexit$", {{"__ly_code", codeType}}, range,
+      [range] {
+        auto raiseWith = [&](parser::NodePtr argument) {
+          return synth::raiseStmt(
+              synth::call(synth::name("SystemExit", range),
+                          {std::move(argument)}, range),
+              range);
+        };
+        std::vector<parser::NodePtr> body;
+        body.push_back(synth::ifStmt(
+            synth::compare(synth::name("__ly_code", range), "Is",
+                           synth::noneConstant(range), range),
+            {raiseWith(synth::noneConstant(range))}, {}, range));
+        body.push_back(synth::ifStmt(
+            synth::call(synth::name("isinstance", range),
+                        {synth::name("__ly_code", range),
+                         synth::name("int", range)},
+                        range),
+            {raiseWith(synth::name("__ly_code", range))}, {}, range));
+        body.push_back(raiseWith(synth::name("__ly_code", range)));
+        return body;
+      },
+      synth::noneConstant(range));
+  parser::NodePtr rewritten =
+      synth::call(synth::name(symbol, range), {argument}, range);
+  synthesizedIteratorDefs.push_back(rewritten);
+  return emitExpr(rewritten.get());
+}
+
+// `e.code` of a SystemExit: CPython's `code` is what `args` says -- None for
+// none, the argument for one, the tuple for more -- and the object keeps
+// `args`, so the read is computed from it rather than stored a second time.
+std::optional<Value>
+ModuleEmitter::tryEmitSystemExitCode(const parser::Node &expr) {
+  if (ast::string(expr, "attr").value_or("") != "code")
+    return std::nullopt;
+  const parser::Field *field = parser::findField(expr, "value");
+  const auto *subject =
+      field ? std::get_if<parser::NodePtr>(&field->value) : nullptr;
+  if (!subject || !*subject)
+    return std::nullopt;
+  mlir::Type systemExit = types.contract("builtins.SystemExit");
+  mlir::Type subjectType = types.widenLiteral(types.inferExpr(subject->get()));
+  if (!subjectType || !isAssignableWithStaticEvidence(subjectType, systemExit,
+                                                      module) ||
+      lookupClassField(subjectType, "code"))
+    return std::nullopt;
+  parser::SourceRange range = expr.range;
+  std::string symbol = docDispatcher(
+      "sysexitcode", "__lysysexitcode$", {{"__ly_e", systemExit}}, range,
+      [range] {
+        auto args = [&] {
+          return synth::attribute(synth::name("__ly_e", range), "args", range);
+        };
+        std::vector<parser::NodePtr> body;
+        body.push_back(synth::ifStmt(
+            synth::compare(synth::lenCall(args(), range), "Eq",
+                           synth::intConstant(0, range), range),
+            {synth::returnStmt(synth::noneConstant(range), range)}, {}, range));
+        body.push_back(synth::ifStmt(
+            synth::compare(synth::lenCall(args(), range), "Eq",
+                           synth::intConstant(1, range), range),
+            {synth::returnStmt(
+                synth::subscript(args(), synth::intConstant(0, range), range),
+                range)},
+            {}, range));
+        body.push_back(synth::returnStmt(args(), range));
+        return body;
+      },
+      synth::name("object", range));
+  parser::NodePtr call =
+      synth::call(synth::name(symbol, range), {*subject}, range);
   synthesizedIteratorDefs.push_back(call);
   return emitExpr(call.get());
 }
