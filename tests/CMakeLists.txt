@@ -102,6 +102,7 @@ add_executable(lython_unit_tests
     unit/ModelCorrespondenceTests.cpp
     unit/SoleProducerTests.cpp
     unit/ParserTests.cpp
+    unit/RuntimeLoopExitTests.cpp
     unit/RuntimeRaisePathTests.cpp
     unit/TypeInferenceTests.cpp
     unit/TypeSystemTests.cpp
@@ -190,7 +191,8 @@ set(LYTHON_UNIT_PATTERNS_meta
     "LayerManifestTest.*"
     "ModelCorrespondenceTest.*"
     "SoleProducerTest.*"
-    "RuntimeRaisePathTest.*")
+    "RuntimeRaisePathTest.*"
+    "RuntimeLoopExitTest.*")
 set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AdaptsBoxedBoolToUnboxedStrInput"
     "DriverTest.BoxedContainerLoopKeepsPayloadSlotsOutOfTheLoopBody"

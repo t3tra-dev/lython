@@ -291,21 +291,22 @@ module {
     %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
     %items_i64 = arith.index_cast %items_idx : index to i64
     %items_ptr = llvm.inttoptr %items_i64 : i64 to !llvm.ptr
-    %found = scf.for %i = %c0 to %len_index step %c1 iter_args(%acc = %minus_one) -> (i64) {
+    %found:2 = scf.while (%acc = %minus_one, %i = %c0) : (i64, index) -> (i64, index) {
+      %in_range = arith.cmpi slt, %i, %len_index : index
       %not_yet = arith.cmpi eq, %acc, %minus_one : i64
-      %next = scf.if %not_yet -> (i64) {
-        %ii = arith.index_cast %i : index to i64
-        %off = arith.muli %ii, %c16_i64 : i64
-        %entry = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-        %eq = func.call @__ly_box_equal(%entry, %probe) : (!llvm.ptr, !llvm.ptr) -> i1
-        %sel = arith.select %eq, %ii, %minus_one : i1, i64
-        scf.yield %sel : i64
-      } else {
-        scf.yield %acc : i64
-      }
-      scf.yield %next : i64
+      %go = arith.andi %in_range, %not_yet : i1
+      scf.condition(%go) %acc, %i : i64, index
+    } do {
+    ^bb0(%acc: i64, %i: index):
+      %ii = arith.index_cast %i : index to i64
+      %off = arith.muli %ii, %c16_i64 : i64
+      %entry = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %eq = func.call @__ly_box_equal(%entry, %probe) : (!llvm.ptr, !llvm.ptr) -> i1
+      %sel = arith.select %eq, %ii, %minus_one : i1, i64
+      %i_next = arith.addi %i, %c1 : index
+      scf.yield %sel, %i_next : i64, index
     }
-    func.return %found : i64
+    func.return %found#0 : i64
   }
 
   // Occurrence count over the 16-word element boxes, shared by list and tuple

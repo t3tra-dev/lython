@@ -1653,43 +1653,45 @@ module attributes {
       %probes = arith.select %linear, %nine, %zero : i1, i64
       %count = arith.addi %probes, %one : i64
       %count_index = arith.index_cast %count : i64 to index
-      %run:2 = scf.for %k = %c0 to %count_index step %c1
-          iter_args(%a = %ans, %d = %done) -> (i64, i1) {
-        %step:2 = scf.if %d -> (i64, i1) {
-          scf.yield %a, %d : i64, i1
+      %run:3 = scf.while (%a = %ans, %d = %done, %k = %c0)
+          : (i64, i1, index) -> (i64, i1, index) {
+        %in_run = arith.cmpi slt, %k, %count_index : index
+        %open = arith.xori %d, %true : i1
+        %go = arith.andi %in_run, %open : i1
+        scf.condition(%go) %a, %d, %k : i64, i1, index
+      } do {
+      ^bb0(%a: i64, %d: i1, %k: index):
+        %kk = arith.index_cast %k : index to i64
+        %s = arith.addi %i, %kk : i64
+        %state = func.call @__ly_dict_slot_load(%table, %width, %s) : (memref<?xi8>, i64, i64) -> i64
+        %unused = arith.cmpi eq, %state, %zero : i64
+        %seen:2 = scf.if %unused -> (i64, i1) {
+          scf.yield %minus_one, %true : i64, i1
         } else {
-          %kk = arith.index_cast %k : index to i64
-          %s = arith.addi %i, %kk : i64
-          %state = func.call @__ly_dict_slot_load(%table, %width, %s) : (memref<?xi8>, i64, i64) -> i64
-          %unused = arith.cmpi eq, %state, %zero : i64
-          %seen:2 = scf.if %unused -> (i64, i1) {
-            scf.yield %minus_one, %true : i64, i1
-          } else {
-            %live = arith.cmpi sge, %state, %two : i64
-            %hit:2 = scf.if %live -> (i64, i1) {
-              %dense_h = arith.subi %state, %two : i64
-              %hash_index = arith.index_cast %dense_h : i64 to index
-              %entry_hash = memref.load %hashes[%hash_index] : memref<?xi64>
-              %same_hash = arith.cmpi eq, %entry_hash, %hash : i64
-              %cmp:2 = scf.if %same_hash -> (i64, i1) {
-                %dense = arith.subi %state, %two : i64
-                %off = arith.muli %dense, %c16 : i64
-                %entry = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-                %eq = func.call @__ly_box_equal(%entry, %elem_box) : (!llvm.ptr, !llvm.ptr) -> i1
-                %found = arith.select %eq, %dense, %a : i1, i64
-                scf.yield %found, %eq : i64, i1
-              } else {
-                scf.yield %a, %false : i64, i1
-              }
-              scf.yield %cmp#0, %cmp#1 : i64, i1
+          %live = arith.cmpi sge, %state, %two : i64
+          %hit:2 = scf.if %live -> (i64, i1) {
+            %dense_h = arith.subi %state, %two : i64
+            %hash_index = arith.index_cast %dense_h : i64 to index
+            %entry_hash = memref.load %hashes[%hash_index] : memref<?xi64>
+            %same_hash = arith.cmpi eq, %entry_hash, %hash : i64
+            %cmp:2 = scf.if %same_hash -> (i64, i1) {
+              %dense = arith.subi %state, %two : i64
+              %off = arith.muli %dense, %c16 : i64
+              %entry = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+              %eq = func.call @__ly_box_equal(%entry, %elem_box) : (!llvm.ptr, !llvm.ptr) -> i1
+              %found = arith.select %eq, %dense, %a : i1, i64
+              scf.yield %found, %eq : i64, i1
             } else {
               scf.yield %a, %false : i64, i1
             }
-            scf.yield %hit#0, %hit#1 : i64, i1
+            scf.yield %cmp#0, %cmp#1 : i64, i1
+          } else {
+            scf.yield %a, %false : i64, i1
           }
-          scf.yield %seen#0, %seen#1 : i64, i1
+          scf.yield %hit#0, %hit#1 : i64, i1
         }
-        scf.yield %step#0, %step#1 : i64, i1
+        %k_next = arith.addi %k, %c1 : index
+        scf.yield %seen#0, %seen#1, %k_next : i64, i1, index
       }
       %np = arith.shrui %p, %shift : i64
       %i5 = arith.muli %i, %probe_scale : i64
@@ -1724,19 +1726,21 @@ module attributes {
       %probes = arith.select %linear, %nine, %zero : i1, i64
       %count = arith.addi %probes, %one : i64
       %count_index = arith.index_cast %count : i64 to index
-      %run:2 = scf.for %k = %c0 to %count_index step %c1
-          iter_args(%a = %ans, %d = %done) -> (i64, i1) {
-        %step:2 = scf.if %d -> (i64, i1) {
-          scf.yield %a, %d : i64, i1
-        } else {
-          %kk = arith.index_cast %k : index to i64
-          %s = arith.addi %i, %kk : i64
-          %state = func.call @__ly_dict_slot_load(%table, %width, %s) : (memref<?xi8>, i64, i64) -> i64
-          %unused = arith.cmpi eq, %state, %zero : i64
-          %pick = arith.select %unused, %s, %a : i1, i64
-          scf.yield %pick, %unused : i64, i1
-        }
-        scf.yield %step#0, %step#1 : i64, i1
+      %run:3 = scf.while (%a = %ans, %d = %done, %k = %c0)
+          : (i64, i1, index) -> (i64, i1, index) {
+        %in_run = arith.cmpi slt, %k, %count_index : index
+        %open = arith.xori %d, %true : i1
+        %go = arith.andi %in_run, %open : i1
+        scf.condition(%go) %a, %d, %k : i64, i1, index
+      } do {
+      ^bb0(%a: i64, %d: i1, %k: index):
+        %kk = arith.index_cast %k : index to i64
+        %s = arith.addi %i, %kk : i64
+        %state = func.call @__ly_dict_slot_load(%table, %width, %s) : (memref<?xi8>, i64, i64) -> i64
+        %unused = arith.cmpi eq, %state, %zero : i64
+        %pick = arith.select %unused, %s, %a : i1, i64
+        %k_next = arith.addi %k, %c1 : index
+        scf.yield %pick, %unused, %k_next : i64, i1, index
       }
       %np = arith.shrui %p, %shift : i64
       %i5 = arith.muli %i, %probe_scale : i64

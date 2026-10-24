@@ -278,14 +278,19 @@ module attributes {
     %true_bit = arith.constant true
     %high_bit = arith.constant -128 : i8
     %zero_i8 = arith.constant 0 : i8
-    %clean = scf.for %i = %c0 to %n step %c1 iter_args(%acc = %true_bit) -> (i1) {
+    %clean:2 = scf.while (%acc = %true_bit, %i = %c0) : (i1, index) -> (i1, index) {
+      %in_range = arith.cmpi slt, %i, %n : index
+      %go = arith.andi %in_range, %acc : i1
+      scf.condition(%go) %acc, %i : i1, index
+    } do {
+    ^bb0(%acc: i1, %i: index):
       %b = memref.load %bytes[%i] : memref<?xi8>
       %masked = arith.andi %b, %high_bit : i8
       %plain = arith.cmpi eq, %masked, %zero_i8 : i8
-      %next = arith.andi %acc, %plain : i1
-      scf.yield %next : i1
+      %iv_next = arith.addi %i, %c1 : index
+      scf.yield %plain, %iv_next : i1, index
     }
-    func.return %clean : i1
+    func.return %clean#0 : i1
   }
 
   // ⭐ CPython's `ascii_upper_or_lower`. ASCII case mapping is one-to-one, never
@@ -616,16 +621,21 @@ module attributes {
     %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
     %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     %count_index = arith.index_cast %count : i64 to index
-    %all = scf.for %i = %c0 to %count_index step %c1 iter_args(%acc = %true_bit) -> (i1) {
+    %all:2 = scf.while (%acc = %true_bit, %i = %c0) : (i1, index) -> (i1, index) {
+      %in_range = arith.cmpi slt, %i, %count_index : index
+      %go = arith.andi %in_range, %acc : i1
+      scf.condition(%go) %acc, %i : i1, index
+    } do {
+    ^bb0(%acc: i1, %i: index):
       %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
       %upper, %lower, %fold, %title, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
       %masked = arith.andi %flags, %mask : i64
       %has = arith.cmpi ne, %masked, %zero : i64
-      %next = arith.andi %acc, %has : i1
-      scf.yield %next : i1
+      %iv_next = arith.addi %i, %c1 : index
+      scf.yield %has, %iv_next : i1, index
     }
     %nonempty = arith.cmpi sgt, %count, %zero : i64
-    %result = arith.andi %nonempty, %all : i1
+    %result = arith.andi %nonempty, %all#0 : i1
     func.return %result : i1
   }
 
@@ -653,16 +663,21 @@ module attributes {
     %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     %count_index = arith.index_cast %count : i64 to index
     %is_decimal_mode = arith.cmpi eq, %which, %zero : i64
-    %all = scf.for %i = %c0 to %count_index step %c1 iter_args(%acc = %true_bit) -> (i1) {
+    %all:2 = scf.while (%acc = %true_bit, %i = %c0) : (i1, index) -> (i1, index) {
+      %in_range = arith.cmpi slt, %i, %count_index : index
+      %go = arith.andi %in_range, %acc : i1
+      scf.condition(%go) %acc, %i : i1, index
+    } do {
+    ^bb0(%acc: i1, %i: index):
       %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
       %upper, %lower, %fold, %title, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
       %value = arith.select %is_decimal_mode, %decimal, %digit : i64
       %has = arith.cmpi ne, %value, %minus_one : i64
-      %next = arith.andi %acc, %has : i1
-      scf.yield %next : i1
+      %iv_next = arith.addi %i, %c1 : index
+      scf.yield %has, %iv_next : i1, index
     }
     %nonempty = arith.cmpi sgt, %count, %zero : i64
-    %result = arith.andi %nonempty, %all : i1
+    %result = arith.andi %nonempty, %all#0 : i1
     func.return %result : i1
   }
 
@@ -687,15 +702,20 @@ module attributes {
     %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
     %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     %count_index = arith.index_cast %count : i64 to index
-    %all = scf.for %i = %c0 to %count_index step %c1 iter_args(%acc = %true_bit) -> (i1) {
+    %all:2 = scf.while (%acc = %true_bit, %i = %c0) : (i1, index) -> (i1, index) {
+      %in_range = arith.cmpi slt, %i, %count_index : index
+      %go = arith.andi %in_range, %acc : i1
+      scf.condition(%go) %acc, %i : i1, index
+    } do {
+    ^bb0(%acc: i1, %i: index):
       %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
       %cat, %numeric = func.call @__ly_ucd_info(%cp) : (i64) -> (i64, i64)
       %has = arith.cmpi ne, %numeric, %minus_one : i64
-      %next = arith.andi %acc, %has : i1
-      scf.yield %next : i1
+      %iv_next = arith.addi %i, %c1 : index
+      scf.yield %has, %iv_next : i1, index
     }
     %nonempty = arith.cmpi sgt, %count, %zero : i64
-    %result = arith.andi %nonempty, %all : i1
+    %result = arith.andi %nonempty, %all#0 : i1
     func.return %result : i1
   }
 
@@ -748,13 +768,18 @@ module attributes {
     %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
     %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     %count_index = arith.index_cast %count : i64 to index
-    %all = scf.for %i = %c0 to %count_index step %c1 iter_args(%acc = %true_bit) -> (i1) {
+    %all:2 = scf.while (%acc = %true_bit, %i = %c0) : (i1, index) -> (i1, index) {
+      %in_range = arith.cmpi slt, %i, %count_index : index
+      %go = arith.andi %in_range, %acc : i1
+      scf.condition(%go) %acc, %i : i1, index
+    } do {
+    ^bb0(%acc: i1, %i: index):
       %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
       %printable = func.call @__ly_ucd_is_printable(%cp) : (i64) -> i1
-      %next = arith.andi %acc, %printable : i1
-      scf.yield %next : i1
+      %iv_next = arith.addi %i, %c1 : index
+      scf.yield %printable, %iv_next : i1, index
     }
-    func.return %all : i1
+    func.return %all#0 : i1
   }
 
   // CPython unicode_istitle: upper/title-case characters may only follow
@@ -803,7 +828,12 @@ module attributes {
     %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
     %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     %count_index = arith.index_cast %count : i64 to index
-    %all = scf.for %i = %c0 to %count_index step %c1 iter_args(%acc = %true_bit) -> (i1) {
+    %all:2 = scf.while (%acc = %true_bit, %i = %c0) : (i1, index) -> (i1, index) {
+      %in_range = arith.cmpi slt, %i, %count_index : index
+      %go = arith.andi %in_range, %acc : i1
+      scf.condition(%go) %acc, %i : i1, index
+    } do {
+    ^bb0(%acc: i1, %i: index):
       %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
       %u, %l, %f, %t, %dec, %dig, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
       %am = arith.andi %flags, %alpha_bit : i64
@@ -815,11 +845,11 @@ module attributes {
       %n1 = arith.ori %is_alpha, %has_dec : i1
       %n2 = arith.ori %has_dig, %has_num : i1
       %is_alnum = arith.ori %n1, %n2 : i1
-      %next = arith.andi %acc, %is_alnum : i1
-      scf.yield %next : i1
+      %iv_next = arith.addi %i, %c1 : index
+      scf.yield %is_alnum, %iv_next : i1, index
     }
     %nonempty = arith.cmpi sgt, %count, %zero : i64
-    %result = arith.andi %nonempty, %all : i1
+    %result = arith.andi %nonempty, %all#0 : i1
     func.return %result : i1
   }
 
@@ -835,7 +865,12 @@ module attributes {
     %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
     %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     %count_index = arith.index_cast %count : i64 to index
-    %all = scf.for %i = %c0 to %count_index step %c1 iter_args(%acc = %true_bit) -> (i1) {
+    %all:2 = scf.while (%acc = %true_bit, %i = %c0) : (i1, index) -> (i1, index) {
+      %in_range = arith.cmpi slt, %i, %count_index : index
+      %go = arith.andi %in_range, %acc : i1
+      scf.condition(%go) %acc, %i : i1, index
+    } do {
+    ^bb0(%acc: i1, %i: index):
       %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
       %u, %l, %f, %t, %dec, %dig, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
       %is_first = arith.cmpi eq, %i, %c0 : index
@@ -845,11 +880,11 @@ module attributes {
       %is_underscore = arith.cmpi eq, %cp, %underscore : i64
       %first_underscore = arith.andi %is_first, %is_underscore : i1
       %valid = arith.ori %has, %first_underscore : i1
-      %next = arith.andi %acc, %valid : i1
-      scf.yield %next : i1
+      %iv_next = arith.addi %i, %c1 : index
+      scf.yield %valid, %iv_next : i1, index
     }
     %nonempty = arith.cmpi sgt, %count, %zero : i64
-    %result = arith.andi %nonempty, %all : i1
+    %result = arith.andi %nonempty, %all#0 : i1
     func.return %result : i1
   }
 
@@ -862,12 +897,17 @@ module attributes {
     %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
     %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     %count_index = arith.index_cast %count : i64 to index
-    %all = scf.for %i = %c0 to %count_index step %c1 iter_args(%acc = %true_bit) -> (i1) {
+    %all:2 = scf.while (%acc = %true_bit, %i = %c0) : (i1, index) -> (i1, index) {
+      %in_range = arith.cmpi slt, %i, %count_index : index
+      %go = arith.andi %in_range, %acc : i1
+      scf.condition(%go) %acc, %i : i1, index
+    } do {
+    ^bb0(%acc: i1, %i: index):
       %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
       %ascii = arith.cmpi ult, %cp, %limit : i64
-      %next = arith.andi %acc, %ascii : i1
-      scf.yield %next : i1
+      %iv_next = arith.addi %i, %c1 : index
+      scf.yield %ascii, %iv_next : i1, index
     }
-    func.return %all : i1
+    func.return %all#0 : i1
   }
 }

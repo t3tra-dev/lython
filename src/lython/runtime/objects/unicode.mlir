@@ -274,14 +274,19 @@ module attributes {
     %comparable = arith.andi %narrow, %same_len : i1
     %result = scf.if %comparable -> (i1) {
       %expected_index = arith.index_cast %expected_len : i64 to index
-      %all = scf.for %i = %c0 to %expected_index step %c1 iter_args(%acc = %true_bit) -> (i1) {
+      %all:2 = scf.while (%acc = %true_bit, %i = %c0) : (i1, index) -> (i1, index) {
+        %in_range = arith.cmpi slt, %i, %expected_index : index
+        %go = arith.andi %in_range, %acc : i1
+        scf.condition(%go) %acc, %i : i1, index
+      } do {
+      ^bb0(%acc: i1, %i: index):
         %a = memref.load %bytes[%i] : memref<?xi8>
         %b = memref.load %expected[%i] : memref<?xi8>
         %eq = arith.cmpi eq, %a, %b : i8
-        %next = arith.andi %acc, %eq : i1
-        scf.yield %next : i1
+        %iv_next = arith.addi %i, %c1 : index
+        scf.yield %eq, %iv_next : i1, index
       }
-      scf.yield %all : i1
+      scf.yield %all#0 : i1
     } else {
       scf.yield %false_bit : i1
     }
@@ -983,14 +988,19 @@ module attributes {
     %result = scf.if %comparable -> (i1) {
       %step = arith.constant 1 : index
       %true = arith.constant true
-      %all_equal = scf.for %index = %c0 to %lhs_dim step %step iter_args(%current = %true) -> (i1) {
+      %all_equal:2 = scf.while (%current = %true, %index = %c0) : (i1, index) -> (i1, index) {
+        %in_range = arith.cmpi slt, %index, %lhs_dim : index
+        %go = arith.andi %in_range, %current : i1
+        scf.condition(%go) %current, %index : i1, index
+      } do {
+      ^bb0(%current: i1, %index: index):
         %lhs_byte = memref.load %lhs_bytes[%index] : memref<?xi8>
         %rhs_byte = memref.load %rhs_bytes[%index] : memref<?xi8>
         %byte_equal = arith.cmpi eq, %lhs_byte, %rhs_byte : i8
-        %next = arith.andi %current, %byte_equal : i1
-        scf.yield %next : i1
+        %iv_next = arith.addi %index, %step : index
+        scf.yield %byte_equal, %iv_next : i1, index
       }
-      scf.yield %all_equal : i1
+      scf.yield %all_equal#0 : i1
     } else {
       %false = arith.constant false
       scf.yield %false : i1
@@ -1021,23 +1031,30 @@ module attributes {
     %lower = arith.constant 0 : index
     %upper = arith.index_cast %min_len : i64 to index
     %step = arith.constant 1 : index
-    %cp_cmp = scf.for %index = %lower to %upper step %step iter_args(%acc = %zero) -> (i64) {
+    %cp_cmp:2 = scf.while (%acc = %zero, %index = %lower) : (i64, index) -> (i64, index) {
+      %in_range = arith.cmpi slt, %index, %upper : index
+      %decided = arith.cmpi ne, %acc, %zero : i64
+      %open_true = arith.constant true
+      %open = arith.xori %decided, %open_true : i1
+      %go = arith.andi %in_range, %open : i1
+      scf.condition(%go) %acc, %index : i64, index
+    } do {
+    ^bb0(%acc: i64, %index: index):
       %lhs_cp = func.call @__ly_unicode_get(%lhs_bytes, %lhs_width, %index) : (memref<?xi8>, i64, index) -> i64
       %rhs_cp = func.call @__ly_unicode_get(%rhs_bytes, %rhs_width, %index) : (memref<?xi8>, i64, index) -> i64
       %lt = arith.cmpi ult, %lhs_cp, %rhs_cp : i64
       %gt = arith.cmpi ugt, %lhs_cp, %rhs_cp : i64
       %gt_val = arith.select %gt, %plus_one, %zero : i64
       %this = arith.select %lt, %minus_one, %gt_val : i64
-      %decided = arith.cmpi ne, %acc, %zero : i64
-      %next = arith.select %decided, %acc, %this : i64
-      scf.yield %next : i64
+      %iv_next = arith.addi %index, %step : index
+      scf.yield %this, %iv_next : i64, index
     }
     %len_lt = arith.cmpi slt, %lhs_len, %rhs_len : i64
     %len_gt = arith.cmpi sgt, %lhs_len, %rhs_len : i64
     %len_gt_val = arith.select %len_gt, %plus_one, %zero : i64
     %len_cmp = arith.select %len_lt, %minus_one, %len_gt_val : i64
-    %prefix_equal = arith.cmpi eq, %cp_cmp, %zero : i64
-    %result = arith.select %prefix_equal, %len_cmp, %cp_cmp : i64
+    %prefix_equal = arith.cmpi eq, %cp_cmp#0, %zero : i64
+    %result = arith.select %prefix_equal, %len_cmp, %cp_cmp#0 : i64
     func.return %result : i64
   }
 
@@ -1609,16 +1626,21 @@ module attributes {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %true_bit = arith.constant true
-    %all = scf.for %j = %c0 to %n step %c1 iter_args(%acc = %true_bit) -> (i1) {
+    %all:2 = scf.while (%acc = %true_bit, %j = %c0) : (i1, index) -> (i1, index) {
+      %in_range = arith.cmpi slt, %j, %n : index
+      %go = arith.andi %in_range, %acc : i1
+      scf.condition(%go) %acc, %j : i1, index
+    } do {
+    ^bb0(%acc: i1, %j: index):
       %sj = arith.addi %si, %j : index
       %tj = arith.addi %ti, %j : index
       %scp = func.call @__ly_unicode_get(%s_bytes, %s_width, %sj) : (memref<?xi8>, i64, index) -> i64
       %tcp = func.call @__ly_unicode_get(%t_bytes, %t_width, %tj) : (memref<?xi8>, i64, index) -> i64
       %eq = arith.cmpi eq, %scp, %tcp : i64
-      %next = arith.andi %acc, %eq : i1
-      scf.yield %next : i1
+      %iv_next = arith.addi %j, %c1 : index
+      scf.yield %eq, %iv_next : i1, index
     }
-    func.return %all : i1
+    func.return %all#0 : i1
   }
 
   // First (or, %reverse, last) index in [start, end-n] where the needle
@@ -1732,15 +1754,20 @@ module attributes {
       %skippable = arith.xori %present, %true : i1
       %step:2 = scf.if %is_last -> (i64, i64) {
         %i_index = arith.index_cast %i : i64 to index
-        %hit = scf.for %j = %c0 to %n_index step %c1 iter_args(%acc = %true) -> (i1) {
+        %hit:2 = scf.while (%acc = %true, %j = %c0) : (i1, index) -> (i1, index) {
+          %in_range = arith.cmpi slt, %j, %n_index : index
+          %go = arith.andi %in_range, %acc : i1
+          scf.condition(%go) %acc, %j : i1, index
+        } do {
+        ^bb0(%acc: i1, %j: index):
           %sj = arith.addi %i_index, %j : index
           %sb = memref.load %s_bytes[%sj] : memref<?xi8>
           %tb = memref.load %t_bytes[%j] : memref<?xi8>
           %eq = arith.cmpi eq, %sb, %tb : i8
-          %next = arith.andi %acc, %eq : i1
-          scf.yield %next : i1
+          %iv_next = arith.addi %j, %c1 : index
+          scf.yield %eq, %iv_next : i1, index
         }
-        %after:2 = scf.if %hit -> (i64, i64) {
+        %after:2 = scf.if %hit#0 -> (i64, i64) {
           scf.yield %i, %i : i64, i64
         } else {
           %chosen = arith.select %skippable, %long_step, %gap_step : i64
@@ -1762,15 +1789,20 @@ module attributes {
     %check_last = arith.andi %missed, %reached : i1
     %answer = scf.if %check_last -> (i64) {
       %tail_index = arith.index_cast %w : i64 to index
-      %hit = scf.for %j = %c0 to %n_index step %c1 iter_args(%acc = %true) -> (i1) {
+      %hit:2 = scf.while (%acc = %true, %j = %c0) : (i1, index) -> (i1, index) {
+        %in_range = arith.cmpi slt, %j, %n_index : index
+        %go = arith.andi %in_range, %acc : i1
+        scf.condition(%go) %acc, %j : i1, index
+      } do {
+      ^bb0(%acc: i1, %j: index):
         %sj = arith.addi %tail_index, %j : index
         %sb = memref.load %s_bytes[%sj] : memref<?xi8>
         %tb = memref.load %t_bytes[%j] : memref<?xi8>
         %eq = arith.cmpi eq, %sb, %tb : i8
-        %next = arith.andi %acc, %eq : i1
-        scf.yield %next : i1
+        %iv_next = arith.addi %j, %c1 : index
+        scf.yield %eq, %iv_next : i1, index
       }
-      %found = arith.select %hit, %w, %minus_one : i64
+      %found = arith.select %hit#0, %w, %minus_one : i64
       scf.yield %found : i64
     } else {
       scf.yield %walk#1 : i64
@@ -2277,13 +2309,20 @@ module attributes {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %false_bit = arith.constant false
-    %found = scf.for %j = %c0 to %t_count step %c1 iter_args(%acc = %false_bit) -> (i1) {
+    %found:2 = scf.while (%acc = %false_bit, %j = %c0) : (i1, index) -> (i1, index) {
+      %in_range = arith.cmpi slt, %j, %t_count : index
+      %open_true = arith.constant true
+      %open = arith.xori %acc, %open_true : i1
+      %go = arith.andi %in_range, %open : i1
+      scf.condition(%go) %acc, %j : i1, index
+    } do {
+    ^bb0(%acc: i1, %j: index):
       %tcp = func.call @__ly_unicode_get(%t_bytes, %t_width, %j) : (memref<?xi8>, i64, index) -> i64
       %eq = arith.cmpi eq, %cp, %tcp : i64
-      %next = arith.ori %acc, %eq : i1
-      scf.yield %next : i1
+      %iv_next = arith.addi %j, %c1 : index
+      scf.yield %eq, %iv_next : i1, index
     }
-    func.return %found : i1
+    func.return %found#0 : i1
   }
 
   // Shared strip walk. %mode bit 1 = strip left, bit 2 = strip right.
@@ -3811,24 +3850,19 @@ module attributes {
     cf.br ^finish(%last : index)
 
   ^format_digits:
-    %lower = arith.constant 0 : index
-    %upper = arith.constant 20 : index
-    %step = arith.constant 1 : index
-    %result:2 = scf.for %i = %lower to %upper step %step iter_args(%n = %abs_value, %pos = %last) -> (i64, index) {
+    %result:2 = scf.while (%n = %abs_value, %pos = %last) : (i64, index) -> (i64, index) {
       %active = arith.cmpi ne, %n, %zero : i64
-      %next:2 = scf.if %active -> (i64, index) {
-        %digit = arith.remui %n, %ten : i64
-        %digit_ch_i64 = arith.addi %digit, %ascii_zero : i64
-        %digit_ch = arith.trunci %digit_ch_i64 : i64 to i8
-        memref.store %digit_ch, %buffer[%pos] : memref<21xi8>
-        %quotient = arith.divui %n, %ten : i64
-        %one_index = arith.constant 1 : index
-        %next_pos = arith.subi %pos, %one_index : index
-        scf.yield %quotient, %next_pos : i64, index
-      } else {
-        scf.yield %n, %pos : i64, index
-      }
-      scf.yield %next#0, %next#1 : i64, index
+      scf.condition(%active) %n, %pos : i64, index
+    } do {
+    ^bb0(%n: i64, %pos: index):
+      %digit = arith.remui %n, %ten : i64
+      %digit_ch_i64 = arith.addi %digit, %ascii_zero : i64
+      %digit_ch = arith.trunci %digit_ch_i64 : i64 to i8
+      memref.store %digit_ch, %buffer[%pos] : memref<21xi8>
+      %quotient = arith.divui %n, %ten : i64
+      %one_index = arith.constant 1 : index
+      %next_pos = arith.subi %pos, %one_index : index
+      scf.yield %quotient, %next_pos : i64, index
     }
     %one_finish = arith.constant 1 : index
     %first_digit = arith.addi %result#1, %one_finish : index

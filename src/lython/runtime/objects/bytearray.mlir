@@ -976,13 +976,20 @@ module attributes {
     %length = memref.load %self[%length_slot] : memref<4xi64>
     %payload = func.call @__ly_bytes_payload(%self) : (memref<4xi64>) -> memref<?xi8>
     %n = arith.index_cast %length : i64 to index
-    %found = scf.for %i = %c0 to %n step %c1 iter_args(%seen = %false) -> (i1) {
+    %found:2 = scf.while (%seen = %false, %i = %c0) : (i1, index) -> (i1, index) {
+      %in_range = arith.cmpi slt, %i, %n : index
+      %open_true = arith.constant true
+      %open = arith.xori %seen, %open_true : i1
+      %go = arith.andi %in_range, %open : i1
+      scf.condition(%go) %seen, %i : i1, index
+    } do {
+    ^bb0(%seen: i1, %i: index):
       %at = memref.load %payload[%i] : memref<?xi8>
       %match = arith.cmpi eq, %at, %byte : i8
-      %either = arith.ori %seen, %match : i1
-      scf.yield %either : i1
+      %iv_next = arith.addi %i, %c1 : index
+      scf.yield %match, %iv_next : i1, index
     }
-    func.return %found : i1
+    func.return %found#0 : i1
   }
 
   // ===== mutation (bytearray methods) =====
