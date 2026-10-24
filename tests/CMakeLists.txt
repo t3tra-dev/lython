@@ -581,6 +581,29 @@ foreach(test_path IN LISTS LYTHON_PYTHON_TESTS)
     endif()
 endforeach()
 
+# --- stdout buffering, seen through one pipe -----------------------------------
+#
+# stdout is buffered as CPython buffers sys.stdout and stderr is not, which only
+# shows when both go to ONE pipe: each case runs that way under CPython 3.14 and
+# under lyc (JIT and AOT), and the bytes must agree in order. CPython is the
+# oracle, so there is no expected file to go stale.
+if(Python3_VERSION VERSION_GREATER_EQUAL 3.14)
+    file(GLOB LYTHON_STREAM_ORDER_CASES CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/stream_order/*.py")
+    foreach(case_path IN LISTS LYTHON_STREAM_ORDER_CASES)
+        get_filename_component(case_name "${case_path}" NAME_WE)
+        add_test(NAME "stream_order.${case_name}"
+            COMMAND Python3::Interpreter
+                "${CMAKE_CURRENT_SOURCE_DIR}/stream_order.py"
+                $<TARGET_FILE:lyc> "${Python3_EXECUTABLE}" "${case_path}"
+                "${CMAKE_CURRENT_BINARY_DIR}/stream_order")
+        set_tests_properties("stream_order.${case_name}" PROPERTIES
+            TIMEOUT 300
+            ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1"
+            LABELS "e2e")
+    endforeach()
+endif()
+
 # --- Precompiled native runtime ----------------------------------------------
 #
 # lyc links a native runtime precompiled for the build machine instead of

@@ -790,6 +790,7 @@ void buildObjectAllocator(SupportBuilder &b) {
     b.builder.setInsertionPointToEnd(fn.addEntryBlock());
     b.call("write_cstr", mlir::TypeRange{},
            mlir::ValueRange{b.iconst32(2), b.addrOf(".lymem_out_of_memory")});
+    b.call("LyHost_FlushStdout", mlir::TypeRange{}, mlir::ValueRange{});
     b.call("abort", mlir::TypeRange{}, mlir::ValueRange{});
     ret({});
   }
@@ -808,6 +809,7 @@ void buildObjectAllocator(SupportBuilder &b) {
     b.builder.setInsertionPointToEnd(fn.addEntryBlock());
     b.call("write_cstr", mlir::TypeRange{},
            mlir::ValueRange{b.iconst32(2), b.addrOf(".lymem_unchecked_size")});
+    b.call("LyHost_FlushStdout", mlir::TypeRange{}, mlir::ValueRange{});
     b.call("abort", mlir::TypeRange{}, mlir::ValueRange{});
     ret({});
   }
@@ -1509,34 +1511,133 @@ void buildReleaseSingleAllocation(SupportBuilder &b, llvm::StringRef name,
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-// void write_len(i32 fd, ptr data, i64 len): raw write(2) guarded by len > 0
-// and data != null. Public: the traceback printer still in the native module
-// calls it through a bridge declaration.
+// The stream the program's stdout goes through: a FILE* opened on fd 1 at the
+// first write (`ly_stdout_stream`), so libc buffers it as CPython buffers
+// sys.stdout -- by line on a terminal, by block otherwise -- and exit() and
+// fflush(NULL) flush it. `LyHost_FlushStdout` is the explicit flush:
+// LyRunPythonMain calls it on every way out, after the traceback, which is
+// where CPython's finalization flushes.
+//
+// ⛔ Not libc's own `stdout`: it is a different symbol on every libc
+// (`__stdoutp`, `stdout`, `__acrt_iob_func(1)`), and a stream of our own is
+// flushed by exit() all the same.
+// ⛔ Not stderr: CPython's is line-buffered, and the runtime writes whole lines
+// to it, so writing it through at once is what a reader sees either way.
+void buildStdoutStream(SupportBuilder &b) {
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToEnd(b.module.getBody());
+    auto global = mlir::LLVM::GlobalOp::create(
+        b.builder, b.loc, b.ptr(), /*isConstant=*/false,
+        mlir::LLVM::Linkage::Internal, "g_ly_stdout_stream", mlir::Attribute(),
+        /*alignment=*/8);
+    mlir::Block *init = b.builder.createBlock(&global.getInitializerRegion());
+    b.builder.setInsertionPointToEnd(init);
+    mlir::Value null = mlir::LLVM::ZeroOp::create(b.builder, b.loc, b.ptr());
+    mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{null});
+  }
+  b.stringGlobal(".stdout_mode", "w");
+
+  {
+    auto fn = b.beginFunction("ly_stdout_stream",
+                              b.builder.getFunctionType({}, {b.ptr()}),
+                              /*isPrivate=*/true);
+    mlir::Block *entry = fn.addEntryBlock();
+    mlir::Region &body = fn.getBody();
+    mlir::Block *open = b.builder.createBlock(&body);
+    mlir::Block *done = b.builder.createBlock(&body, body.end(), {b.ptr()},
+                                              {b.loc});
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value held = b.loadPtrVal(b.addrOf("g_ly_stdout_stream"));
+    mlir::cf::CondBranchOp::create(b.builder, b.loc,
+                                   b.ptrEq(held, b.nullPtr()), open,
+                                   mlir::ValueRange{}, done,
+                                   mlir::ValueRange{held});
+    b.builder.setInsertionPointToEnd(open);
+    mlir::Value opened =
+        b.call("fdopen", b.ptr(),
+               mlir::ValueRange{b.iconst32(1), b.addrOf(".stdout_mode")})
+            .front();
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, opened,
+                                b.addrOf("g_ly_stdout_stream"),
+                                /*alignment=*/8);
+    mlir::cf::BranchOp::create(b.builder, b.loc, done,
+                               mlir::ValueRange{opened});
+    b.builder.setInsertionPointToEnd(done);
+    mlir::func::ReturnOp::create(b.builder, b.loc,
+                                 mlir::ValueRange{done->getArgument(0)});
+  }
+
+  {
+    auto fn = b.beginFunction("LyHost_FlushStdout",
+                              b.builder.getFunctionType({}, {}));
+    mlir::Block *entry = fn.addEntryBlock();
+    mlir::Region &body = fn.getBody();
+    mlir::Block *flush = b.builder.createBlock(&body);
+    mlir::Block *done = b.builder.createBlock(&body);
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::Value held = b.loadPtrVal(b.addrOf("g_ly_stdout_stream"));
+    mlir::cf::CondBranchOp::create(b.builder, b.loc,
+                                   b.ptrEq(held, b.nullPtr()), done,
+                                   mlir::ValueRange{}, flush,
+                                   mlir::ValueRange{});
+    b.builder.setInsertionPointToEnd(flush);
+    b.call("fflush", b.i32(), mlir::ValueRange{held});
+    mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
+    b.builder.setInsertionPointToEnd(done);
+    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+  }
+}
+
+// void write_len(i32 fd, ptr data, i64 len): write guarded by len > 0 and
+// data != null; fd 1 through the stdout stream, anything else raw write(2).
+// Public: the traceback printer still in the native module calls it through a
+// bridge declaration.
 void buildWriteLen(SupportBuilder &b) {
   auto fn = b.beginFunction(
       "write_len", b.builder.getFunctionType({b.i32(), b.ptr(), b.i64()}, {}));
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
   mlir::Block *doWrite = b.builder.createBlock(&body);
+  mlir::Block *toStdout = b.builder.createBlock(&body);
+  mlir::Block *buffered = b.builder.createBlock(&body);
+  mlir::Block *raw = b.builder.createBlock(&body);
   mlir::Block *done = b.builder.createBlock(&body);
   b.builder.setInsertionPointToEnd(entry);
+  mlir::Value fd = entry->getArgument(0);
+  mlir::Value data = entry->getArgument(1);
+  mlir::Value len = entry->getArgument(2);
   mlir::Value zero = b.iconst(0);
   mlir::Value null =
       mlir::LLVM::ZeroOp::create(b.builder, b.loc, b.ptr()).getResult();
   mlir::Value lenPositive =
-      b.cmpi(mlir::arith::CmpIPredicate::sgt, entry->getArgument(2), zero);
+      b.cmpi(mlir::arith::CmpIPredicate::sgt, len, zero);
   mlir::Value dataOk = mlir::LLVM::ICmpOp::create(
-      b.builder, b.loc, mlir::LLVM::ICmpPredicate::ne, entry->getArgument(1),
-      null);
+      b.builder, b.loc, mlir::LLVM::ICmpPredicate::ne, data, null);
   mlir::Value shouldWrite =
       mlir::arith::AndIOp::create(b.builder, b.loc, lenPositive, dataOk);
   mlir::cf::CondBranchOp::create(b.builder, b.loc, shouldWrite, doWrite,
                                  mlir::ValueRange{}, done, mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(doWrite);
-  mlir::func::CallOp::create(
-      b.builder, b.loc, "write", b.i64(),
-      mlir::ValueRange{entry->getArgument(0), entry->getArgument(1),
-                       entry->getArgument(2)});
+  mlir::Value isStdout =
+      b.cmpi(mlir::arith::CmpIPredicate::eq, fd, b.iconst32(1));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, isStdout, toStdout,
+                                 mlir::ValueRange{}, raw, mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(toStdout);
+  mlir::Value stream =
+      b.call("ly_stdout_stream", b.ptr(), mlir::ValueRange{}).front();
+  // fdopen can fail (fd 1 closed): then the write goes to the fd and fails
+  // there, as it did before there was a stream.
+  mlir::cf::CondBranchOp::create(b.builder, b.loc,
+                                 b.ptrEq(stream, b.nullPtr()), raw,
+                                 mlir::ValueRange{}, buffered,
+                                 mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(buffered);
+  b.call("fwrite", b.i64(), mlir::ValueRange{data, b.iconst(1), len, stream});
+  mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(raw);
+  mlir::func::CallOp::create(b.builder, b.loc, "write", b.i64(),
+                             mlir::ValueRange{fd, data, len});
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(done);
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
@@ -3286,6 +3387,15 @@ static void enterHostWorkingDirectory(SupportBuilder &b) {
 // unwind of one frame per program run pays the C++ ABI's price; the Python
 // frames do not.
 void buildRunPythonMain(SupportBuilder &b) {
+  // The stdout stream is flushed as soon as the body is done, raising or not,
+  // and so BEFORE the traceback or the SystemExit message: CPython's
+  // pyrun_file flushes (`flush_io`) between running the module and printing
+  // its error. And once more on every way out, for what releasing the
+  // exception printed.
+  auto flushStdout = [&] {
+    mlir::func::CallOp::create(b.builder, b.loc, "LyHost_FlushStdout",
+                               mlir::TypeRange{}, mlir::ValueRange{});
+  };
   auto fn = beginLLVMFunction(b, "LyRunPythonMain", b.i32(), {b.ptr()});
   fn.setPersonalityAttr(mlir::FlatSymbolRefAttr::get(b.builder.getContext(),
                                                      "__gxx_personality_v0"));
@@ -3327,6 +3437,7 @@ void buildRunPythonMain(SupportBuilder &b) {
   // here with its exception still on its way: it is raised once more through
   // the unwinder, into the landing pad below that reports it.
   b.builder.setInsertionPointToEnd(ok);
+  flushStdout();
   mlir::Value propagating = mlir::LLVM::LoadOp::create(
       b.builder, b.loc, b.i1(), b.addrOf(kPropagatingFlag), /*alignment=*/1);
   mlir::LLVM::CondBrOp::create(b.builder, b.loc, propagating, bridge, done);
@@ -3343,10 +3454,12 @@ void buildRunPythonMain(SupportBuilder &b) {
                                mlir::ValueRange{}, done, mlir::ValueRange{},
                                landing, mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(done);
+  flushStdout();
   mlir::LLVM::ReturnOp::create(b.builder, b.loc,
                                mlir::ValueRange{b.iconst32(0)});
 
   b.builder.setInsertionPointToEnd(nullEntry);
+  flushStdout();
   mlir::LLVM::ReturnOp::create(b.builder, b.loc,
                                mlir::ValueRange{b.iconst32(1)});
 
@@ -3360,6 +3473,7 @@ void buildRunPythonMain(SupportBuilder &b) {
       b.builder, b.loc, pad, llvm::ArrayRef<std::int64_t>{0});
   mlir::LLVM::StoreOp::create(b.builder, b.loc, exceptionObject,
                               b.addrOf("g_current_carrier"), /*alignment=*/8);
+  flushStdout();
   mlir::Value descriptor = mlir::LLVM::AllocaOp::create(
       b.builder, b.loc, b.ptr(), exceptionPartsType(b), b.iconst32(1),
       /*alignment=*/8);
@@ -3380,6 +3494,7 @@ void buildRunPythonMain(SupportBuilder &b) {
   mlir::func::CallOp::create(b.builder, b.loc, "LyTraceback_Clear",
                              mlir::TypeRange{}, mlir::ValueRange{});
   emitDeleteCurrentCarrier(b);
+  flushStdout();
   mlir::LLVM::ReturnOp::create(b.builder, b.loc,
                                mlir::ValueRange{b.iconst32(1)});
 
@@ -3445,6 +3560,7 @@ void buildRunPythonMain(SupportBuilder &b) {
                              mlir::TypeRange{}, mlir::ValueRange{});
   releaseTaken();
   emitDeleteCurrentCarrier(b);
+  flushStdout();
   mlir::LLVM::ReturnOp::create(b.builder, b.loc,
                                mlir::ValueRange{b.iconst32(1)});
 
@@ -3490,11 +3606,13 @@ void buildRunPythonMain(SupportBuilder &b) {
                                                  exitCodeBiased, b.iconst(1));
   mlir::Value status32 =
       mlir::arith::TruncIOp::create(b.builder, b.loc, b.i32(), status);
+  flushStdout();
   mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{status32});
 
   b.builder.setInsertionPointToEnd(exitSilently);
   releaseTaken();
   emitDeleteCurrentCarrier(b);
+  flushStdout();
   mlir::LLVM::ReturnOp::create(b.builder, b.loc,
                                mlir::ValueRange{b.iconst32(0)});
 
@@ -3513,6 +3631,7 @@ void buildRunPythonMain(SupportBuilder &b) {
   b.call("free", mlir::TypeRange{}, mlir::ValueRange{messageCStr});
   releaseTaken();
   emitDeleteCurrentCarrier(b);
+  flushStdout();
   mlir::LLVM::ReturnOp::create(b.builder, b.loc,
                                mlir::ValueRange{b.iconst32(1)});
 }
@@ -4490,6 +4609,9 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   support.declareExternal(
       "fflush", builder.getFunctionType({support.ptr()}, {support.i32()}));
   support.declareExternal(
+      "fdopen", builder.getFunctionType({support.i32(), support.ptr()},
+                                        {support.ptr()}));
+  support.declareExternal(
       "fileno", builder.getFunctionType({support.ptr()}, {support.i32()}));
   support.declareExternal(
       "fseek",
@@ -4524,6 +4646,7 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   buildReleaseStorageRawToZero(support);
   buildRetainStorageRaw(support);
   buildReleaseSingleAllocation(support, "release_unicode_raw", /*twoArgs=*/true);
+  buildStdoutStream(support);
   buildWriteLen(support);
   buildWriteCStr(support);
   buildWriteChar(support);
