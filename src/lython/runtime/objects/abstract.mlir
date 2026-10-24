@@ -120,7 +120,24 @@ module {
         %off = arith.muli %i, %c16_i64 : i64
         %lbox = llvm.getelementptr %lhs_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
         %rbox = llvm.getelementptr %rhs_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-        %eq = func.call @__ly_box_equal(%lbox, %rbox) : (!llvm.ptr, !llvm.ptr) -> i1
+        // ⭐ The same object, or two immediate ints, answer from the words:
+        // CPython's PyObject_RichCompareBool answers identity without asking,
+        // and two immediates are equal exactly when their words are.
+        %lword = llvm.load %lbox : !llvm.ptr -> i64
+        %rword = llvm.load %rbox : !llvm.ptr -> i64
+        %same_word = arith.cmpi eq, %lword, %rword : i64
+        %stored = arith.cmpi ne, %lword, %zero : i64
+        %identical = arith.andi %same_word, %stored : i1
+        %both_tags = arith.andi %lword, %rword : i64
+        %int_bits = arith.andi %both_tags, %one : i64
+        %both_int = arith.cmpi ne, %int_bits, %zero : i64
+        %by_word = arith.ori %identical, %both_int : i1
+        %eq = scf.if %by_word -> (i1) {
+          scf.yield %same_word : i1
+        } else {
+          %by_value = func.call @__ly_box_equal(%lbox, %rbox) : (!llvm.ptr, !llvm.ptr) -> i1
+          scf.yield %by_value : i1
+        }
         scf.yield %eq : i1
       } else {
         %no = arith.constant false

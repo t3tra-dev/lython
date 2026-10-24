@@ -1,0 +1,146 @@
+# Ordering answers what CPython's does on every path a sort or a comparison
+# can take: a list whose slots are all immediate ints, all exact strs or all
+# exact tuples (list.sort chooses its comparison once, as CPython's listsort
+# does), a list that mixes immediates with objects, and the comparisons that
+# max, min and tuple ordering reach without a sort.
+import unittest
+
+
+def insertion_sorted(xs: list[int]) -> list[int]:
+    out: list[int] = []
+    for x in xs:
+        i = len(out)
+        out.append(x)
+        while i > 0 and out[i - 1] > x:
+            out[i] = out[i - 1]
+            i -= 1
+        out[i] = x
+    return out
+
+
+class SortKindTest(unittest.TestCase):
+
+    def test_literal_ints(self) -> None:
+        xs = [5, -3, 0, 12, -3, 7, -100, 1]
+        xs.sort()
+        self.assertEqual(xs, [-100, -3, -3, 0, 1, 5, 7, 12])
+
+    def test_computed_ints(self) -> None:
+        # Computed, so each slot holds the value itself rather than a shared
+        # literal object; long enough to merge blocks.
+        xs = [(i * 7919) % 1009 - 500 for i in range(300)]
+        expected = insertion_sorted(xs)
+        xs.sort()
+        self.assertEqual(xs, expected)
+
+    def test_computed_ints_with_one_past_the_immediate_range(self) -> None:
+        xs = [(i * 7919) % 1009 - 500 for i in range(100)]
+        xs.append(2 ** 62 + len(xs))
+        xs.append(-(2 ** 62) - len(xs))
+        expected = insertion_sorted(xs)
+        xs.sort()
+        self.assertEqual(xs, expected)
+
+    def test_ints_past_the_immediate_range(self) -> None:
+        big = 2 ** 62
+        xs = [big, -big - 1, 3, 2 ** 100, -(2 ** 100), big - 1, -big]
+        xs.sort()
+        self.assertEqual(xs, [-(2 ** 100), -big - 1, -big, 3, big - 1, big,
+                              2 ** 100])
+
+    def test_bools_among_ints(self) -> None:
+        xs = [True, 0, -1, False, 1]
+        xs.sort()
+        self.assertEqual(repr(xs), "[-1, 0, False, True, 1]")
+
+    def test_strs_of_every_width(self) -> None:
+        xs = ["b", "aĀ", "a", "a\xe9", "\U0001f600", "", "ab", "a\U0001f600"]
+        xs.sort()
+        self.assertEqual(xs, ["", "a", "ab", "a\xe9", "aĀ", "a\U0001f600",
+                              "b", "\U0001f600"])
+
+    def test_strs_sharing_a_prefix(self) -> None:
+        xs = ["w10", "w1", "w100", "w09", "w"]
+        xs.sort()
+        self.assertEqual(xs, ["w", "w09", "w1", "w10", "w100"])
+
+    def test_tuples_are_stable_on_equal_keys(self) -> None:
+        xs = [(1, "b"), (0, "z"), (1, "a"), (0, "y")]
+        xs.sort()
+        self.assertEqual(xs, [(0, "y"), (0, "z"), (1, "a"), (1, "b")])
+
+    def test_tuples_of_different_lengths(self) -> None:
+        xs = [(1, 2, 3), (1, 2), (1,), (0, 9)]
+        xs.sort()
+        self.assertEqual(repr(xs), "[(0, 9), (1,), (1, 2), (1, 2, 3)]")
+
+    def test_one_nan_object_is_equal_to_itself_inside_a_tuple(self) -> None:
+        nan = float("nan")
+        xs = [(nan, 1), (nan, 0)]
+        xs.sort()
+        self.assertEqual([t[1] for t in xs], [0, 1])
+
+    def test_two_nan_objects_leave_the_order_alone(self) -> None:
+        xs = [(float("nan"), 1), (float("nan"), 0)]
+        xs.sort()
+        self.assertEqual([t[1] for t in xs], [1, 0])
+
+    def test_floats_keep_equal_zeros_in_order(self) -> None:
+        xs = [2.5, 0.0, -1.0, -0.0, 1e300]
+        xs.sort()
+        self.assertEqual(repr(xs), "[-1.0, 0.0, -0.0, 2.5, 1e+300]")
+
+    def test_key_sort_is_stable_both_ways(self) -> None:
+        words = ["bb", "a", "cc", "d", "ee"]
+        self.assertEqual(sorted(words, key=len), ["a", "d", "bb", "cc", "ee"])
+        self.assertEqual(sorted(words, key=len, reverse=True),
+                         ["bb", "cc", "ee", "a", "d"])
+
+
+class OrderWithoutSortTest(unittest.TestCase):
+
+    def test_max_and_min_of_computed_ints(self) -> None:
+        xs = [(i * 37) % 101 - 50 for i in range(101)]
+        self.assertEqual(max(xs), 50)
+        self.assertEqual(min(xs), -50)
+
+    def test_max_and_min_of_computed_floats(self) -> None:
+        xs = [((i * 37) % 101 - 50) / 4 for i in range(101)]
+        self.assertEqual(max(xs), 12.5)
+        self.assertEqual(min(xs), -12.5)
+
+    def test_tuples_of_computed_ints(self) -> None:
+        a = (len("ab"), len("abc") * 10)
+        b = (len("ab"), len("abcd") * 10)
+        self.assertTrue(a < b)
+        self.assertFalse(b <= a)
+        self.assertTrue(a == (2, 30))
+
+    def test_max_and_min_of_ints(self) -> None:
+        xs = [3, -5, 2 ** 63, 7]
+        self.assertEqual(max(xs), 2 ** 63)
+        self.assertEqual(min(xs), -5)
+
+    def test_min_and_max_return_the_first_of_equal_floats(self) -> None:
+        self.assertEqual(repr(min([1.5, -0.0, 0.0])), "-0.0")
+        self.assertEqual(repr(max([0.0, -0.0])), "0.0")
+
+    def test_tuple_operators(self) -> None:
+        a = (1, 2, 3)
+        b = (1, 2, 4)
+        self.assertTrue(a < b)
+        self.assertTrue(a <= b)
+        self.assertFalse(a > b)
+        self.assertFalse(a >= b)
+        self.assertTrue((1, 2) < (1, 2, 0))
+        self.assertTrue((-1, 5) < (0, -5))
+
+    def test_str_operators_across_widths(self) -> None:
+        self.assertTrue("a\xff" < "aĀ")
+        self.assertTrue("abc" < "abd")
+        self.assertFalse("abc" < "ab")
+        self.assertTrue("\U0001f600" > "￿")
+
+
+if __name__ == "__main__":
+    unittest.main()
