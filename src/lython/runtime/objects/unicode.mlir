@@ -47,6 +47,7 @@ module attributes {
   func.func private @__ly_fmt_raise_sign_str()
   func.func private @__ly_fmt_raise_unknown_code(%code: i64, %name: memref<?xi8>, %name_len: i64)
   func.func private @__ly_fmt_str_from_cps(%cps: memref<?xi32>, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
+  func.func private @__ly_global_view_i64(%pointer: i64, %size: i64) -> memref<?xi64>
   func.func private @__ly_global_view_i8(%pointer: i64, %size: i64) -> memref<?xi8>
   func.func private @__ly_hash_bytes(%ptr: i64, %len: i64) -> i64
   func.func private @__ly_hash_fixup(%h: i64) -> i64
@@ -671,7 +672,11 @@ module attributes {
     %width = arith.andi %shape, %mask : i64
     %shift = arith.constant 3 : i64
     %data_bytes = arith.shrui %shape, %shift : i64
-    %count = arith.divsi %data_bytes, %width : i64
+    // ⛔ Not a division: the width is 1, 2 or 4, so it is a shift by width/2,
+    // and every str operation asks this.
+    %one = arith.constant 1 : i64
+    %log_width = arith.shrui %width, %one : i64
+    %count = arith.shrui %data_bytes, %log_width : i64
     func.return %count : i64
   }
 
@@ -1031,31 +1036,73 @@ module attributes {
     %lower = arith.constant 0 : index
     %upper = arith.index_cast %min_len : i64 to index
     %step = arith.constant 1 : index
-    %cp_cmp:2 = scf.while (%acc = %zero, %index = %lower) : (i64, index) -> (i64, index) {
-      %in_range = arith.cmpi slt, %index, %upper : index
-      %decided = arith.cmpi ne, %acc, %zero : i64
-      %open_true = arith.constant true
-      %open = arith.xori %decided, %open_true : i1
-      %go = arith.andi %in_range, %open : i1
-      scf.condition(%go) %acc, %index : i64, index
-    } do {
-    ^bb0(%acc: i64, %index: index):
-      %lhs_cp = func.call @__ly_unicode_get(%lhs_bytes, %lhs_width, %index) : (memref<?xi8>, i64, index) -> i64
-      %rhs_cp = func.call @__ly_unicode_get(%rhs_bytes, %rhs_width, %index) : (memref<?xi8>, i64, index) -> i64
-      %lt = arith.cmpi ult, %lhs_cp, %rhs_cp : i64
-      %gt = arith.cmpi ugt, %lhs_cp, %rhs_cp : i64
-      %gt_val = arith.select %gt, %plus_one, %zero : i64
-      %this = arith.select %lt, %minus_one, %gt_val : i64
-      %iv_next = arith.addi %index, %step : index
-      scf.yield %this, %iv_next : i64, index
+    // ⭐ Two latin-1 strings compare as bytes, which is CPython's
+    // unsafe_latin_compare (a memcmp): the width is fixed for the whole loop,
+    // and `__ly_unicode_get` is a call and a width branch per code point.
+    %one_wide = arith.constant 1 : i64
+    %lhs_narrow = arith.cmpi eq, %lhs_width, %one_wide : i64
+    %rhs_narrow = arith.cmpi eq, %rhs_width, %one_wide : i64
+    %narrow = arith.andi %lhs_narrow, %rhs_narrow : i1
+    %cp_cmp = scf.if %narrow -> (i64) {
+      %bytewise:2 = scf.while (%acc = %zero, %index = %lower) : (i64, index) -> (i64, index) {
+        %in_range = arith.cmpi slt, %index, %upper : index
+        %undecided = arith.cmpi eq, %acc, %zero : i64
+        %go = arith.andi %in_range, %undecided : i1
+        scf.condition(%go) %acc, %index : i64, index
+      } do {
+      ^bb0(%acc: i64, %index: index):
+        %lhs_byte = memref.load %lhs_bytes[%index] : memref<?xi8>
+        %rhs_byte = memref.load %rhs_bytes[%index] : memref<?xi8>
+        %lt = arith.cmpi ult, %lhs_byte, %rhs_byte : i8
+        %gt = arith.cmpi ugt, %lhs_byte, %rhs_byte : i8
+        %gt_val = arith.select %gt, %plus_one, %zero : i64
+        %this = arith.select %lt, %minus_one, %gt_val : i64
+        %iv_next = arith.addi %index, %step : index
+        scf.yield %this, %iv_next : i64, index
+      }
+      scf.yield %bytewise#0 : i64
+    } else {
+      %by_code_point:2 = scf.while (%acc = %zero, %index = %lower) : (i64, index) -> (i64, index) {
+        %in_range = arith.cmpi slt, %index, %upper : index
+        %undecided = arith.cmpi eq, %acc, %zero : i64
+        %go = arith.andi %in_range, %undecided : i1
+        scf.condition(%go) %acc, %index : i64, index
+      } do {
+      ^bb0(%acc: i64, %index: index):
+        %lhs_cp = func.call @__ly_unicode_get(%lhs_bytes, %lhs_width, %index) : (memref<?xi8>, i64, index) -> i64
+        %rhs_cp = func.call @__ly_unicode_get(%rhs_bytes, %rhs_width, %index) : (memref<?xi8>, i64, index) -> i64
+        %lt = arith.cmpi ult, %lhs_cp, %rhs_cp : i64
+        %gt = arith.cmpi ugt, %lhs_cp, %rhs_cp : i64
+        %gt_val = arith.select %gt, %plus_one, %zero : i64
+        %this = arith.select %lt, %minus_one, %gt_val : i64
+        %iv_next = arith.addi %index, %step : index
+        scf.yield %this, %iv_next : i64, index
+      }
+      scf.yield %by_code_point#0 : i64
     }
     %len_lt = arith.cmpi slt, %lhs_len, %rhs_len : i64
     %len_gt = arith.cmpi sgt, %lhs_len, %rhs_len : i64
     %len_gt_val = arith.select %len_gt, %plus_one, %zero : i64
     %len_cmp = arith.select %len_lt, %minus_one, %len_gt_val : i64
-    %prefix_equal = arith.cmpi eq, %cp_cmp#0, %zero : i64
-    %result = arith.select %prefix_equal, %len_cmp, %cp_cmp#0 : i64
+    %prefix_equal = arith.cmpi eq, %cp_cmp, %zero : i64
+    %result = arith.select %prefix_equal, %len_cmp, %cp_cmp : i64
     func.return %result : i64
+  }
+
+  // `LyUnicode_Compare` over two str blocks named by address, for a caller
+  // that holds slot words and no views (list.sort over a list of str).
+  func.func private @__ly_unicode_compare_blocks(%lhs: i64, %rhs: i64) -> i64 {
+    %two = arith.constant 2 : i64
+    %lhs_view = func.call @__ly_global_view_i64(%lhs, %two) : (i64, i64) -> memref<?xi64>
+    %rhs_view = func.call @__ly_global_view_i64(%rhs, %two) : (i64, i64) -> memref<?xi64>
+    %lhs_header = memref.cast %lhs_view : memref<?xi64> to memref<2xi64>
+    %rhs_header = memref.cast %rhs_view : memref<?xi64> to memref<2xi64>
+    %lhs_ptr, %lhs_len = func.call @__ly_unicode_lane_words(%lhs) : (i64) -> (i64, i64)
+    %rhs_ptr, %rhs_len = func.call @__ly_unicode_lane_words(%rhs) : (i64) -> (i64, i64)
+    %lhs_bytes = func.call @__ly_global_view_i8(%lhs_ptr, %lhs_len) : (i64, i64) -> memref<?xi8>
+    %rhs_bytes = func.call @__ly_global_view_i8(%rhs_ptr, %rhs_len) : (i64, i64) -> memref<?xi8>
+    %cmp = func.call @LyUnicode_Compare(%lhs_header, %lhs_bytes, %rhs_header, %rhs_bytes) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> i64
+    func.return %cmp : i64
   }
 
   func.func @LyUnicode_LtBool(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> i1 attributes {ly.runtime.contract = "builtins.str", ly.runtime.method = "__lt__"} {

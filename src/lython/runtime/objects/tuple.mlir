@@ -147,6 +147,18 @@ module attributes {
     func.return %cmp : i1
   }
 
+  // `__ly_tuple_compare` over two tuple blocks named by address, for a caller
+  // that holds slot words and no views (list.sort over a list of tuples).
+  func.func private @__ly_tuple_compare_blocks(%lhs: i64, %rhs: i64, %op: i64) -> i1 {
+    %five = arith.constant 5 : i64
+    %lhs_view = func.call @__ly_global_view_i64(%lhs, %five) : (i64, i64) -> memref<?xi64>
+    %rhs_view = func.call @__ly_global_view_i64(%rhs, %five) : (i64, i64) -> memref<?xi64>
+    %lhs_handle = memref.cast %lhs_view : memref<?xi64> to memref<5xi64>
+    %rhs_handle = memref.cast %rhs_view : memref<?xi64> to memref<5xi64>
+    %cmp = func.call @__ly_tuple_compare(%lhs_handle, %rhs_handle, %op) : (memref<5xi64>, memref<5xi64>, i64) -> i1
+    func.return %cmp : i1
+  }
+
   func.func @LyTuple_LtBool(%lhs: memref<5xi64> {ly.ownership.object_header}, %rhs: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__lt__"} {
     %op = arith.constant 0 : i64
     %result = func.call @__ly_tuple_compare(%lhs, %rhs, %op) : (memref<5xi64>, memref<5xi64>, i64) -> i1

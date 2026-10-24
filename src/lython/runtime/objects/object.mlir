@@ -30,6 +30,7 @@ module attributes {
   func.func private @LyLong_TryAsI64(%header: memref<2xi64> {ly.ownership.object_header}) -> (i64, i1) attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "try_unbox.i64"}
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @__ly_float_immediate_fits(%bits: i64) -> i1
+  func.func private @__ly_float_from_immediate(%word: i64) -> i64
   func.func private @__ly_float_to_immediate(%bits: i64) -> i64
   func.func private @__ly_hash_fixup(%h: i64) -> i64
   func.func private @__ly_int_from_immediate(%word: i64) -> i64
@@ -1898,6 +1899,57 @@ module attributes {
   // CPython asks `nan > 1.0` and answers False, a class with only `__gt__`
   // could not be ordered at all, and every refusal said '<'.
   func.func private @__ly_box_order(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %op: i64) -> i1 {
+    %c1 = arith.constant 1 : i64
+    %c2 = arith.constant 2 : i64
+    %c3 = arith.constant 3 : i64
+    %c4 = arith.constant 4 : i64
+    %c0 = arith.constant 0 : i64
+    %lhs_word = llvm.load %lhs : !llvm.ptr -> i64
+    %rhs_word = llvm.load %rhs : !llvm.ptr -> i64
+    // ⭐ Two immediates of one class order by value, with no object made for
+    // the class's hook to read: an int's `v << 1 | 1` is monotonic in v, and a
+    // float immediate is always finite. This is where `max`, `min`, a tuple's
+    // ordering and a sort of mixed slots arrive with ints.
+    %both_tags = arith.andi %lhs_word, %rhs_word : i64
+    %int_bits = arith.andi %both_tags, %c1 : i64
+    %both_int = arith.cmpi ne, %int_bits, %c0 : i64
+    %lhs_tag = arith.andi %lhs_word, %c3 : i64
+    %rhs_tag = arith.andi %rhs_word, %c3 : i64
+    %lhs_float = arith.cmpi eq, %lhs_tag, %c2 : i64
+    %rhs_float = arith.cmpi eq, %rhs_tag, %c2 : i64
+    %both_float = arith.andi %lhs_float, %rhs_float : i1
+    %immediate = arith.ori %both_int, %both_float : i1
+    %result = scf.if %immediate -> (i1) {
+      %lt, %eq, %gt = scf.if %both_int -> (i1, i1, i1) {
+        %ilt = arith.cmpi slt, %lhs_word, %rhs_word : i64
+        %ieq = arith.cmpi eq, %lhs_word, %rhs_word : i64
+        %igt = arith.cmpi sgt, %lhs_word, %rhs_word : i64
+        scf.yield %ilt, %ieq, %igt : i1, i1, i1
+      } else {
+        %lbits = func.call @__ly_float_from_immediate(%lhs_word) : (i64) -> i64
+        %rbits = func.call @__ly_float_from_immediate(%rhs_word) : (i64) -> i64
+        %lf = arith.bitcast %lbits : i64 to f64
+        %rf = arith.bitcast %rbits : i64 to f64
+        %flt = arith.cmpf olt, %lf, %rf : f64
+        %feq = arith.cmpf oeq, %lf, %rf : f64
+        %fgt = arith.cmpf ogt, %lf, %rf : f64
+        scf.yield %flt, %feq, %fgt : i1, i1, i1
+      }
+      %greater_side = arith.cmpi uge, %op, %c4 : i64
+      %equal_bit = arith.andi %op, %c1 : i64
+      %or_equal = arith.cmpi ne, %equal_bit, %c0 : i64
+      %strict = arith.select %greater_side, %gt, %lt : i1
+      %equal_counts = arith.andi %or_equal, %eq : i1
+      %ordered = arith.ori %strict, %equal_counts : i1
+      scf.yield %ordered : i1
+    } else {
+      %ordered = func.call @__ly_box_order_by_class(%lhs, %rhs, %op) : (!llvm.ptr, !llvm.ptr, i64) -> i1
+      scf.yield %ordered : i1
+    }
+    func.return %result : i1
+  }
+
+  func.func private @__ly_box_order_by_class(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %op: i64) -> i1 {
     %false = arith.constant false
     %true = arith.constant true
     %c0_i64 = arith.constant 0 : i64
