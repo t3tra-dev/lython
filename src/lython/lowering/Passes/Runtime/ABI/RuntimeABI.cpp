@@ -1913,7 +1913,8 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
 }
 
 // The block `__ly_unicode_alloc_capacity` would build for `text`, with the
-// immortal refcount: [refcount, class, shape, capacity] then the code units,
+// immortal refcount: [refcount, class, shape, capacity, hash] then the code
+// units (the hash -1, not taken: the key is random per process),
 // each word little-endian (every supported target is). The width is PEP 393's,
 // chosen from the largest code point as `__ly_unicode_width_for` chooses it.
 // Empty when `text` is not strict UTF-8, which the runtime decoder rejects and
@@ -1966,6 +1967,7 @@ staticStrImage(llvm::StringRef text) {
   word(0);
   word((dataBytes << 3) | width);
   word(dataBytes);
+  word(points.empty() ? 0 : ~std::uint64_t{0});
   for (std::uint32_t point : points)
     for (unsigned k = 0; k < width; ++k)
       image.push_back(static_cast<std::int8_t>((point >> (8 * k)) & 0xFF));
