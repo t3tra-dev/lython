@@ -238,20 +238,31 @@ module attributes {
     %len_index = arith.index_cast %len : i64 to index
 
     // Trim ASCII whitespace at both ends (strtod skips it in front only).
-    %first = scf.for %i = %c0 to %len_index step %c1 iter_args(%found = %neg_one) -> (i64) {
+    %first:2 = scf.while (%found = %neg_one, %i = %c0) : (i64, index) -> (i64, index) {
+      %in_range = arith.cmpi slt, %i, %len_index : index
+      %unset = arith.cmpi eq, %found, %neg_one : i64
+      %go = arith.andi %in_range, %unset : i1
+      scf.condition(%go) %found, %i : i64, index
+    } do {
+    ^bb0(%found: i64, %i: index):
       %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
       %is_sp = arith.cmpi eq, %cp, %cp_space : i64
       %ge_tab = arith.cmpi sge, %cp, %cp_tab : i64
       %le_cr = arith.cmpi sle, %cp, %cp_cr : i64
       %is_ctl = arith.andi %ge_tab, %le_cr : i1
       %is_ws = arith.ori %is_sp, %is_ctl : i1
-      %unset = arith.cmpi eq, %found, %neg_one : i64
       %i64v = arith.index_cast %i : index to i64
       %candidate = arith.select %is_ws, %found, %i64v : i1, i64
-      %next = arith.select %unset, %candidate, %found : i1, i64
-      scf.yield %next : i64
+      %iv_next = arith.addi %i, %c1 : index
+      scf.yield %candidate, %iv_next : i64, index
     }
-    %last = scf.for %i = %c0 to %len_index step %c1 iter_args(%found = %neg_one) -> (i64) {
+    %last:2 = scf.while (%found = %neg_one, %i = %c0) : (i64, index) -> (i64, index) {
+      %in_range = arith.cmpi slt, %i, %len_index : index
+      %unset = arith.cmpi eq, %found, %neg_one : i64
+      %go = arith.andi %in_range, %unset : i1
+      scf.condition(%go) %found, %i : i64, index
+    } do {
+    ^bb0(%found: i64, %i: index):
       %step = arith.addi %i, %c1 : index
       %rev = arith.subi %len_index, %step : index
       %cp = func.call @__ly_unicode_get(%bytes, %width, %rev) : (memref<?xi8>, i64, index) -> i64
@@ -260,23 +271,22 @@ module attributes {
       %le_cr = arith.cmpi sle, %cp, %cp_cr : i64
       %is_ctl = arith.andi %ge_tab, %le_cr : i1
       %is_ws = arith.ori %is_sp, %is_ctl : i1
-      %unset = arith.cmpi eq, %found, %neg_one : i64
       %rev64 = arith.index_cast %rev : index to i64
       %candidate = arith.select %is_ws, %found, %rev64 : i1, i64
-      %next = arith.select %unset, %candidate, %found : i1, i64
-      scf.yield %next : i64
+      %iv_next = arith.addi %i, %c1 : index
+      scf.yield %candidate, %iv_next : i64, index
     }
-    %empty = arith.cmpi eq, %first, %neg_one : i64
+    %empty = arith.cmpi eq, %first#0, %neg_one : i64
     cf.cond_br %empty, ^invalid, ^scan
 
   ^scan:
-    %end = arith.addi %last, %one64 : i64
-    %span = arith.subi %end, %first : i64
+    %end = arith.addi %last#0, %one64 : i64
+    %span = arith.subi %end, %first#0 : i64
     %span_index = arith.index_cast %span : i64 to index
     %buffer_len = arith.addi %span, %one64 : i64
     %buffer_index = arith.index_cast %buffer_len : i64 to index
     %buffer = memref.alloc(%buffer_index) : memref<?xi8>
-    %start_index = arith.index_cast %first : i64 to index
+    %start_index = arith.index_cast %first#0 : i64 to index
     %end_index = arith.index_cast %end : i64 to index
 
     // One pass: copy, drop underscores, and reject everything float() does
@@ -2234,13 +2244,20 @@ module attributes {
     }
     %decided = arith.ori %below_or_odd, %next_odd : i1
     %after_key = arith.addi %key_index, %c1 : index
-    %sticky = scf.for %at = %after_key to %total_index step %c1 iter_args(%any = %false) -> (i1) {
+    %sticky:2 = scf.while (%any = %false, %at = %after_key) : (i1, index) -> (i1, index) {
+      %in_range = arith.cmpi slt, %at, %total_index : index
+      %open_true = arith.constant true
+      %open = arith.xori %any, %open_true : i1
+      %go = arith.andi %in_range, %open : i1
+      scf.condition(%go) %any, %at : i1, index
+    } do {
+    ^bb0(%any: i1, %at: index):
       %d8 = memref.load %digits[%at] : memref<?xi8>
       %nonzero = arith.cmpi ne, %d8, %c0_i8 : i8
-      %next = arith.ori %any, %nonzero : i1
-      scf.yield %next : i1
+      %iv_next = arith.addi %at, %c1 : index
+      scf.yield %nonzero, %iv_next : i1, index
     }
-    %up_reason = arith.ori %decided, %sticky : i1
+    %up_reason = arith.ori %decided, %sticky#0 : i1
     %round_up = arith.andi %at_half, %up_reason : i1
     %bumped = arith.addi %x0, %two_half : i64
     %x = arith.select %round_up, %bumped, %x0 : i64
@@ -2264,7 +2281,12 @@ module attributes {
     %word_len = memref.dim %word, %c0 : memref<?xi8>
     %same_len = arith.cmpi eq, %len, %word_len : index
     %result = scf.if %same_len -> (i1) {
-      %all = scf.for %i = %c0 to %len step %c1 iter_args(%acc = %true) -> (i1) {
+      %all:2 = scf.while (%acc = %true, %i = %c0) : (i1, index) -> (i1, index) {
+        %in_range = arith.cmpi slt, %i, %len : index
+        %go = arith.andi %in_range, %acc : i1
+        scf.condition(%go) %acc, %i : i1, index
+      } do {
+      ^bb0(%acc: i1, %i: index):
         %at = arith.addi %start, %i : index
         %cp = func.call @__ly_unicode_get(%bytes, %width, %at) : (memref<?xi8>, i64, index) -> i64
         %upper_a = arith.constant 65 : i64
@@ -2278,10 +2300,10 @@ module attributes {
         %w8 = memref.load %word[%i] : memref<?xi8>
         %w = arith.extui %w8 : i8 to i64
         %eq = arith.cmpi eq, %folded, %w : i64
-        %next = arith.andi %acc, %eq : i1
-        scf.yield %next : i1
+        %iv_next = arith.addi %i, %c1 : index
+        scf.yield %eq, %iv_next : i1, index
       }
-      scf.yield %all : i1
+      scf.yield %all#0 : i1
     } else {
       %no = arith.constant false
       scf.yield %no : i1
@@ -2311,20 +2333,31 @@ module attributes {
     %cp_space = arith.constant 32 : i64
     %cp_tab = arith.constant 9 : i64
     %cp_cr = arith.constant 13 : i64
-    %first = scf.for %i = %c0 to %count_index step %c1 iter_args(%found = %neg_one) -> (i64) {
+    %first:2 = scf.while (%found = %neg_one, %i = %c0) : (i64, index) -> (i64, index) {
+      %in_range = arith.cmpi slt, %i, %count_index : index
+      %unset = arith.cmpi eq, %found, %neg_one : i64
+      %go = arith.andi %in_range, %unset : i1
+      scf.condition(%go) %found, %i : i64, index
+    } do {
+    ^bb0(%found: i64, %i: index):
       %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
       %is_sp = arith.cmpi eq, %cp, %cp_space : i64
       %ge_tab = arith.cmpi sge, %cp, %cp_tab : i64
       %le_cr = arith.cmpi sle, %cp, %cp_cr : i64
       %is_ctl = arith.andi %ge_tab, %le_cr : i1
       %is_ws = arith.ori %is_sp, %is_ctl : i1
-      %unset = arith.cmpi eq, %found, %neg_one : i64
       %i64v = arith.index_cast %i : index to i64
       %candidate = arith.select %is_ws, %found, %i64v : i1, i64
-      %next = arith.select %unset, %candidate, %found : i1, i64
-      scf.yield %next : i64
+      %iv_next = arith.addi %i, %c1 : index
+      scf.yield %candidate, %iv_next : i64, index
     }
-    %last = scf.for %i = %c0 to %count_index step %c1 iter_args(%found = %neg_one) -> (i64) {
+    %last:2 = scf.while (%found = %neg_one, %i = %c0) : (i64, index) -> (i64, index) {
+      %in_range = arith.cmpi slt, %i, %count_index : index
+      %unset = arith.cmpi eq, %found, %neg_one : i64
+      %go = arith.andi %in_range, %unset : i1
+      scf.condition(%go) %found, %i : i64, index
+    } do {
+    ^bb0(%found: i64, %i: index):
       %step = arith.addi %i, %c1 : index
       %rev = arith.subi %count_index, %step : index
       %cp = func.call @__ly_unicode_get(%bytes, %width, %rev) : (memref<?xi8>, i64, index) -> i64
@@ -2333,18 +2366,17 @@ module attributes {
       %le_cr = arith.cmpi sle, %cp, %cp_cr : i64
       %is_ctl = arith.andi %ge_tab, %le_cr : i1
       %is_ws = arith.ori %is_sp, %is_ctl : i1
-      %unset = arith.cmpi eq, %found, %neg_one : i64
       %rev64 = arith.index_cast %rev : index to i64
       %candidate = arith.select %is_ws, %found, %rev64 : i1, i64
-      %next = arith.select %unset, %candidate, %found : i1, i64
-      scf.yield %next : i64
+      %iv_next = arith.addi %i, %c1 : index
+      scf.yield %candidate, %iv_next : i64, index
     }
-    %empty = arith.cmpi eq, %first, %neg_one : i64
+    %empty = arith.cmpi eq, %first#0, %neg_one : i64
     cf.cond_br %empty, ^invalid, ^sign
 
   ^sign:
-    %first_index = arith.index_cast %first : i64 to index
-    %end64 = arith.addi %last, %one : i64
+    %first_index = arith.index_cast %first#0 : i64 to index
+    %end64 = arith.addi %last#0, %one : i64
     %end = arith.index_cast %end64 : i64 to index
     %lead = func.call @__ly_unicode_get(%bytes, %width, %first_index) : (memref<?xi8>, i64, index) -> i64
     %cp_minus = arith.constant 45 : i64

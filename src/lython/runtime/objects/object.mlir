@@ -373,18 +373,18 @@ module attributes {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %sixteen = arith.constant 16 : i64
-    %max_digits_index = arith.constant 16 : index
     %lower = arith.constant 0 : index
     %step = arith.constant 1 : index
     %ascii_zero = arith.constant 48 : i64
     %ascii_a_minus_ten = arith.constant 87 : i64
     %ascii_gt = arith.constant 62 : i8
-    %counted:2 = scf.for %i = %lower to %max_digits_index step %step iter_args(%n = %ptr, %digits = %zero) -> (i64, i64) {
+    %counted:2 = scf.while (%n = %ptr, %digits = %zero) : (i64, i64) -> (i64, i64) {
       %active = arith.cmpi ne, %n, %zero : i64
-      %next_n_active = arith.divui %n, %sixteen : i64
-      %next_n = arith.select %active, %next_n_active, %n : i1, i64
-      %incremented = arith.addi %digits, %one : i64
-      %next_digits = arith.select %active, %incremented, %digits : i1, i64
+      scf.condition(%active) %n, %digits : i64, i64
+    } do {
+    ^bb0(%n: i64, %digits: i64):
+      %next_n = arith.divui %n, %sixteen : i64
+      %next_digits = arith.addi %digits, %one : i64
       scf.yield %next_n, %next_digits : i64, i64
     }
     %ptr_is_zero = arith.cmpi eq, %ptr, %zero : i64
@@ -1351,7 +1351,12 @@ module attributes {
               %c0_index = arith.constant 0 : index
               %count_index = arith.index_cast %count : i64 to index
               %c1_index = arith.constant 1 : index
-              %all_match = scf.for %li = %c0_index to %count_index step %c1_index iter_args(%ok = %true) -> (i1) {
+              %all_match:2 = scf.while (%ok = %true, %li = %c0_index) : (i1, index) -> (i1, index) {
+                %in_range = arith.cmpi slt, %li, %count_index : index
+                %go = arith.andi %in_range, %ok : i1
+                scf.condition(%go) %ok, %li : i1, index
+              } do {
+              ^bb0(%ok: i1, %li: index):
                 %li_i64 = arith.index_cast %li : index to i64
                 %limb_gep = llvm.getelementptr %digits_ptr[%li_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i32
                 %limb_i32 = llvm.load %limb_gep : !llvm.ptr -> i32
@@ -1376,10 +1381,10 @@ module attributes {
                 %window_mask = arith.constant 1073741823 : i64
                 %expected = arith.andi %shifted, %window_mask : i64
                 %limb_matches = arith.cmpi eq, %limb, %expected : i64
-                %next = arith.andi %ok, %limb_matches : i1
-                scf.yield %next : i1
+                %iv_next = arith.addi %li, %c1_index : index
+                scf.yield %limb_matches, %iv_next : i1, index
               }
-              scf.yield %all_match : i1
+              scf.yield %all_match#0 : i1
             } else {
               scf.yield %false : i1
             }

@@ -545,7 +545,15 @@ module attributes {
     %lhs_len = arith.index_cast %lhs_dim : index to i64
     %rhs_len = arith.index_cast %rhs_dim : index to i64
     %min_dim = arith.minsi %lhs_dim, %rhs_dim : index
-    %byte_cmp = scf.for %index = %c0 to %min_dim step %step iter_args(%acc = %zero) -> (i64) {
+    %byte_cmp:2 = scf.while (%acc = %zero, %index = %c0) : (i64, index) -> (i64, index) {
+      %in_range = arith.cmpi slt, %index, %min_dim : index
+      %decided = arith.cmpi ne, %acc, %zero : i64
+      %open_true = arith.constant true
+      %open = arith.xori %decided, %open_true : i1
+      %go = arith.andi %in_range, %open : i1
+      scf.condition(%go) %acc, %index : i64, index
+    } do {
+    ^bb0(%acc: i64, %index: index):
       %lhs_byte = memref.load %lhs_bytes[%index] : memref<?xi8>
       %rhs_byte = memref.load %rhs_bytes[%index] : memref<?xi8>
       %lhs_val = arith.extui %lhs_byte : i8 to i64
@@ -554,16 +562,15 @@ module attributes {
       %gt = arith.cmpi ugt, %lhs_val, %rhs_val : i64
       %gt_val = arith.select %gt, %plus_one, %zero : i64
       %this = arith.select %lt, %minus_one, %gt_val : i64
-      %decided = arith.cmpi ne, %acc, %zero : i64
-      %next = arith.select %decided, %acc, %this : i64
-      scf.yield %next : i64
+      %iv_next = arith.addi %index, %step : index
+      scf.yield %this, %iv_next : i64, index
     }
     %len_lt = arith.cmpi slt, %lhs_len, %rhs_len : i64
     %len_gt = arith.cmpi sgt, %lhs_len, %rhs_len : i64
     %len_gt_val = arith.select %len_gt, %plus_one, %zero : i64
     %len_cmp = arith.select %len_lt, %minus_one, %len_gt_val : i64
-    %prefix_equal = arith.cmpi eq, %byte_cmp, %zero : i64
-    %result = arith.select %prefix_equal, %len_cmp, %byte_cmp : i64
+    %prefix_equal = arith.cmpi eq, %byte_cmp#0, %zero : i64
+    %result = arith.select %prefix_equal, %len_cmp, %byte_cmp#0 : i64
     func.return %result : i64
   }
 
@@ -864,15 +871,20 @@ module attributes {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %true_bit = arith.constant true
-    %all = scf.for %j = %c0 to %n step %c1 iter_args(%acc = %true_bit) -> (i1) {
+    %all:2 = scf.while (%acc = %true_bit, %j = %c0) : (i1, index) -> (i1, index) {
+      %in_range = arith.cmpi slt, %j, %n : index
+      %go = arith.andi %in_range, %acc : i1
+      scf.condition(%go) %acc, %j : i1, index
+    } do {
+    ^bb0(%acc: i1, %j: index):
       %sj = arith.addi %si, %j : index
       %a = memref.load %s[%sj] : memref<?xi8>
       %b = memref.load %t[%j] : memref<?xi8>
       %eq = arith.cmpi eq, %a, %b : i8
-      %next = arith.andi %acc, %eq : i1
-      scf.yield %next : i1
+      %iv_next = arith.addi %j, %c1 : index
+      scf.yield %eq, %iv_next : i1, index
     }
-    func.return %all : i1
+    func.return %all#0 : i1
   }
 
   func.func private @__ly_bytes_find_core(%s: memref<?xi8>, %t: memref<?xi8>, %start: i64, %end: i64, %n: i64, %reverse: i1) -> i64 {
@@ -952,14 +964,21 @@ module attributes {
     }
     %bytes = func.call @__ly_bytes_payload(%header) : (memref<4xi64>) -> memref<?xi8>
     %dim = memref.dim %bytes, %c0 : memref<?xi8>
-    %hit = scf.for %i = %c0 to %dim step %c1 iter_args(%seen = %false_bit) -> (i1) {
+    %hit:2 = scf.while (%seen = %false_bit, %i = %c0) : (i1, index) -> (i1, index) {
+      %in_range = arith.cmpi slt, %i, %dim : index
+      %open_true = arith.constant true
+      %open = arith.xori %seen, %open_true : i1
+      %go = arith.andi %in_range, %open : i1
+      scf.condition(%go) %seen, %i : i1, index
+    } do {
+    ^bb0(%seen: i1, %i: index):
       %raw = memref.load %bytes[%i] : memref<?xi8>
       %b = arith.extui %raw : i8 to i64
       %same = arith.cmpi eq, %b, %value : i64
-      %next = arith.ori %seen, %same : i1
-      scf.yield %next : i1
+      %iv_next = arith.addi %i, %c1 : index
+      scf.yield %same, %iv_next : i1, index
     }
-    func.return %hit : i1
+    func.return %hit#0 : i1
   }
 
   func.func private @__ly_bytes_raise_byte_range() attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.primitive = "raise_byte_range"} {
@@ -1087,14 +1106,21 @@ module attributes {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %false_bit = arith.constant false
-    %found = scf.for %j = %c0 to %n step %c1 iter_args(%acc = %false_bit) -> (i1) {
+    %found:2 = scf.while (%acc = %false_bit, %j = %c0) : (i1, index) -> (i1, index) {
+      %in_range = arith.cmpi slt, %j, %n : index
+      %open_true = arith.constant true
+      %open = arith.xori %acc, %open_true : i1
+      %go = arith.andi %in_range, %open : i1
+      scf.condition(%go) %acc, %j : i1, index
+    } do {
+    ^bb0(%acc: i1, %j: index):
       %cj_i8 = memref.load %chars[%j] : memref<?xi8>
       %cj = arith.extui %cj_i8 : i8 to i64
       %eq = arith.cmpi eq, %b, %cj : i64
-      %next = arith.ori %acc, %eq : i1
-      scf.yield %next : i1
+      %iv_next = arith.addi %j, %c1 : index
+      scf.yield %eq, %iv_next : i1, index
     }
-    func.return %found : i1
+    func.return %found#0 : i1
   }
 
   func.func private @__ly_bytes_strip_core(%bytes: memref<?xi8>, %mode: i64, %use_chars: i1, %chars: memref<?xi8>, %chars_n: index) -> memref<4xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytes"], ly.ownership.owned_results = [0]} {

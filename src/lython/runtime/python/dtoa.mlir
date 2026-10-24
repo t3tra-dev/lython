@@ -103,7 +103,15 @@ module {
       %c0 = arith.constant 0 : index
       %c1 = arith.constant 1 : index
       %n = arith.index_cast %alen : i64 to index
-      %scan = scf.for %i = %c0 to %n step %c1 iter_args(%acc = %zero) -> (i64) {
+      %scan:2 = scf.while (%acc = %zero, %i = %c0) : (i64, index) -> (i64, index) {
+        %in_range = arith.cmpi slt, %i, %n : index
+        %decided = arith.cmpi ne, %acc, %zero : i64
+        %open_true = arith.constant true
+        %open = arith.xori %decided, %open_true : i1
+        %go = arith.andi %in_range, %open : i1
+        scf.condition(%go) %acc, %i : i64, index
+      } do {
+      ^bb0(%acc: i64, %i: index):
         %ip1 = arith.addi %i, %c1 : index
         %rev = arith.subi %n, %ip1 : index
         %av32 = memref.load %a[%rev] : memref<?xi32>
@@ -114,11 +122,10 @@ module {
         %gt = arith.cmpi ugt, %av, %bv : i64
         %gtv = arith.select %gt, %plus, %zero : i64
         %this = arith.select %lt, %minus, %gtv : i64
-        %decided = arith.cmpi ne, %acc, %zero : i64
-        %next = arith.select %decided, %acc, %this : i64
-        scf.yield %next : i64
+        %iv_next = arith.addi %i, %c1 : index
+        scf.yield %this, %iv_next : i64, index
       }
-      scf.yield %scan : i64
+      scf.yield %scan#0 : i64
     }
     func.return %result : i64
   }

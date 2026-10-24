@@ -491,43 +491,45 @@ module attributes {
       %probes = arith.select %linear, %nine, %zero : i1, i64
       %count = arith.addi %probes, %one : i64
       %count_index = arith.index_cast %count : i64 to index
-      %run:2 = scf.for %k = %c0 to %count_index step %c1
-          iter_args(%a = %ans, %d = %done) -> (i64, i1) {
-        %step:2 = scf.if %d -> (i64, i1) {
-          scf.yield %a, %d : i64, i1
+      %run:3 = scf.while (%a = %ans, %d = %done, %k = %c0)
+          : (i64, i1, index) -> (i64, i1, index) {
+        %in_run = arith.cmpi slt, %k, %count_index : index
+        %open = arith.xori %d, %true : i1
+        %go = arith.andi %in_run, %open : i1
+        scf.condition(%go) %a, %d, %k : i64, i1, index
+      } do {
+      ^bb0(%a: i64, %d: i1, %k: index):
+        %kk = arith.index_cast %k : index to i64
+        %s = arith.addi %i, %kk : i64
+        %state_index = arith.index_cast %s : i64 to index
+        %state_word = memref.load %table[%state_index] : memref<?xi64>
+        %state = arith.andi %state_word, %low32 : i64
+        %unused = arith.cmpi eq, %state, %zero : i64
+        %seen:2 = scf.if %unused -> (i64, i1) {
+          scf.yield %minus_one, %true : i64, i1
         } else {
-          %kk = arith.index_cast %k : index to i64
-          %s = arith.addi %i, %kk : i64
-          %state_index = arith.index_cast %s : i64 to index
-          %state_word = memref.load %table[%state_index] : memref<?xi64>
-          %state = arith.andi %state_word, %low32 : i64
-          %unused = arith.cmpi eq, %state, %zero : i64
-          %seen:2 = scf.if %unused -> (i64, i1) {
-            scf.yield %minus_one, %true : i64, i1
-          } else {
-            %live = arith.cmpi sge, %state, %two : i64
-            %hit:2 = scf.if %live -> (i64, i1) {
-              %entry_hash = arith.shrui %state_word, %thirty_two : i64
-              %same_hash = arith.cmpi eq, %entry_hash, %hash32 : i64
-              %cmp:2 = scf.if %same_hash -> (i64, i1) {
-                %dense = arith.subi %state, %two : i64
-                %off = arith.muli %dense, %c16 : i64
-                %entry = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-                %eq = func.call @__ly_box_equal(%entry, %elem_box) : (!llvm.ptr, !llvm.ptr) -> i1
-                %found = arith.select %eq, %dense, %a : i1, i64
-                scf.yield %found, %eq : i64, i1
-              } else {
-                scf.yield %a, %false : i64, i1
-              }
-              scf.yield %cmp#0, %cmp#1 : i64, i1
+          %live = arith.cmpi sge, %state, %two : i64
+          %hit:2 = scf.if %live -> (i64, i1) {
+            %entry_hash = arith.shrui %state_word, %thirty_two : i64
+            %same_hash = arith.cmpi eq, %entry_hash, %hash32 : i64
+            %cmp:2 = scf.if %same_hash -> (i64, i1) {
+              %dense = arith.subi %state, %two : i64
+              %off = arith.muli %dense, %c16 : i64
+              %entry = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+              %eq = func.call @__ly_box_equal(%entry, %elem_box) : (!llvm.ptr, !llvm.ptr) -> i1
+              %found = arith.select %eq, %dense, %a : i1, i64
+              scf.yield %found, %eq : i64, i1
             } else {
               scf.yield %a, %false : i64, i1
             }
-            scf.yield %hit#0, %hit#1 : i64, i1
+            scf.yield %cmp#0, %cmp#1 : i64, i1
+          } else {
+            scf.yield %a, %false : i64, i1
           }
-          scf.yield %seen#0, %seen#1 : i64, i1
+          scf.yield %hit#0, %hit#1 : i64, i1
         }
-        scf.yield %step#0, %step#1 : i64, i1
+        %k_next = arith.addi %k, %c1 : index
+        scf.yield %seen#0, %seen#1, %k_next : i64, i1, index
       }
       %np = arith.shrui %p, %shift : i64
       %i5 = arith.muli %i, %probe_scale : i64
@@ -584,49 +586,50 @@ module attributes {
       %probes = arith.select %linear, %nine, %zero : i1, i64
       %count = arith.addi %probes, %one : i64
       %count_index = arith.index_cast %count : i64 to index
-      %run:4 = scf.for %k = %c0 to %count_index step %c1
-          iter_args(%f = %found, %sl = %slot, %fr = %free, %d = %done)
-          -> (i64, i64, i64, i1) {
-        %step:4 = scf.if %d -> (i64, i64, i64, i1) {
-          scf.yield %f, %sl, %fr, %d : i64, i64, i64, i1
+      %run:5 = scf.while (%f = %found, %sl = %slot, %fr = %free, %d = %done, %k = %c0)
+          : (i64, i64, i64, i1, index) -> (i64, i64, i64, i1, index) {
+        %in_run = arith.cmpi slt, %k, %count_index : index
+        %open = arith.xori %d, %true : i1
+        %go = arith.andi %in_run, %open : i1
+        scf.condition(%go) %f, %sl, %fr, %d, %k : i64, i64, i64, i1, index
+      } do {
+      ^bb0(%f: i64, %sl: i64, %fr: i64, %d: i1, %k: index):
+        %kk = arith.index_cast %k : index to i64
+        %s = arith.addi %i, %kk : i64
+        %state_index = arith.index_cast %s : i64 to index
+        %state_word = memref.load %table[%state_index] : memref<?xi64>
+        %state = arith.andi %state_word, %low32 : i64
+        %unused = arith.cmpi eq, %state, %zero : i64
+        %seen:4 = scf.if %unused -> (i64, i64, i64, i1) {
+          // found_unused_or_dummy: a dummy already seen wins the slot.
+          %reuse = arith.cmpi sge, %fr, %zero : i64
+          %target = arith.select %reuse, %fr, %s : i1, i64
+          scf.yield %minus_one, %target, %fr, %true : i64, i64, i64, i1
         } else {
-          %kk = arith.index_cast %k : index to i64
-          %s = arith.addi %i, %kk : i64
-          %state_index = arith.index_cast %s : i64 to index
-          %state_word = memref.load %table[%state_index] : memref<?xi64>
-          %state = arith.andi %state_word, %low32 : i64
-          %unused = arith.cmpi eq, %state, %zero : i64
-          %seen:4 = scf.if %unused -> (i64, i64, i64, i1) {
-            // found_unused_or_dummy: a dummy already seen wins the slot.
-            %reuse = arith.cmpi sge, %fr, %zero : i64
-            %target = arith.select %reuse, %fr, %s : i1, i64
-            scf.yield %minus_one, %target, %fr, %true : i64, i64, i64, i1
-          } else {
-            %live = arith.cmpi sge, %state, %two : i64
-            %hit:4 = scf.if %live -> (i64, i64, i64, i1) {
-              %entry_hash = arith.shrui %state_word, %thirty_two : i64
-              %same_hash = arith.cmpi eq, %entry_hash, %hash32 : i64
-              %cmp:4 = scf.if %same_hash -> (i64, i64, i64, i1) {
-                %dense = arith.subi %state, %two : i64
-                %off = arith.muli %dense, %c16 : i64
-                %entry = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-                %eq = func.call @__ly_box_equal(%entry, %elem_box) : (!llvm.ptr, !llvm.ptr) -> i1
-                %hit_dense = arith.select %eq, %dense, %f : i1, i64
-                %hit_slot = arith.select %eq, %s, %sl : i1, i64
-                scf.yield %hit_dense, %hit_slot, %fr, %eq : i64, i64, i64, i1
-              } else {
-                scf.yield %f, %sl, %fr, %false : i64, i64, i64, i1
-              }
-              scf.yield %cmp#0, %cmp#1, %cmp#2, %cmp#3 : i64, i64, i64, i1
+          %live = arith.cmpi sge, %state, %two : i64
+          %hit:4 = scf.if %live -> (i64, i64, i64, i1) {
+            %entry_hash = arith.shrui %state_word, %thirty_two : i64
+            %same_hash = arith.cmpi eq, %entry_hash, %hash32 : i64
+            %cmp:4 = scf.if %same_hash -> (i64, i64, i64, i1) {
+              %dense = arith.subi %state, %two : i64
+              %off = arith.muli %dense, %c16 : i64
+              %entry = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+              %eq = func.call @__ly_box_equal(%entry, %elem_box) : (!llvm.ptr, !llvm.ptr) -> i1
+              %hit_dense = arith.select %eq, %dense, %f : i1, i64
+              %hit_slot = arith.select %eq, %s, %sl : i1, i64
+              scf.yield %hit_dense, %hit_slot, %fr, %eq : i64, i64, i64, i1
             } else {
-              // A dummy. CPython overwrites freeslot, so the last one wins.
-              scf.yield %f, %sl, %s, %false : i64, i64, i64, i1
+              scf.yield %f, %sl, %fr, %false : i64, i64, i64, i1
             }
-            scf.yield %hit#0, %hit#1, %hit#2, %hit#3 : i64, i64, i64, i1
+            scf.yield %cmp#0, %cmp#1, %cmp#2, %cmp#3 : i64, i64, i64, i1
+          } else {
+            // A dummy. CPython overwrites freeslot, so the last one wins.
+            scf.yield %f, %sl, %s, %false : i64, i64, i64, i1
           }
-          scf.yield %seen#0, %seen#1, %seen#2, %seen#3 : i64, i64, i64, i1
+          scf.yield %hit#0, %hit#1, %hit#2, %hit#3 : i64, i64, i64, i1
         }
-        scf.yield %step#0, %step#1, %step#2, %step#3 : i64, i64, i64, i1
+        %k_next = arith.addi %k, %c1 : index
+        scf.yield %seen#0, %seen#1, %seen#2, %seen#3, %k_next : i64, i64, i64, i1, index
       }
       %np = arith.shrui %p, %shift : i64
       %i5 = arith.muli %i, %probe_scale : i64
@@ -671,21 +674,23 @@ module attributes {
       %probes = arith.select %linear, %nine, %zero : i1, i64
       %count = arith.addi %probes, %one : i64
       %count_index = arith.index_cast %count : i64 to index
-      %run:2 = scf.for %k = %c0 to %count_index step %c1
-          iter_args(%a = %ans, %d = %done) -> (i64, i1) {
-        %step:2 = scf.if %d -> (i64, i1) {
-          scf.yield %a, %d : i64, i1
-        } else {
-          %kk = arith.index_cast %k : index to i64
-          %s = arith.addi %i, %kk : i64
-          %state_index = arith.index_cast %s : i64 to index
-          %state_word = memref.load %table[%state_index] : memref<?xi64>
-          %state = arith.andi %state_word, %low32 : i64
-          %unused = arith.cmpi eq, %state, %zero : i64
-          %pick = arith.select %unused, %s, %a : i1, i64
-          scf.yield %pick, %unused : i64, i1
-        }
-        scf.yield %step#0, %step#1 : i64, i1
+      %run:3 = scf.while (%a = %ans, %d = %done, %k = %c0)
+          : (i64, i1, index) -> (i64, i1, index) {
+        %in_run = arith.cmpi slt, %k, %count_index : index
+        %open = arith.xori %d, %true : i1
+        %go = arith.andi %in_run, %open : i1
+        scf.condition(%go) %a, %d, %k : i64, i1, index
+      } do {
+      ^bb0(%a: i64, %d: i1, %k: index):
+        %kk = arith.index_cast %k : index to i64
+        %s = arith.addi %i, %kk : i64
+        %state_index = arith.index_cast %s : i64 to index
+        %state_word = memref.load %table[%state_index] : memref<?xi64>
+        %state = arith.andi %state_word, %low32 : i64
+        %unused = arith.cmpi eq, %state, %zero : i64
+        %pick = arith.select %unused, %s, %a : i1, i64
+        %k_next = arith.addi %k, %c1 : index
+        scf.yield %pick, %unused, %k_next : i64, i1, index
       }
       %np = arith.shrui %p, %shift : i64
       %i5 = arith.muli %i, %probe_scale : i64
@@ -1181,29 +1186,30 @@ module attributes {
     %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
     %items_i64 = arith.index_cast %items_idx : index to i64
     %items_ptr = llvm.inttoptr %items_i64 : i64 to !llvm.ptr
-    %found = scf.for %i = %c0 to %len_index step %c1 iter_args(%acc = %minus_one) -> (i64) {
+    %found:2 = scf.while (%acc = %minus_one, %i = %c0) : (i64, index) -> (i64, index) {
+      %in_range = arith.cmpi slt, %i, %len_index : index
       %not_yet = arith.cmpi eq, %acc, %minus_one : i64
-      %next = scf.if %not_yet -> (i64) {
-        %ii = arith.index_cast %i : index to i64
-        %base = arith.muli %ii, %c16 : i64
-        %entry = llvm.getelementptr %items_ptr[%base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-        %hash_role_1 = arith.constant 2 : i64
-        %entry_hash = func.call @__ly_box_hash_key(%entry, %hash_role_1) : (!llvm.ptr, i64) -> i64
-        %hash_matches = arith.cmpi eq, %entry_hash, %elem_hash : i64
-        %matched = scf.if %hash_matches -> (i64) {
-          %eq = func.call @__ly_box_equal(%entry, %elem_box) : (!llvm.ptr, !llvm.ptr) -> i1
-          %slot_or = arith.select %eq, %ii, %minus_one : i1, i64
-          scf.yield %slot_or : i64
-        } else {
-          scf.yield %minus_one : i64
-        }
-        scf.yield %matched : i64
+      %go = arith.andi %in_range, %not_yet : i1
+      scf.condition(%go) %acc, %i : i64, index
+    } do {
+    ^bb0(%acc: i64, %i: index):
+      %ii = arith.index_cast %i : index to i64
+      %base = arith.muli %ii, %c16 : i64
+      %entry = llvm.getelementptr %items_ptr[%base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %hash_role_1 = arith.constant 2 : i64
+      %entry_hash = func.call @__ly_box_hash_key(%entry, %hash_role_1) : (!llvm.ptr, i64) -> i64
+      %hash_matches = arith.cmpi eq, %entry_hash, %elem_hash : i64
+      %matched = scf.if %hash_matches -> (i64) {
+        %eq = func.call @__ly_box_equal(%entry, %elem_box) : (!llvm.ptr, !llvm.ptr) -> i1
+        %slot_or = arith.select %eq, %ii, %minus_one : i1, i64
+        scf.yield %slot_or : i64
       } else {
-        scf.yield %acc : i64
+        scf.yield %minus_one : i64
       }
-      scf.yield %next : i64
+      %i_next = arith.addi %i, %c1 : index
+      scf.yield %matched, %i_next : i64, index
     }
-    func.return %found : i64
+    func.return %found#0 : i64
   }
 
   // Probe a handle for a raw box: the dense index, or -1. One table lookup,
