@@ -11,6 +11,7 @@ here and the host's function throws an Error with its message, which is what
 the host can make of it.
 """
 
+import sys
 from typing import Callable
 
 from _js import JsProxy, callback_slot, fail_callback, function_for
@@ -31,6 +32,9 @@ def dispatch() -> None:
         _callbacks[callback_slot()]()
     except BaseException as error:
         fail_callback(type(error).__name__ + ": " + str(error))
+    # The host need not call back again or exit, which is when a buffered
+    # stdout is flushed otherwise; what the callback printed leaves with it.
+    sys.stdout.flush()
 
 
 def release() -> None:

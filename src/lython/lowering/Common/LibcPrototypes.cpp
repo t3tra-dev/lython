@@ -70,6 +70,7 @@ constexpr LibcPrototype kLibc[] = {
     {"dlsym", C::Ptr, {C::Ptr, C::Ptr}, 2},
     {"exit", C::Void, {C::Int}, 1},
     {"fclose", C::Int, {C::Ptr}, 1},
+    {"fdopen", C::Ptr, {C::Int, C::Ptr}, 2},
     {"fflush", C::Int, {C::Ptr}, 1},
     {"fgetc", C::Int, {C::Ptr}, 1},
     {"fgets", C::Ptr, {C::Ptr, C::Int, C::Ptr}, 3},

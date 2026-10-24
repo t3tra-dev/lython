@@ -2750,8 +2750,9 @@ TEST(DriverTest, PutsIsDeclaredWithItsCPrototype) {
 // program's MemoryError (`LyErr_NoMemory`, called where the size is checked),
 // the reach is the target's -- under 2^31 where libc takes a 32-bit size_t
 // (wasm32, armv7), 2^47 on a 64-bit target -- and neither the allocator's own
-// failure path nor the guard behind every allocation raises, so allocating
-// never makes a call one that may unwind.
+// failure path nor the guard behind every allocation raises (they say so,
+// flush stdout as Py_FatalError does, and abort), so allocating never makes a
+// call one that may unwind.
 TEST(DriverTest, ASizePastTheTargetsReachIsMemoryErrorAndTheAllocatorNeverRaises) {
   struct Expected {
     const char *triple;
@@ -2778,6 +2779,7 @@ TEST(DriverTest, ASizePastTheTargetsReachIsMemoryErrorAndTheAllocatorNeverRaises
           if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
             if (const llvm::Function *callee = call->getCalledFunction())
               EXPECT_TRUE(callee->getName() == "write_cstr" ||
+                          callee->getName() == "LyHost_FlushStdout" ||
                           callee->getName() == "abort")
                   << expected.triple << ": " << ending.str() << " calls "
                   << callee->getName().str();

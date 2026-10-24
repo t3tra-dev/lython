@@ -155,6 +155,7 @@ module attributes {
   } {}
 
   // ===== shared runtime declarations (defined in runtime/objects/ and runtime/python/, or by the support) =====
+  func.func private @LyHost_FlushStdout()
   func.func private @LyHost_WriteBytes(i32, memref<?xi8>, i64)
   func.func private @LyHost_FOpen(memref<?xi8>, i64, memref<?xi8>, i64) -> i64
   func.func private @LyHost_FRead(i64, memref<?xi8>, i64, i64) -> i64
@@ -600,9 +601,15 @@ module attributes {
     func.call @__ly_textio_check_open(%self) : (memref<8xi64>) -> ()
     %kind = memref.load %self[%kind_slot] : memref<8xi64>
     %is_file = arith.cmpi eq, %kind, %one : i64
+    %handle = memref.load %self[%handle_slot] : memref<8xi64>
     scf.if %is_file {
-      %handle = memref.load %self[%handle_slot] : memref<8xi64>
       %status = func.call @LyHost_FFlush(%handle) : (i64) -> i32
+    } else {
+      // An fd stream: only fd 1 is buffered (`LyHost_FlushStdout`).
+      %is_stdout = arith.cmpi eq, %handle, %one : i64
+      scf.if %is_stdout {
+        func.call @LyHost_FlushStdout() : () -> ()
+      }
     }
     func.return
   }
