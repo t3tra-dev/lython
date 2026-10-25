@@ -21,6 +21,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/SaveAndRestore.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
@@ -1829,6 +1830,209 @@ mlir::Type belowDeclaredRung(const TypeSystem &types, mlir::Type supplied,
   return anyBelow ? supplied : mlir::Type();
 }
 
+// Only a tower rung is re-read. Every other proper subtype already reaches the
+// declared body correctly (a subclass instance travels the object ABI,
+// `take(Dog(4))` against `def take(a: Animal)` runs today), and specializing
+// those would emit a second body for no difference in behaviour.
+//
+// ⭐ A UNION PARAMETER TOO: `def f(v: int | None)` called with True is read at
+// `bool | None`, the nearest tower member above the argument replaced by the
+// argument's own rung -- what the scalar case does to the whole parameter.
+// Passing the bool unchanged reached the lowering as "arguments do not match
+// Callable contract for function target f", a union having no place for it.
+mlir::Type lowerRungParameter(const TypeSystem &types, mlir::Type declared,
+                              mlir::Type supplied) {
+  if (numericTowerRung(types, declared) >= 0)
+    return belowDeclaredRung(types, supplied, declared);
+  int suppliedRung = numericTowerRung(types, supplied);
+  if (suppliedRung < 0)
+    return {};
+  auto unionType = mlir::dyn_cast_if_present<py::UnionType>(declared);
+  if (!unionType || unionType.hasMember(supplied))
+    return {};
+  std::optional<unsigned> nearest;
+  int nearestRung = -1;
+  for (auto [memberIndex, member] :
+       llvm::enumerate(unionType.getMemberTypes())) {
+    int rung = numericTowerRung(types, types.widenLiteral(member));
+    if (rung > suppliedRung && (!nearest || rung < nearestRung)) {
+      nearest = memberIndex;
+      nearestRung = rung;
+    }
+  }
+  if (!nearest)
+    return {};
+  llvm::SmallVector<mlir::Type, 4> members(unionType.getMemberTypes().begin(),
+                                           unionType.getMemberTypes().end());
+  members[*nearest] = supplied;
+  return types.join(members);
+}
+
+// ⭐ A DECORATED NAME IS NOT ITS DEF. `@d def f` binds `f` to what `d`
+// returns, and a call of `f` reaches that; re-reading the def at the
+// argument's rung called the undecorated body -- `keep(3)` through a logging
+// decorator skipped the wrapper while `keep(2.5)` ran it.
+bool TypeSystem::argumentSpecializable(const parser::Node &function,
+                                       const FunctionSignature &sig) const {
+  const auto *decorators = ast::nodeList(function, "decorator_list");
+  return (!decorators || decorators->empty()) && !sig.varargType &&
+         !sig.kwargType && sig.kwOnlyTypes.empty() &&
+         !sig.positionalTypes.empty() && !forwardsParamSpec(sig) &&
+         unboundStaticParameterCount(sig.publicCallable) == 0;
+}
+
+std::optional<FunctionSignature> TypeSystem::argumentRungSpecialization(
+    const parser::Node &function, const FunctionSignature &declared,
+    llvm::ArrayRef<mlir::Type> supplied) const {
+  llvm::ArrayRef<mlir::Type> parameters = declared.positionalTypes;
+  if (supplied.size() != parameters.size())
+    return std::nullopt;
+  llvm::SmallVector<mlir::Type, 4> actual;
+  bool anyLowerRung = false;
+  for (auto [index, given] : llvm::enumerate(supplied)) {
+    mlir::Type widened = widenLiteral(given);
+    if (mlir::Type lowered =
+            lowerRungParameter(*this, parameters[index], widened)) {
+      actual.push_back(lowered);
+      anyLowerRung = true;
+      continue;
+    }
+    // ⛔ Not equality: a union parameter given one of its members (`w: int |
+    // str` given "s") keeps its declaration in the specialized body, and
+    // demanding the exact type sent `g(2, "s")` against `def g(v: float |
+    // None, w: int | str)` back to the refusal the first position escaped.
+    if (widened != parameters[index] &&
+        !(mlir::isa<py::UnionType>(parameters[index]) &&
+          mlir::cast<py::UnionType>(parameters[index]).hasMember(widened)))
+      return std::nullopt;
+    actual.push_back(parameters[index]);
+  }
+  if (!anyLowerRung)
+    return std::nullopt;
+  py::CallableType target = py::CallableType::get(
+      &context, actual, {}, {}, {},
+      llvm::ArrayRef<mlir::Type>{declared.resultType});
+  // ⭐ ASKED ONCE PER READING. Inference asks a call's type several times as
+  // the emitter writes it, and re-reading the body each time tripled the
+  // walk of a program made of such calls (1200 of them: 90 -> 258 ms).
+  // ⛔ Kept only while no signature is forgotten: a forgotten one was read
+  // under facts that changed, and a reading of any body may have read it.
+  auto key = std::make_pair(&function, mlir::Type(target));
+  if (auto known = rungSpecializations.find(key);
+      known != rungSpecializations.end())
+    return known->second;
+  // ⛔ Not re-entered: a body that calls the function being re-read takes its
+  // declaration there, which for a body calling ITSELF one rung down is the
+  // refusal it had (`power(2, 3)`), not a type built from a guess. Nor is
+  // that answer kept: it is the answer of a reading still in progress.
+  if (!rungSpecializing.insert(&function).second)
+    return std::nullopt;
+  auto done = llvm::scope_exit([&] { rungSpecializing.erase(&function); });
+  std::optional<FunctionSignature> answer =
+      readAtArgumentRungs(function, declared, actual, target);
+  if (rungSpecializing.size() == 1)
+    rungSpecializations[key] = answer;
+  return answer;
+}
+
+std::optional<FunctionSignature> TypeSystem::readAtArgumentRungs(
+    const parser::Node &function, const FunctionSignature &declared,
+    llvm::ArrayRef<mlir::Type> actual, py::CallableType target) const {
+  FunctionSignature specialized =
+      functionSignature(function, /*selfName=*/std::nullopt, target,
+                        /*selfType=*/{}, /*monomorphize=*/true);
+  if (specialized.positionalTypes.size() != actual.size())
+    return std::nullopt;
+  for (auto [index, type] : llvm::enumerate(specialized.positionalTypes))
+    if (type != actual[index])
+      return std::nullopt;
+  // ⭐ A signature the emit boundary would reject means the specialization is
+  // not available, NOT that the program is wrong: the ordinary dispatch then
+  // reports the call site, not the declaration the reader did not write wrong.
+  if (!specialized.bodyInferenceFailures.empty() ||
+      !specialized.missingParameterAnnotations.empty() ||
+      !specialized.invalidParameterAnnotations.empty() ||
+      !specialized.generatorAnalysisFailures.empty() ||
+      !specialized.generatorAnnotationMismatch.empty())
+    return std::nullopt;
+  // ⭐ A result the annotation was WIDENING must not be specialized, and this
+  // is the guard that keeps the whole path from turning a refusal into a wrong
+  // answer. Re-reading `def pick(n: int) -> int` at bool gives its two
+  // branches `builtins.bool` and the literal 5, whose join is a union -- and
+  // the annotation is exactly what used to collapse that to int.
+  //
+  // ⛔ Why NOT collapse it here instead, along the tower, which is what the
+  // annotation did: because CPython does not. `def pick(n: int) -> int` with
+  // `return n` reached by `pick(False)` prints False, and an int-collapsed
+  // result prints 0. The union is the honest type and the py ABI cannot carry
+  // one as a return value, so the call goes back to being refused -- which is
+  // what it already was, and a refusal is the outcome this project prefers to
+  // a plausible number.
+  if (mlir::isa_and_present<py::UnionType>(specialized.resultType) &&
+      !mlir::isa_and_present<py::UnionType>(declared.resultType))
+    return std::nullopt;
+  return specialized;
+}
+
+std::optional<mlir::Type> TypeSystem::rungSpecializedCallResult(
+    llvm::StringRef name, const parser::Node &call,
+    llvm::ArrayRef<mlir::Type> positional,
+    llvm::ArrayRef<CallKeywordType> keywords,
+    const ExprInferenceContext *ctx) const {
+  const parser::Node *function = topLevelFunction(name);
+  if (!function || !keywords.empty() ||
+      (ctx && ctx->localSymbols && ctx->localSymbols->count(name)))
+    return std::nullopt;
+  // ⛔ Only a signature already read: one being read now is in the middle of
+  // the module's walk, and reading it here re-entered the functions that call
+  // each other.
+  auto memoized = signatureMemo.find(function);
+  if (memoized == signatureMemo.end())
+    return std::nullopt;
+  const FunctionSignature &declared = memoized->second;
+  if (!argumentSpecializable(*function, declared))
+    return std::nullopt;
+  // The name still means the function: nothing in scope rebinds it.
+  std::optional<mlir::Type> bound = lookupSymbol(name);
+  if (!bound || *bound != declared.publicCallable)
+    return std::nullopt;
+  const auto *args = ast::nodeList(call, "args");
+  if (args && llvm::any_of(*args, [](const parser::NodePtr &arg) {
+        return !arg || arg->kind == "Starred";
+      }))
+    return std::nullopt;
+  std::size_t count = declared.positionalTypes.size();
+  if (positional.size() > count)
+    return std::nullopt;
+  llvm::SmallVector<mlir::Type, 4> supplied;
+  for (mlir::Type type : positional)
+    supplied.push_back(widenLiteral(type));
+  // An omitted parameter stands for its default, a literal whose type is
+  // exact (`ModuleEmitter::specializationArgumentNodes`).
+  if (supplied.size() < count) {
+    const parser::Node *arguments = ast::node(*function, "args");
+    const auto *defaults =
+        arguments ? ast::nodeList(*arguments, "defaults") : nullptr;
+    if (!defaults || defaults->size() > count)
+      return std::nullopt;
+    std::size_t firstDefault = count - defaults->size();
+    for (std::size_t index = supplied.size(); index < count; ++index) {
+      if (index < firstDefault)
+        return std::nullopt;
+      const parser::Node *value = (*defaults)[index - firstDefault].get();
+      if (!value || value->kind != "Constant")
+        return std::nullopt;
+      mlir::Type type = widenLiteral(inferExpr(value));
+      if (numericTowerRung(*this, type) < 0)
+        return std::nullopt;
+      supplied.push_back(type);
+    }
+  }
+  if (std::optional<FunctionSignature> specialized =
+          argumentRungSpecialization(*function, declared, supplied))
+    return specialized->resultType;
+  return std::nullopt;
+}
 
 TypeSystem::TypeSystem(mlir::MLIRContext &context)
     : context(context), inferenceState(context) {}
@@ -2321,6 +2525,7 @@ void collectModuleCallNodes(const parser::Node *node,
 void TypeSystem::forgetSignature(const parser::Node *function) {
   if (function)
     signatureMemo.erase(function);
+  rungSpecializations.clear();
 }
 
 // ⛔ The RESULT VARIABLE goes with the memo, or the recomputation collides with
@@ -2332,6 +2537,7 @@ void TypeSystem::forgetSignature(const parser::Node *function) {
 void TypeSystem::forgetInferredResult(const parser::Node *function) {
   if (function)
     resultTypeOverrides.erase(function);
+  rungSpecializations.clear();
 }
 
 void TypeSystem::registerModule(const parser::Node &moduleNode) {
@@ -5394,6 +5600,18 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           return fail(inference.failureReason);
         }
       }
+      // ⭐ A CALL THE EMITTER RE-READS AT ITS ARGUMENTS' RUNGS HAS THAT
+      // READING'S TYPE. `ident(True)` emits the body read at bool, so its
+      // value is a bool; answering int from the declaration made every reader
+      // that asks the type first disagree with it -- `return ident(True)`
+      // under `-> int` and `ident(True) if c else 5` failed in the lowering,
+      // and a specialized body calling another specializable function was
+      // refused (`outer(4)` calling `r(x)`). Answered by the one function the
+      // emitter decides with (`argumentRungSpecialization`).
+      if (std::optional<mlir::Type> specialized =
+              rungSpecializedCallResult(name, *node, positional, keywords,
+                                        ctx))
+        return *specialized;
       // ⭐ Before every per-name rule below: each answers for the BUILTIN of
       // its spelling (`range` is `builtins.range`, `len` an int), and an
       // imported function under that spelling is what the call reaches.

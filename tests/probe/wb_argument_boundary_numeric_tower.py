@@ -40,25 +40,26 @@
 # golden scalar_loop_carried_mutate, which is the only program in the corpus
 # that passes a complex literal expression to a complex parameter.
 #
-# ⛔ TWO THINGS IT DOES NOT COVER, both refusals rather than wrong answers, and
-# both with the mechanism named:
-#
-#   1. A specialization whose body calls a specializable function -- ANOTHER
-#      one, or ITSELF -- with the narrowed parameter:
+# ⭐ A SPECIALIZATION WHOSE BODY CALLS ANOTHER specializable function with the
+# narrowed parameter is covered since 2026-10-26 (`outer(4)` below prints 8):
+# inference re-reads that call at its argument's rung through the one decision
+# the emitter specializes by (TypeSystem::argumentRungSpecialization), so the
+# call's type is the value's. The same made a call above the def it reaches
+# specialize (the registry is filled when a function is first asked for), and
+# kept a decorated def out of it -- its name is the decorator's result.
 #
 #          def r(x: float) -> float: return x * 2
 #          def outer(x: float) -> float: return r(x)
-#          print(outer(4))          # CPython 8; refused here
+#          print(outer(4))          # CPython 8, and here
 #
-#      Specializing `outer` at int has to TYPE `r(x)` with an int, and
-#      inference answers on r's declared signature -- the refusal this whole
-#      path exists to lift. Covering it means a hook from
-#      `inferCallWithEvidence` back to the registry, keyed on the declared
-#      callable (so two functions of identical signature have to be detected
-#      and dropped) and cycle-guarded. Scoped, not built. Self-recursion is the
-#      same wall and not a milder one: `def power(base: float, n: int)` reached
-#      by `power(2, 3)` fails at exactly the same point, even though the
-#      signature it recurses at is the one already being emitted.
+# ⛔ TWO THINGS IT DOES NOT COVER, both refusals rather than wrong answers:
+#
+#   1. A body calling ITSELF one rung down: `def power(base: float, n: int)`
+#      reached by `power(2, 3)`. Re-reading `power` at int meets `power(base,
+#      n - 1)` while the re-reading is in progress, which takes the declared
+#      float, and `1` joined with a float is a union the result guard in
+#      `argumentRungSpecialization` refuses.
+#      Typing it needs a fixpoint over the recursion, not a guess.
 #
 #   2. A body whose branches return different rungs:
 #
