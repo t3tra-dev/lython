@@ -53,6 +53,7 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -2033,6 +2034,10 @@ private:
       mlir::Operation *op, mlir::BlockArgument argument,
       llvm::ArrayRef<mlir::Type> physicalTypes, bool primitiveIntLane);
   mlir::LogicalResult drainDeferredControlFlowExpansions();
+  // The (i64, valid, held object) an int joins a deferred-int merge with,
+  // built at the current insertion point.
+  mlir::FailureOr<std::array<mlir::Value, 3>>
+  deferredIntJoinOperands(mlir::Operation *anchor, const RuntimeBundle &source);
   mlir::LogicalResult lowerRuntimeValueSelect(mlir::arith::SelectOp select);
   llvm::SmallVector<mlir::BlockArgument, 16>
   logicalBlockArgumentsHighestIndexFirst() const;

@@ -274,6 +274,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AModuleBesideAProgramRunFromItsDirectoryHasNoDotInItsPath"
     "DriverTest.OnlyAValueWhoseReleaseIsObservableIsKeptAlive"
     "DriverTest.AnIntOrFloatAContainerOnlyStoresGoesInAsItsSlotWord"
+    "DriverTest.AnIntReadThatIsChosenComputedOrStoredMakesNoObject"
     "DriverTest.ALibrarysModuleAliasIsNotTheProgramsName"
     "DriverTest.AFinalizerOnAnExceptionClassIsRefused"
     "DriverTest.AListOfObjectIsNotSolvedAsAnEmptyLiteral"
@@ -1023,7 +1024,11 @@ set(LYTHON_LEAK_GATE_CASES
     # Two closures over one captured object: the merge's heap dead placeholder
     # is a real object with a refcount, and marking it complete moves where the
     # edge retain goes.
-    two_closures_over_one_capture)
+    two_closures_over_one_capture
+    # A choice between two wide ints held as deferred ints keeps one object
+    # and releases the other, whether each came from an operator, a list
+    # element, a loop-carried int or a field.
+    wide_ints_chosen_stored_and_passed)
 
 # Cases that end with a non-zero status BY DESIGN, as `<dir>/<case>=<code>`.
 #

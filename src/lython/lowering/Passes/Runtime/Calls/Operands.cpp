@@ -506,6 +506,22 @@ mlir::LogicalResult RuntimeBundleLowerer::appendPrimitiveI64EvidenceOperand(
   if (source.primitiveI64) {
     operands.push_back(source.primitiveI64->value);
     operands.push_back(source.primitiveI64->valid);
+    inputIndex += 2;
+    return mlir::success();
+  }
+  // ⭐ An int object with no lane gives the callee its i64 when it has one.
+  // ⛔ Not "not the value": every operator in the callee then took its slow
+  // arm and boxed its answer -- a closure's captured int, passed as the
+  // object its creation site made, cost each call two allocations.
+  std::optional<RuntimeSymbol> tryUnbox =
+      manifest.primitive("builtins.int", "try_unbox.i64");
+  if (tryUnbox && source.physicalValues().size() == 1 &&
+      source.physicalValues().front().getType() ==
+          tryUnbox->function.getFunctionType().getInput(0)) {
+    mlir::func::CallOp read = RuntimeBundleLowerer::createRuntimeCall(
+        op->getLoc(), *tryUnbox, source.physicalValues());
+    operands.push_back(read.getResult(0));
+    operands.push_back(read.getResult(1));
   } else {
     operands.push_back(
         mlir::arith::ConstantIntOp::create(builder, op->getLoc(), 0, 64)

@@ -41,23 +41,12 @@ bool isMethodDescriptorKind(py::AttrGetOp op) {
 // write: a Python int is arbitrary precision and a word is 64 bits. It is
 // boxed now like every other object field.
 //
-// ⛔ THE COST IS THE STORE AND ONLY THE STORE, measured on a 2,000,000-trip
-// loop over one instance (jit `phase=execution`, best of 3):
-//
-//     self.total = self.total + self.step    231 ms word -> 307 ms boxed
-//     total      = total      + self.step    279 ms word -> 270 ms boxed
-//
-// A read rebuilds lanes from box words and is no slower than loading a word;
-// a store has to put the value on the heap, which is one allocation per
-// store where the word was free. ⭐ SEEDING THE READ WITH THE UNBOXED LANE
-// DOES NOT RECOVER IT and was measured and reverted: a non-raising
-// `try_unbox.i64` at every boxed int field read (raising is not an option --
-// the value may legitimately be large) fed the `__lyrt_prim_i64`
-// speculation, which removed the `LyLong_Add` call and left the allocation,
-// for 316 ms on the first loop and 296 ms on the second. The speculation was
-// never the missing piece; the word was, and getting it back means a tagged
-// field -- a body word that holds either the value or a pointer to a box --
-// which is a different design and not a predicate.
+// ⛔ Why not the body word back for speed: the box's entity word already is
+// one for every int that fits -- an immediate, the object's address only for
+// a wider one -- so a store of such an int makes no object
+// (`slot_word_taking_deferred`) and neither does a read whose uses take the
+// i64 (`bindDeferredIntRead`). A body word would add a second int storage for
+// the value the immediate already covers.
 // ⭐ AND A CLASS VALUE, whose word is the class word itself: the type object
 // is immortal, so the field holds an address and owns nothing, and a store is
 // one word with no box and no reference to drop.
@@ -2624,6 +2613,20 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
         return op.emitError() << "attribute evidence " << loadedContract
                               << " is not assignable to result "
                               << op.getResult().getType();
+      // An int field reads as a list element does (`bindDeferredIntRead`):
+      // an immediate makes no object unless a use needs one.
+      mlir::FailureOr<bool> deferred =
+          RuntimeBundleLowerer::bindDeferredIntRead(
+              op, op.getResult(),
+              RuntimeValue{loadedContract, values,
+                           ownership::logicalOwnershipKind(
+                               loadedContract, /*ownsObject=*/false)});
+      if (mlir::failed(deferred))
+        return mlir::failure();
+      if (*deferred) {
+        erase.push_back(op);
+        return mlir::success();
+      }
       RuntimeBundle read;
       if (cached) {
         read = *cached;

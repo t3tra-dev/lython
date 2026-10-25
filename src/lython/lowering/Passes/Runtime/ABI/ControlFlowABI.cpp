@@ -602,46 +602,12 @@ mlir::LogicalResult RuntimeBundleLowerer::spliceControlFlowBlockArgumentEdges(
 
     llvm::SmallVector<mlir::Value, 8> physicalOperands;
     if (isDeferredIntMerge(argument)) {
-      mlir::Location loc = anchor->getLoc();
-      if (source->primitiveI64 && source->physicalValues().empty() &&
-          source->deferredObject) {
-        physicalOperands.append({source->primitiveI64->value,
-                                 source->primitiveI64->valid,
-                                 source->deferredObject});
-      } else if (!source->physicalValues().empty()) {
-        // An int object: its i64 when it has one, read when it has not.
-        mlir::Value object = source->physicalValues().front();
-        if (source->primitiveI64) {
-          physicalOperands.append({source->primitiveI64->value,
-                                   source->primitiveI64->valid, object});
-        } else {
-          std::optional<RuntimeSymbol> tryUnbox =
-              manifest.primitive("builtins.int", "try_unbox.i64");
-          if (!tryUnbox)
-            return anchor->emitError()
-                   << "runtime manifest has no int try_unbox.i64";
-          mlir::func::CallOp read = RuntimeBundleLowerer::createRuntimeCall(
-              loc, *tryUnbox, mlir::ValueRange{object});
-          physicalOperands.append(
-              {read.getResult(0), read.getResult(1), object});
-        }
-      } else if (source->primitiveI64) {
-        // A lane with no object (a clone's result) holds a real one.
-        mlir::FailureOr<RuntimeValue> object =
-            RuntimeBundleLowerer::materializePrimitiveI64ObjectAtCurrentInsertion(
-                anchor, *source);
-        if (mlir::failed(object))
-          return mlir::failure();
-        physicalOperands.append({source->primitiveI64->value,
-                                 constantInt(builder, loc,
-                                             builder.getI1Type(), 1),
-                                 object->values.front()});
-      } else {
-        return anchor->emitError()
-               << "deferred int merge source has neither an object nor an i64";
-      }
-      if (physicalOperands.size() != 3 ||
-          physicalOperands[2].getType() != physicalTypes[2])
+      mlir::FailureOr<std::array<mlir::Value, 3>> joined =
+          RuntimeBundleLowerer::deferredIntJoinOperands(anchor, *source);
+      if (mlir::failed(joined))
+        return mlir::failure();
+      physicalOperands.append(joined->begin(), joined->end());
+      if (physicalOperands[2].getType() != physicalTypes[2])
         return anchor->emitError()
                << "deferred int merge source does not match "
                << physicalTypes[2];
@@ -1129,6 +1095,46 @@ RuntimeBundleLowerer::eraseControlFlowLogicalBlockArguments() {
   return mlir::success();
 }
 
+mlir::FailureOr<std::array<mlir::Value, 3>>
+RuntimeBundleLowerer::deferredIntJoinOperands(mlir::Operation *anchor,
+                                              const RuntimeBundle &source) {
+  mlir::Location loc = anchor->getLoc();
+  if (source.primitiveI64 && source.physicalValues().empty() &&
+      source.deferredObject)
+    return std::array<mlir::Value, 3>{source.primitiveI64->value,
+                                      source.primitiveI64->valid,
+                                      source.deferredObject};
+  if (!source.physicalValues().empty()) {
+    // An int object: its i64 when it has one, read when it has not.
+    mlir::Value object = source.physicalValues().front();
+    if (source.primitiveI64)
+      return std::array<mlir::Value, 3>{source.primitiveI64->value,
+                                        source.primitiveI64->valid, object};
+    std::optional<RuntimeSymbol> tryUnbox =
+        manifest.primitive("builtins.int", "try_unbox.i64");
+    if (!tryUnbox)
+      return anchor->emitError() << "runtime manifest has no int try_unbox.i64";
+    mlir::func::CallOp read = RuntimeBundleLowerer::createRuntimeCall(
+        loc, *tryUnbox, mlir::ValueRange{object});
+    return std::array<mlir::Value, 3>{read.getResult(0), read.getResult(1),
+                                      object};
+  }
+  if (source.primitiveI64) {
+    // A lane with no object (a clone's result) holds a real one.
+    mlir::FailureOr<RuntimeValue> object =
+        RuntimeBundleLowerer::materializePrimitiveI64ObjectAtCurrentInsertion(
+            anchor, source);
+    if (mlir::failed(object))
+      return mlir::failure();
+    return std::array<mlir::Value, 3>{
+        source.primitiveI64->value,
+        constantInt(builder, loc, builder.getI1Type(), 1),
+        object->values.front()};
+  }
+  return anchor->emitError()
+         << "deferred int merge source has neither an object nor an i64";
+}
+
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerRuntimeValueSelect(mlir::arith::SelectOp select) {
   mlir::Value result = select.getResult();
@@ -1192,6 +1198,41 @@ RuntimeBundleLowerer::lowerRuntimeValueSelect(mlir::arith::SelectOp select) {
       materialized.copyEvidenceFrom(*side);
       *side = std::move(materialized);
     }
+  }
+
+  // ⭐ An int select with a deferred side picks what a merge argument carries
+  // (`deferredIntJoinOperands`), one select per part, all three after every
+  // operand is built: refcount insertion turns a run of selects on one
+  // condition into ONE diamond, and the held objects are what it moves.
+  // ⛔ Not both sides made objects for the physical spans below:
+  // `if v > best: best = v` over a list made an int on each side per trip.
+  if (runtimeContractName(result.getType()) == "builtins.int" &&
+      (trueBundle.deferredObject || falseBundle.deferredObject)) {
+    builder.setInsertionPoint(select);
+    mlir::FailureOr<std::array<mlir::Value, 3>> picks[2] = {
+        RuntimeBundleLowerer::deferredIntJoinOperands(select, trueBundle),
+        RuntimeBundleLowerer::deferredIntJoinOperands(select, falseBundle)};
+    if (mlir::failed(picks[0]) || mlir::failed(picks[1]))
+      return mlir::failure();
+    if ((*picks[0])[2].getType() != (*picks[1])[2].getType())
+      return select.emitError()
+             << "deferred int select holds objects of different types";
+    mlir::Location loc = select.getLoc();
+    llvm::SmallVector<mlir::Value, 3> picked;
+    for (unsigned part = 0; part < 3; ++part)
+      picked.push_back(mlir::arith::SelectOp::create(
+                           builder, loc, select.getCondition(),
+                           (*picks[0])[part], (*picks[1])[part])
+                           .getResult());
+    RuntimeBundle lazy = RuntimeBundle::objectWithOwnership(
+        result.getType(), mlir::ValueRange{},
+        ownership::logicalOwnershipKind(result.getType(),
+                                        /*ownsObject=*/false));
+    lazy.primitiveI64 = RuntimePrimitiveI64Evidence{picked[0], picked[1]};
+    lazy.deferredObject = picked[2];
+    valueBundles[result] = std::move(lazy);
+    erase.push_back(select);
+    return mlir::success();
   }
 
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> physicalTypes =
