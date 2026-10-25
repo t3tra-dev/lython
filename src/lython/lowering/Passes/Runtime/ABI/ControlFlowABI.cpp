@@ -1099,6 +1099,18 @@ mlir::FailureOr<std::array<mlir::Value, 3>>
 RuntimeBundleLowerer::deferredIntJoinOperands(mlir::Operation *anchor,
                                               const RuntimeBundle &source) {
   mlir::Location loc = anchor->getLoc();
+  // A bool where the merge declares int joins as the int it is.
+  if (source.contractName() == "builtins.bool") {
+    mlir::FailureOr<RuntimeBundle> asInt =
+        RuntimeBundleLowerer::boolAsDeferredInt(
+            anchor, runtimeContractType(context, "builtins.int"),
+            source.physicalValues());
+    if (mlir::failed(asInt))
+      return mlir::failure();
+    return std::array<mlir::Value, 3>{asInt->primitiveI64->value,
+                                      asInt->primitiveI64->valid,
+                                      asInt->deferredObject};
+  }
   if (source.primitiveI64 && source.physicalValues().empty() &&
       source.deferredObject)
     return std::array<mlir::Value, 3>{source.primitiveI64->value,

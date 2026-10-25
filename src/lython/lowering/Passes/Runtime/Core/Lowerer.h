@@ -1610,6 +1610,15 @@ private:
                                llvm::StringRef target);
   mlir::FailureOr<mlir::Value> exactRuntimeClassWord(mlir::Operation *op,
                                                    const RuntimeBundle &object);
+  // The class word of an int's value: a bool's where an int-declared slot or
+  // field kept one, int's for every other.
+  mlir::Value intRuntimeClassWord(mlir::Operation *op,
+                                  const RuntimeBundle &value);
+  // A bool met where an int is declared, as the int it is: a deferred int
+  // whose i64 is the truth bit and whose held object is the bool's singleton.
+  mlir::FailureOr<RuntimeBundle>
+  boolAsDeferredInt(mlir::Operation *op, mlir::Type intType,
+                    llvm::ArrayRef<mlir::Value> boolValues);
   mlir::Value exactClassWordFromWords(mlir::Operation *op, mlir::Value classWord,
                                     mlir::Value entityWord);
   // A union's physical values -- tag plus every member's lanes -- built from a

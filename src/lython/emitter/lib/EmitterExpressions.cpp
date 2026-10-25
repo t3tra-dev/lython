@@ -2268,6 +2268,34 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
             builder, loc(expr), literalType, builder.getBoolAttr(truth));
         return Value{constant.getResult(), literalType};
       }
+    // ⭐ AN INT AND A BOOL MAY BE ONE OBJECT: a list or field declared int
+    // keeps a bool's object, so `xs[0] is True` is a run-time question (the
+    // identity lowering asks the int's class word and value).
+    // ⛔ Not the disjointness fold below, which answered False.
+    if ((types.widenLiteral(lhs.type) == types.intType() &&
+         types.widenLiteral(rhs.type) == types.boolType()) ||
+        (types.widenLiteral(lhs.type) == types.boolType() &&
+         types.widenLiteral(rhs.type) == types.intType())) {
+      Value intSide = coerceValue(
+          types.widenLiteral(lhs.type) == types.intType() ? lhs : rhs,
+          types.intType(), expr);
+      Value boolSide = coerceValue(
+          types.widenLiteral(lhs.type) == types.boolType() ? lhs : rhs,
+          types.boolType(), expr);
+      mlir::Value bit =
+          py::IsOp::create(builder, loc(expr), builder.getI1Type(),
+                           intSide.value, boolSide.value)
+              .getResult();
+      if (negatedIdentity)
+        bit = mlir::arith::XOrIOp::create(
+                  builder, loc(expr), bit,
+                  mlir::arith::ConstantIntOp::create(builder, loc(expr), 1, 1))
+                  .getResult();
+      return Value{py::CastFromPrimOp::create(builder, loc(expr),
+                                              types.boolType(), bit)
+                       .getResult(),
+                   types.boolType()};
+    }
     // ⭐ TWO DISJOINT TYPES ARE NEVER THE SAME OBJECT, and that is decidable
     // here. The value-type refusal below is about SAME-type identity, where
     // interning makes the answer an implementation detail; `p is 5` for a

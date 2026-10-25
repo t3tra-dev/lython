@@ -86,6 +86,19 @@ module attributes {
     func.return %box : memref<3xi64>
   }
 
+  // The singleton of a truth bit seen as the int it also is: what an int read
+  // holds for a bool an int-declared container kept (the lowering's deferred
+  // int, whose held object answers class and repr). Owned in name only, as
+  // `LyLong_DeferredStandIn` is: the singleton is immortal.
+  func.func @LyBool_AsInt(%value: i1) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bool", ly.runtime.primitive = "as_int"} {
+    %true_global = memref.get_global @__ly_bool_box_true : memref<5xi64>
+    %false_global = memref.get_global @__ly_bool_box_false : memref<5xi64>
+    %true_int = memref.reinterpret_cast %true_global to offset: [0], sizes: [2], strides: [1] : memref<5xi64> to memref<2xi64>
+    %false_int = memref.reinterpret_cast %false_global to offset: [0], sizes: [2], strides: [1] : memref<5xi64> to memref<2xi64>
+    %held = arith.select %value, %true_int, %false_int : memref<2xi64>
+    func.return %held : memref<2xi64>
+  }
+
   // unbox: boxed singleton -> canonical i1.
   func.func @LyBool_Unbox(%header: memref<3xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bool", ly.runtime.primitive = "unbox"} {
     %c2 = arith.constant 2 : index

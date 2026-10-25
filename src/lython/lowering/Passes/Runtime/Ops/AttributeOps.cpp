@@ -2740,6 +2740,62 @@ RuntimeBundleLowerer::exactRuntimeClassWord(mlir::Operation *op,
   return RuntimeBundleLowerer::exactClassWordFromWords(op, classWord, entityWord);
 }
 
+mlir::FailureOr<RuntimeBundle> RuntimeBundleLowerer::boolAsDeferredInt(
+    mlir::Operation *op, mlir::Type intType,
+    llvm::ArrayRef<mlir::Value> boolValues) {
+  mlir::Location loc = op->getLoc();
+  if (boolValues.size() != 1)
+    return op->emitError() << "a bool read as an int needs its one lane";
+  mlir::Value bit = boolValues.front();
+  if (!bit.getType().isInteger(1)) {
+    std::optional<RuntimeSymbol> unbox =
+        manifest.primitive("builtins.bool", "unbox");
+    if (!unbox)
+      return op->emitError() << "runtime manifest has no bool unbox";
+    bit = RuntimeBundleLowerer::createRuntimeCall(loc, *unbox, boolValues)
+              .getResult(0);
+  }
+  std::optional<RuntimeSymbol> asInt =
+      manifest.primitive("builtins.bool", "as_int");
+  if (!asInt)
+    return op->emitError() << "runtime manifest has no bool as_int";
+  RuntimeBundle lazy = RuntimeBundle::objectWithOwnership(
+      intType, mlir::ValueRange{},
+      ownership::logicalOwnershipKind(intType, /*ownsObject=*/false));
+  lazy.primitiveI64 = RuntimePrimitiveI64Evidence{
+      mlir::arith::ExtUIOp::create(builder, loc, builder.getI64Type(), bit)
+          .getResult(),
+      constantBool(builder, loc, true)};
+  lazy.deferredObject =
+      RuntimeBundleLowerer::createRuntimeCall(loc, *asInt, mlir::ValueRange{bit})
+          .getResult(0);
+  return lazy;
+}
+
+mlir::Value RuntimeBundleLowerer::intRuntimeClassWord(
+    mlir::Operation *op, const RuntimeBundle &value) {
+  mlir::Location loc = op->getLoc();
+  // A bool's own lanes where an int is declared (a container's evidence).
+  if (value.contractName() == "builtins.bool")
+    return type_objects::classWord(builder, loc, module, "builtins.bool");
+  // The object a value is, or the one a deferred int holds -- the int 0 while
+  // its i64 is the value, so word 1 answers int then too.
+  mlir::Value header = value.deferredObject;
+  if (!header && !value.physicalValues().empty() &&
+      mlir::isa<mlir::MemRefType>(value.physicalValues().front().getType()))
+    header = value.physicalValues().front();
+  if (!header)
+    return type_objects::classWord(builder, loc, module, "builtins.int");
+  mlir::Type words =
+      mlir::MemRefType::get({mlir::ShapedType::kDynamic}, builder.getI64Type());
+  if (header.getType() != words)
+    header = mlir::memref::CastOp::create(builder, loc, words, header);
+  return mlir::memref::LoadOp::create(
+             builder, loc, header,
+             mlir::arith::ConstantIndexOp::create(builder, loc, 1).getResult())
+      .getResult();
+}
+
 // The same question asked of a box's two WORDS rather than of a bundle: a
 // container element is addressed by an interior view, not by a value.
 mlir::Value RuntimeBundleLowerer::exactClassWordFromWords(mlir::Operation *op,
@@ -3141,11 +3197,6 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerClassTest(py::ClassTestOp op) {
   if (mlir::failed(targets))
     return mlir::failure();
 
-  mlir::FailureOr<mlir::Value> header =
-      RuntimeBundleLowerer::objectPhysicalHeader(op, object->objectValue);
-  if (mlir::failed(header))
-    return mlir::failure();
-
   // Every sibling lowering in this file sets the insertion point first; this
   // one did not, so it emitted wherever the builder happened to point. When
   // the test is the FIRST py op in its function there is nowhere sensible,
@@ -3153,11 +3204,21 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerClassTest(py::ClassTestOp op) {
   // isinstance(a, B)` failed with "operation's operand is unlinked".
   builder.setInsertionPoint(op);
   mlir::Location loc = op.getLoc();
-  mlir::FailureOr<mlir::Value> actual =
-      RuntimeBundleLowerer::exactRuntimeClassWord(op, *object);
-  if (mlir::failed(actual))
-    return mlir::failure();
-  mlir::Value actualClassWord = *actual;
+  mlir::Value actualClassWord;
+  // An int may be only its i64, with no header to read a class from.
+  if (object->contractName() == "builtins.int") {
+    actualClassWord = RuntimeBundleLowerer::intRuntimeClassWord(op, *object);
+  } else {
+    mlir::FailureOr<mlir::Value> header =
+        RuntimeBundleLowerer::objectPhysicalHeader(op, object->objectValue);
+    if (mlir::failed(header))
+      return mlir::failure();
+    mlir::FailureOr<mlir::Value> actual =
+        RuntimeBundleLowerer::exactRuntimeClassWord(op, *object);
+    if (mlir::failed(actual))
+      return mlir::failure();
+    actualClassWord = *actual;
+  }
 
   mlir::Value result = mlir::arith::ConstantIntOp::create(builder, loc, 0, 1);
   for (const std::string &target : *targets) {
@@ -3268,6 +3329,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
   // tuple here to disagree about.
   bool assignable = py::isAssignableTo(value->objectValue.contract,
                                        fieldTypes[*fieldIndex], op);
+  // ⭐ A bool IS AN int, and an int field's box keeps the bool's object as a
+  // container slot does: its reads are int views of an int-layout object
+  // whose class word says bool (`intRuntimeClassWord`). ⛔ Not refused on the
+  // representation any more: `c.n = True` is a store CPython makes.
+  if (!assignable &&
+      runtimeContractName(value->objectValue.contract) == "builtins.bool" &&
+      runtimeContractName(fieldTypes[*fieldIndex]) == "builtins.int" &&
+      RuntimeBundleLowerer::classFieldStoredBoxed(fieldTypes[*fieldIndex]))
+    assignable = true;
   if (!assignable && !value->functionTarget.empty() &&
       mlir::isa<py::CallableType>(fieldTypes[*fieldIndex])) {
     if (mlir::func::FuncOp target =

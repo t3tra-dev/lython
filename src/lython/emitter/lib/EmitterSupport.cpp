@@ -998,6 +998,17 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
     return analysis;
   }
 
+  // ⭐ AN INT MAY BE A BOOL: a list or field declared int keeps a bool's
+  // object, so `isinstance(xs[0], bool)` reads the class word. ⛔ The true arm
+  // keeps the int: the value is the bool's object, which the int view reads
+  // exactly, and nothing here unboxes it.
+  if (analysis.sourceType == types.intType() &&
+      analysis.targetType == types.boolType()) {
+    analysis.kind = IsInstanceAnalysis::Kind::ClassTest;
+    analysis.trueType = analysis.sourceType;
+    return analysis;
+  }
+
   // ⭐ TWO CLASSES WITH NO EDGE BETWEEN THEM ARE NOT DISJOINT: a THIRD class
   // may derive from both.
   //
