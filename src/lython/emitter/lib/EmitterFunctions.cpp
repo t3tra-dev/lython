@@ -138,9 +138,9 @@ void ModuleEmitter::recordMonomorphicFunction(
   // as `go()` with the declared float ABI and an int default materialised
   // against it, which the lowering reported as "runtime bundle value 0 for
   // '!py.contract<"builtins.float">' has type 'i64'".
-  if (sig.varargType || sig.kwargType || !sig.kwOnlyTypes.empty())
-    return;
-  if (sig.positionalTypes.empty())
+  // The same question inference asks (TypeSystem::argumentSpecializable),
+  // which is also where a decorated def is excluded.
+  if (!types.argumentSpecializable(function, sig))
     return;
   GenericFunctionInfo &info = monomorphicFunctions[key];
   info.node = &function;
@@ -159,6 +159,26 @@ ModuleEmitter::lookupMonomorphicFunction(llvm::StringRef name) {
     found = monomorphicFunctions.find(*canonical);
     if (found != monomorphicFunctions.end())
       return &found->second;
+  }
+  // ⭐ A FUNCTION WRITTEN BELOW ITS CALL IS ONE TOO, registered when it is
+  // first asked for rather than when it is declared. Inference re-reads a
+  // call at its arguments' rungs whatever the order (TypeSystem::
+  // argumentRungSpecialization), so a body above the def that took the
+  // declared call returned a value its own signature disagreed with --
+  // `return ident(True)` under `-> int` failed in the lowering -- and
+  // `keep(3)` above `def keep(x: float)` was refused outright.
+  if (const parser::Node *function = types.topLevelFunction(name)) {
+    FunctionSignature sig = types.functionSignature(*function);
+    std::optional<mlir::Type> bound = types.lookupSymbol(name);
+    if (bound && *bound == sig.publicCallable &&
+        types.argumentSpecializable(*function, sig)) {
+      recordMonomorphicFunction(name, *function, sig,
+                                topLevelFunctionSymbol(name),
+                                /*source=*/nullptr);
+      found = monomorphicFunctions.find(name);
+      if (found != monomorphicFunctions.end())
+        return &found->second;
+    }
   }
   return nullptr;
 }

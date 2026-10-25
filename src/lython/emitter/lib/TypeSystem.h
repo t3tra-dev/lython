@@ -8,6 +8,7 @@
 
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
@@ -359,6 +360,19 @@ public:
     auto found = topLevelFunctionDefs.find(name);
     return found == topLevelFunctionDefs.end() ? nullptr : found->second;
   }
+  // Whether a direct call of `function`, declared `sig`, is re-read at its
+  // arguments' numeric rungs: a plain positional signature with no type
+  // parameter and no decorator. The emitter registers exactly these.
+  bool argumentSpecializable(const parser::Node &function,
+                             const FunctionSignature &sig) const;
+  // The signature a call of `function` is read at when `supplied` -- one type
+  // per declared positional parameter -- stands a rung below a parameter, or
+  // nothing when the call is the declared one. The emitter specializes by it
+  // and inference types the call by it, so the two cannot disagree.
+  std::optional<FunctionSignature>
+  argumentRungSpecialization(const parser::Node &function,
+                             const FunctionSignature &declared,
+                             llvm::ArrayRef<mlir::Type> supplied) const;
 
   Scope pushScope() const;
   ScopeIsolation isolateScopes() const;
@@ -787,6 +801,28 @@ private:
   mutable const parser::Node *callAskedAgain = nullptr;
   mutable bool rungUnionsAsInt = false;
   mutable bool callMetRungUnion = false;
+  // The functions inference is re-reading at an argument's rung, so a body
+  // that calls one of them again takes its declaration instead of re-entering.
+  mutable llvm::SmallPtrSet<const parser::Node *, 4> rungSpecializing;
+  // What `argumentRungSpecialization` answered, by function and the parameter
+  // types it re-read them at; dropped whenever a signature is forgotten.
+  mutable llvm::DenseMap<std::pair<const parser::Node *, mlir::Type>,
+                         std::optional<FunctionSignature>>
+      rungSpecializations;
+  // `function` read at `actual`, the parameter types `target` carries, when
+  // the emit boundary would take that reading.
+  std::optional<FunctionSignature>
+  readAtArgumentRungs(const parser::Node &function,
+                      const FunctionSignature &declared,
+                      llvm::ArrayRef<mlir::Type> actual,
+                      py::CallableType target) const;
+  // The type of a direct call of the top-level function `name` when it is
+  // read at its arguments' rungs, or nothing when it is not.
+  std::optional<mlir::Type>
+  rungSpecializedCallResult(llvm::StringRef name, const parser::Node &call,
+                            llvm::ArrayRef<mlir::Type> positional,
+                            llvm::ArrayRef<CallKeywordType> keywords,
+                            const ExprInferenceContext *ctx) const;
   llvm::DenseMap<const parser::Node *, mlir::Type> resultTypeOverrides;
   std::string targetTriple;
   bool jsHost = false;
@@ -861,5 +897,10 @@ int numericTowerRung(const TypeSystem &types, mlir::Type type);
 // annotation does not convert in CPython either.
 mlir::Type belowDeclaredRung(const TypeSystem &types, mlir::Type supplied,
                              mlir::Type declared);
+
+// The parameter type a call re-reads its callee at when the argument is a
+// lower numeric rung than the parameter declares, or null when it is not.
+mlir::Type lowerRungParameter(const TypeSystem &types, mlir::Type declared,
+                              mlir::Type supplied);
 
 } // namespace lython::emitter
