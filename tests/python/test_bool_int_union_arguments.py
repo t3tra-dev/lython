@@ -2,9 +2,9 @@
 # passed where a parameter declares int: through a Callable value, to a list's,
 # set's or dict's method, to abs and round, to a method of the program's own
 # class, to a nested function and to a function with a keyword-only parameter.
-# The callee sees the value as it is: True stays a bool and adds as 1. (A call
-# given such a value is bound to a local before it is compared: a tuple of them
-# is typed before it is emitted, and that typing does not convert.)
+# The callee sees the value as it is: True stays a bool and adds as 1. Such a
+# call has a type wherever it is written, a tuple given to assertEqual
+# included.
 import unittest
 from typing import Callable
 
@@ -48,13 +48,8 @@ class CallableValueTest(unittest.TestCase):
     def test_a_bool_or_an_int(self) -> None:
         d = {1: 5, 4: True}
         f: Callable[[int], str] = kind
-        held = f(d[4])
-        other = f(d[1])
-        self.assertEqual((held, other), ("bool:1", "int:5"))
-        doubled = apply(twice, d[4])
-        self.assertEqual(doubled, 2)
-        doubled = apply(twice, d[1])
-        self.assertEqual(doubled, 10)
+        self.assertEqual((f(d[4]), f(d[1])), ("bool:1", "int:5"))
+        self.assertEqual((apply(twice, d[4]), apply(twice, d[1])), (2, 10))
 
 
 class ContainerMethodTest(unittest.TestCase):
@@ -93,9 +88,7 @@ class FunctionAndMethodTest(unittest.TestCase):
         a.put(d[4])
         a.put(d[1])
         self.assertEqual((repr(a.items), a.total), ("[True, 5]", 6))
-        held = a.kind(d[4])
-        other = a.kind(d[1])
-        self.assertEqual((held, other), ("bool", "int"))
+        self.assertEqual((a.kind(d[4]), a.kind(d[1])), ("bool", "int"))
         method = a.kind
         self.assertEqual((method(True), method(3)), ("bool", "int"))
 
@@ -105,12 +98,8 @@ class FunctionAndMethodTest(unittest.TestCase):
         def inner(x: int) -> str:
             return type(x).__name__
 
-        held = inner(d[4])
-        other = inner(d[1])
-        self.assertEqual((held, other), ("bool", "int"))
-        held = keyword(d[4])
-        other = keyword(d[1], k=1)
-        self.assertEqual((held, other, keyword(True)),
+        self.assertEqual((inner(d[4]), inner(d[1])), ("bool", "int"))
+        self.assertEqual((keyword(d[4]), keyword(d[1], k=1), keyword(True)),
                          ("bool:1", "int:6", "bool:1"))
 
 

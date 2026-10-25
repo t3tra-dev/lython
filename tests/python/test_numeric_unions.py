@@ -19,6 +19,10 @@ def scaled(x: float) -> float:
     return x * 2.0
 
 
+def echo(x: int) -> int:
+    return x
+
+
 def pick(c: bool) -> int:
     return 7 if c else True
 
@@ -67,6 +71,10 @@ class LocalTest(unittest.TestCase):
 
 
 class ReturnTest(unittest.TestCase):
+
+    def test_a_call_read_at_its_arguments_rung(self) -> None:
+        self.assertEqual((repr(echo(True)), str(echo(True))), ("True", "True"))
+        self.assertEqual((repr(echo(5)), repr(halved(True))), ("5", "0.5"))
 
     def test_arms_of_different_rungs(self) -> None:
         self.assertEqual((repr(pick(True)), repr(pick(False))), ("7", "True"))

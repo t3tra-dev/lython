@@ -10678,6 +10678,17 @@ ModuleEmitter::tryEmitReprCall(const parser::Node &expr,
               reprReceiverType, "__repr__", {})) {
         Value argument = coerceValue(emitExpr(args->front().get()),
                                      argumentType, expr);
+        // ⭐ THE VALUE MAY BE A LOWER RUNG THAN THE TYPE INFERRED FOR IT. A
+        // direct call specialized at its argument's rung returns what that
+        // body returns -- `ident(True)` is a bool, inferred int from the
+        // declaration -- and int's `__repr__` over a bool reached the lowering
+        // as "evidence is not a manifest candidate for receiver type bool".
+        if (mlir::Type actual = types.widenLiteral(argument.value.getType());
+            actual != argumentType && isNumericPrimitiveContract(actual) &&
+            isNumericPrimitiveContract(argumentType))
+          if (CallInferenceResult own =
+                  types.inferMethodCallWithEvidence(actual, "__repr__", {}))
+            inference = own;
         mlir::Type resultType = types.contract("builtins.str");
         auto op = py::ReprOp::create(
             builder, loc(expr), resultType,
