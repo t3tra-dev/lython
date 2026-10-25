@@ -3689,6 +3689,31 @@ TEST(DriverTest, AnIntReadThatIsChosenComputedOrStoredMakesNoObject) {
   EXPECT_TRUE(calls(shown, "LyLong_FromSlotWord"));
 }
 
+// What: an int a runtime call answers, which comes without its i64, takes an
+// operator's i64 arm like any other int: `t * 10 + w.find("a")` adds through
+// the deferred operator (`LyLong_AddDeferred` is its slow arm) rather than
+// one boxed call that makes an object of every answer.
+TEST(DriverTest, AnIntARuntimeCallAnswersTakesTheOperatorsI64Arm) {
+  CompileResult result = compileSource("def f(w: str, t: int) -> int:\n"
+                                       "    return t * 10 + w.find(\"a\")\n\n\n"
+                                       "print(f(\"banana\", 3))\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  const llvm::Function *f =
+      result.verified.llvmModule->getFunction(mainSymbol("f"));
+  ASSERT_NE(f, nullptr);
+  bool boxedAdd = false;
+  bool deferredAdd = false;
+  for (const llvm::BasicBlock &block : *f)
+    for (const llvm::Instruction &instruction : block)
+      if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+        if (const llvm::Function *callee = call->getCalledFunction()) {
+          boxedAdd |= callee->getName() == "LyLong_Add";
+          deferredAdd |= callee->getName() == "LyLong_AddDeferred";
+        }
+  EXPECT_FALSE(boxedAdd);
+  EXPECT_TRUE(deferredAdd);
+}
+
 // What: a value is kept referenced to the end of its frame only when its
 // release can be observed. A list of ints and a plain class instance are
 // released at their last use -- no keep-alive call anywhere. An instance of a

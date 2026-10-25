@@ -1,8 +1,9 @@
-# An int read out of a list, a field, a dict or a closure, or answered by an
-# operator, gives CPython's answer wherever it goes next: a conditional choice
-# between two ints, a field store, a call, a return. Each case runs over small
-# ints, ints that fill a machine word and ints wider than one; a bool held in a
-# list where an int is declared stays the bool.
+# An int read out of a list, a field, a dict or a closure, answered by an
+# operator or returned by a runtime call, gives CPython's answer wherever it
+# goes next: a conditional choice between two ints, a field store, a call, a
+# return. Each case runs over small ints, ints that fill a machine word and
+# ints wider than one; a bool held in a list where an int is declared stays
+# the bool.
 import unittest
 from typing import Callable
 
@@ -155,6 +156,33 @@ class CallTest(unittest.TestCase):
         for start in [5, WORD, BIG]:
             c = Counter(start)
             self.assertEqual(c.doubled() - c.n, start)
+
+
+class RuntimeAnswerTest(unittest.TestCase):
+
+    def test_arithmetic_on_what_runtime_calls_answer(self) -> None:
+        t = 0
+        for w in ["banana", "kiwi", "apple", "cherry"]:
+            t = t * 10 + w.find("a") + 1
+        self.assertEqual(t, 2010)
+        h = 0
+        for c in "h\xe9llo":
+            h = (h * 31 + ord(c)) % 1000003
+        expected = 0
+        for code in [104, 233, 108, 108, 111]:
+            expected = (expected * 31 + code) % 1000003
+        self.assertEqual(h, expected)
+
+    def test_comparisons_with_what_runtime_calls_answer(self) -> None:
+        self.assertTrue("abc".find("c") > len("a"))
+        self.assertFalse(ord("a") >= ord("b"))
+        self.assertEqual(int("12") * 5 + int("8"), 68)
+
+    def test_an_answer_wider_than_the_word(self) -> None:
+        big = int("1" * 30)
+        self.assertEqual(big * 3 - big, big + big)
+        self.assertTrue(int("9" * 25) > int("9" * 24) * 9)
+        self.assertEqual((big + len("ab")) % 1000, 113)
 
 
 if __name__ == "__main__":

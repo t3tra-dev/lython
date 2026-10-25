@@ -749,6 +749,45 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBinarySpecial(
   if (primitiveArithmetic && boolOperand &&
       primitiveI64ArithmeticKeepsBool(*primitiveArithmetic))
     primitiveArithmetic.reset();
+  // ⭐ An int object that came without its i64 -- a module global, a value a
+  // runtime call answered -- reads it here (`try_unbox.i64`), so the operator
+  // takes its i64 arm when the value fits.
+  // ⛔ Not the boxed call for the whole operator, which made an object of
+  // every answer: `t % MOD` with `MOD` a module constant allocated per trip.
+  // ⛔ Not in an i64 clone or a generator's resume, whose int lanes say
+  // "cannot say" or refuse rather than take a slow arm.
+  llvm::SmallVector<RuntimeBundle, 2> laned;
+  laned.reserve(2);
+  if (sources.size() == 2 &&
+      (primitiveArithmetic || primitiveI64ComparePredicate(methodName)))
+    if (auto function = op->getParentOfType<mlir::func::FuncOp>();
+        function && !function->hasAttr(kPrimitiveI64CloneAttr) &&
+        !function->hasAttr("ly.generator.resume"))
+      if (std::optional<RuntimeSymbol> tryUnbox =
+              manifest.primitive("builtins.int", "try_unbox.i64")) {
+        mlir::Type header = tryUnbox->function.getFunctionType().getInput(0);
+        auto readable = [&](const RuntimeBundle *source) {
+          return source && source->kind == RuntimeBundle::Kind::Object &&
+                 source->contractName() == "builtins.int" &&
+                 source->physicalValues().size() == 1 &&
+                 source->physicalValues().front().getType() == header;
+        };
+        if (llvm::all_of(sources, [&](const RuntimeBundle *source) {
+              return RuntimeBundleLowerer::hasPrimitiveI64Evidence(source) ||
+                     readable(source);
+            }))
+          for (const RuntimeBundle *&source : sources) {
+            if (RuntimeBundleLowerer::hasPrimitiveI64Evidence(source))
+              continue;
+            builder.setInsertionPoint(op);
+            mlir::func::CallOp read = RuntimeBundleLowerer::createRuntimeCall(
+                op->getLoc(), *tryUnbox, source->physicalValues());
+            laned.push_back(*source);
+            laned.back().primitiveI64 =
+                RuntimePrimitiveI64Evidence{read.getResult(0), read.getResult(1)};
+            source = &laned.back();
+          }
+      }
   if (sources.size() == 2 &&
       RuntimeBundleLowerer::hasPrimitiveI64Evidence(sources[0]) &&
       RuntimeBundleLowerer::hasPrimitiveI64Evidence(sources[1]) &&
