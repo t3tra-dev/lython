@@ -719,10 +719,30 @@ LogicalResult runLoweringPipeline(ModuleOp module,
     return failure();
   dumpMLIRForPass(irDump, "refcount-elision", module);
 
+  // ⭐ THE BODIES NOBODY CAN REACH ARE EMPTIED, NOT REMOVED. The merged
+  // manifest brings ~1500 functions into a module whose program uses a few
+  // hundred; every verifier and every conversion after this point walked all
+  // of them. Symbol DCE cannot run here -- the verifiers read manifest
+  // declarations as contract witnesses (that is why it runs after phase 13,
+  // and moving it up made `LyLong_FromI64` look like it may unwind) -- so the
+  // symbol and its attributes stay and only the body goes.
+  //
+  // ⛔ Placed AFTER refcount insertion, not before: that pass is what mints
+  // the calls to deallocators, and a deallocator is unreachable until it does.
+  // Nothing after this point introduces a call to a manifest body; the unwind
+  // insertion below calls LLVM externals the support builder declares.
+  {
+    PerfScope perf("lowering.unreachable-body-strip");
+    lowering::runtime::cleanup::stripUnreachableManifestBodies(module);
+  }
+
   // LYTHON_OWNERSHIP_MUTATE=<kind>:<n> breaks the n-th refcount call of the
   // program's own functions, after insertion, so that what the ownership
   // verifier catches can be measured: `drop` erases a release, `dropretain`
   // a retain, `dup` releases twice. It prints how many candidates there were.
+  // ⛔ Not before the strip above: a body nobody calls (an i64 clone the
+  // program never reaches) is emptied there, so a break in it is neither
+  // verified nor run, and counting it reported a verifier miss that is none.
   if (const char *mutate = ::getenv("LYTHON_OWNERSHIP_MUTATE")) {
     llvm::StringRef spec(mutate);
     auto [kind, ordinal] = spec.split(':');
@@ -763,23 +783,6 @@ LogicalResult runLoweringPipeline(ModuleOp module,
         victim.erase();
       }
     }
-  }
-
-  // ⭐ THE BODIES NOBODY CAN REACH ARE EMPTIED, NOT REMOVED. The merged
-  // manifest brings ~1500 functions into a module whose program uses a few
-  // hundred; every verifier and every conversion after this point walked all
-  // of them. Symbol DCE cannot run here -- the verifiers read manifest
-  // declarations as contract witnesses (that is why it runs after phase 13,
-  // and moving it up made `LyLong_FromI64` look like it may unwind) -- so the
-  // symbol and its attributes stay and only the body goes.
-  //
-  // ⛔ Placed AFTER refcount insertion, not before: that pass is what mints
-  // the calls to deallocators, and a deallocator is unreachable until it does.
-  // Nothing after this point introduces a call to a manifest body; the unwind
-  // insertion below calls LLVM externals the support builder declares.
-  {
-    PerfScope perf("lowering.unreachable-body-strip");
-    lowering::runtime::cleanup::stripUnreachableManifestBodies(module);
   }
 
   // The contracts are checked here, as insertion left them; the walk over

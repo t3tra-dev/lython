@@ -3928,3 +3928,38 @@ TEST(DriverTest, EveryDroppedOrDoubledReleaseIsRefused) {
     }
   }
 }
+
+TEST(DriverTest, EveryReleaseOfAChosenOrCarriedIntIsChecked) {
+  // `min(x * 2, hi)` keeps the product's object as an `scf.if` result and
+  // releases it after the choice; the loop carries `t`'s and `i`'s objects
+  // round its back edge, releasing the old ones there. Every release of the
+  // program's own functions, dropped or doubled, is refused.
+  const char *source =
+      "def f(x: int, hi: int) -> int:\n"
+      "    return min(x * 2, hi)\n"
+      "def g(n: int) -> int:\n"
+      "    t = 0\n"
+      "    for i in range(n):\n"
+      "        t += f(i, 7)\n"
+      "    return t\n"
+      "print(f(3, 5), g(10), f(2 ** 62, 2 ** 63))\n";
+  auto mutated = [&](const std::string &spec) {
+    ::setenv("LYTHON_OWNERSHIP_MUTATE", spec.c_str(), /*overwrite=*/1);
+    CompileResult result = compileSource(source);
+    ::unsetenv("LYTHON_OWNERSHIP_MUTATE");
+    return result;
+  };
+  for (const char *kind : {"drop", "dup"}) {
+    CompileResult counted = mutated(std::string(kind) + ":1000000");
+    ASSERT_TRUE(counted.succeeded) << counted.diagnostics;
+    std::size_t at = counted.diagnostics.find("candidates=");
+    ASSERT_NE(at, std::string::npos) << counted.diagnostics;
+    unsigned candidates =
+        std::stoul(counted.diagnostics.substr(at + std::strlen("candidates=")));
+    ASSERT_GT(candidates, 0u);
+    for (unsigned index = 0; index < candidates; ++index) {
+      std::string spec = std::string(kind) + ":" + std::to_string(index);
+      EXPECT_FALSE(mutated(spec).succeeded) << spec << " was accepted";
+    }
+  }
+}
