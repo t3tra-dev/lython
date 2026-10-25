@@ -733,7 +733,8 @@ bool RuntimeBundleLowerer::canAppendImplicitRuntimeArgument(
 
 bool RuntimeBundleLowerer::canBuildRuntimeCallOperands(
     const RuntimeSymbol &symbol, llvm::ArrayRef<const RuntimeBundle *> sources,
-    bool allowUnusedSources, const RuntimeBundle *classObject) const {
+    bool allowUnusedSources, const RuntimeBundle *classObject,
+    unsigned *taken) const {
   mlir::func::FuncOp function = symbol.function;
   mlir::FunctionType functionType = function.getFunctionType();
   unsigned inputIndex = 0;
@@ -758,6 +759,8 @@ bool RuntimeBundleLowerer::canBuildRuntimeCallOperands(
       return false;
     ++sourceIndex;
   }
+  if (taken)
+    *taken = sourceIndex;
   return allowUnusedSources || sourceIndex == sources.size();
 }
 
@@ -765,7 +768,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildRuntimeCallOperands(
     mlir::Operation *op, const RuntimeSymbol &symbol,
     llvm::ArrayRef<const RuntimeBundle *> sources,
     llvm::SmallVectorImpl<mlir::Value> &operands, bool allowUnusedSources,
-    const RuntimeBundle *classObject) {
+    const RuntimeBundle *classObject, unsigned *taken) {
   mlir::func::FuncOp function = symbol.function;
   mlir::FunctionType functionType = function.getFunctionType();
   unsigned inputIndex = 0;
@@ -802,7 +805,18 @@ mlir::LogicalResult RuntimeBundleLowerer::buildRuntimeCallOperands(
   if (!allowUnusedSources && sourceIndex != sources.size())
     return op->emitError() << "too many runtime arguments for "
                            << symbol.contract << "." << symbol.name;
+  if (taken)
+    *taken = sourceIndex;
   return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::refuseDroppedSources(
+    mlir::Operation *op, const RuntimeSymbol &symbol, unsigned taken,
+    std::size_t count) {
+  return op->emitError() << symbol.contract << "." << symbol.name
+                         << " takes " << taken << " of the " << count
+                         << " values this call gives it, and the rest would "
+                            "be dropped; no overload takes them all";
 }
 
 } // namespace py::lowering

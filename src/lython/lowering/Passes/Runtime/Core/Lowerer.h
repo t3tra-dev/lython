@@ -1985,17 +1985,30 @@ private:
       llvm::SmallVectorImpl<mlir::Value> &operands);
   bool canAppendImplicitRuntimeArgument(const RuntimeSymbol &symbol,
                                         unsigned &inputIndex) const;
+  // `taken`, when given, is how many sources the symbol's inputs take.
   bool
   canBuildRuntimeCallOperands(const RuntimeSymbol &symbol,
                               llvm::ArrayRef<const RuntimeBundle *> sources,
                               bool allowUnusedSources,
-                              const RuntimeBundle *classObject = nullptr) const;
+                              const RuntimeBundle *classObject = nullptr,
+                              unsigned *taken = nullptr) const;
   mlir::LogicalResult
   buildRuntimeCallOperands(mlir::Operation *op, const RuntimeSymbol &symbol,
                            llvm::ArrayRef<const RuntimeBundle *> sources,
                            llvm::SmallVectorImpl<mlir::Value> &operands,
                            bool allowUnusedSources,
-                           const RuntimeBundle *classObject = nullptr);
+                           const RuntimeBundle *classObject = nullptr,
+                           unsigned *taken = nullptr);
+  // A callee allowed to leave sources unused takes all of them or none past
+  // the `leading` ones (a method's receiver): anything between is a call
+  // whose other arguments would be dropped, and is refused here.
+  static bool takesAllOrLeading(unsigned taken, std::size_t count,
+                                unsigned leading) {
+    return taken == count || taken <= leading;
+  }
+  mlir::LogicalResult refuseDroppedSources(mlir::Operation *op,
+                                           const RuntimeSymbol &symbol,
+                                           unsigned taken, std::size_t count);
   mlir::LogicalResult lowerBinarySpecial(mlir::Operation *op, mlir::Value lhs,
                                          mlir::Value rhs,
                                          llvm::StringRef methodName,
