@@ -777,6 +777,15 @@ RuntimeBundleLowerer::aliasViewBundle(mlir::Operation *op,
                                       mlir::Type resultType) {
   const RuntimeBundle *inputBundle = &source;
 
+  // ⭐ A bool SEEN AS AN int is the int it is: its i64 the truth bit, its
+  // object the bool's singleton, which carries the int layout and keeps its
+  // class word. ⛔ Not aliased as the classes below are: a bool's lane is
+  // its bit, which no int reader takes.
+  if (source.contractName() == "builtins.bool" &&
+      runtimeContractName(resultType) == "builtins.int")
+    return RuntimeBundleLowerer::boolAsDeferredInt(op, resultType,
+                                                   source.physicalValues());
+
   // ⭐ A UNION SEEN AS `object` IS BOXED, as an argument handed to an `object`
   // parameter already is: the tag picks the class and entity words the box
   // keeps (`objectPayloadClassEntity`). The common-base view below wants

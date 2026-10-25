@@ -6176,7 +6176,8 @@ std::string ModuleEmitter::cellElementRepresentationMismatch(
       continue;
     mlir::Type declaredLeaf, assignedLeaf;
     if (!numericRepresentationMismatch(parameter, argument, declaredLeaf,
-                                       assignedLeaf))
+                                       assignedLeaf) ||
+        boolKeptAsInt(parameter, argument))
       continue;
     auto spell = [&](mlir::Type numeric) -> llvm::StringRef {
       if (numeric == types.boolType())
@@ -6274,6 +6275,51 @@ std::string ModuleEmitter::cellTypeSpelling(mlir::Type type) const {
     return py::contracts::displayClassNameForContract(
         contract.getContractName());
   return typeText(type);
+}
+
+// ⭐ A bool IS AN int, and an int holds an object: the bool's singleton
+// carries the int layout, and every int reader asks its class word for the
+// type, as of a list[int] element or an int field. So a bool, or a union of
+// bool and int, goes where int is declared as the int it is. ⛔ Not a float,
+// whose one lane is the double, nor a union cell, whose int member has no tag
+// for a bool; and not a container of bools retyped as a container of ints,
+// whose elements were never this question.
+bool ModuleEmitter::boolKeptAsInt(mlir::Type declared,
+                                  mlir::Type assigned) const {
+  if (options.runtimeInternal || !declared || !assigned ||
+      types.widenLiteral(declared) != types.intType())
+    return false;
+  mlir::Type widened = types.widenLiteral(assigned);
+  if (widened == types.boolType())
+    return true;
+  auto unionType = mlir::dyn_cast<py::UnionType>(widened);
+  return unionType &&
+         llvm::all_of(unionType.getMemberTypes(),
+                      [&](mlir::Type member) {
+                        mlir::Type rung = types.widenLiteral(member);
+                        return rung == types.boolType() ||
+                               rung == types.intType();
+                      }) &&
+         llvm::any_of(unionType.getMemberTypes(), [&](mlir::Type member) {
+           return types.widenLiteral(member) == types.boolType();
+         });
+}
+
+// The bool through `py.class.upcast`, which views its singleton as the int
+// base it is; a union member by member.
+Value ModuleEmitter::rungsAsInt(Value value, const parser::Node &anchor) {
+  mlir::Type intType = types.intType();
+  mlir::Type widened = types.widenLiteral(value.type);
+  if (widened == types.boolType())
+    return {py::ClassUpcastOp::create(builder, loc(anchor), intType,
+                                      value.value)
+                .getResult(),
+            intType};
+  if (auto unionType = mlir::dyn_cast<py::UnionType>(value.type))
+    return emitUnionMemberDispatch(
+        anchor, value, unionType, intType,
+        [&](Value member) { return rungsAsInt(member, anchor); });
+  return coerceValue(value, intType, anchor);
 }
 
 bool ModuleEmitter::numericRepresentationMismatch(

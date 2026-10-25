@@ -179,7 +179,9 @@ EmitResult ModuleEmitter::emit() {
   // Register module globals after the top-level classes are predeclared (a
   // global's annotation may name a user class) but before any function body
   // is emitted so their reads resolve.
+  llvm::StringSet<> unboundTargets = unboundModuleTargets(moduleNode);
   collectModuleGlobals(moduleNode);
+  forgetSignaturesReadingLateGlobals(moduleNode, unboundTargets);
   forgetImportedSignatures();
 
   // Generic class instantiations may now be emitted as they are demanded.

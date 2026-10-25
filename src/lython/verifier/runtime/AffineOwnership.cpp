@@ -965,11 +965,29 @@ public:
   // blocks), and dominance is the property SSA already guarantees for every
   // genuine use of a tracked value.
   //
+  // ⭐ A PRODUCER INSIDE AN ARM IS ITS REGION OP, seen from outside it. An
+  // `scf.if` arm that makes the token yields it, and from the yield on the
+  // walk's names are the `scf.if`'s results; the call inside the arm dominates
+  // nothing after the `scf.if`, so every release there read as some other
+  // instance's -- a deferred int's held object released twice after
+  // `min(x * 2, hi)` was accepted (LYTHON_OWNERSHIP_MUTATE=dup:0). ⛔ Not out
+  // of a region that runs again (a loop body): there the next trip's
+  // production is the fresh instance this question exists to tell apart.
+  //
   // Built lazily: functions whose resources are all released in their producing
   // block never ask.
   bool producerDominates(mlir::Operation *producer, mlir::Operation *op) {
     if (!producer || !op)
       return true;
+    while (mlir::Region *region = producer->getParentRegion()) {
+      if (region->isAncestor(op->getParentRegion()))
+        break;
+      auto branch = mlir::dyn_cast_if_present<mlir::RegionBranchOpInterface>(
+          region->getParentOp());
+      if (!branch || branch.isRepetitiveRegion(region->getRegionNumber()))
+        break;
+      producer = branch.getOperation();
+    }
     if (!dominance)
       dominance = std::make_unique<mlir::DominanceInfo>(function);
     return dominance->dominates(producer, op);
@@ -3043,6 +3061,15 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
     next.exceptional = true;
     worklist.push_back(std::move(next));
   };
+  // The edge on which an owned token lost its every name, if one did.
+  mlir::Operation *namesRebound = nullptr;
+  auto reportNamesRebound = [&]() {
+    return namesRebound->emitError()
+           << "owned resource from " << resource.producerLabel << " result "
+           << resource.resultOffset
+           << " is still owned when this edge rebinds the block argument "
+              "that names it; it must be released, transferred, or forwarded";
+  };
   // The states a terminator hands its first `limit` successors, as the walk
   // builds them at the terminator.
   auto pushSuccessors = [&](mlir::Operation *op, const AffinePathState &state,
@@ -3097,6 +3124,27 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
       if (renamed)
         for (mlir::Value value : state.group)
           keepPreviousName(value);
+      // ⭐ AND SO DO THE GROUP'S OWN NAMES. An owned token every name of which
+      // is an argument this edge rebinds without forwarding it has lost them:
+      // past the edge they name the value the edge passed -- on a back edge,
+      // the next trip's. Kept, that value's release read as this token's, and
+      // a dropped release of a loop-carried int's held object was accepted
+      // (LYTHON_OWNERSHIP_MUTATE=drop over `for i in range(n): t += f(i, 7)`).
+      // The token goes on under the pre-rename names a release may still be
+      // written with; with none left, nothing can release it.
+      if (!renamed && nextToken == AffineTokenState::Owned &&
+          !state.group.empty() &&
+          llvm::all_of(state.group, [&](mlir::Value value) {
+            auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
+            return argument && argument.getOwner() == successor;
+          })) {
+        if (mappedPrevious.empty()) {
+          if (!namesRebound)
+            namesRebound = op;
+          continue;
+        }
+        mappedGroup = mappedPrevious;
+      }
       // Views name the same object as the group, so they follow the same
       // rename: a view left under its pre-edge name would be read as the
       // previous iteration's token on the next trip round a loop. A view the
@@ -3289,6 +3337,8 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
             // it next, as it would have.
             pushSuccessors(terminator, state,
                            position + 1 == end ? successors : successors - 1);
+            if (namesRebound)
+              return reportNamesRebound();
           }
           summarizedStates +=
               walk.summarizedStateCount(at.chain, at.position, end);
@@ -3976,6 +4026,8 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
     }
 
     pushSuccessors(op, state, successors);
+    if (namesRebound)
+      return reportNamesRebound();
   }
 
   return mlir::success();

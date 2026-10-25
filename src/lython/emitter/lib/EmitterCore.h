@@ -602,6 +602,12 @@ private:
       const parser::Node &moduleNode, llvm::SmallVectorImpl<std::string> &names,
       llvm::SmallVectorImpl<mlir::Attribute> &values) const;
   void collectModuleGlobals(const parser::Node &moduleNode);
+  // The module's assignment targets nothing has bound yet, and the memoized
+  // top-level signatures that read one once `collectModuleGlobals` bound it
+  // (EmitterGlobals.cpp).
+  llvm::StringSet<> unboundModuleTargets(const parser::Node &moduleNode) const;
+  void forgetSignaturesReadingLateGlobals(const parser::Node &moduleNode,
+                                          const llvm::StringSet<> &unbound);
   // Every name any function in `scope` declares `global`, at any depth.
   llvm::StringSet<> moduleGlobalDeclarations(const parser::Node &scope) const;
   // The element/key/value type an empty `[]`, `{}` or `set()` bound to `name`
@@ -1806,6 +1812,11 @@ private:
   bool numericRepresentationMismatch(mlir::Type declared, mlir::Type assigned,
                                      mlir::Type &declaredLeaf,
                                      mlir::Type &assignedLeaf) const;
+  // A bool -- or a union of bool and int -- met where int is declared by a
+  // storage or a callee that cannot take it as itself, and the int it is
+  // there (EmitterExpressions.cpp).
+  bool boolKeptAsInt(mlir::Type declared, mlir::Type assigned) const;
+  Value rungsAsInt(Value value, const parser::Node &anchor);
   // The declared-cell name a container expression reads (a module global or a
   // class attribute), or empty when it is not one.
   std::string declaredCellNameFor(const parser::Node *container) const;
