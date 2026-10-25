@@ -782,10 +782,11 @@ private:
   // before the call sites have had their rounds to bind that variable.
   mutable bool defaultsDescribeParameters = true;
   // The call whose type is being asked again with each positional union of
-  // bool and int as the int its emission passes, and whether this asking is
-  // that one (`inferExprImpl`).
+  // bool and int as the int its emission passes, whether this asking is that
+  // one, and whether its first asking met such a union (`inferExprImpl`).
   mutable const parser::Node *callAskedAgain = nullptr;
   mutable bool rungUnionsAsInt = false;
+  mutable bool callMetRungUnion = false;
   llvm::DenseMap<const parser::Node *, mlir::Type> resultTypeOverrides;
   std::string targetTriple;
   bool jsHost = false;
