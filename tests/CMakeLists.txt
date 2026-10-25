@@ -286,7 +286,8 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AGeneratorResumedByItsFrameNamesWhatItCannotResume"
     "DriverTest.ALiteralsElementsAreBuiltWithNoUnwindEdges"
     "DriverTest.EveryDroppedOrDoubledReleaseIsRefused"
-    "DriverTest.EveryReleaseOfAChosenOrCarriedIntIsChecked")
+    "DriverTest.EveryReleaseOfAChosenOrCarriedIntIsChecked"
+    "DriverTest.AConstructorThatWouldDropArgumentsIsRefused")
 
 set(LYTHON_UNIT_LABELS_parse  "parse;unit;fast")
 set(LYTHON_UNIT_LABELS_emit   "emit;unit;fast")

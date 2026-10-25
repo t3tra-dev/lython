@@ -478,16 +478,20 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
       // overload of `int.from_bytes` takes only the bytes, and with unused
       // sources allowed it took `(b, "little", signed=True)` as big-endian
       // and unsigned -- an answer, not a refusal.
+      // ⛔ And not one that takes only some of them (`lowerNew`).
       for (bool allowUnused : {false, true}) {
         bool selected = false;
         for (const RuntimeSymbol &candidate :
-             manifest.initializerCandidates(contract, methodName))
+             manifest.initializerCandidates(contract, methodName)) {
+          unsigned taken = 0;
           if (canBuildRuntimeCallOperands(candidate, sources, allowUnused,
-                                          &receiver)) {
+                                          &receiver, &taken) &&
+              takesAllOrLeading(taken, sources.size(), /*leading=*/0)) {
             initializer = candidate;
             selected = true;
             break;
           }
+        }
         if (selected)
           break;
       }
@@ -495,11 +499,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
         return mlir::failure();
       llvm::SmallVector<mlir::Value, 8> operands;
       builder.setInsertionPoint(op);
+      unsigned taken = 0;
       if (mlir::failed(buildRuntimeCallOperands(op, *initializer, sources,
                                                 operands,
                                                 /*allowUnusedSources=*/true,
-                                                &receiver)))
+                                                &receiver, &taken)))
         return mlir::failure();
+      if (!takesAllOrLeading(taken, sources.size(), /*leading=*/0))
+        return refuseDroppedSources(op, *initializer, taken, sources.size());
       mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
           op.getLoc(), *initializer, operands);
       RuntimeBundle result;

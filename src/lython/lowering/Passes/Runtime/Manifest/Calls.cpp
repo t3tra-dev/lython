@@ -160,13 +160,17 @@ mlir::FailureOr<RuntimeSymbol> RuntimeBundleLowerer::selectManifestMethod(
   // `bytes([65, 66])` picked the empty one and answered b''. The first pass
   // asks who can take EVERY source; only when nobody can does the permissive
   // question get asked.
+  // ⛔ And not one that takes only some of them -- see `lowerNew`: the
+  // permissive question is for a method that takes its receiver alone.
   auto pick = [&](bool allowUnused,
                   bool &ambiguous) -> const RuntimeSymbol * {
     const RuntimeSymbol *found = nullptr;
     ambiguous = false;
     for (const RuntimeSymbol &candidate : methods) {
+      unsigned taken = 0;
       if (!canBuildRuntimeCallOperands(candidate, sources, allowUnused,
-                                       /*classObject=*/nullptr))
+                                       /*classObject=*/nullptr, &taken) ||
+          !takesAllOrLeading(taken, sources.size(), /*leading=*/1))
         continue;
       if (found) {
         ambiguous = true;
@@ -208,9 +212,15 @@ mlir::LogicalResult RuntimeBundleLowerer::emitManifestMethodCall(
 
   llvm::SmallVector<mlir::Value, 8> operands;
   builder.setInsertionPoint(op);
+  unsigned taken = 0;
   if (mlir::failed(buildRuntimeCallOperands(op, *selected, sources, operands,
-                                            allowUnusedSources)))
+                                            allowUnusedSources,
+                                            /*classObject=*/nullptr, &taken)))
     return mlir::failure();
+  // The overload no candidate took the call for -- the first, by default --
+  // is held to the same rule as the ones that were asked.
+  if (!takesAllOrLeading(taken, sources.size(), /*leading=*/1))
+    return refuseDroppedSources(op, *selected, taken, sources.size());
 
   mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
       op->getLoc(), *selected, operands);
@@ -475,13 +485,21 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNew(py::NewOp op) {
   // A contract may declare several -- `bytes()` is empty, a size, a bytes-like
   // or a string with an encoding -- and the first lookup answers with whichever
   // was recorded first.
+  // ⭐ AND WHAT IT LEAVES UNUSED IS EVERYTHING OR NOTHING. A `__new__` that
+  // takes none of the arguments leaves them to `__init__` (an exception's,
+  // a file's); one that takes some of them is an overload of another arity.
+  // Allowed, `range(0, 9, s)` with a step it could not adapt took the
+  // one-argument overload and built `range(0)` -- printed [], where CPython
+  // prints the steps.
   llvm::ArrayRef<RuntimeSymbol> constructors =
       manifest.initializerCandidates(contract, *methodName);
   for (bool allowUnused : {false, true}) {
     bool selected = false;
     for (const RuntimeSymbol &candidate : constructors) {
+      unsigned taken = 0;
       if (!canBuildRuntimeCallOperands(candidate, sources, allowUnused,
-                                       classObject))
+                                       classObject, &taken) ||
+          !takesAllOrLeading(taken, sources.size(), /*leading=*/0))
         continue;
       initializer = candidate;
       selected = true;
@@ -495,10 +513,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNew(py::NewOp op) {
 
   llvm::SmallVector<mlir::Value, 8> operands;
   builder.setInsertionPoint(op);
+  unsigned taken = 0;
   if (mlir::failed(buildRuntimeCallOperands(op, *initializer, sources, operands,
                                             /*allowUnusedSources=*/true,
-                                            classObject)))
+                                            classObject, &taken)))
     return mlir::failure();
+  if (!takesAllOrLeading(taken, sources.size(), /*leading=*/0))
+    return refuseDroppedSources(op, *initializer, taken, sources.size());
 
   mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
       op.getLoc(), *initializer, operands);

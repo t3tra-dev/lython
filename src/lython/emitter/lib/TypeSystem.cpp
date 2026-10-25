@@ -4135,6 +4135,35 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
                                      const ExprInferenceContext *ctx) const {
   if (!node)
     return object();
+  // ⭐ A CALL GIVEN A UNION OF bool AND int WHERE int IS DECLARED HAS THE
+  // TYPE OF THE CALL ITS EMISSION MAKES, which passes the union as the int it
+  // is (`ModuleEmitter::rungsAsInt`). Unasked, the call had no type while it
+  // emitted fine, and a tuple of them given to a generic method specialized it
+  // over nothing -- `assertEqual((f(d[k]), "x"), ...)` failed inside pprint.
+  // So a call that does not type is asked once more, its positional unions of
+  // bool and int as int, and keeps the answer only if that one types.
+  // ⛔ Not by teaching the solver that the union fits an int parameter: the
+  // solver also answers the emitter's own checks, and a call that is not
+  // converted then took the union as it is (`range(0, 9, d[k])` reached the
+  // lowering). This answers what the expression's type is, and nothing else.
+  // ⛔ Whether the first asking met such a union is recorded as it reads the
+  // arguments, not found by reading them again: a call that does not type is
+  // common, and re-reading each one's arguments doubled the work per level
+  // of a nest of them.
+  if (node->kind == "Call" && callAskedAgain != node) {
+    llvm::SaveAndRestore<const parser::Node *> once(callAskedAgain, node);
+    llvm::SaveAndRestore<bool> plainly(rungUnionsAsInt, false);
+    llvm::SaveAndRestore<bool> unmet(callMetRungUnion, false);
+    mlir::Type answer = inferExprImpl(node, ctx);
+    auto typed = [&](mlir::Type type) {
+      return ctx && ctx->strict ? static_cast<bool>(type) : type != object();
+    };
+    if (typed(answer) || !callMetRungUnion)
+      return answer;
+    rungUnionsAsInt = true;
+    mlir::Type askedAgain = inferExprImpl(node, ctx);
+    return typed(askedAgain) ? askedAgain : answer;
+  }
   const bool strict = ctx && ctx->strict;
   auto fail = [&](std::string reason) -> mlir::Type {
     if (ctx)
@@ -5312,6 +5341,11 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         mlir::Type argType = recurse(arg.get());
         if (strict && !argType)
           return {};
+        if (callAskedAgain == node && isUnionOfBoolAndInt(argType)) {
+          callMetRungUnion = true;
+          if (rungUnionsAsInt)
+            argType = intType();
+        }
         positional.push_back(argType);
       }
     }
@@ -5938,6 +5972,21 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     return functionSignature(*node).callable;
   }
   return object();
+}
+
+bool TypeSystem::isUnionOfBoolAndInt(mlir::Type type) const {
+  auto unionType = mlir::dyn_cast_if_present<py::UnionType>(widenLiteral(type));
+  if (!unionType)
+    return false;
+  bool sawBool = false;
+  for (mlir::Type member : unionType.getMemberTypes()) {
+    mlir::Type rung = widenLiteral(member);
+    if (rung == boolType())
+      sawBool = true;
+    else if (rung != intType())
+      return false;
+  }
+  return sawBool;
 }
 
 mlir::Type

@@ -12,6 +12,8 @@
 
 #include "Common/RuntimeLibrary.h"
 #include "Common/LibcPrototypes.h"
+#include "Common/LoweringPipeline.h"
+#include "PyDialectTypes.h"
 #include "Common/RuntimeSupport.h"
 #include "Common/SupportBuilder.h"
 #include "Common/UnwindABI.h"
@@ -3927,6 +3929,59 @@ TEST(DriverTest, EveryDroppedOrDoubledReleaseIsRefused) {
       EXPECT_FALSE(mutated(spec).succeeded) << spec << " was accepted";
     }
   }
+}
+
+TEST(DriverTest, AConstructorThatWouldDropArgumentsIsRefused) {
+  // A `range(0, 9, k)` object whose step is made a value no `range.__new__`
+  // overload takes -- a union, which the emitter converts or refuses before
+  // the lowering -- is refused by name, not built as the one-argument
+  // `range(0)` its first argument fits.
+  mlir::MLIRContext context(testRegistry());
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  mlir::ScopedDiagnosticHandler capture(
+      &context, [&](mlir::Diagnostic &diagnostic) {
+        diag << diagnostic.str() << "\n";
+        return mlir::success();
+      });
+  lython::driver::DriverOptions options;
+  mlir::OwningOpRef<mlir::ModuleOp> module;
+  ASSERT_TRUE(mlir::succeeded(lython::driver::emitMLIRFromSource(
+      "def stepped(k: int) -> str:\n"
+      "    return repr(range(0, 9, k))\n"
+      "print(stepped(2))\n",
+      "<test>.py", "<lython-no-import-dir>", options, context, module, diag)))
+      << diagnostics;
+  mlir::Type intType = py::ContractType::get(&context, "builtins.int");
+  mlir::Type unionType = py::UnionType::getNormalized(
+      &context, {py::ContractType::get(&context, "builtins.bool"), intType});
+  unsigned rewritten = 0;
+  module->walk([&](mlir::Operation *op) {
+    auto owner = op->getAttrOfType<mlir::StringAttr>("ly.constructor.owner");
+    if (op->getName().getStringRef() != "py.new" || !owner ||
+        owner.getValue() != "range" || op->getNumOperands() < 2)
+      return;
+    mlir::Operation *pack = op->getOperand(1).getDefiningOp();
+    if (!pack || pack->getName().getStringRef() != "py.pack" ||
+        pack->getNumOperands() != 3)
+      return;
+    mlir::OpBuilder builder(pack);
+    mlir::OperationState wrap(pack->getLoc(), "py.union.wrap");
+    wrap.addOperands(pack->getOperand(2));
+    wrap.addTypes(unionType);
+    pack->setOperand(2, builder.create(wrap)->getResult(0));
+    ++rewritten;
+  });
+  ASSERT_GT(rewritten, 0u);
+  py::TensorLoweringTarget target =
+      lython::driver::detectTensorLoweringTarget(options);
+  ASSERT_TRUE(mlir::succeeded(lython::driver::stampTargetPlatformFacts(
+      *module, target, options, diag)));
+  EXPECT_TRUE(mlir::failed(
+      py::runLoweringPipeline(*module, target, py::IRDumpConfig{})));
+  EXPECT_NE(diagnostics.find("builtins.range.__new__ takes 1 of the 3 values"),
+            std::string::npos)
+      << diagnostics;
 }
 
 TEST(DriverTest, EveryReleaseOfAChosenOrCarriedIntIsChecked) {

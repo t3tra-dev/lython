@@ -658,6 +658,9 @@ public:
   // theirs, instead of a union nothing can call.
   mlir::Type commonCallableJoin(mlir::ArrayRef<mlir::Type> members) const;
   mlir::Type widenLiteral(mlir::Type type) const;
+  // A union of bool and int (literals widened), with a bool among them: the
+  // value a call passes where int is declared as the int it is.
+  bool isUnionOfBoolAndInt(mlir::Type type) const;
 
   // Synthesized-function support (lazy iterator desugars): pins an
   // unannotated parameter node to a concrete type, exactly like the module
@@ -778,6 +781,12 @@ private:
   // whose inference variable is unresolved takes its default's type, but not
   // before the call sites have had their rounds to bind that variable.
   mutable bool defaultsDescribeParameters = true;
+  // The call whose type is being asked again with each positional union of
+  // bool and int as the int its emission passes, whether this asking is that
+  // one, and whether its first asking met such a union (`inferExprImpl`).
+  mutable const parser::Node *callAskedAgain = nullptr;
+  mutable bool rungUnionsAsInt = false;
+  mutable bool callMetRungUnion = false;
   llvm::DenseMap<const parser::Node *, mlir::Type> resultTypeOverrides;
   std::string targetTriple;
   bool jsHost = false;
