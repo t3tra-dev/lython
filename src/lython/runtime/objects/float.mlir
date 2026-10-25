@@ -931,8 +931,11 @@ module attributes {
     cf.br ^assemble(%sp, %sp_len, %zero, %neg_sp : memref<?xi32>, i64, i64, i1)
 
   ^finite_case:
-    %dig_cap_idx = arith.constant 800 : index
-    %dig_store = memref.alloc(%dig_cap_idx) : memref<?xi8>
+    // On the stack, as round()'s is: a fixed 800 bytes is past the object
+    // allocator's 512-byte classes, so a heap buffer went to the system
+    // allocator and back on every format -- its free alone read the clock.
+    %dig_fixed = memref.alloca() : memref<800xi8>
+    %dig_store = memref.cast %dig_fixed : memref<800xi8> to memref<?xi8>
     %is_zero_v = arith.cmpf oeq, %abs, %zero_f : f64
     %dtoa:2 = scf.if %is_zero_v -> (i64, i64) {
       %zc8 = arith.constant 48 : i8
@@ -1040,7 +1043,6 @@ module attributes {
     } else {
       scf.yield %bl#0 : i64
     }
-    memref.dealloc %dig_store : memref<?xi8>
     cf.br ^assemble(%body, %bl_pct, %bl#1, %negative : memref<?xi32>, i64, i64, i1)
 
   ^assemble(%body_a: memref<?xi32>, %body_len_a: i64, %int_len_a: i64, %neg_a: i1):

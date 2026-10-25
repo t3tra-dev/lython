@@ -514,6 +514,360 @@ module {
     func.return %final#0, %final#1 : i64, i64
   }
 
+  // CPython's tens[] and bigtens[] (Python/dtoa.c).
+  memref.global "private" constant @__ly_dtoa_tens : memref<23xf64> = dense<[1.0e0, 1.0e1, 1.0e2, 1.0e3, 1.0e4, 1.0e5, 1.0e6, 1.0e7, 1.0e8, 1.0e9, 1.0e10, 1.0e11, 1.0e12, 1.0e13, 1.0e14, 1.0e15, 1.0e16, 1.0e17, 1.0e18, 1.0e19, 1.0e20, 1.0e21, 1.0e22]>
+  memref.global "private" constant @__ly_dtoa_bigtens : memref<5xf64> = dense<[1.0e16, 1.0e32, 1.0e64, 1.0e128, 1.0e256]>
+
+  func.func private @__ly_dtoa_ten_to(%k: i64) -> f64 {
+    %table = memref.get_global @__ly_dtoa_tens : memref<23xf64>
+    %index = arith.index_cast %k : i64 to index
+    %value = memref.load %table[%index] : memref<23xf64>
+    func.return %value : f64
+  }
+
+  // Trailing zeros of the digits [0, count) dropped.
+  func.func private @__ly_dtoa_trim(%digits: memref<?xi8>, %count: i64) -> i64 {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %zero_ch = arith.constant 48 : i8
+    %false = arith.constant false
+    %trimmed = scf.while (%c = %count) : (i64) -> i64 {
+      %has = arith.cmpi sgt, %c, %zero : i64
+      %is_zero_ch = scf.if %has -> (i1) {
+        %cm1 = arith.subi %c, %one : i64
+        %idx = arith.index_cast %cm1 : i64 to index
+        %ch = memref.load %digits[%idx] : memref<?xi8>
+        %z = arith.cmpi eq, %ch, %zero_ch : i8
+        scf.yield %z : i1
+      } else {
+        scf.yield %false : i1
+      }
+      scf.condition(%is_zero_ch) %c : i64
+    } do {
+    ^bb0(%c: i64):
+      %cm1 = arith.subi %c, %one : i64
+      scf.yield %cm1 : i64
+    }
+    func.return %trimmed : i64
+  }
+
+  // The two ways _Py_dg_dtoa answers modes 2 and 3 without bignums, ported:
+  // floating-point digit generation with a running error bound when the
+  // digit count is at most Quick_max (14), and exact double arithmetic for an
+  // integer below 10^15 (Int_max). Answers (ok, digit count, decimal point)
+  // in __ly_dtoa_counted's terms, ok false when neither applies or the error
+  // bound cannot decide the last digit -- then the bignum path answers, as
+  // CPython's does at its `fast_failed`. A positive finite `u`.
+  // ⛔ Not log10 for the decimal exponent: libm's may round 999.9999999999
+  // up to 3.0, and the floating-point path relies on CPython's estimate
+  // never being too small.
+  func.func private @__ly_dtoa_quick(%u: f64, %fixed_mode: i1, %ndigits: i64, %digits_out: memref<?xi8>) -> (i1, i64, i64) {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %ten = arith.constant 10 : i64
+    %fifteen = arith.constant 15 : i64
+    %sixteen = arith.constant 16 : i64
+    %four = arith.constant 4 : i64
+    %quick_max = arith.constant 14 : i64
+    %ten_pmax = arith.constant 22 : i64
+    %ascii_zero = arith.constant 48 : i64
+    %false = arith.constant false
+    %true = arith.constant true
+    %zero_f = arith.constant 0.0 : f64
+    %half_f = arith.constant 0.5 : f64
+    %one_f = arith.constant 1.0 : f64
+    %five_f = arith.constant 5.0 : f64
+    %seven_f = arith.constant 7.0 : f64
+    %ten_f = arith.constant 10.0 : f64
+    %bits = arith.bitcast %u : f64 to i64
+    %c52 = arith.constant 52 : i64
+    %exp_mask = arith.constant 2047 : i64
+    %shifted = arith.shrui %bits, %c52 : i64
+    %biased = arith.andi %shifted, %exp_mask : i64
+    %denormal = arith.cmpi eq, %biased, %zero : i64
+    cf.cond_br %denormal, ^fail, ^estimate
+
+  ^estimate:
+    // k = floor(log10(u)), possibly one too large but never too small: the
+    // first-order expansion of log10 about 1.5, with the exponent's share.
+    %frac_mask = arith.constant 4503599627370495 : i64
+    %one_exponent = arith.constant 4607182418800017408 : i64
+    %frac = arith.andi %bits, %frac_mask : i64
+    %d2_bits = arith.ori %frac, %one_exponent : i64
+    %d2 = arith.bitcast %d2_bits : i64 to f64
+    %bias = arith.constant 1023 : i64
+    %i_exp = arith.subi %biased, %bias : i64
+    %i_exp_f = arith.sitofp %i_exp : i64 to f64
+    %one_half = arith.constant 1.5 : f64
+    %slope = arith.constant 0.289529654602168 : f64
+    %intercept = arith.constant 0.1760912590558 : f64
+    %log10_2 = arith.constant 0.301029995663981 : f64
+    %d2_off = arith.subf %d2, %one_half : f64
+    %t0 = arith.mulf %d2_off, %slope : f64
+    %t1 = arith.addf %t0, %intercept : f64
+    %t2 = arith.mulf %i_exp_f, %log10_2 : f64
+    %ds_est = arith.addf %t1, %t2 : f64
+    %k_trunc = arith.fptosi %ds_est : f64 to i64
+    %k_trunc_f = arith.sitofp %k_trunc : i64 to f64
+    %ds_negative = arith.cmpf olt, %ds_est, %zero_f : f64
+    %ds_fractional = arith.cmpf one, %ds_est, %k_trunc_f : f64
+    %round_down = arith.andi %ds_negative, %ds_fractional : i1
+    %k_dec = arith.subi %k_trunc, %one : i64
+    %k_floor = arith.select %round_down, %k_dec, %k_trunc : i64
+    %k_nonneg = arith.cmpi sge, %k_floor, %zero : i64
+    %k_small = arith.cmpi sle, %k_floor, %ten_pmax : i64
+    %in_table = arith.andi %k_nonneg, %k_small : i1
+    %k = scf.if %in_table -> (i64) {
+      %power = func.call @__ly_dtoa_ten_to(%k_floor) : (i64) -> f64
+      %below = arith.cmpf olt, %u, %power : f64
+      %k_less = arith.subi %k_floor, %one : i64
+      %exact = arith.select %below, %k_less, %k_floor : i64
+      scf.yield %exact : i64
+    } else {
+      scf.yield %k_floor : i64
+    }
+    %k_check = arith.xori %in_table, %true : i1
+    // mode 2: max(1, ndigits) significant digits; mode 3: ndigits past the
+    // point, so ndigits + k + 1 digits in all.
+    %fixed_count = arith.addi %ndigits, %k : i64
+    %fixed_ilim = arith.addi %fixed_count, %one : i64
+    %sig = arith.maxsi %ndigits, %one : i64
+    %ilim = arith.select %fixed_mode, %fixed_ilim, %sig : i64
+    %ilim1 = arith.select %fixed_mode, %fixed_count, %sig : i64
+    %ilim_nonneg = arith.cmpi sge, %ilim, %zero : i64
+    %ilim_small = arith.cmpi sle, %ilim, %quick_max : i64
+    %try_quick = arith.andi %ilim_nonneg, %ilim_small : i1
+    cf.cond_br %try_quick, ^scale, ^small_integer
+
+  ^scale:
+    // u / 10^k, with ieps counting the roundings that took.
+    %bigtens = memref.get_global @__ly_dtoa_bigtens : memref<5xf64>
+    %k_positive = arith.cmpi sgt, %k, %zero : i64
+    %k_negative = arith.cmpi slt, %k, %zero : i64
+    %scaled:2 = scf.if %k_positive -> (f64, i64) {
+      %low = arith.andi %k, %fifteen : i64
+      %ds0 = func.call @__ly_dtoa_ten_to(%low) : (i64) -> f64
+      %j0 = arith.shrui %k, %four : i64
+      %bletch_bit = arith.andi %j0, %sixteen : i64
+      %bletch = arith.cmpi ne, %bletch_bit, %zero : i64
+      %j_masked = arith.andi %j0, %fifteen : i64
+      %j = arith.select %bletch, %j_masked, %j0 : i64
+      %c4i = arith.constant 4 : index
+      %top = memref.load %bigtens[%c4i] : memref<5xf64>
+      %u_pre = arith.divf %u, %top : f64
+      %u1 = arith.select %bletch, %u_pre, %u : f64
+      %three = arith.constant 3 : i64
+      %ieps0 = arith.select %bletch, %three, %two : i64
+      %walk:4 = scf.while (%jj = %j, %ii = %zero, %ds = %ds0, %ieps = %ieps0) : (i64, i64, f64, i64) -> (i64, i64, f64, i64) {
+        %more = arith.cmpi ne, %jj, %zero : i64
+        scf.condition(%more) %jj, %ii, %ds, %ieps : i64, i64, f64, i64
+      } do {
+      ^bb0(%jj: i64, %ii: i64, %ds: f64, %ieps: i64):
+        %bit = arith.andi %jj, %one : i64
+        %set = arith.cmpi ne, %bit, %zero : i64
+        %index = arith.index_cast %ii : i64 to index
+        %big = memref.load %bigtens[%index] : memref<5xf64>
+        %ds_mul = arith.mulf %ds, %big : f64
+        %ds_next = arith.select %set, %ds_mul, %ds : f64
+        %ieps_inc = arith.addi %ieps, %one : i64
+        %ieps_next = arith.select %set, %ieps_inc, %ieps : i64
+        %jj_next = arith.shrui %jj, %one : i64
+        %ii_next = arith.addi %ii, %one : i64
+        scf.yield %jj_next, %ii_next, %ds_next, %ieps_next : i64, i64, f64, i64
+      }
+      %u2 = arith.divf %u1, %walk#2 : f64
+      scf.yield %u2, %walk#3 : f64, i64
+    } else {
+      %neg:2 = scf.if %k_negative -> (f64, i64) {
+        %j1 = arith.subi %zero, %k : i64
+        %low = arith.andi %j1, %fifteen : i64
+        %scale0 = func.call @__ly_dtoa_ten_to(%low) : (i64) -> f64
+        %u1 = arith.mulf %u, %scale0 : f64
+        %j = arith.shrui %j1, %four : i64
+        %walk:4 = scf.while (%jj = %j, %ii = %zero, %uu = %u1, %ieps = %two) : (i64, i64, f64, i64) -> (i64, i64, f64, i64) {
+          %more = arith.cmpi ne, %jj, %zero : i64
+          scf.condition(%more) %jj, %ii, %uu, %ieps : i64, i64, f64, i64
+        } do {
+        ^bb0(%jj: i64, %ii: i64, %uu: f64, %ieps: i64):
+          %bit = arith.andi %jj, %one : i64
+          %set = arith.cmpi ne, %bit, %zero : i64
+          %index = arith.index_cast %ii : i64 to index
+          %big = memref.load %bigtens[%index] : memref<5xf64>
+          %uu_mul = arith.mulf %uu, %big : f64
+          %uu_next = arith.select %set, %uu_mul, %uu : f64
+          %ieps_inc = arith.addi %ieps, %one : i64
+          %ieps_next = arith.select %set, %ieps_inc, %ieps : i64
+          %jj_next = arith.shrui %jj, %one : i64
+          %ii_next = arith.addi %ii, %one : i64
+          scf.yield %jj_next, %ii_next, %uu_next, %ieps_next : i64, i64, f64, i64
+        }
+        scf.yield %walk#2, %walk#3 : f64, i64
+      } else {
+        scf.yield %u, %two : f64, i64
+      }
+      scf.yield %neg#0, %neg#1 : f64, i64
+    }
+    // An estimate one too large leaves u below 1: take one digit fewer.
+    %below_one = arith.cmpf olt, %scaled#0, %one_f : f64
+    %some_digits = arith.cmpi sgt, %ilim, %zero : i64
+    %fix0 = arith.andi %k_check, %below_one : i1
+    %fix = arith.andi %fix0, %some_digits : i1
+    %ilim1_empty = arith.cmpi sle, %ilim1, %zero : i64
+    %fix_fails = arith.andi %fix, %ilim1_empty : i1
+    cf.cond_br %fix_fails, ^small_integer, ^fixed_up
+
+  ^fixed_up:
+    %u_times_ten = arith.mulf %scaled#0, %ten_f : f64
+    %uq = arith.select %fix, %u_times_ten, %scaled#0 : f64
+    %ilim_q = arith.select %fix, %ilim1, %ilim : i64
+    %k_less = arith.subi %k, %one : i64
+    %kq = arith.select %fix, %k_less, %k : i64
+    %ieps_more = arith.addi %scaled#1, %one : i64
+    %ieps_q = arith.select %fix, %ieps_more, %scaled#1 : i64
+    // eps = (ieps*u + 7) * 2^-(P-1): CPython lowers the exponent field by 52.
+    %ieps_f = arith.sitofp %ieps_q : i64 to f64
+    %eps_a = arith.mulf %ieps_f, %uq : f64
+    %eps_b = arith.addf %eps_a, %seven_f : f64
+    %two_m52 = arith.constant 2.220446049250313e-16 : f64
+    %eps = arith.mulf %eps_b, %two_m52 : f64
+    %no_digit_place = arith.cmpi eq, %ilim_q, %zero : i64
+    cf.cond_br %no_digit_place, ^half_place, ^generate
+
+  ^half_place:
+    // The first digit is the cutoff place: one unit there, or nothing.
+    %over_five = arith.subf %uq, %five_f : f64
+    %neg_eps = arith.negf %eps : f64
+    %clearly_up = arith.cmpf ogt, %over_five, %eps : f64
+    %clearly_down = arith.cmpf olt, %over_five, %neg_eps : f64
+    cf.cond_br %clearly_up, ^one_digit(%kq : i64), ^half_place_down
+
+  ^half_place_down:
+    cf.cond_br %clearly_down, ^no_digits, ^small_integer
+
+  ^generate:
+    %ilim_q_m1 = arith.subi %ilim_q, %one : i64
+    %ten_place = func.call @__ly_dtoa_ten_to(%ilim_q_m1) : (i64) -> f64
+    %eps_g = arith.mulf %eps, %ten_place : f64
+    %gen:3 = scf.while (%i = %one, %uu = %uq, %lim = %ilim_q) : (i64, f64, i64) -> (i64, f64, i64) {
+      %digit = arith.fptosi %uu : f64 to i64
+      %digit_f = arith.sitofp %digit : i64 to f64
+      %rest = arith.subf %uu, %digit_f : f64
+      %exhausted = arith.cmpf oeq, %rest, %zero_f : f64
+      %lim_now = arith.select %exhausted, %i, %lim : i64
+      %ch_i64 = arith.addi %digit, %ascii_zero : i64
+      %ch = arith.trunci %ch_i64 : i64 to i8
+      %pos_i64 = arith.subi %i, %one : i64
+      %pos = arith.index_cast %pos_i64 : i64 to index
+      memref.store %ch, %digits_out[%pos] : memref<?xi8>
+      %last = arith.cmpi eq, %i, %lim_now : i64
+      %go = arith.xori %last, %true : i1
+      scf.condition(%go) %i, %rest, %lim_now : i64, f64, i64
+    } do {
+    ^bb0(%i: i64, %rest: f64, %lim: i64):
+      %i_next = arith.addi %i, %one : i64
+      %u_next = arith.mulf %rest, %ten_f : f64
+      scf.yield %i_next, %u_next, %lim : i64, f64, i64
+    }
+    %up_edge = arith.addf %half_f, %eps_g : f64
+    %down_edge = arith.subf %half_f, %eps_g : f64
+    %round_up = arith.cmpf ogt, %gen#1, %up_edge : f64
+    %round_down_q = arith.cmpf olt, %gen#1, %down_edge : f64
+    cf.cond_br %round_up, ^bump(%gen#0, %kq : i64, i64), ^quick_down
+
+  ^quick_down:
+    cf.cond_br %round_down_q, ^done(%gen#0, %kq : i64, i64), ^small_integer
+
+  ^small_integer:
+    // An integer below 10^15 divides exactly by tens[k].
+    %floor_u = math.floor %u : f64
+    %integral = arith.cmpf oeq, %floor_u, %u : f64
+    %int_max = arith.constant 14 : i64
+    %k_fits = arith.cmpi sle, %k, %int_max : i64
+    %k_nonneg2 = arith.cmpi sge, %k, %zero : i64
+    %k_ok = arith.andi %k_fits, %k_nonneg2 : i1
+    %small = arith.andi %integral, %k_ok : i1
+    cf.cond_br %small, ^small_digits, ^fail
+
+  ^small_digits:
+    %ds_int = func.call @__ly_dtoa_ten_to(%k) : (i64) -> f64
+    // A cutoff at or above the integer's first digit (round(x, -n)): one unit
+    // there or nothing, an exact half going down.
+    %nd_negative = arith.cmpi slt, %ndigits, %zero : i64
+    %no_place = arith.cmpi sle, %ilim, %zero : i64
+    %cut_above0 = arith.andi %fixed_mode, %nd_negative : i1
+    %cut_above = arith.andi %cut_above0, %no_place : i1
+    cf.cond_br %cut_above, ^cut_above, ^small_loop
+
+  ^cut_above:
+    %ilim_negative = arith.cmpi slt, %ilim, %zero : i64
+    %five_ds = arith.mulf %five_f, %ds_int : f64
+    %at_most_half = arith.cmpf ole, %u, %five_ds : f64
+    %nothing = arith.ori %ilim_negative, %at_most_half : i1
+    cf.cond_br %nothing, ^no_digits, ^one_digit(%k : i64)
+
+  ^small_loop:
+    %sgen:4 = scf.while (%i = %one, %uu = %u) : (i64, f64) -> (i64, f64, i64, i1) {
+      %q = arith.divf %uu, %ds_int : f64
+      %digit = arith.fptosi %q : f64 to i64
+      %digit_f = arith.sitofp %digit : i64 to f64
+      %taken = arith.mulf %digit_f, %ds_int : f64
+      %rest = arith.subf %uu, %taken : f64
+      %ch_i64 = arith.addi %digit, %ascii_zero : i64
+      %ch = arith.trunci %ch_i64 : i64 to i8
+      %pos_i64 = arith.subi %i, %one : i64
+      %pos = arith.index_cast %pos_i64 : i64 to index
+      memref.store %ch, %digits_out[%pos] : memref<?xi8>
+      %exhausted = arith.cmpf oeq, %rest, %zero_f : f64
+      %at_limit = arith.cmpi eq, %i, %ilim : i64
+      %stop = arith.ori %exhausted, %at_limit : i1
+      // Round at the limit when something is left: twice the rest against
+      // tens[k], a tie going to the even digit.
+      %twice = arith.addf %rest, %rest : f64
+      %over = arith.cmpf ogt, %twice, %ds_int : f64
+      %tie = arith.cmpf oeq, %twice, %ds_int : f64
+      %odd_bit = arith.andi %digit, %one : i64
+      %odd = arith.cmpi ne, %odd_bit, %zero : i64
+      %tie_up = arith.andi %tie, %odd : i1
+      %up0 = arith.ori %over, %tie_up : i1
+      %not_exhausted = arith.xori %exhausted, %true : i1
+      %up1 = arith.andi %up0, %not_exhausted : i1
+      %up = arith.andi %up1, %at_limit : i1
+      %go = arith.xori %stop, %true : i1
+      scf.condition(%go) %i, %rest, %digit, %up : i64, f64, i64, i1
+    } do {
+    ^bb0(%i: i64, %rest: f64, %digit: i64, %up: i1):
+      %i_next = arith.addi %i, %one : i64
+      %u_next = arith.mulf %rest, %ten_f : f64
+      scf.yield %i_next, %u_next : i64, f64
+    }
+    cf.cond_br %sgen#3, ^bump(%sgen#0, %k : i64, i64), ^done(%sgen#0, %k : i64, i64)
+
+  ^bump(%count_b: i64, %k_b: i64):
+    %bumped:2 = func.call @__ly_d4_round_up(%digits_out, %count_b) : (memref<?xi8>, i64) -> (i64, i64)
+    %k_after = arith.addi %k_b, %bumped#1 : i64
+    cf.br ^done(%bumped#0, %k_after : i64, i64)
+
+  ^done(%count_d: i64, %k_d: i64):
+    %trimmed = func.call @__ly_dtoa_trim(%digits_out, %count_d) : (memref<?xi8>, i64) -> i64
+    %decpt = arith.addi %k_d, %one : i64
+    func.return %true, %trimmed, %decpt : i1, i64, i64
+
+  ^one_digit(%k_o: i64):
+    %one_ch = arith.constant 49 : i8
+    %c0 = arith.constant 0 : index
+    memref.store %one_ch, %digits_out[%c0] : memref<?xi8>
+    %decpt_o = arith.addi %k_o, %two : i64
+    func.return %true, %one, %decpt_o : i1, i64, i64
+
+  ^no_digits:
+    %decpt_n = arith.subi %zero, %ndigits : i64
+    func.return %true, %zero, %decpt_n : i1, i64, i64
+
+  ^fail:
+    func.return %false, %zero, %zero : i1, i64, i64
+  }
+
   // Fixed-count digits for a positive finite double: `fixed_mode` counts
   // digits after the decimal point ('f'), otherwise `req` is a significant
   // digit count ('e'/'g'). Correctly rounded, half to even, like CPython's
@@ -521,6 +875,13 @@ module {
   // zeros are trimmed (presentation pads), zero digits means the value
   // rounded to zero at the cutoff.
   func.func private @__ly_dtoa_counted(%abs: f64, %fixed_mode: i1, %req: i64, %digits_out: memref<?xi8>) -> (i64, i64) {
+    %quick:3 = func.call @__ly_dtoa_quick(%abs, %fixed_mode, %req, %digits_out) : (f64, i1, i64, memref<?xi8>) -> (i1, i64, i64)
+    cf.cond_br %quick#0, ^quick_answer, ^exact
+
+  ^quick_answer:
+    func.return %quick#1, %quick#2 : i64, i64
+
+  ^exact:
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %two = arith.constant 2 : i64

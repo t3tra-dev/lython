@@ -9368,6 +9368,73 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
   if (reducerArgs && reducerArgs->size() == 1 && reducerArgs->front() &&
       reducerKeywordsUnderstood && (reducer == "max" || reducer == "min")) {
     mlir::Type elementType = reducerElementType();
+    // ⭐ A LIST OF INTS, FLOATS, STRS OR BOOLS WITH NO KEY is CPython's
+    // min_max loop in the runtime (`list.__best_index__`), and the winner is
+    // read once. ⛔ Not the folds below: the accumulator carries the best
+    // element across the loop as an object, boxing every immediate int it
+    // compares, and the index fold boxes the index at every join -- `max(xs)`
+    // over 10,000 ints ran at 0.75x CPython either way. Only these element
+    // types, whose `a > b` is `b < a`, which is the one comparison the runtime
+    // loop asks.
+    if (!reducerKeyNode && !reducerDefaultValue) {
+      auto argContract = mlir::dyn_cast_if_present<py::ContractType>(
+          types.widenLiteral(types.inferExpr(reducerArgs->front().get())));
+      auto elementContract = mlir::dyn_cast_if_present<py::ContractType>(
+          types.widenLiteral(elementType));
+      llvm::StringRef elementName =
+          elementContract ? elementContract.getContractName()
+                          : llvm::StringRef();
+      if (argContract && argContract.getContractName() == "builtins.list" &&
+          (elementName == "builtins.int" || elementName == "builtins.float" ||
+           elementName == "builtins.str" || elementName == "builtins.bool")) {
+        std::string counter = std::to_string(++listCompCounter);
+        std::string src = "__" + reducer.str() + "src" + counter;
+        std::string bestIndex = "__" + reducer.str() + "bi" + counter;
+        Value list = emitExpr(reducerArgs->front().get());
+        values[src] = list;
+        types.bindSymbol(src, list.type);
+        parser::NodePtr greatestNode =
+            synth::constantBool(reducer == "max", expr.range);
+        Value greatest = emitExpr(greatestNode.get());
+        CallInferenceResult inference = types.inferMethodCallWithEvidence(
+            list.type, "__best_index__", {greatest.type});
+        if (inference && requireStaticEvidence(expr, inference)) {
+          Value posPack = emitPack({greatest});
+          Value namePack = emitPack({});
+          Value valuePack = emitPack({});
+          auto call = py::CallOp::create(
+              builder, loc(expr), mlir::TypeRange{inference.resultType},
+              callProtocolFor(inference), list.value, posPack.value,
+              namePack.value, valuePack.value);
+          call->setAttr("ly.bound_method",
+                        builder.getStringAttr("__best_index__"));
+          values[bestIndex] =
+              Value{call.getResults().front(), inference.resultType};
+          types.bindSymbol(bestIndex, inference.resultType);
+          auto nameOf = [&](const std::string &id) {
+            return synth::name(id, expr.range);
+          };
+          parser::NodePtr emptyCheck = synth::ifStmt(
+              synth::compare(nameOf(bestIndex), "Lt",
+                             synth::intConstant(0, expr.range), expr.range),
+              {synth::raiseCall("ValueError",
+                                reducer.str() + "() iterable argument is empty",
+                                expr.range)},
+              {}, expr.range);
+          synthesizedIteratorDefs.push_back(emptyCheck);
+          emitStatement(*emptyCheck);
+          parser::NodePtr winner = synth::subscript(
+              nameOf(src), nameOf(bestIndex), expr.range);
+          synthesizedIteratorDefs.push_back(winner);
+          Value result = emitExpr(winner.get());
+          values.erase(src);
+          values.erase(bestIndex);
+          return result;
+        }
+        values.erase(src);
+        return emitNone(expr);
+      }
+    }
     // The accumulator needs a value of the element type before the first
     // trip; the seen-flag is what keeps it from ever being READ, so only its
     // TYPE has to be right.
