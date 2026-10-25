@@ -384,6 +384,26 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
       readFromAFunction.insert(entry.getKey());
   }
 
+  // ⭐ A CELL'S VALUE IS READ WITH THE NAMES BOUND ABOVE IT, as the module
+  // body runs. A value-bound name is in no table this inference reads, so a
+  // cell computed from one was `object`:
+  //
+  //     D = {1: 5, 4: 7}
+  //     U = D[4]
+  //     def f() -> int:
+  //         return U + 1   # object does not provide manifest method '__add__'
+  //
+  // ⛔ Not bound into the type system: nothing outside the module body can
+  // read a value-bound name, and binding it would say otherwise.
+  llvm::StringMap<mlir::Type> boundAbove;
+  const llvm::StringMap<mlir::Type> noCallables;
+  auto inferBelow = [&](const parser::Node *value) {
+    if (boundAbove.empty())
+      return types.widenLiteral(types.inferExpr(value));
+    return types.widenLiteral(types.inferExpr(
+        value, ExprInferenceContext{noCallables, nullptr, &boundAbove,
+                                    /*strict=*/false}));
+  };
   for (const parser::NodePtr &statement : *body) {
     if (!statement || statement->kind != "Assign")
       continue;
@@ -392,14 +412,17 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
         targets->front()->kind != "Name")
       continue;
     llvm::StringRef name = ast::nameSpelling(*targets->front());
+    const parser::Node *value = ast::node(*statement, "value");
     if (!boundOnce.contains(name) || moduleGlobals.count(name) ||
         moduleConstantBindings.count(name) ||
-        !readFromAFunction.contains(name))
+        !readFromAFunction.contains(name)) {
+      if (value && !types.lookupSymbol(name))
+        boundAbove[name] = inferBelow(value);
       continue;
-    const parser::Node *value = ast::node(*statement, "value");
+    }
     if (!value)
       continue;
-    mlir::Type inferred = types.widenLiteral(types.inferExpr(value));
+    mlir::Type inferred = inferBelow(value);
     // ⭐ AN EMPTY CONTAINER GLOBAL TAKES ITS ELEMENT FROM THE FUNCTIONS THAT
     // FILL IT. The cell's type is decided HERE, before any body is emitted, so
     // seeding it at the assignment (where a local is seeded) is too late --
@@ -453,11 +476,129 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
     // instance); it is only the static type that is spelled differently, and
     // keeping that spelling is what lets the call through the global check its
     // arguments.
+    // ⭐ AND A UNION, as an annotated one gets a cell when a function reads
+    // it: every name here is one. `U = D[4]` over `{1: 5, 4: True}` is
+    // `bool | int`, and without a cell `return U` was "unresolved name 'U'".
     if (!mlir::isa_and_nonnull<py::ContractType>(inferred) &&
-        !mlir::isa_and_nonnull<py::CallableType>(inferred))
+        !mlir::isa_and_nonnull<py::CallableType>(inferred) &&
+        !mlir::isa_and_nonnull<py::UnionType>(inferred))
       continue;
     moduleGlobals[name] = inferred;
     types.bindSymbol(name, inferred);
+  }
+}
+
+llvm::StringSet<>
+ModuleEmitter::unboundModuleTargets(const parser::Node &moduleNode) const {
+  llvm::StringSet<> unbound;
+  const auto *body = ast::nodeList(moduleNode, "body");
+  if (!body)
+    return unbound;
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement)
+      continue;
+    const parser::Node *target = nullptr;
+    if (statement->kind == "AnnAssign") {
+      target = ast::node(*statement, "target");
+    } else if (statement->kind == "Assign") {
+      const auto *targets = ast::nodeList(*statement, "targets");
+      if (targets && targets->size() == 1)
+        target = targets->front().get();
+    }
+    if (target && target->kind == "Name") {
+      llvm::StringRef name = ast::nameSpelling(*target);
+      if (!types.lookupSymbol(name))
+        unbound.insert(name);
+    }
+  }
+  return unbound;
+}
+
+// ⭐ A SIGNATURE READ BEFORE THE GLOBALS WERE BOUND IS READ AGAIN. Every
+// top-level signature is memoized by `registerModule`, which has to run before
+// this pass -- a global's value may call a function -- so a body that returns
+// a global saw an unbound name:
+//
+//     B = True
+//     def f() -> int:
+//         return B
+//     print(f())      # "type of return operand 0 ('!py.literal<True>')
+//                     #  doesn't match function result type"
+//
+// The return walk keeps a lower rung (`belowDeclaredRung`) only when it can
+// see it, and the body then returned the bool its signature said was an int.
+// Forgotten, a signature is recomputed where it is declared, with the globals
+// bound -- as the empty-container globals above and the generators in
+// `emitTopLevelDeclarations` already are. And so is every function that reads
+// a forgotten one: its own walk read the stale result. ⛔ Not every signature:
+// one that reads no late global was read under the facts it has now.
+void ModuleEmitter::forgetSignaturesReadingLateGlobals(
+    const parser::Node &moduleNode, const llvm::StringSet<> &unbound) {
+  llvm::StringSet<> late;
+  for (const auto &entry : unbound)
+    if (types.lookupSymbol(entry.getKey()))
+      late.insert(entry.getKey());
+  const auto *body = ast::nodeList(moduleNode, "body");
+  if (late.empty() || !body)
+    return;
+  struct Reader {
+    const parser::Node *function;
+    llvm::StringRef name;
+    llvm::StringSet<> names;
+  };
+  std::vector<Reader> readers;
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement || (statement->kind != "FunctionDef" &&
+                       statement->kind != "AsyncFunctionDef"))
+      continue;
+    Reader reader{statement.get(), ast::nameSpelling(*statement), {}};
+    ast::walk(statement.get(), [&](const parser::Node &node) {
+      if (node.kind == "Name")
+        reader.names.insert(ast::nameSpelling(node));
+      return ast::Walk::Continue;
+    });
+    readers.push_back(std::move(reader));
+  }
+  llvm::SmallPtrSet<const parser::Node *, 8> forgotten;
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (const Reader &reader : readers) {
+      if (forgotten.contains(reader.function) ||
+          llvm::none_of(reader.names, [&](const auto &entry) {
+            return late.contains(entry.getKey());
+          }))
+        continue;
+      types.forgetSignature(reader.function);
+      types.forgetInferredResult(reader.function);
+      forgotten.insert(reader.function);
+      late.insert(reader.name);
+      changed = true;
+    }
+  }
+  // ...AND THEIR SYMBOLS ARE BOUND AGAIN NOW, until they hold still: a
+  // function declared above the one it calls reads the callee's symbol, which
+  // still held the stale answer (`def h() -> int: return k()` above
+  // `def k() -> int: return B`). ⛔ Not memoized: the declaration reads each
+  // one a last time, with the classes emitted. ⛔ Not a decorated name, which
+  // this pass bound to what the decorator returns.
+  for (std::size_t round = 0; round <= forgotten.size(); ++round) {
+    bool moved = false;
+    for (const Reader &reader : readers) {
+      const auto *decorators =
+          ast::nodeList(*reader.function, "decorator_list");
+      if (!forgotten.contains(reader.function) ||
+          (decorators && !decorators->empty()))
+        continue;
+      mlir::Type callable =
+          types.functionSignature(*reader.function).publicCallable;
+      std::optional<mlir::Type> bound = types.lookupSymbol(reader.name);
+      if (!callable || (bound && *bound == callable))
+        continue;
+      types.bindSymbol(reader.name, callable);
+      moved = true;
+    }
+    if (!moved)
+      break;
   }
 }
 

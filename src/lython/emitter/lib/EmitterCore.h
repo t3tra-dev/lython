@@ -602,6 +602,12 @@ private:
       const parser::Node &moduleNode, llvm::SmallVectorImpl<std::string> &names,
       llvm::SmallVectorImpl<mlir::Attribute> &values) const;
   void collectModuleGlobals(const parser::Node &moduleNode);
+  // The module's assignment targets nothing has bound yet, and the memoized
+  // top-level signatures that read one once `collectModuleGlobals` bound it
+  // (EmitterGlobals.cpp).
+  llvm::StringSet<> unboundModuleTargets(const parser::Node &moduleNode) const;
+  void forgetSignaturesReadingLateGlobals(const parser::Node &moduleNode,
+                                          const llvm::StringSet<> &unbound);
   // Every name any function in `scope` declares `global`, at any depth.
   llvm::StringSet<> moduleGlobalDeclarations(const parser::Node &scope) const;
   // The element/key/value type an empty `[]`, `{}` or `set()` bound to `name`
