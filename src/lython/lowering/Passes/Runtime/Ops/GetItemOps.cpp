@@ -103,10 +103,7 @@ mlir::LogicalResult RuntimeBundleLowerer::bindEvidenceObjectResult(
            mlir::isa<py::CallableType>(resultValue.getType());
   };
   // ⭐ A bool IS AN int, and a local `dict[str, int]` that was given True
-  // holds the bool object. The bundle keeps the bool contract -- its shape is
-  // not int's, and `print(d["b"])` must still say True -- and an int input
-  // that receives it unboxes the truth bit (`appendRuntimeSource`), as the
-  // list read already did.
+  // holds the bool object; the read below is the int it is.
   auto boolReadAsInt = [&] {
     auto contract = mlir::dyn_cast_if_present<py::ContractType>(value.contract);
     auto result = mlir::dyn_cast<py::ContractType>(resultValue.getType());
@@ -119,6 +116,20 @@ mlir::LogicalResult RuntimeBundleLowerer::bindEvidenceObjectResult(
     return op->emitError() << label << " evidence contract " << value.contract
                            << " is not assignable to result "
                            << resultValue.getType();
+  // Its i64 is the truth bit and it holds the bool's singleton, whose int
+  // layout a print reads back as True. ⛔ Not the bool's own lanes under the
+  // int type, which a user function's int parameter could not take ("missing
+  // positional args") and an int merge refused (`max(d["b"], 0)`).
+  if (boolReadAsInt()) {
+    builder.setInsertionPoint(op);
+    mlir::FailureOr<RuntimeBundle> asInt =
+        RuntimeBundleLowerer::boolAsDeferredInt(op, resultValue.getType(),
+                                                value.values);
+    if (mlir::failed(asInt))
+      return mlir::failure();
+    valueBundles[resultValue] = std::move(*asInt);
+    return mlir::success();
+  }
 
   mlir::Type bundleContract = value.contract;
   std::string resultContract = runtimeContractName(resultValue.getType());
@@ -146,8 +157,7 @@ mlir::LogicalResult RuntimeBundleLowerer::bindEvidenceObjectResult(
       return mlir::failure();
     bound = std::move(*widened);
     bound.setObjectLogicalOwnership(/*ownsObject=*/false);
-  } else if (mlir::isa<py::ContractType>(resultValue.getType()) &&
-             !boolReadAsInt()) {
+  } else if (mlir::isa<py::ContractType>(resultValue.getType())) {
     // ⭐ AND A MEMBER-TYPED READ GETS THE MEMBER'S LANES: `{"k": False}["k"]` is
     // a bool, and the slot holds the bool's box. Every consumer that names
     // the ABI -- a module global's cell, a union join -- refused the box
@@ -202,6 +212,20 @@ mlir::LogicalResult RuntimeBundleLowerer::bindSelectedEvidenceObjectResult(
     if (mlir::failed(
             RuntimeBundleLowerer::canonicalizeSlotElementBundle(op, bundle)))
       return mlir::failure();
+  } else if (resultContract && resultContract.getArguments().empty() &&
+             resultContract.getContractName() == "builtins.int" &&
+             bundle.kind == RuntimeBundle::Kind::Object &&
+             bundle.contractName() == "builtins.bool") {
+    // A bool read as an int, as in `bindEvidenceObjectResult`.
+    builder.setInsertionPoint(op);
+    mlir::FailureOr<RuntimeBundle> asInt =
+        RuntimeBundleLowerer::boolAsDeferredInt(op, resultContract,
+                                                bundle.physicalValues());
+    if (mlir::failed(asInt))
+      return mlir::failure();
+    valueBundles[resultValue] = std::move(*asInt);
+    erase.push_back(op);
+    return mlir::success();
   }
   bundle.setObjectLogicalOwnership(/*ownsObject=*/false);
   valueBundles[resultValue] = std::move(bundle);

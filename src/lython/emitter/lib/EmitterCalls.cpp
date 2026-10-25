@@ -5945,6 +5945,11 @@ bool ModuleEmitter::classIsClosed(llvm::StringRef contract) const {
   if (contract == "builtins.object" || contract == "typing.Any" ||
       contract == "builtins.type")
     return false;
+  // ⭐ AND `int`: bool is its builtin subclass, and a list or field declared
+  // int keeps a bool's object -- `type(xs[0])` for `xs: list[int] = [True]`
+  // is bool. ⛔ Not found below, which walks only the program's classes.
+  if (contract == "builtins.int")
+    return false;
   llvm::StringRef leaf = contract.rsplit('.').second;
   if (leaf.empty())
     leaf = contract;
@@ -8256,9 +8261,13 @@ ModuleEmitter::tryEmitIntCall(const parser::Node &expr,
   mlir::Type argumentType =
       types.widenLiteral(types.inferExpr(intArgs->front().get()));
   if (argumentType == types.intType()) {
-    // int is immutable, so int(n) is the identity (CPython returns n).
-    Value argument = emitExpr(intArgs->front().get());
-    return coerceValue(argument, types.intType(), expr);
+    // ⭐ int(n) IS AN EXACT INT, and an int-declared slot or field may hold a
+    // bool: `int(xs[0])` for `xs: list[int] = [True]` is 1. `n + 0` is the
+    // int of n's value, n itself in value for an exact int.
+    // ⛔ Not the identity it was, which answered True there.
+    parser::NodePtr exact = synth::binOp(
+        intArgs->front(), "Add", synth::intConstant(0, expr.range), expr.range);
+    return coerceValue(emitExpr(exact.get()), types.intType(), expr);
   }
   if (argumentType == types.boolType()) {
     // int(True) == 1 / int(False) == 0: widen the truth bit.

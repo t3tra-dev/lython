@@ -276,6 +276,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerTypeOf(py::TypeOfOp op) {
   mlir::Value word;
   if (input->kind == RuntimeBundle::Kind::TypeObject) {
     word = type_objects::classWord(builder, loc, module, "builtins.type");
+  } else if (runtimeContractName(staticType) == "builtins.int") {
+    // An int-declared slot or field may have kept a bool's object.
+    word = RuntimeBundleLowerer::intRuntimeClassWord(op, *input);
   } else if (headerless() ||
              (!RuntimeBundleLowerer::isBuiltinsObjectContract(input->contract) &&
               !RuntimeBundleLowerer::classForContract(staticType) &&
@@ -1623,6 +1626,70 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIs(py::IsOp op) {
   };
   builder.setInsertionPoint(op);
   mlir::Location loc = op.getLoc();
+  // ⭐ AN INT IS A BOOL OBJECT when an int-declared slot or field kept one,
+  // and bools are singletons: the int is that bool exactly when its class is
+  // bool and its value is the bool's. ⛔ Not the header compare below: a bool
+  // is a truth bit with no header of its own here.
+  {
+    const RuntimeBundle *intSide = nullptr;
+    const RuntimeBundle *boolSide = nullptr;
+    for (auto [input, side] : llvm::zip(inputs, sources)) {
+      std::string declared = runtimeContractName(input.getType());
+      if (declared == "builtins.int")
+        intSide = side;
+      else if (declared == "builtins.bool")
+        boolSide = side;
+    }
+    if (intSide && boolSide) {
+      // A bool's truth bit, whether its lane is the bit or the boxed singleton.
+      auto truthBit = [&](const RuntimeBundle &side) -> mlir::Value {
+        if (side.physicalValues().empty())
+          return {};
+        if (side.physicalValues().front().getType().isInteger(1))
+          return side.physicalValues().front();
+        std::optional<RuntimeSymbol> unbox =
+            manifest.primitive("builtins.bool", "unbox");
+        if (!unbox || unbox->function.getFunctionType().getInput(0) !=
+                          side.physicalValues().front().getType())
+          return {};
+        return RuntimeBundleLowerer::createRuntimeCall(loc, *unbox,
+                                                       side.physicalValues())
+            .getResult(0);
+      };
+      mlir::Value bit = truthBit(*boolSide);
+      mlir::Value value;
+      if (intSide->contractName() == "builtins.bool") {
+        if (mlir::Value own = truthBit(*intSide))
+          value = mlir::arith::ExtUIOp::create(builder, loc,
+                                               builder.getI64Type(), own)
+                      .getResult();
+      } else if (intSide->primitiveI64) {
+        value = intSide->primitiveI64->value;
+      } else if (std::optional<RuntimeSymbol> tryUnbox =
+                     manifest.primitive("builtins.int", "try_unbox.i64");
+                 tryUnbox && intSide->physicalValues().size() == 1) {
+        value = RuntimeBundleLowerer::createRuntimeCall(
+                    loc, *tryUnbox, intSide->physicalValues())
+                    .getResult(0);
+      }
+      if (!bit || !value)
+        return op.emitError()
+               << "identity of an int and a bool needs the int's value and "
+                  "the bool's truth bit";
+      mlir::Value isBool = RuntimeBundleLowerer::classTestMatches(
+          loc, RuntimeBundleLowerer::intRuntimeClassWord(op, *intSide),
+          "builtins.bool");
+      mlir::Value sameValue = mlir::arith::CmpIOp::create(
+          builder, loc, mlir::arith::CmpIPredicate::eq, value,
+          mlir::arith::ExtUIOp::create(builder, loc, builder.getI64Type(), bit)
+              .getResult());
+      op.getResult().replaceAllUsesWith(
+          mlir::arith::AndIOp::create(builder, loc, isBool, sameValue)
+              .getResult());
+      erase.push_back(op);
+      return mlir::success();
+    }
+  }
   // Two class values are the same class when they view one type object.
   if (sources.front()->kind == RuntimeBundle::Kind::TypeObject &&
       sources.back()->kind == RuntimeBundle::Kind::TypeObject) {
