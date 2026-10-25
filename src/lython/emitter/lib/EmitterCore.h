@@ -1812,6 +1812,11 @@ private:
   bool numericRepresentationMismatch(mlir::Type declared, mlir::Type assigned,
                                      mlir::Type &declaredLeaf,
                                      mlir::Type &assignedLeaf) const;
+  // A bool -- or a union of bool and int -- met where int is declared by a
+  // storage or a callee that cannot take it as itself, and the int it is
+  // there (EmitterExpressions.cpp).
+  bool boolKeptAsInt(mlir::Type declared, mlir::Type assigned) const;
+  Value rungsAsInt(Value value, const parser::Node &anchor);
   // The declared-cell name a container expression reads (a module global or a
   // class attribute), or empty when it is not one.
   std::string declaredCellNameFor(const parser::Node *container) const;

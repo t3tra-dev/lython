@@ -6190,6 +6190,13 @@ bool ModuleEmitter::inlineArgumentFits(mlir::Type actual,
     return true;
   if (isAssignableWithStaticEvidence(actual, expected, module))
     return true;
+  // ⭐ AND A UNION OF NUMERIC RUNGS AT OR BELOW THE DECLARED ONE, as a lone
+  // lower rung is: the inlined body binds the value as it is, which is what a
+  // free function's specialization at the union does (`lowerRungParameter`).
+  // `acc.add(d[k])` over `{1: 5, 4: True}` was refused.
+  if (mlir::isa<py::UnionType>(actual) &&
+      belowDeclaredRung(types, actual, expected))
+    return true;
   // ⭐ A VALUE FITS A UNION WHEN IT FITS A MEMBER, by the rules below as much
   // as by assignability: `run(result: TestResult | None)` reached by a
   // TextTestResult was refused, though a TestResult parameter takes the

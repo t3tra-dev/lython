@@ -2273,8 +2273,10 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
       // correct: a local has no declared cell, so the name simply carries the
       // type the value has. The cell is what makes this a question.
       mlir::Type declaredLeaf, assignedLeaf;
-      if (numericRepresentationMismatch(type, value.type, declaredLeaf,
-                                        assignedLeaf)) {
+      bool keptAsInt = boolKeptAsInt(type, value.type);
+      if (!keptAsInt && numericRepresentationMismatch(type, value.type,
+                                                      declaredLeaf,
+                                                      assignedLeaf)) {
         auto spell = [&](mlir::Type numeric) -> llvm::StringRef {
           if (numeric == types.boolType())
             return "bool";
@@ -2297,7 +2299,8 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
                 "type"});
         return;
       }
-      Value coerced = coerceValue(value, type, target);
+      Value coerced = keptAsInt ? rungsAsInt(value, target)
+                                : coerceValue(value, type, target);
       auto op = py::GlobalSetOp::create(builder, loc(target),
                                         builder.getStringAttr(name),
                                         coerced.value);
@@ -2644,6 +2647,15 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
                                 "__setslice__", value);
       return;
     }
+    // A union of bool and int where the element is int, as an argument
+    // (`emitCallOperands`): `m[k] = d[j]` over `{1: 5, 4: True}`.
+    if (mlir::isa<py::UnionType>(value.type))
+      if (std::optional<py::CallableType> expected =
+              types.manifestMethodCallExpectations(container.type,
+                                                   "__setitem__", 2);
+          expected && expected->getPositionalTypes().size() == 2 &&
+          boolKeptAsInt(expected->getPositionalTypes()[1], value.type))
+        value = rungsAsInt(value, target);
     CallInferenceResult inference = types.inferMethodCallWithEvidence(
         container.type, "__setitem__", {index.type, value.type});
     if (!requireStaticEvidence(target, inference))

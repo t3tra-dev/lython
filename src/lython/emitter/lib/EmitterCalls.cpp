@@ -192,6 +192,14 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
                               valueNode,
                               expectedFor(operands.positionalTypes.size()))
                         : emitExpr(valueNode);
+      // ⭐ A UNION OF bool AND int WHERE int IS EXPECTED is the int it is:
+      // `xs.append(d[k])` over `{1: 5, 4: True}` had no signature for the
+      // union, and the element keeps the bool's own object either way.
+      if (positionalAligned && !unpacked &&
+          mlir::isa<py::UnionType>(value.type) &&
+          boolKeptAsInt(expectedFor(operands.positionalTypes.size()),
+                        value.type))
+        value = rungsAsInt(value, *valueNode);
       // ⭐ A UNION OF CLASSES BELOW THE PARAMETER'S IS THAT CLASS: `describe(
       // pick())` with `pick() -> ValueError | KeyError` and `describe(e:
       // Exception)` handed the call the union's tag and both members' lanes,
@@ -818,6 +826,54 @@ Value ModuleEmitter::emitCallableDispatch(const parser::Node &anchor,
       if (!normalizeDynamicUnpacks(anchor, *target, normalized))
         return emitNone(anchor);
       chosen = &normalized;
+    }
+  // ⭐ A bool, OR A UNION OF bool AND int, GIVEN AN int PARAMETER is passed
+  // as the int it is. A function reached through a value has one body, at
+  // its declared type, so it cannot be specialized at the argument's rung as
+  // a direct call is: `f(True)` for `f: Callable[[int], int]` failed in the
+  // lowering ("arguments do not match Callable contract") and `f(d[k])` was
+  // refused at emit. The int keeps the bool's object, so the callee sees it.
+  // A builtin's overloads say which one the call takes only once it is
+  // resolved: asked with each such union as the int it becomes, the overload
+  // that answers says where an int is declared. ⛔ Not a lone bool there: the
+  // manifest ABI widens its bit, and its result is the builtin's.
+  CallOperands asInts;
+  py::CallableType callable = mlir::dyn_cast_if_present<py::CallableType>(
+      types.widenLiteral(callee.type));
+  bool unionsOnly = false;
+  if (!callable && chosen->valid &&
+      !mlir::isa<py::TypeType>(types.widenLiteral(callee.type))) {
+    llvm::SmallVector<mlir::Type, 4> asked(chosen->positionalTypes.begin(),
+                                           chosen->positionalTypes.end());
+    bool anyUnion = false;
+    for (mlir::Type &type : asked)
+      if (mlir::isa<py::UnionType>(type) &&
+          boolKeptAsInt(types.intType(), type)) {
+        type = types.intType();
+        anyUnion = true;
+      }
+    if (anyUnion) {
+      CallInferenceResult chosenOverload = types.inferCallWithEvidence(
+          callee.type, asked, chosen->keywordTypes);
+      callable = mlir::dyn_cast_if_present<py::CallableType>(
+          chosenOverload.evidence.callableContract);
+      unionsOnly = true;
+    }
+  }
+  if (callable && chosen->valid)
+    for (auto [index, value] : llvm::enumerate(chosen->positional)) {
+      if (index >= callable.getPositionalTypes().size() ||
+          index >= chosen->positionalUnpacked.size() ||
+          chosen->positionalUnpacked[index] ||
+          (unionsOnly && !mlir::isa<py::UnionType>(value.type)) ||
+          !boolKeptAsInt(callable.getPositionalTypes()[index], value.type))
+        continue;
+      if (chosen != &asInts) {
+        asInts = *chosen;
+        chosen = &asInts;
+      }
+      asInts.positional[index] = rungsAsInt(value, anchor);
+      asInts.positionalTypes[index] = asInts.positional[index].type;
     }
   const CallOperands &operands = *chosen;
   if (!operands.valid) {
@@ -10439,6 +10495,11 @@ ModuleEmitter::tryEmitRoundCall(const parser::Node &expr,
     inputs.push_back(receiver.value);
     if (explicitDigits) {
       Value ndigits = emitExpr((*bound)[1]);
+      // A union of bool and int is the int it is, as an argument
+      // (`emitCallableDispatch`).
+      if (mlir::isa<py::UnionType>(ndigits.type) &&
+          boolKeptAsInt(types.intType(), ndigits.type))
+        ndigits = rungsAsInt(ndigits, expr);
       inputs.push_back(ndigits.value);
       extraTypes.push_back(ndigits.type);
     }

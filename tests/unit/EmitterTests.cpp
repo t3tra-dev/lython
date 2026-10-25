@@ -2670,20 +2670,16 @@ TEST(EmitterTest, AModuleGlobalContainerNamesItsElementRepresentation) {
 }
 
 TEST(EmitterTest, ACellsElementStorageNamesItsRepresentation) {
-  // A cell holds ONE element type and its subscript read decodes with that
-  // type's lane count, so an element written at a different numeric rung came
-  // back as something else: `xs: list[int] = [1, 2]; xs[0] = True` printed
-  // `[True, 2] 0` -- the container's repr decodes by tag and was right, the
-  // subscript decoded by the declaration and was not.
+  // A cell's element type is its storage one level in, so a CONTAINER of
+  // bools stored as an element of a `list[list[int]]` cell is refused, and the
+  // refusal names the element assignment.
   const char *cells[] = {
-      "xs: list[int] = [1, 2]\nxs[0] = True\nprint(xs[0])\n",
-      "xs: list[int] = [1, 2]\nxs.append(True)\nprint(xs[2])\n",
-      "d: dict[str, int] = {\"a\": 1}\nd[\"b\"] = True\nprint(d[\"b\"])\n",
-      "class P:\n    v: list[int] = [1, 2]\nP.v[0] = True\nprint(P.v[0])\n",
+      "xs: list[list[int]] = [[1]]\nxs.append([True])\nprint(xs)\n",
+      "xs: list[list[int]] = [[1]]\nxs[0] = [True]\nprint(xs)\n",
       // Written from inside a function, where the name still resolves to the
       // module global's cell.
-      ("xs: list[int] = [1, 2]\ndef go() -> None:\n    xs[0] = True\n"
-       "go()\nprint(xs[0])\n"),
+      ("xs: list[list[int]] = [[1]]\ndef go() -> None:\n    xs[0] = [True]\n"
+       "go()\nprint(xs)\n"),
   };
   for (const char *cell : cells) {
     mlir::MLIRContext context(testRegistry());
@@ -2697,7 +2693,7 @@ TEST(EmitterTest, ACellsElementStorageNamesItsRepresentation) {
   }
 
   // A LOCAL is not a cell: the emitter refines the name's element type at the
-  // store, so all four of these are correct today and must stay compiling.
+  // store, so these are correct and must stay compiling.
   const char *locals[] = {
       "def go() -> None:\n    xs: list[int] = [1, 2]\n    xs[0] = True\n"
       "    print(xs[0])\ngo()\n",
@@ -2707,6 +2703,15 @@ TEST(EmitterTest, ACellsElementStorageNamesItsRepresentation) {
       "    print(xs[0])\ngo()\n",
       // And a same-rung store into a cell is not this question at all.
       "xs: list[int] = [1, 2]\nxs[0] = 5\nprint(xs[0])\n",
+      // A bool written into an int cell's element is kept as its own object,
+      // which the int element reads back as the bool
+      // (tests/python/test_bool_in_module_storage.py runs these).
+      "xs: list[int] = [1, 2]\nxs[0] = True\nprint(xs[0])\n",
+      "xs: list[int] = [1, 2]\nxs.append(True)\nprint(xs[2])\n",
+      "d: dict[str, int] = {\"a\": 1}\nd[\"b\"] = True\nprint(d[\"b\"])\n",
+      "class P:\n    v: list[int] = [1, 2]\nP.v[0] = True\nprint(P.v[0])\n",
+      ("xs: list[int] = [1, 2]\ndef go() -> None:\n    xs[0] = True\n"
+       "go()\nprint(xs[0])\n"),
       // ⛔ A dict KEY of a lower rung is correct and must stay correct:
       // CPython unifies `db[True]` with `db[1]` by hash and equality, and so
       // does this compiler (golden dict_generic_keys).
