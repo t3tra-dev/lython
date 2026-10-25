@@ -2,7 +2,8 @@
 # list[int] or a tuple[int, ...], a value of a dict[str, int] -- is still the
 # bool: its type is bool, isinstance(v, bool) holds, it is True (the
 # singleton), int(v) is the plain int of its value, and it prints as True
-# while adding as 1. Storing an int back makes the slot an int again.
+# while adding as 1 -- after a function returns it, too. Storing an int back
+# makes the slot an int again.
 import unittest
 
 
@@ -22,6 +23,10 @@ class Annotated:
 def described(x: int) -> str:
     return (repr(x) + ":" + type(x).__name__ + ":" +
             str(isinstance(x, bool)) + ":" + str(x is True))
+
+
+def ident(x: int) -> int:
+    return x
 
 
 def facts(v: int) -> tuple[str, bool, bool, bool, str, int]:
@@ -97,6 +102,15 @@ class ContainerTest(unittest.TestCase):
         self.assertEqual(repr(max(d["a"], 0)), "True")
         t: tuple[int, int] = (True, 5)
         self.assertEqual(facts(t[0]), ("bool", True, True, False, "1", 2))
+
+    def test_returned_by_a_function(self) -> None:
+        xs: list[int] = [5]
+        xs.append(True)
+        c = Counter(3)
+        c.n = False
+        self.assertEqual(facts(ident(xs[1])), ("bool", True, True, False, "1", 2))
+        self.assertEqual(facts(ident(c.n)), ("bool", True, False, True, "0", 1))
+        self.assertEqual(facts(ident(xs[0])), ("int", False, False, False, "5", 6))
 
     def test_type_objects(self) -> None:
         xs: list[int] = [5]

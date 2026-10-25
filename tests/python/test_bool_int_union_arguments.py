@@ -2,9 +2,9 @@
 # passed where a parameter declares int: through a Callable value, to a list's,
 # set's or dict's method, to abs and round, to a method of the program's own
 # class, to a nested function and to a function with a keyword-only parameter.
-# The callee sees the value as it is: True stays a bool and adds as 1. Such a
-# call has a type wherever it is written, a tuple given to assertEqual
-# included.
+# The callee sees the value as it is: True stays a bool and adds as 1, and a
+# callee that returns it returns the bool. Such a call has a type wherever it is
+# written, a tuple given to assertEqual included.
 import unittest
 from typing import Callable
 
@@ -23,6 +23,10 @@ def keyword(x: int, *, k: int = 0) -> str:
 
 def apply(f: Callable[[int], int], v: int) -> int:
     return f(v)
+
+
+def ident(x: int) -> int:
+    return x
 
 
 class Acc:
@@ -101,6 +105,12 @@ class FunctionAndMethodTest(unittest.TestCase):
         self.assertEqual((inner(d[4]), inner(d[1])), ("bool", "int"))
         self.assertEqual((keyword(d[4]), keyword(d[1], k=1), keyword(True)),
                          ("bool:1", "int:6", "bool:1"))
+
+    def test_a_returned_value(self) -> None:
+        d = {1: 5, 4: True}
+        self.assertEqual((repr(ident(d[4])), type(ident(d[4])).__name__),
+                         ("True", "bool"))
+        self.assertEqual((repr(ident(d[1])), ident(d[4]) + 1), ("5", 2))
 
 
 if __name__ == "__main__":

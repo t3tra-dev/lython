@@ -2762,10 +2762,14 @@ mlir::FailureOr<RuntimeBundle> RuntimeBundleLowerer::boolAsDeferredInt(
   RuntimeBundle lazy = RuntimeBundle::objectWithOwnership(
       intType, mlir::ValueRange{},
       ownership::logicalOwnershipKind(intType, /*ownsObject=*/false));
+  // ⛔ The i64 is NOT valid, though it is the value: a valid lane says the
+  // i64 alone is the int, so a call took the callee's i64 clone and the
+  // answer came back as `LyLong_FromI64` of it -- `ident(xs[1])` over a bool
+  // element printed 1 and its type int. Only the object says it is a bool.
   lazy.primitiveI64 = RuntimePrimitiveI64Evidence{
       mlir::arith::ExtUIOp::create(builder, loc, builder.getI64Type(), bit)
           .getResult(),
-      constantBool(builder, loc, true)};
+      constantBool(builder, loc, false)};
   lazy.deferredObject =
       RuntimeBundleLowerer::createRuntimeCall(loc, *asInt, mlir::ValueRange{bit})
           .getResult(0);

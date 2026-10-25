@@ -1615,7 +1615,8 @@ private:
   mlir::Value intRuntimeClassWord(mlir::Operation *op,
                                   const RuntimeBundle &value);
   // A bool met where an int is declared, as the int it is: a deferred int
-  // whose i64 is the truth bit and whose held object is the bool's singleton.
+  // whose held object is the bool's singleton, the carrier of the value; its
+  // i64 is the truth bit but not valid.
   mlir::FailureOr<RuntimeBundle>
   boolAsDeferredInt(mlir::Operation *op, mlir::Type intType,
                     llvm::ArrayRef<mlir::Value> boolValues);
