@@ -4082,6 +4082,8 @@ TEST(EmitterTest, AnInternalManifestMethodIsNotAnAttributeOfABuiltin) {
               "'list' object has no attribute '__sort_by_keys__'");
   refusedWith("s = 'abc'\nf = s.__getslice__\n",
               "'str' object has no attribute '__getslice__'");
+  refusedWith("xs = [3, 1, 2]\nprint(xs.__best_index__(True))\n",
+              "'list' object has no attribute '__best_index__'");
   lython::emitter::EmitResult own = emitSource(
       "class C:\n"
       "    def __getslice__(self, a: int) -> int:\n"

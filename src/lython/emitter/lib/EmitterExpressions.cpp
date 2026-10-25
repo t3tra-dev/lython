@@ -3431,10 +3431,12 @@ bool ModuleEmitter::refuseInternalManifestMethod(const parser::Node &attribute) 
   if (!name)
     return false;
   // The manifest methods the emitter reaches without a written attribute: a
-  // subscript, a slice assignment, `del a[i:j]`, and a sort with a key. The
+  // subscript, a slice assignment, `del a[i:j]`, a sort with a key, and
+  // min/max over a list. The
   // builtin types CPython defines have none of them.
   static constexpr llvm::StringLiteral kInternal[] = {
-      "__getslice__", "__setslice__", "__delslice__", "__sort_by_keys__"};
+      "__getslice__", "__setslice__", "__delslice__", "__sort_by_keys__",
+      "__best_index__"};
   if (!llvm::is_contained(kInternal, llvm::StringRef(name->data(), name->size())))
     return false;
   const parser::Node *receiver = ast::node(attribute, "value");

@@ -232,6 +232,39 @@ class OrderWithoutSortTest(unittest.TestCase):
         self.assertEqual(repr(min([1.5, -0.0, 0.0])), "-0.0")
         self.assertEqual(repr(max([0.0, -0.0])), "0.0")
 
+    def test_max_and_min_of_strs(self) -> None:
+        words = ["b", "ab", "c", "ca", "\U0001f600", ""]
+        self.assertEqual(max(words), "\U0001f600")
+        self.assertEqual(min(words), "")
+        self.assertEqual(max(["b", "ab", "c"]), "c")
+
+    def test_nan_is_kept_when_nothing_compares_past_it(self) -> None:
+        nan = float("nan")
+        first = max([nan, 1.0, 2.0])
+        self.assertTrue(first != first)
+        self.assertEqual(min([1.0, nan, 0.5]), 0.5)
+        self.assertEqual(max([1.0, nan]), 1.0)
+
+    def test_the_first_of_equal_ints_is_answered(self) -> None:
+        self.assertEqual(repr(max([len("a"), True])), "1")
+        self.assertEqual(repr(min([True, len("a")])), "True")
+        self.assertEqual(repr(max([False, True, len("a")])), "True")
+
+    def test_a_temporary_list(self) -> None:
+        self.assertEqual(max([x * 3 % 11 for x in range(20)]), 10)
+        self.assertEqual(min([x * 3 % 11 for x in range(1, 20)]), 0)
+
+    def test_an_empty_list_raises(self) -> None:
+        xs = [len("ab")]
+        with self.assertRaises(ValueError) as caught:
+            max(xs[:0])
+        self.assertEqual(str(caught.exception),
+                         "max() iterable argument is empty")
+        with self.assertRaises(ValueError) as caught:
+            min(xs[:0])
+        self.assertEqual(str(caught.exception),
+                         "min() iterable argument is empty")
+
     def test_tuple_operators(self) -> None:
         a = (1, 2, 3)
         b = (1, 2, 4)

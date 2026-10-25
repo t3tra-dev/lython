@@ -2271,6 +2271,127 @@ module attributes {
     func.return %result : memref<2xi64>
   }
 
+  // CPython's default_find in FAST_COUNT mode over two latin-1 strings: the
+  // filtered walk of `__ly_unicode_find_fwd_bytes`, which on a match counts
+  // and resumes past it instead of answering.
+  func.func private @__ly_unicode_count_fwd_bytes(%s_bytes: memref<?xi8>, %t_bytes: memref<?xi8>, %start: i64, %end: i64, %n: i64) -> i64 {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %true = arith.constant true
+    %mlast = arith.subi %n, %one : i64
+    %mlast_index = arith.index_cast %mlast : i64 to index
+    %last = memref.load %t_bytes[%mlast_index] : memref<?xi8>
+    %last_cp = arith.extui %last : i8 to i64
+    %pre:2 = scf.for %k = %c0 to %mlast_index step %c1 iter_args(%mask = %zero, %gap = %mlast) -> (i64, i64) {
+      %b = memref.load %t_bytes[%k] : memref<?xi8>
+      %cp = arith.extui %b : i8 to i64
+      %next_mask = func.call @__ly_unicode_bloom_add(%mask, %cp) : (i64, i64) -> i64
+      %same = arith.cmpi eq, %b, %last : i8
+      %k64 = arith.index_cast %k : index to i64
+      %behind = arith.subi %mlast, %k64 : i64
+      %candidate = arith.subi %behind, %one : i64
+      %next_gap = arith.select %same, %candidate, %gap : i64
+      scf.yield %next_mask, %next_gap : i64, i64
+    }
+    %mask = func.call @__ly_unicode_bloom_add(%pre#0, %last_cp) : (i64, i64) -> i64
+    %gap_step = arith.addi %pre#1, %one : i64
+    %long_step = arith.addi %n, %one : i64
+    %n_index = arith.index_cast %n : i64 to index
+    %w = arith.subi %end, %n : i64
+    // The lookahead s[i + n] is inside the haystack for every i < w; the
+    // alignment at w is checked after the walk, as in the find.
+    %walk:2 = scf.while (%i = %start, %count = %zero) : (i64, i64) -> (i64, i64) {
+      %in_range = arith.cmpi slt, %i, %w : i64
+      scf.condition(%in_range) %i, %count : i64, i64
+    } do {
+    ^bb0(%i: i64, %count: i64):
+      %at = arith.addi %i, %mlast : i64
+      %at_index = arith.index_cast %at : i64 to index
+      %b = memref.load %s_bytes[%at_index] : memref<?xi8>
+      %is_last = arith.cmpi eq, %b, %last : i8
+      %nextpos = arith.addi %at, %one : i64
+      %next_index = arith.index_cast %nextpos : i64 to index
+      %nb = memref.load %s_bytes[%next_index] : memref<?xi8>
+      %ncp = arith.extui %nb : i8 to i64
+      %present = func.call @__ly_unicode_bloom_has(%mask, %ncp) : (i64, i64) -> i1
+      %skippable = arith.xori %present, %true : i1
+      %step:2 = scf.if %is_last -> (i64, i64) {
+        %i_index = arith.index_cast %i : i64 to index
+        %hit:2 = scf.while (%acc = %true, %j = %c0) : (i1, index) -> (i1, index) {
+          %in_needle = arith.cmpi slt, %j, %n_index : index
+          %go = arith.andi %in_needle, %acc : i1
+          scf.condition(%go) %acc, %j : i1, index
+        } do {
+        ^bb0(%acc: i1, %j: index):
+          %sj = arith.addi %i_index, %j : index
+          %sb = memref.load %s_bytes[%sj] : memref<?xi8>
+          %tb = memref.load %t_bytes[%j] : memref<?xi8>
+          %eq = arith.cmpi eq, %sb, %tb : i8
+          %iv_next = arith.addi %j, %c1 : index
+          scf.yield %eq, %iv_next : i1, index
+        }
+        %after:2 = scf.if %hit#0 -> (i64, i64) {
+          %past = arith.addi %i, %n : i64
+          %more = arith.addi %count, %one : i64
+          scf.yield %past, %more : i64, i64
+        } else {
+          %chosen = arith.select %skippable, %long_step, %gap_step : i64
+          %ni = arith.addi %i, %chosen : i64
+          scf.yield %ni, %count : i64, i64
+        }
+        scf.yield %after#0, %after#1 : i64, i64
+      } else {
+        %chosen = arith.select %skippable, %long_step, %one : i64
+        %ni = arith.addi %i, %chosen : i64
+        scf.yield %ni, %count : i64, i64
+      }
+      scf.yield %step#0, %step#1 : i64, i64
+    }
+    %at_last = arith.cmpi eq, %walk#0, %w : i64
+    %total = scf.if %at_last -> (i64) {
+      %tail_index = arith.index_cast %w : i64 to index
+      %hit:2 = scf.while (%acc = %true, %j = %c0) : (i1, index) -> (i1, index) {
+        %in_needle = arith.cmpi slt, %j, %n_index : index
+        %go = arith.andi %in_needle, %acc : i1
+        scf.condition(%go) %acc, %j : i1, index
+      } do {
+      ^bb0(%acc: i1, %j: index):
+        %sj = arith.addi %tail_index, %j : index
+        %sb = memref.load %s_bytes[%sj] : memref<?xi8>
+        %tb = memref.load %t_bytes[%j] : memref<?xi8>
+        %eq = arith.cmpi eq, %sb, %tb : i8
+        %iv_next = arith.addi %j, %c1 : index
+        scf.yield %eq, %iv_next : i1, index
+      }
+      %more = arith.addi %walk#1, %one : i64
+      %counted = arith.select %hit#0, %more, %walk#1 : i64
+      scf.yield %counted : i64
+    } else {
+      scf.yield %walk#1 : i64
+    }
+    func.return %total : i64
+  }
+
+  // CPython's count_char over a latin-1 string: every byte compared, the
+  // matches summed.
+  func.func private @__ly_unicode_count_byte(%s_bytes: memref<?xi8>, %target: i8, %start: i64, %end: i64) -> i64 {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %c1 = arith.constant 1 : index
+    %start_index = arith.index_cast %start : i64 to index
+    %end_index = arith.index_cast %end : i64 to index
+    %count = scf.for %k = %start_index to %end_index step %c1 iter_args(%acc = %zero) -> (i64) {
+      %b = memref.load %s_bytes[%k] : memref<?xi8>
+      %hit = arith.cmpi eq, %b, %target : i8
+      %add = arith.select %hit, %one, %zero : i64
+      %next = arith.addi %acc, %add : i64
+      scf.yield %next : i64
+    }
+    func.return %count : i64
+  }
+
   // Non-overlapping occurrence count in [start, end).
   func.func @LyUnicode_CountSub(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sub_header: memref<2xi64> {ly.ownership.object_header}, %sub_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 9223372036854775807 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "count", ly.runtime.result_contract = "builtins.int"} {
     %zero = arith.constant 0 : i64
@@ -2286,25 +2407,54 @@ module attributes {
       %count = arith.select %viable, %hits, %zero : i64
       scf.yield %count : i64
     } else {
+      // CPython's FASTSEARCH in count mode: a byte loop for one character,
+      // the filtered walk for a longer needle, both over latin-1 bytes.
+      // ⛔ Not a comparison at every position: `base.count("the")` over 880
+      // characters spent most of str_methods there, two code point reads per
+      // character compared.
       %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
       %sub_width = func.call @__ly_unicode_width(%sub_header) : (memref<2xi64>) -> i64
-      %n_index = arith.index_cast %n : i64 to index
-      %scan:2 = scf.while (%pos = %start, %count = %zero) : (i64, i64) -> (i64, i64) {
-        %tail = arith.addi %pos, %n : i64
-        %more = arith.cmpi sle, %tail, %end : i64
-        scf.condition(%more) %pos, %count : i64, i64
-      } do {
-      ^bb0(%pos: i64, %count: i64):
-        %pos_index = arith.index_cast %pos : i64 to index
-        %ti = arith.constant 0 : index
-        %eq = func.call @__ly_unicode_match_at(%bytes, %width, %pos_index, %sub_bytes, %sub_width, %ti, %n_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> i1
-        %skip = arith.select %eq, %n, %one : i64
-        %bump = arith.select %eq, %one, %zero : i64
-        %next_pos = arith.addi %pos, %skip : i64
-        %next_count = arith.addi %count, %bump : i64
-        scf.yield %next_pos, %next_count : i64, i64
+      %span = arith.subi %end, %start : i64
+      %fits = arith.cmpi sge, %span, %n : i64
+      %counted = scf.if %fits -> (i64) {
+        %narrow_s = arith.cmpi eq, %width, %one : i64
+        %narrow_t = arith.cmpi eq, %sub_width, %one : i64
+        %narrow = arith.andi %narrow_s, %narrow_t : i1
+        %single = arith.cmpi eq, %n, %one : i64
+        %by_kind = scf.if %narrow -> (i64) {
+          %bytes_count = scf.if %single -> (i64) {
+            %c0 = arith.constant 0 : index
+            %target = memref.load %sub_bytes[%c0] : memref<?xi8>
+            %c = func.call @__ly_unicode_count_byte(%bytes, %target, %start, %end) : (memref<?xi8>, i8, i64, i64) -> i64
+            scf.yield %c : i64
+          } else {
+            %c = func.call @__ly_unicode_count_fwd_bytes(%bytes, %sub_bytes, %start, %end, %n) : (memref<?xi8>, memref<?xi8>, i64, i64, i64) -> i64
+            scf.yield %c : i64
+          }
+          scf.yield %bytes_count : i64
+        } else {
+          %false_bit = arith.constant false
+          %minus_one = arith.constant -1 : i64
+          %walk:2 = scf.while (%pos = %start, %count = %zero) : (i64, i64) -> (i64, i64) {
+            %found = func.call @__ly_unicode_find_core(%bytes, %width, %sub_bytes, %sub_width, %pos, %end, %n, %false_bit) : (memref<?xi8>, i64, memref<?xi8>, i64, i64, i64, i64, i1) -> i64
+            %hit = arith.cmpi ne, %found, %minus_one : i64
+            %past = arith.addi %found, %n : i64
+            %more = arith.addi %count, %one : i64
+            scf.condition(%hit) %past, %more : i64, i64
+          } do {
+          ^bb0(%pos: i64, %count: i64):
+            scf.yield %pos, %count : i64, i64
+          }
+          // The condition passes the advanced pair on a hit only; a miss
+          // leaves the last count the loop yielded.
+          %last_count = arith.subi %walk#1, %one : i64
+          scf.yield %last_count : i64
+        }
+        scf.yield %by_kind : i64
+      } else {
+        scf.yield %zero : i64
       }
-      scf.yield %scan#1 : i64
+      scf.yield %counted : i64
     }
     %result = func.call @LyLong_FromI64(%total) : (i64) -> memref<2xi64>
     func.return %result : memref<2xi64>
@@ -2640,23 +2790,70 @@ module attributes {
       %out_width = arith.maxsi %width, %new_width : i64
       %out_header, %out_bytes = func.call @__ly_unicode_alloc(%len, %out_width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
       %len_index = arith.index_cast %len : i64 to index
-      func.call @__ly_unicode_copy_run(%out_bytes, %out_width, %c0, %bytes, %width, %c0, %len_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> ()
-      // The search reads the INPUT, never the half-rewritten output: a
-      // replacement can spell the needle again (`"ab".replace("ab", "ba")`)
-      // and searching what has been written would find it.
-      %poke:2 = scf.while (%i = %first, %rem = %limit) : (i64, i64) -> (i64, i64) {
-        %found = arith.cmpi sge, %i, %zero : i64
-        %budget = arith.cmpi ne, %rem, %zero : i64
-        %go = arith.andi %found, %budget : i1
-        scf.condition(%go) %i, %rem : i64, i64
-      } do {
-      ^bb0(%i: i64, %rem: i64):
-        %at = arith.index_cast %i : i64 to index
-        func.call @__ly_unicode_copy_run(%out_bytes, %out_width, %at, %new_bytes, %new_width, %c0, %new_n_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> ()
-        %after = arith.addi %i, %old_n : i64
-        %next = func.call @__ly_unicode_find_core(%bytes, %width, %old_bytes, %old_width, %after, %len, %old_n, %false_bit) : (memref<?xi8>, i64, memref<?xi8>, i64, i64, i64, i64, i1) -> i64
-        %spent = arith.subi %rem, %one : i64
-        scf.yield %next, %spent : i64, i64
+      // One latin-1 character for another is CPython's replace_1char_inplace:
+      // the matches are overwritten where they stand. With no count it is one
+      // pass that writes every byte, chosen or copied, which vectorizes.
+      // ⛔ Not a search call per match: `base.replace("o", "0")` made eighty
+      // calls into the finder per string, each set up for a scan of about ten
+      // bytes; and not a copy and then a walk, which read the string twice.
+      %one_char = arith.cmpi eq, %old_n, %one : i64
+      %narrow_out = arith.cmpi eq, %out_width, %one : i64
+      %narrow_old = arith.cmpi eq, %old_width, %one : i64
+      %narrow_pair = arith.andi %narrow_out, %narrow_old : i1
+      %char_for_char = arith.andi %one_char, %narrow_pair : i1
+      %unlimited = arith.cmpi slt, %limit, %zero : i64
+      %every_char = arith.andi %char_for_char, %unlimited : i1
+      scf.if %every_char {
+        %u1 = memref.load %old_bytes[%c0] : memref<?xi8>
+        %u2 = memref.load %new_bytes[%c0] : memref<?xi8>
+        scf.for %at = %c0 to %len_index step %c1 {
+          %b = memref.load %bytes[%at] : memref<?xi8>
+          %hit = arith.cmpi eq, %b, %u1 : i8
+          %written = arith.select %hit, %u2, %b : i8
+          memref.store %written, %out_bytes[%at] : memref<?xi8>
+        }
+      } else {
+        func.call @__ly_unicode_copy_run(%out_bytes, %out_width, %c0, %bytes, %width, %c0, %len_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> ()
+        scf.if %char_for_char {
+          %u1 = memref.load %old_bytes[%c0] : memref<?xi8>
+          %u2 = memref.load %new_bytes[%c0] : memref<?xi8>
+          %walk:2 = scf.while (%i = %first, %rem = %limit) : (i64, i64) -> (i64, i64) {
+            %inside = arith.cmpi slt, %i, %len : i64
+            %budget = arith.cmpi ne, %rem, %zero : i64
+            %go = arith.andi %inside, %budget : i1
+            scf.condition(%go) %i, %rem : i64, i64
+          } do {
+          ^bb0(%i: i64, %rem: i64):
+            %at = arith.index_cast %i : i64 to index
+            %b = memref.load %bytes[%at] : memref<?xi8>
+            %hit = arith.cmpi eq, %b, %u1 : i8
+            scf.if %hit {
+              memref.store %u2, %out_bytes[%at] : memref<?xi8>
+            }
+            %spent = arith.subi %rem, %one : i64
+            %rem_next = arith.select %hit, %spent, %rem : i64
+            %i_next = arith.addi %i, %one : i64
+            scf.yield %i_next, %rem_next : i64, i64
+          }
+        } else {
+          // The search reads the INPUT, never the half-rewritten output: a
+          // replacement can spell the needle again (`"ab".replace("ab", "ba")`)
+          // and searching what has been written would find it.
+          %poke:2 = scf.while (%i = %first, %rem = %limit) : (i64, i64) -> (i64, i64) {
+            %found = arith.cmpi sge, %i, %zero : i64
+            %budget = arith.cmpi ne, %rem, %zero : i64
+            %go = arith.andi %found, %budget : i1
+            scf.condition(%go) %i, %rem : i64, i64
+          } do {
+          ^bb0(%i: i64, %rem: i64):
+            %at = arith.index_cast %i : i64 to index
+            func.call @__ly_unicode_copy_run(%out_bytes, %out_width, %at, %new_bytes, %new_width, %c0, %new_n_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> ()
+            %after = arith.addi %i, %old_n : i64
+            %next = func.call @__ly_unicode_find_core(%bytes, %width, %old_bytes, %old_width, %after, %len, %old_n, %false_bit) : (memref<?xi8>, i64, memref<?xi8>, i64, i64, i64, i64, i1) -> i64
+            %spent = arith.subi %rem, %one : i64
+            scf.yield %next, %spent : i64, i64
+          }
+        }
       }
       scf.yield %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
     } else {

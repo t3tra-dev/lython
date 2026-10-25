@@ -67,7 +67,7 @@ module attributes {
                     "__delslice__", "__setitem__", "__delitem__",
                     "__contains__", "__repr__", "sort", "reverse", "copy",
                     "count", "index", "__add__", "__mul__", "__eq__",
-                    "__ne__", "__lt__", "__le__", "__gt__", "__ge__", "__getslice__", "__setslice__", "__delslice__", "__sort_by_keys__"],
+                    "__ne__", "__lt__", "__le__", "__gt__", "__ge__", "__getslice__", "__setslice__", "__delslice__", "__sort_by_keys__", "__best_index__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"builtins.list">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.protocol<"Iterable", [!py.contract<"$T">]>] -> [!py.literal<None>]>,
@@ -104,7 +104,8 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.slice">] -> [!py.contract<"builtins.list", [!py.contract<"$T">]>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.slice">, !py.contract<"builtins.list", [!py.contract<"$T">]>] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.slice">] -> [!py.literal<None>]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.list", [!py.typevar<"K">]>, !py.contract<"builtins.bool">] -> [!py.literal<None>]>
+      !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.list", [!py.typevar<"K">]>, !py.contract<"builtins.bool">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.bool">] -> [!py.contract<"builtins.int">]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
@@ -113,7 +114,7 @@ module attributes {
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
   } {}
 
   // ===== impls: list methods =====
@@ -577,6 +578,62 @@ module attributes {
     %items = func.call @__ly_list_items(%self) : (memref<5xi64>) -> memref<?xi64>
     func.call @__ly_sort_slots(%items, %len) : (memref<?xi64>, i64) -> ()
     func.return
+  }
+
+  // CPython's min_max over a list with no key, for elements whose `>` is the
+  // reverse of their `<` (int, float, str, bool): the index of the first least
+  // element, or with `greatest` the first greatest, and -1 for an empty list.
+  // Two immediate ints compare as their words; anything else as
+  // `__ly_slot_less` orders it.
+  // ⛔ Not the emitter's fold over the elements: carried across the loop, the
+  // best element is an object, so `max(xs)` over a list[int] boxed each
+  // immediate it compared and freed the loser; carried as an index, the index
+  // was boxed at every join instead.
+  // ⛔ Not a public name: the emitter calls it without a written attribute.
+  func.func @LyList_BestIndex(%self: memref<5xi64> {ly.ownership.object_header}, %greatest: i1) -> i64 attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__best_index__"} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %minus_one = arith.constant -1 : i64
+    %c1 = arith.constant 1 : index
+    %length_slot = arith.constant 2 : index
+    %len = memref.load %self[%length_slot] : memref<5xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<5xi64>) -> memref<?xi64>
+    %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
+    %items_i64 = arith.index_cast %items_idx : index to i64
+    %items_ptr = llvm.inttoptr %items_i64 : i64 to !llvm.ptr
+    %empty = arith.cmpi eq, %len, %zero : i64
+    %answer = scf.if %empty -> (i64) {
+      scf.yield %minus_one : i64
+    } else {
+      %first_word = llvm.load %items_ptr : !llvm.ptr -> i64
+      %len_index = arith.index_cast %len : i64 to index
+      // The best word rides beside its index, so a comparison does not wait
+      // on a load of the element the previous one chose.
+      %best:2 = scf.for %iv = %c1 to %len_index step %c1 iter_args(%b = %zero, %bw = %first_word) -> (i64, i64) {
+        %i = arith.index_cast %iv : index to i64
+        %slot = llvm.getelementptr %items_ptr[%i] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+        %w = llvm.load %slot : !llvm.ptr -> i64
+        %tags = arith.andi %w, %bw : i64
+        %int_tags = arith.andi %tags, %one : i64
+        %both_ints = arith.cmpi ne, %int_tags, %zero : i64
+        %better = scf.if %both_ints -> (i1) {
+          %below = arith.cmpi slt, %w, %bw : i64
+          %above = arith.cmpi slt, %bw, %w : i64
+          %pick = arith.select %greatest, %above, %below : i1
+          scf.yield %pick : i1
+        } else {
+          %lhs = arith.select %greatest, %b, %i : i64
+          %rhs = arith.select %greatest, %i, %b : i64
+          %lt = func.call @__ly_slot_less(%items_ptr, %lhs, %rhs) : (!llvm.ptr, i64, i64) -> i1
+          scf.yield %lt : i1
+        }
+        %nb = arith.select %better, %i, %b : i64
+        %nbw = arith.select %better, %w, %bw : i64
+        scf.yield %nb, %nbw : i64, i64
+      }
+      scf.yield %best#0 : i64
+    }
+    func.return %answer : i64
   }
 
   // `xs.sort(key=f, reverse=r)` once the emitter has called `f` on every
