@@ -7285,7 +7285,8 @@ public:
       });
       // Does the frame own what this value names? Only then can a select
       // strand a reference.
-      auto frameProduces = [&](mlir::Value value) {
+      std::function<bool(mlir::Value, unsigned)> frameProduces =
+          [&](mlir::Value value, unsigned depth) -> bool {
         // ⭐ Ask the value ITSELF before peeling. `underlyingObjectValue`
         // reads through the `owned_local_object` marker cast to the raw
         // alloc, whose defining op carries no attribute -- so a loop element
@@ -7333,11 +7334,29 @@ public:
         if (definition->hasAttr(own::kOwnedLocalObjectAttr) ||
             definition->hasAttr(own::kObjectHeaderAttr))
           return true;
+        auto result = mlir::dyn_cast<mlir::OpResult>(root);
+        // ⭐ A DEFERRED INT HOLDS THE `scf.if` ITS OPERATOR YIELDS -- the
+        // stand-in on one arm, the slow arm's object on the other, both owned
+        // calls. ⛔ Read as "not frame-owned", a select over two of them
+        // stayed a select, and whichever object lost was never released.
+        if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(definition)) {
+          if (!result || depth > 4)
+            return false;
+          for (mlir::Region *arm : {&ifOp.getThenRegion(), &ifOp.getElseRegion()}) {
+            if (arm->empty())
+              return false;
+            mlir::Operation *yield = arm->front().getTerminator();
+            if (!yield || result.getResultNumber() >= yield->getNumOperands() ||
+                !frameProduces(yield->getOperand(result.getResultNumber()),
+                               depth + 1))
+              return false;
+          }
+          return true;
+        }
         auto call = mlir::dyn_cast<mlir::func::CallOp>(definition);
         if (!call)
           return false;
         auto callee = module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
-        auto result = mlir::dyn_cast<mlir::OpResult>(root);
         return callee && result &&
                own::callResultGroupIsOwned(callee, result.getResultNumber());
       };
@@ -7359,8 +7378,8 @@ public:
         // arm holds a reference to lose.
         bool strandable = false;
         for (mlir::arith::SelectOp select : run)
-          if (frameProduces(select.getTrueValue()) ||
-              frameProduces(select.getFalseValue()))
+          if (frameProduces(select.getTrueValue(), 0) ||
+              frameProduces(select.getFalseValue(), 0))
             strandable = true;
         if (!strandable)
           continue;

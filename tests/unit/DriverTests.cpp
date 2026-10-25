@@ -3645,6 +3645,75 @@ TEST(DriverTest, AnIntOrFloatAContainerOnlyStoresGoesInAsItsSlotWord) {
                     "LyLong_SlotWordTakingDeferred"));
 }
 
+// What: an int read out of a list element or an instance field that is only
+// compared, chosen between, computed with and stored into a field makes no
+// object for any of that: the slot word is decoded where it is read
+// (`LyLong_ReadSlotWord`), never turned into an object at the read
+// (`LyLong_FromSlotWord`), and the field store takes the word
+// (`LyLong_SlotWordTakingDeferred`). A read with a use that needs its object
+// still makes the object at the read.
+TEST(DriverTest, AnIntReadThatIsChosenComputedOrStoredMakesNoObject) {
+  auto calls = [](const std::string &source, llvm::StringRef callee) {
+    CompileResult result = compileSource(source);
+    EXPECT_TRUE(result.succeeded) << result.diagnostics;
+    return result.succeeded &&
+           callsFunctionNamed(*result.verified.llvmModule, callee);
+  };
+  const std::string runningMax = "def best(xs: list[int]) -> int:\n"
+                                 "    b = xs[0]\n"
+                                 "    for i in range(1, len(xs)):\n"
+                                 "        v = xs[i]\n"
+                                 "        if v > b:\n"
+                                 "            b = v\n"
+                                 "    return b\n\n\n"
+                                 "print(best([3, 1, 4]))\n";
+  EXPECT_TRUE(calls(runningMax, "LyLong_ReadSlotWord"));
+  EXPECT_FALSE(calls(runningMax, "LyLong_FromSlotWord"));
+  const std::string fieldLoop = "class C:\n"
+                                "    def __init__(self) -> None:\n"
+                                "        self.n = 0\n"
+                                "        self.step = 3\n\n\n"
+                                "def run(c: C, k: int) -> None:\n"
+                                "    for _ in range(k):\n"
+                                "        c.n = (c.n + c.step) % 1000\n\n\n"
+                                "c = C()\n"
+                                "run(c, 5)\n"
+                                "print(c.n + 1)\n";
+  EXPECT_TRUE(calls(fieldLoop, "LyLong_ReadSlotWord"));
+  EXPECT_TRUE(calls(fieldLoop, "LyLong_SlotWordTakingDeferred"));
+  EXPECT_FALSE(calls(fieldLoop, "LyLong_FromSlotWord"));
+  const std::string shown = "def show(xs: list[int]) -> int:\n"
+                            "    v = xs[1]\n"
+                            "    return len(str(v)) + v\n\n\n"
+                            "print(show([1, 2000]))\n";
+  EXPECT_TRUE(calls(shown, "LyLong_FromSlotWord"));
+}
+
+// What: an int a runtime call answers, which comes without its i64, takes an
+// operator's i64 arm like any other int: `t * 10 + w.find("a")` adds through
+// the deferred operator (`LyLong_AddDeferred` is its slow arm) rather than
+// one boxed call that makes an object of every answer.
+TEST(DriverTest, AnIntARuntimeCallAnswersTakesTheOperatorsI64Arm) {
+  CompileResult result = compileSource("def f(w: str, t: int) -> int:\n"
+                                       "    return t * 10 + w.find(\"a\")\n\n\n"
+                                       "print(f(\"banana\", 3))\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  const llvm::Function *f =
+      result.verified.llvmModule->getFunction(mainSymbol("f"));
+  ASSERT_NE(f, nullptr);
+  bool boxedAdd = false;
+  bool deferredAdd = false;
+  for (const llvm::BasicBlock &block : *f)
+    for (const llvm::Instruction &instruction : block)
+      if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+        if (const llvm::Function *callee = call->getCalledFunction()) {
+          boxedAdd |= callee->getName() == "LyLong_Add";
+          deferredAdd |= callee->getName() == "LyLong_AddDeferred";
+        }
+  EXPECT_FALSE(boxedAdd);
+  EXPECT_TRUE(deferredAdd);
+}
+
 // What: a value is kept referenced to the end of its frame only when its
 // release can be observed. A list of ints and a plain class instance are
 // released at their last use -- no keep-alive call anywhere. An instance of a

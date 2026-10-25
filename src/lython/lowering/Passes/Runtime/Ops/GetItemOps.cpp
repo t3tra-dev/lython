@@ -7,6 +7,8 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 namespace py::lowering {
 
@@ -762,39 +764,90 @@ RuntimeBundleLowerer::retainEvidenceElementWithFallback(
   return retained;
 }
 
-// True when every use of `result` can take a lazy int: the arithmetic and
-// comparison operators that have an i64 form (`primitiveI64ArithmeticKind`,
-// `primitiveI64ComparePredicate`) with an int on both sides, whose slow arm
-// materializes its lazy operands, and the reference drops the emitter writes.
-// ⛔ Not any use: a lazy int's value is only the value where its flag says,
-// and the other readers of `primitiveI64` were written for lanes that are.
+namespace {
+
+bool isPlainIntType(mlir::Type type) {
+  if (auto contract = mlir::dyn_cast<py::ContractType>(type))
+    return contract.getContractName() == "builtins.int" &&
+           contract.getArguments().empty();
+  if (auto literal = mlir::dyn_cast<py::LiteralType>(type)) {
+    llvm::StringRef digits = literal.getSpelling();
+    digits.consume_front("-");
+    return !digits.empty() && llvm::all_of(digits, llvm::isDigit);
+  }
+  return false;
+}
+
+// An operator with an i64 form (`primitiveI64ArithmeticKind`,
+// `primitiveI64ComparePredicate`) and an int on both sides: its slow arm
+// materializes what it needs.
+bool isIntOperatorUse(mlir::Operation *user) {
+  return mlir::isa<py::AddOp, py::SubOp, py::MulOp, py::FloorDivOp, py::ModOp,
+                   py::LShiftOp, py::RShiftOp, py::BitAndOp, py::BitOrOp,
+                   py::BitXorOp, py::EqOp, py::NeOp, py::LtOp, py::LeOp,
+                   py::GtOp, py::GeOp>(user) &&
+         user->getNumOperands() >= 2 &&
+         isPlainIntType(user->getOperand(0).getType()) &&
+         isPlainIntType(user->getOperand(1).getType());
+}
+
+// The uses of a deferred int and of every int merge it reaches: all take it
+// as it is, but for one return of a merge argument.
+struct DeferredUseWalk {
+  llvm::SmallPtrSet<void *, 8> visited;
+  bool returned = false;
+
+  bool admits(mlir::Value value) {
+    if (!visited.insert(value.getAsOpaquePointer()).second)
+      return true;
+    for (mlir::OpOperand &use : value.getUses()) {
+      mlir::Operation *user = use.getOwner();
+      if (mlir::isa<py::DecRefOp, py::IncRefOp>(user) || isIntOperatorUse(user))
+        continue;
+      // A field store takes the word (`slot_word_taking_deferred`).
+      if (auto store = mlir::dyn_cast<py::AttrSetOp>(user))
+        if (store.getValue() == value)
+          continue;
+      // A merge carries the deferred int as it is (`deferredIntJoinOperands`).
+      if (auto select = mlir::dyn_cast<mlir::arith::SelectOp>(user))
+        if (use.getOperandNumber() != 0 && isPlainIntType(select.getType())) {
+          if (!admits(select.getResult()))
+            return false;
+          continue;
+        }
+      if (auto branch = mlir::dyn_cast<mlir::BranchOpInterface>(user))
+        if (std::optional<mlir::BlockArgument> argument =
+                branch.getSuccessorBlockArgument(use.getOperandNumber()))
+          if (isPlainIntType(argument->getType())) {
+            if (!admits(*argument))
+              return false;
+            continue;
+          }
+      if (!mlir::isa<mlir::BlockArgument>(value) ||
+          !mlir::isa<mlir::func::ReturnOp>(user) || returned)
+        return false;
+      returned = true;
+    }
+    return true;
+  }
+};
+
+} // namespace
+
+// ⭐ A READ STAYS ITS I64 WHEN EVERY USE TAKES IT AS IT IS: an operator with
+// an i64 form, a reference drop, a field store, a merge whose own uses do too
+// -- and a merge argument may also be returned once, which a call reaches
+// once where the read may run once per trip (`if v > best: best = v`, then
+// `return best`).
+// ⛔ Not a read with a use that needs its object: `materialize_read` makes the
+// object the read would have made, after a decode and a stand-in the read did
+// not need -- `enumerate(zip(a, b))`, which stores each element into a tuple,
+// ran 8% slower.
 static bool deferrableIntRead(mlir::Value result) {
   if (result.use_empty())
     return false;
-  auto isInt = [](mlir::Type type) {
-    if (auto contract = mlir::dyn_cast<py::ContractType>(type))
-      return contract.getContractName() == "builtins.int" &&
-             contract.getArguments().empty();
-    if (auto literal = mlir::dyn_cast<py::LiteralType>(type)) {
-      llvm::StringRef digits = literal.getSpelling();
-      digits.consume_front("-");
-      return !digits.empty() && llvm::all_of(digits, llvm::isDigit);
-    }
-    return false;
-  };
-  for (mlir::Operation *user : result.getUsers()) {
-    if (mlir::isa<py::DecRefOp>(user))
-      continue;
-    if (!mlir::isa<py::AddOp, py::SubOp, py::MulOp, py::FloorDivOp, py::ModOp,
-                   py::LShiftOp, py::RShiftOp, py::BitAndOp, py::BitOrOp,
-                   py::BitXorOp, py::EqOp, py::NeOp, py::LtOp, py::LeOp,
-                   py::GtOp, py::GeOp>(user))
-      return false;
-    if (user->getNumOperands() < 2 || !isInt(user->getOperand(0).getType()) ||
-        !isInt(user->getOperand(1).getType()))
-      return false;
-  }
-  return true;
+  DeferredUseWalk walk;
+  return walk.admits(result);
 }
 
 // The view a read built from a slot word, through the `scf.if` an
@@ -823,8 +876,8 @@ static bool isSlotEntityView(mlir::Value view) {
 mlir::FailureOr<bool> RuntimeBundleLowerer::bindDeferredIntRead(
     mlir::Operation *op, mlir::Value resultValue, const RuntimeValue &value) {
   if (runtimeContractName(value.contract) != "builtins.int" ||
-      value.values.size() != 1 || !deferrableIntRead(resultValue) ||
-      !isSlotEntityView(value.values.front()))
+      !isPlainIntType(resultValue.getType()) || value.values.size() != 1 ||
+      !deferrableIntRead(resultValue) || !isSlotEntityView(value.values.front()))
     return false;
   // ⛔ Not in an i64 clone or a generator's resume: there an int lane whose
   // flag is false is not a slow arm to take but a replay or a refusal
