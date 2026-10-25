@@ -97,6 +97,113 @@ class SortKindTest(unittest.TestCase):
                          ["bb", "cc", "ee", "a", "d"])
 
 
+def stable_sorted_by(xs: list[tuple[int, int]], descending: bool) -> list[tuple[int, int]]:
+    # Insertion sort on the second field, equal keys kept in input order.
+    out: list[tuple[int, int]] = []
+    for x in xs:
+        i = len(out)
+        out.append(x)
+        while i > 0 and ((out[i - 1][1] < x[1]) if descending
+                         else (out[i - 1][1] > x[1])):
+            out[i] = out[i - 1]
+            i -= 1
+        out[i] = x
+    return out
+
+
+def second(t: tuple[int, int]) -> int:
+    return t[1]
+
+
+calls_seen: list[int] = []
+
+
+def picked(store: list[list[int]]) -> list[int]:
+    calls_seen.append(1)
+    return store[len(calls_seen) - 1]
+
+
+class KeySortTest(unittest.TestCase):
+
+    def test_elements_move_with_their_keys_through_the_merges(self) -> None:
+        # Long enough to merge blocks; few distinct keys, so stability shows.
+        xs = [(i, (i * 7919) % 37) for i in range(500)]
+        self.assertEqual(sorted(xs, key=second),
+                         stable_sorted_by(xs, False))
+
+    def test_reverse_keeps_equal_keys_in_input_order(self) -> None:
+        xs = [(i, (i * 7919) % 37) for i in range(500)]
+        self.assertEqual(sorted(xs, key=second, reverse=True),
+                         stable_sorted_by(xs, True))
+
+    def test_list_sort_with_a_key_sorts_the_list_itself(self) -> None:
+        xs = [(i, (i * 31) % 7) for i in range(100)]
+        alias = xs
+        xs.sort(key=lambda t: t[1], reverse=True)
+        self.assertTrue(alias is xs)
+        self.assertEqual(alias, stable_sorted_by(
+            [(i, (i * 31) % 7) for i in range(100)], True))
+
+    def test_the_receiver_is_evaluated_once(self) -> None:
+        calls_seen.clear()
+        store = [[3, 1, 2], [9, 8]]
+        picked(store).sort(key=lambda v: -v)
+        self.assertEqual(len(calls_seen), 1)
+        self.assertEqual(store, [[3, 2, 1], [9, 8]])
+
+    def test_str_keys(self) -> None:
+        words = ["b", "A", "c", "B", "a"]
+        self.assertEqual(sorted(words, key=str.lower),
+                         ["A", "a", "b", "B", "c"])
+
+    def test_a_raising_key_leaves_the_list_alone(self) -> None:
+        xs = [3, 1, 2]
+
+        def key(v: int) -> int:
+            if v == 2:
+                raise ValueError("no")
+            return v
+
+        with self.assertRaises(ValueError):
+            xs.sort(key=key)
+        self.assertEqual(xs, [3, 1, 2])
+
+    def test_unorderable_keys(self) -> None:
+        with self.assertRaises(TypeError) as caught:
+            sorted([1, 2], key=lambda v: v if v == 1 else "s")
+        self.assertEqual(str(caught.exception),
+                         "'<' not supported between instances of 'str' and "
+                         "'int'")
+
+    def test_a_key_that_grows_the_list(self) -> None:
+        xs = [3, 1, 2]
+
+        def key(v: int) -> int:
+            if len(xs) < 5:
+                xs.append(0)
+            return v
+
+        with self.assertRaises(ValueError) as caught:
+            xs.sort(key=key)
+        self.assertEqual(str(caught.exception), "list modified during sort")
+
+
+class StrSortTest(unittest.TestCase):
+
+    def test_strs_sharing_prefixes_through_the_merges(self) -> None:
+        xs = ["w" + str((i * 7919) % 1009) for i in range(600)]
+        expected = sorted(xs, key=lambda s: [ord(c) for c in s])
+        xs.sort()
+        self.assertEqual(xs, expected)
+
+    def test_concatenation_results_stay_appendable(self) -> None:
+        s = "w" + str(len("abc"))
+        t = s
+        s += "x"
+        s += "y"
+        self.assertEqual((s, t), ("w3xy", "w3"))
+
+
 class OrderWithoutSortTest(unittest.TestCase):
 
     def test_max_and_min_of_computed_ints(self) -> None:

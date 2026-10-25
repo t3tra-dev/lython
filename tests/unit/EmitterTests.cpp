@@ -4061,3 +4061,32 @@ TEST(EmitterTest, ADocstringIsRefusedWhereItIsNotTheProgramsOwn) {
                    diagnostics))
       << diagnostics;
 }
+
+// What: a manifest method that only the emitter calls (a slice, a sort with a
+// key) is not an attribute of the builtin type in a program, as it is not in
+// CPython -- read or called -- while a class of the program's own may still
+// define a method spelled the same.
+TEST(EmitterTest, AnInternalManifestMethodIsNotAnAttributeOfABuiltin) {
+  mlir::MLIRContext context(testRegistry());
+  auto refusedWith = [&](llvm::StringRef source, llvm::StringRef message) {
+    lython::emitter::EmitResult emitted = emitSource(source, context);
+    EXPECT_FALSE(emitted.ok()) << source.str();
+    bool found = false;
+    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+      found = found || diagnostic.message.find(message.str()) != std::string::npos;
+    EXPECT_TRUE(found) << source.str();
+  };
+  refusedWith("xs = [3, 1, 2]\nprint(xs.__getslice__(0, 2, 1, 3))\n",
+              "'list' object has no attribute '__getslice__'");
+  refusedWith("xs = [3, 1, 2]\nxs.__sort_by_keys__([0, 1, 2], False)\n",
+              "'list' object has no attribute '__sort_by_keys__'");
+  refusedWith("s = 'abc'\nf = s.__getslice__\n",
+              "'str' object has no attribute '__getslice__'");
+  lython::emitter::EmitResult own = emitSource(
+      "class C:\n"
+      "    def __getslice__(self, a: int) -> int:\n"
+      "        return a + 1\n"
+      "print(C().__getslice__(4))\n",
+      context);
+  EXPECT_TRUE(own.ok());
+}

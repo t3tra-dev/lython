@@ -954,6 +954,7 @@ LogicalResult runLoweringPipeline(ModuleOp module,
       PerfScope perf("lowering.final-llvm-cleanup");
       optimizer::pipeline::finalLLVMCleanup(module);
       lowering::runtime::cleanup::markCannotRaiseNoUnwind(module);
+      lowering::runtime::cleanup::markOutOfLineNoInline(module);
     }
     {
       PerfScope perf("lowering.type-objects");

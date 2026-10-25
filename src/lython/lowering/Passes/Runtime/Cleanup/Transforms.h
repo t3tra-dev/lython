@@ -33,6 +33,11 @@ unsigned markCannotRaiseFunctions(mlir::ModuleOp module);
 // Gives every converted function so marked LLVM's `nounwind`.
 void markCannotRaiseNoUnwind(mlir::ModuleOp module);
 
+// On a runtime func.func that must not be inlined into its callers.
+inline constexpr llvm::StringLiteral kOutOfLineAttr{"ly.runtime.out_of_line"};
+// Gives every converted function so marked LLVM's `noinline`.
+void markOutOfLineNoInline(mlir::ModuleOp module);
+
 // On the casts between a memref and the narrow form that carries it across a
 // call (MemRefCallABI.cpp).
 inline constexpr llvm::StringLiteral kNarrowCastAttr{"ly.abi.narrow"};

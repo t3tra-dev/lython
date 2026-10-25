@@ -3426,7 +3426,36 @@ ModuleEmitter::tryEmitDynamicClassName(const parser::Node &expr) {
   return Value{op.getResult(), strType};
 }
 
+bool ModuleEmitter::refuseInternalManifestMethod(const parser::Node &attribute) {
+  std::optional<std::string_view> name = ast::string(attribute, "attr");
+  if (!name)
+    return false;
+  // The manifest methods the emitter reaches without a written attribute: a
+  // subscript, a slice assignment, `del a[i:j]`, and a sort with a key. The
+  // builtin types CPython defines have none of them.
+  static constexpr llvm::StringLiteral kInternal[] = {
+      "__getslice__", "__setslice__", "__delslice__", "__sort_by_keys__"};
+  if (!llvm::is_contained(kInternal, llvm::StringRef(name->data(), name->size())))
+    return false;
+  const parser::Node *receiver = ast::node(attribute, "value");
+  if (!receiver)
+    return false;
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+      types.widenLiteral(types.inferExpr(receiver)));
+  if (!contract || !contract.getContractName().starts_with("builtins."))
+    return false;
+  std::string typeName =
+      contract.getContractName().drop_front(strlen("builtins.")).str();
+  diagnostics.push_back(parser::Diagnostic{
+      parser::Severity::Error, attribute.range.start,
+      "'" + typeName + "' object has no attribute '" + std::string(*name) +
+          "'"});
+  return true;
+}
+
 Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
+  if (refuseInternalManifestMethod(expr))
+    return emitNone(expr);
   if (std::optional<Value> doc = tryEmitDocRead(expr))
     return *doc;
   if (std::optional<Value> name = tryEmitFunctionValueNameRead(expr))
