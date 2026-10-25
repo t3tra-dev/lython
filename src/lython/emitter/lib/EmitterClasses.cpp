@@ -6746,10 +6746,23 @@ Value ModuleEmitter::emitInlineMethodBody(
   // walk never swapped -- and at module scope the ASSIGNMENT above it went to
   // the global's cell too, so the local was never bound at all.
   std::optional<ImporterModuleScope> importerScope;
+  std::optional<MainModuleScope> mainScope;
   std::optional<llvm::SaveAndRestore<std::string>> savedSourceName;
   std::optional<llvm::SaveAndRestore<std::string>> savedPackageName;
   llvm::SmallVector<LoopControlContext, 4> savedLoopContexts;
+  bool mainMethodInImportedCode = false;
   auto crossModuleCleanup = llvm::scope_exit([&] {
+    if (mainMethodInImportedCode) {
+      // ⛔ Not left unnamed: the walk that emits the imported code names every
+      // unnamed diagnostic after its own module when it returns, and an error
+      // in the program's hook was reported as `baselib.py:6:15` -- the
+      // program's line in the base class's file.
+      for (std::size_t index = crossModuleDiagnosticStart;
+           index < diagnostics.size(); ++index)
+        if (diagnostics[index].filename.empty())
+          diagnostics[index].filename = kMainModuleDiagnosticFile;
+      return;
+    }
     if (!methodSource)
       return;
     // Attribute before SaveAndRestore rolls sourceName back (destruction
@@ -6783,6 +6796,22 @@ Value ModuleEmitter::emitInlineMethodBody(
     // against the test's lines -- which a traceback filter by file then
     // dropped as the runner's own.
     savedSourceName.emplace(sourceName, mainSourceName);
+    mainMethodInImportedCode = true;
+    // ⭐ AND SO ARE ITS NAMES, the rest of what the branch above re-establishes
+    // for an imported module's method. The use site's names were in scope and
+    // the program's module bindings were not (the imported code's
+    // ImporterModuleScope hides them): a hook that a base class of another
+    // module calls read that method's local `out` for the program's global of
+    // the name and printed the base's string; `log.append` in a TestCase's
+    // setUp read `log` as nothing ("unresolved runtime binding 'log'"); and
+    // `time()` in setUp, under `from time import time`, read unittest.case's
+    // `import time` and was refused as a module.
+    mainScope.emplace(*this);
+    if (mainScope->restoresMainModule()) {
+      values.clear();
+      isolation.emplace(types.isolateScopes());
+      moduleScope.emplace(types.pushScope());
+    }
   }
   // A generic class's method body still spells its type parameters (`item:
   // T`), and this inlining happens far from the specialization's emission
@@ -6795,7 +6824,7 @@ Value ModuleEmitter::emitInlineMethodBody(
   // `T` as a class of that name (`builtins.T`) -- a closure the call then
   // found no target for, `@skip("...")` through an imported `skip` with a
   // generic `__call__`.
-  if (methodSource)
+  if (methodSource || (mainScope && mainScope->restoresMainModule()))
     for (const auto &binding : typeArguments) {
       types.bindLocalSymbol(binding.first, binding.second);
       types.bindLocalTypeParameter(binding.first, binding.second);

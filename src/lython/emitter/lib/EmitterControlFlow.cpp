@@ -1907,10 +1907,29 @@ void ModuleEmitter::bindConditionallyAssignedLocals(
     llvm::StringRef name = entry.getKey();
     if (values.find(name) != values.end())
       continue;
-    // A name the module already owns is a global, not a local of this scope.
-    if (isModuleGlobalRead(name) || moduleGlobals.count(name) ||
-        (currentBoxedLocals.contains(name) && !readByNested.contains(name)) ||
-        types.lookupSymbol(name) || types.lookupClass(name))
+    // A name the module already owns is a global, not a local of this scope
+    // -- at module scope, or in a function that declared it `global`.
+    //
+    // ⛔ Not in any other function: there an assignment makes a local whatever
+    // the module binds, and with `tag = "global"` at module level,
+    //
+    //     def pick(which: int) -> str:
+    //         if which == 1:
+    //             tag = "- "
+    //         else:
+    //             raise ValueError(which)
+    //         return tag
+    //
+    // returned "global" -- the arm's binding had no slot to reach the read,
+    // which found the module's. A builtin, a class, or a name an enclosing
+    // function binds is shadowed the same way.
+    bool writesModuleName = (atModuleScope && methodsBeingInlined.empty()) ||
+                            currentGlobalDecls.count(name);
+    if (writesModuleName &&
+        (isModuleGlobalRead(name) || moduleGlobals.count(name) ||
+         types.lookupSymbol(name) || types.lookupClass(name)))
+      continue;
+    if (currentBoxedLocals.contains(name) && !readByNested.contains(name))
       continue;
     // ⭐ ONLY A NAME SOMETHING LATER READS. Every name a region binds could be
     // given a slot, and giving one to a name used only INSIDE the region

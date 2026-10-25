@@ -265,6 +265,9 @@ EmitResult ModuleEmitter::emit() {
   // diagnostics (rejected string forward references) surface here.
   for (parser::Diagnostic &diagnostic : types.takeAnnotationDiagnostics())
     diagnostics.push_back(std::move(diagnostic));
+  for (parser::Diagnostic &diagnostic : diagnostics)
+    if (diagnostic.filename == kMainModuleDiagnosticFile)
+      diagnostic.filename.clear();
   result.diagnostics = std::move(diagnostics);
   result.module = mlir::OwningOpRef<mlir::ModuleOp>(module);
   return result;

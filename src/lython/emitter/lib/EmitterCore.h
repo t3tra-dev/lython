@@ -2231,6 +2231,11 @@ private:
       emitter.moduleGlobals.clear();
       emitter.moduleConstantBindings.clear();
       emitter.primitiveConstants.clear();
+      // The outermost one holds the main module's bindings.
+      if (!emitter.mainModuleHiddenBy) {
+        emitter.mainModuleHiddenBy = this;
+        hidesMainModule = true;
+      }
       // ⛔ EXCEPT AN IMPORTED MODULE'S OWN GLOBALS, which are exactly what a
       // body being emitted here reads. Their keys are QUALIFIED (`lib.NAMES`)
       // and a main-module global's is bare, so they cannot shadow one -- and
@@ -2253,10 +2258,70 @@ private:
       emitter->moduleGlobals = std::move(globals);
       emitter->moduleConstantBindings = std::move(constants);
       emitter->primitiveConstants = std::move(primitives);
+      if (hidesMainModule)
+        emitter->mainModuleHiddenBy = nullptr;
+    }
+
+    // What this scope took out of sight, for `MainModuleScope`.
+    const llvm::StringMap<mlir::Type> &hiddenGlobals() const { return globals; }
+    const llvm::StringMap<const parser::Node *> &hiddenConstants() const {
+      return constants;
+    }
+    const llvm::StringMap<PrimitiveConstant> &hiddenPrimitives() const {
+      return primitives;
     }
 
   private:
     ModuleEmitter *emitter;
+    llvm::StringMap<mlir::Type> globals;
+    llvm::StringMap<const parser::Node *> constants;
+    llvm::StringMap<PrimitiveConstant> primitives;
+    bool hidesMainModule = false;
+  };
+  const ImporterModuleScope *mainModuleHiddenBy = nullptr;
+  // The file of a main-module diagnostic raised inside imported code, until
+  // emit() returns it to the empty name that means the main module.
+  static constexpr llvm::StringLiteral kMainModuleDiagnosticFile =
+      "<main module>";
+  // ⭐ The main module's bindings back in scope, for a body written in the
+  // main module and emitted inside an imported module's code: a method of a
+  // program class that an imported runner calls is inlined there, and Python
+  // reads its globals in the module that defines it -- `self.addCleanup(
+  // log.append, ...)` in a TestCase's setUp read the program's `log` as a
+  // function symbol of that name ("unresolved runtime binding 'log'").
+  class MainModuleScope {
+  public:
+    explicit MainModuleScope(ModuleEmitter &emitter) : emitter(&emitter) {
+      const ImporterModuleScope *hidden = emitter.mainModuleHiddenBy;
+      if (!hidden)
+        return;
+      active = true;
+      globals = std::move(emitter.moduleGlobals);
+      constants = std::move(emitter.moduleConstantBindings);
+      primitives = std::move(emitter.primitiveConstants);
+      emitter.moduleGlobals = hidden->hiddenGlobals();
+      emitter.moduleConstantBindings = hidden->hiddenConstants();
+      emitter.primitiveConstants = hidden->hiddenPrimitives();
+    }
+    MainModuleScope(const MainModuleScope &) = delete;
+    MainModuleScope &operator=(const MainModuleScope &) = delete;
+    ~MainModuleScope() {
+      if (!active)
+        return;
+      // What the body declared of an imported module's globals outlives it,
+      // as an ImporterModuleScope's does.
+      for (const auto &entry : emitter->moduleGlobals)
+        if (entry.getKey().contains('.') && !globals.count(entry.getKey()))
+          globals[entry.getKey()] = entry.getValue();
+      emitter->moduleGlobals = std::move(globals);
+      emitter->moduleConstantBindings = std::move(constants);
+      emitter->primitiveConstants = std::move(primitives);
+    }
+    bool restoresMainModule() const { return active; }
+
+  private:
+    ModuleEmitter *emitter;
+    bool active = false;
     llvm::StringMap<mlir::Type> globals;
     llvm::StringMap<const parser::Node *> constants;
     llvm::StringMap<PrimitiveConstant> primitives;

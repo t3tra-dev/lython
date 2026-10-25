@@ -155,6 +155,37 @@ TEST(EmitterTest, RefusesAStatementInAnImportedModuleBody) {
       << emitted.diagnostics;
 }
 
+// What: an error in a method of the program that another module's code calls
+// -- the hook a base class of that module calls -- names the program's file
+// and line, and no line of the other module.
+TEST(EmitterTest, NamesTheProgramForAnErrorInAMethodImportedCodeCalls) {
+  ImportedModuleEmit emitted = emitWithImportedModule(
+      "hookbase",
+      "class Base:\n"
+      "    def go(self) -> str:\n"
+      "        out = \"base\"\n"
+      "        return self.hook() + out\n"
+      "\n"
+      "    def hook(self) -> str:\n"
+      "        return \"\"\n",
+      "import hookbase\n"
+      "\n"
+      "\n"
+      "class Sub(hookbase.Base):\n"
+      "    def hook(self) -> str:\n"
+      "        return undefined_name\n"
+      "\n"
+      "\n"
+      "print(Sub().go())\n");
+  EXPECT_FALSE(emitted.succeeded);
+  EXPECT_NE(emitted.diagnostics.find(
+                "main.py:6:15: emit error: unresolved name 'undefined_name'"),
+            std::string::npos)
+      << emitted.diagnostics;
+  EXPECT_EQ(emitted.diagnostics.find("hookbase.py"), std::string::npos)
+      << emitted.diagnostics;
+}
+
 // What: an imported module's `assert` whose test the compiler can decide is
 // decided: a true one compiles, a false one is refused as the AssertionError
 // the import raises, and one over a run-time value is refused.
