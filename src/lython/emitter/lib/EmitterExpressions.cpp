@@ -6493,6 +6493,14 @@ Value ModuleEmitter::coerceValue(Value value, mlir::Type targetType,
       widened != targetType && isNumericPrimitiveContract(widened) &&
       isNumericPrimitiveContract(targetType))
     return value;
+  // ⭐ AND A UNION OF RUNGS BELOW THE TARGET (`bool | int` where int is
+  // declared), for the same reason. ⛔ Not the member arms below, which meet
+  // as the target: the bool arm arrived at an int merge as a bool, and the
+  // merge was invalid IR ("type mismatch for bb argument").
+  if (mlir::Type below =
+          belowDeclaredRung(types, types.widenLiteral(value.type), targetType);
+      below && mlir::isa<py::UnionType>(below))
+    return value;
   // ⭐ AND THE SAME LIE ONE LEVEL IN. A container's ELEMENT type is its storage,
   // so retyping `list[int]` to `list[float]` leaves int boxes in float slots:
   //

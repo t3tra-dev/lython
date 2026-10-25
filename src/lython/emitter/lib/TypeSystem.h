@@ -840,4 +840,17 @@ private:
 bool appendStarredArgumentTypes(const TypeSystem &types, mlir::Type type,
                                 llvm::SmallVectorImpl<mlir::Type> &out);
 
+// Where a type stands in CPython's numeric tower (PEP 484): bool below int
+// below float below complex, and -1 for anything that is not one of them (a
+// union included).
+int numericTowerRung(const TypeSystem &types, mlir::Type type);
+
+// `supplied` when it stands BELOW `declared` on the numeric tower -- a lower
+// rung, or a union of rungs none above `declared` and one below it -- and null
+// otherwise. A boundary that declares `declared` keeps such a value's own type
+// rather than the declaration's: the rungs share no representation, and the
+// annotation does not convert in CPython either.
+mlir::Type belowDeclaredRung(const TypeSystem &types, mlir::Type supplied,
+                             mlir::Type declared);
+
 } // namespace lython::emitter
