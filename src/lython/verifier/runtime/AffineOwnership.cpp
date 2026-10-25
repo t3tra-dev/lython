@@ -542,6 +542,11 @@ struct BorrowedPathState {
   // `AffinePathState::previous` is not: a path-dependent set in the key lets
   // nested loops defeat the dedup. Missing a state can only miss a detection.
   llvm::SmallVector<llvm::SmallVector<mlir::Value, 4>, 4> previousGroups = {};
+  // The earlier names this block has LENT afresh (a merge-borrow retain on a
+  // name the group had before), as `previousGroups` held them. The edge that
+  // forwards one hands the merge argument the new lend, not the earlier
+  // name's own token. Empty at every block entry, so not part of the key.
+  llvm::SmallVector<llvm::SmallVector<mlir::Value, 4>, 2> freshLends = {};
   // Path entered through an exceptional (unwind) edge. Retain balance is
   // required on these paths like any other (rfc/stdlib-semantics.md R2).
   bool exceptional = false;
@@ -2441,6 +2446,7 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
             next.block = handler;
             next.start = firstOperation(handler);
             next.exceptional = true;
+            next.freshLends.clear();
             worklist.push_back(std::move(next));
           }
           op = op->getNextNode();
@@ -2537,6 +2543,30 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
                    << " of @" << resource.function.getSymName()
                    << " retain balance exceeded " << kMaxRetainedBalance;
           ++state.retained;
+        } else if (isBlockArgMergeBorrowRetain(call) ||
+                   own::isEmitterIncrefRetain(call)) {
+          // ⭐ AND A LEND TAKEN ON A NAME THE GROUP HAD EARLIER, which the
+          // release credit above already returns. Two choices over one
+          // borrowed parameter -- `min(x * 2, hi)` then `max(hi, x * 2)` --
+          // move the group onto the first merge, and the second merge's lend
+          // is taken on the parameter's own name: the release of that merge
+          // was credited, its lend never counted, and the first merge's
+          // release then found a zero balance -- "released or transferred
+          // without a prior retain" over IR whose lends and releases pair.
+          for (const llvm::SmallVector<mlir::Value, 4> &earlier :
+               llvm::reverse(state.previousGroups)) {
+            if (!callRetainsGroup(contracts, call, earlier, aliases))
+              continue;
+            if (state.retained >= kMaxRetainedBalance)
+              return call.emitError()
+                     << "borrowed entry argument " << resource.logicalIndex
+                     << " of @" << resource.function.getSymName()
+                     << " retain balance exceeded " << kMaxRetainedBalance;
+            ++state.retained;
+            if (!llvm::is_contained(state.freshLends, earlier))
+              state.freshLends.push_back(earlier);
+            break;
+          }
         }
 
         if (walk.raiseFacts(call).raiseLike) {
@@ -2690,8 +2720,27 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
       // borrowed parameter and a loop between them, refused with "borrowed
       // entry argument 1 reaches function exit with 1 retained ownership
       // token(s)" over IR whose lends and returns pair exactly.
-      for (llvm::SmallVector<mlir::Value, 4> &earlier : next.previousGroups)
-        earlier = remapGroupForSuccessor(op, index, successor, earlier, aliases);
+      //
+      // ⛔ EXCEPT A NAME THIS BLOCK LENT AFRESH: the edge then carries the new
+      // lend, and the earlier name keeps its own token. `caret = start` lent
+      // `start` into caret's merge, and `start` moved on to `mark` at the next
+      // edge -- followed as if it were caret, start's own release was never
+      // seen (`_anchors` in runtime/lib/traceback.py).
+      llvm::SmallVector<llvm::SmallVector<mlir::Value, 4>, 2> lentOnward;
+      for (llvm::SmallVector<mlir::Value, 4> &earlier : next.previousGroups) {
+        llvm::SmallVector<mlir::Value, 4> remapped =
+            remapGroupForSuccessor(op, index, successor, earlier, aliases);
+        if (remapped != earlier && llvm::is_contained(state.freshLends, earlier))
+          lentOnward.push_back(std::move(remapped));
+        else
+          earlier = std::move(remapped);
+      }
+      for (llvm::SmallVector<mlir::Value, 4> &lent : lentOnward) {
+        next.previousGroups.push_back(std::move(lent));
+        if (next.previousGroups.size() > kMaxBorrowedPreviousGroups)
+          next.previousGroups.erase(next.previousGroups.begin());
+      }
+      next.freshLends.clear();
       // A rename: remember what the group was called, so the lend taken on
       // that name can be credited when it is returned there.
       //
