@@ -1127,6 +1127,9 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                                                   types.boolType(), test);
         return Value{boolean.getResult(), types.boolType()};
       }
+  if (calleeNode && calleeNode->kind == "Attribute" &&
+      refuseInternalManifestMethod(*calleeNode))
+    return emitNone(expr);
   if (std::optional<Value> subclasses = tryEmitSubclassesCall(expr))
     return *subclasses;
   if (std::optional<Value> exited = tryEmitSysExit(expr))

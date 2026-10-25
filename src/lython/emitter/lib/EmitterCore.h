@@ -885,13 +885,14 @@ private:
   std::optional<Value>
   tryEmitStrTranslateSugar(const parser::Node &expr,
                            const parser::Node *calleeNode);
-  // sorted(key=, reverse=) / list.sort(key=, reverse=):
-  // decorate-sort-undecorate over the native stable sort.
+  // sorted(key=, reverse=) / list.sort(key=, reverse=): the keys taken
+  // into a list, then the native stable sort over them.
   std::optional<Value> tryEmitSortSugar(const parser::Node &expr,
                                         const parser::Node *calleeNode);
   std::optional<std::string>
   emitDsuSortStatements(const parser::Node &anchor, parser::NodePtr source,
-                        const LazyCallable *key, bool reverse, unsigned serial,
+                        const LazyCallable *key, bool reverse, bool inPlace,
+                        unsigned serial,
                         llvm::SmallVectorImpl<std::string> &scratchNames);
   void emitWhile(const parser::Node &statement);
   void emitAsyncFor(const parser::Node &statement);
@@ -1622,6 +1623,10 @@ private:
   Value emitSliceProtocolRead(const parser::Node &expr, Value container,
                               llvm::ArrayRef<Value> bounds);
   Value emitAttribute(const parser::Node &expr);
+  // A written `obj.name` where `name` is a manifest method only the emitter
+  // calls (`__getslice__`, `__sort_by_keys__`, ...) on a builtin type: the
+  // diagnostic CPython's AttributeError would be. True when refused.
+  bool refuseInternalManifestMethod(const parser::Node &attribute);
   Value emitAwait(const parser::Node &expr);
   Value emitAwaitValue(const parser::Node &anchor, Value awaitable);
   // The element type an EMPTY container literal inside `literal` takes from

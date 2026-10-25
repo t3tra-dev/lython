@@ -1604,17 +1604,21 @@ module attributes {
       scf.yield %lhs_header, %grown : memref<2xi64>, memref<?xi8>
     } else {
       // ⭐ THE ONLY PLACE THAT ASKS FOR SLACK, and it asks the way CPython's
-      // list_resize does: an eighth over, plus a floor. A string that is never
-      // appended to is allocated exactly, so the capacity word costs it 8 bytes
-      // and no more; one that IS appended to stops paying per append after the
-      // first move.
+      // list_resize does: an eighth over, plus a floor -- but only when the
+      // left operand is the sole reference to itself, which is what a string
+      // being grown by `s += x` looks like once it has outgrown its block.
+      // Any other concatenation (`"w" + str(i)`: a literal on the left) is
+      // allocated exactly, so the capacity word costs it 8 bytes and no more.
+      // ⛔ Not slack on every concatenation: the 6 bytes of "w12345" then took
+      // an 80-byte block where CPython takes 48.
       %width = arith.maxsi %lhs_width, %rhs_width : i64
       %exact = arith.muli %total_len, %width : i64
       %eighth_shift = arith.constant 3 : i64
       %eighth = arith.shrui %exact, %eighth_shift : i64
       %floor = arith.constant 32 : i64
       %slack = arith.addi %exact, %eighth : i64
-      %room = arith.addi %slack, %floor : i64
+      %grown_room = arith.addi %slack, %floor : i64
+      %room = arith.select %unique, %grown_room, %exact : i64
       %header, %bytes = func.call @__ly_unicode_alloc_capacity(%total_len, %width, %room) : (i64, i64, i64) -> (memref<2xi64>, memref<?xi8>)
       %lhs_upper = arith.index_cast %lhs_len : i64 to index
       %rhs_upper = arith.index_cast %rhs_len : i64 to index

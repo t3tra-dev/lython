@@ -67,7 +67,7 @@ module attributes {
                     "__delslice__", "__setitem__", "__delitem__",
                     "__contains__", "__repr__", "sort", "reverse", "copy",
                     "count", "index", "__add__", "__mul__", "__eq__",
-                    "__ne__", "__lt__", "__le__", "__gt__", "__ge__", "__getslice__", "__setslice__", "__delslice__"],
+                    "__ne__", "__lt__", "__le__", "__gt__", "__ge__", "__getslice__", "__setslice__", "__delslice__", "__sort_by_keys__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"builtins.list">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.protocol<"Iterable", [!py.contract<"$T">]>] -> [!py.literal<None>]>,
@@ -103,7 +103,8 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.list">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.slice">] -> [!py.contract<"builtins.list", [!py.contract<"$T">]>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.slice">, !py.contract<"builtins.list", [!py.contract<"$T">]>] -> [!py.literal<None>]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.slice">] -> [!py.literal<None>]>
+      !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.slice">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.list", [!py.typevar<"K">]>, !py.contract<"builtins.bool">] -> [!py.literal<None>]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
@@ -112,7 +113,7 @@ module attributes {
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
   } {}
 
   // ===== impls: list methods =====
@@ -178,6 +179,33 @@ module attributes {
     func.return
   }
 
+  // The moves of a sort that orders `items` by itself, or -- when `paired` --
+  // orders `items` (the keys) and moves `values` along with it, as CPython's
+  // sortslice moves `keys` and `values` together.
+  func.func private @__ly_swap_pair(%items: memref<?xi64>, %values: memref<?xi64>, %paired: i1, %a: index, %b: index) {
+    func.call @__ly_swap_slots(%items, %a, %b) : (memref<?xi64>, index, index) -> ()
+    scf.if %paired {
+      func.call @__ly_swap_slots(%values, %a, %b) : (memref<?xi64>, index, index) -> ()
+    }
+    func.return
+  }
+
+  func.func private @__ly_reverse_pair(%items: memref<?xi64>, %values: memref<?xi64>, %paired: i1, %lo: i64, %hi: i64) {
+    func.call @__ly_reverse_slots(%items, %lo, %hi) : (memref<?xi64>, i64, i64) -> ()
+    scf.if %paired {
+      func.call @__ly_reverse_slots(%values, %lo, %hi) : (memref<?xi64>, i64, i64) -> ()
+    }
+    func.return
+  }
+
+  func.func private @__ly_move_pair(%dst: memref<?xi64>, %vdst: memref<?xi64>, %d: i64, %src: memref<?xi64>, %vsrc: memref<?xi64>, %s: i64, %paired: i1) {
+    func.call @__ly_box_move_slot(%dst, %d, %src, %s) : (memref<?xi64>, i64, memref<?xi64>, i64) -> ()
+    scf.if %paired {
+      func.call @__ly_box_move_slot(%vdst, %d, %vsrc, %s) : (memref<?xi64>, i64, memref<?xi64>, i64) -> ()
+    }
+    func.return
+  }
+
   // What every slot of a list about to be sorted holds, asked once before the
   // sort as CPython's listsort asks it (its `unsafe_*_compare` selection):
   // 1 when every slot is an immediate int, 2 when every slot is an exact str,
@@ -224,15 +252,16 @@ module attributes {
   }
 
   // `items[a] < items[b]` for a sort of `kind` (`__ly_sort_kind`).
+  // ⛔ The tuple and generic comparisons live in `__ly_sort_less_other`, not
+  // here: with them inlined this function saved six register pairs on entry,
+  // which was most of the cost of comparing two immediate ints, and it was too
+  // large to be inlined into the sort's loops itself.
   func.func private @__ly_sort_less(%kind: i64, %items_ptr: !llvm.ptr, %a: i64, %b: i64) -> i1 {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %two = arith.constant 2 : i64
-    %c16 = func.call @__ly_box_word_count() : () -> i64
-    %ao = arith.muli %a, %c16 : i64
-    %bo = arith.muli %b, %c16 : i64
-    %ap = llvm.getelementptr %items_ptr[%ao] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    %bp = llvm.getelementptr %items_ptr[%bo] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %ap = llvm.getelementptr %items_ptr[%a] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %bp = llvm.getelementptr %items_ptr[%b] : (!llvm.ptr, i64) -> !llvm.ptr, i64
     %ints = arith.cmpi eq, %kind, %one : i64
     %less = scf.if %ints -> (i1) {
       %aw = llvm.load %ap : !llvm.ptr -> i64
@@ -248,20 +277,28 @@ module attributes {
         %lt = arith.cmpi slt, %cmp, %zero : i64
         scf.yield %lt : i1
       } else {
-        %three = arith.constant 3 : i64
-        %tuples = arith.cmpi eq, %kind, %three : i64
-        %rest = scf.if %tuples -> (i1) {
-          %aw = llvm.load %ap : !llvm.ptr -> i64
-          %bw = llvm.load %bp : !llvm.ptr -> i64
-          %lt = func.call @__ly_tuple_compare_blocks(%aw, %bw, %zero) : (i64, i64, i64) -> i1
-          scf.yield %lt : i1
-        } else {
-          %lt = func.call @__ly_slot_less(%items_ptr, %a, %b) : (!llvm.ptr, i64, i64) -> i1
-          scf.yield %lt : i1
-        }
-        scf.yield %rest : i1
+        %lt = func.call @__ly_sort_less_other(%kind, %items_ptr, %a, %b) : (i64, !llvm.ptr, i64, i64) -> i1
+        scf.yield %lt : i1
       }
       scf.yield %other : i1
+    }
+    func.return %less : i1
+  }
+
+  func.func private @__ly_sort_less_other(%kind: i64, %items_ptr: !llvm.ptr, %a: i64, %b: i64) -> i1 attributes {ly.runtime.out_of_line} {
+    %zero = arith.constant 0 : i64
+    %three = arith.constant 3 : i64
+    %tuples = arith.cmpi eq, %kind, %three : i64
+    %less = scf.if %tuples -> (i1) {
+      %ap = llvm.getelementptr %items_ptr[%a] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %bp = llvm.getelementptr %items_ptr[%b] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %aw = llvm.load %ap : !llvm.ptr -> i64
+      %bw = llvm.load %bp : !llvm.ptr -> i64
+      %lt = func.call @__ly_tuple_compare_blocks(%aw, %bw, %zero) : (i64, i64, i64) -> i1
+      scf.yield %lt : i1
+    } else {
+      %lt = func.call @__ly_slot_less(%items_ptr, %a, %b) : (!llvm.ptr, i64, i64) -> i1
+      scf.yield %lt : i1
     }
     func.return %less : i1
   }
@@ -271,7 +308,7 @@ module attributes {
   // insertion-sort the remainder of the block into it. This is count_run plus
   // binary_sort, and the block is at most minrun long so the quadratic tail is
   // bounded by 64.
-  func.func private @__ly_sort_block(%kind: i64, %items: memref<?xi64>, %items_ptr: !llvm.ptr, %lo: i64, %hi: i64) {
+  func.func private @__ly_sort_block(%kind: i64, %items: memref<?xi64>, %items_ptr: !llvm.ptr, %values: memref<?xi64>, %paired: i1, %lo: i64, %hi: i64) {
     %one = arith.constant 1 : i64
     %two = arith.constant 2 : i64
     %false = arith.constant false
@@ -299,28 +336,47 @@ module attributes {
         scf.yield %nk : i64
       }
       scf.if %desc {
-        func.call @__ly_reverse_slots(%items, %lo, %end) : (memref<?xi64>, i64, i64) -> ()
+        func.call @__ly_reverse_pair(%items, %values, %paired, %lo, %end) : (memref<?xi64>, memref<?xi64>, i1, i64, i64) -> ()
       }
+      // CPython's binarysort: the place of each remaining element is found by
+      // bisection over the sorted prefix, then the element is rotated into it.
+      // ⛔ Not a linear walk back from the end: that compares about a quarter
+      // of the block per element (12 for a 49-element block, against 6), and a
+      // comparison of two str blocks is a cache miss on each side.
+      // Equal keys bisect to the right of their equals, which keeps the sort
+      // stable; nothing moves until the search is over.
       %end_index = arith.index_cast %end : i64 to index
       %hi_index = arith.index_cast %hi : i64 to index
       scf.for %p = %end_index to %hi_index step %c1i {
         %pp = arith.index_cast %p : index to i64
-        %fin = scf.while (%j = %pp) : (i64) -> i64 {
-          %above = arith.cmpi sgt, %j, %lo : i64
-          %swap = scf.if %above -> (i1) {
-            %prev = arith.subi %j, %one : i64
-            %lt = func.call @__ly_sort_less(%kind, %items_ptr, %j, %prev) : (i64, !llvm.ptr, i64, i64) -> i1
-            scf.yield %lt : i1
+        %place:2 = scf.while (%l = %lo, %r = %pp) : (i64, i64) -> (i64, i64) {
+          %open = arith.cmpi slt, %l, %r : i64
+          scf.condition(%open) %l, %r : i64, i64
+        } do {
+        ^bb0(%l: i64, %r: i64):
+          %span = arith.subi %r, %l : i64
+          %half = arith.shrui %span, %one : i64
+          %m = arith.addi %l, %half : i64
+          %lt = func.call @__ly_sort_less(%kind, %items_ptr, %pp, %m) : (i64, !llvm.ptr, i64, i64) -> i1
+          // A branch for the reason the merge's is (`__ly_merge_slots`).
+          %nlr:2 = scf.if %lt -> (i64, i64) {
+            llvm.inline_asm has_side_effects "", "" : () -> ()
+            scf.yield %l, %m : i64, i64
           } else {
-            scf.yield %false : i1
+            %m_next = arith.addi %m, %one : i64
+            scf.yield %m_next, %r : i64, i64
           }
-          scf.condition(%swap) %j : i64
+          scf.yield %nlr#0, %nlr#1 : i64, i64
+        }
+        %fin = scf.while (%j = %pp) : (i64) -> i64 {
+          %above = arith.cmpi sgt, %j, %place#0 : i64
+          scf.condition(%above) %j : i64
         } do {
         ^bb0(%j: i64):
           %prev = arith.subi %j, %one : i64
           %ji = arith.index_cast %j : i64 to index
           %pi = arith.index_cast %prev : i64 to index
-          func.call @__ly_swap_slots(%items, %ji, %pi) : (memref<?xi64>, index, index) -> ()
+          func.call @__ly_swap_pair(%items, %values, %paired, %ji, %pi) : (memref<?xi64>, memref<?xi64>, i1, index, index) -> ()
           scf.yield %prev : i64
         }
       }
@@ -343,7 +399,7 @@ module attributes {
   // allocated. CPython avoids even that by emptying the list for the duration
   // of the sort and cleaning up in its error path; writing that here needs a
   // landing pad the manifest has no spelling for.
-  func.func private @__ly_merge_slots(%kind: i64, %items: memref<?xi64>, %items_ptr: !llvm.ptr, %scratch: memref<?xi64>, %decisions: memref<?xi8>, %lo: i64, %mid: i64, %hi: i64) {
+  func.func private @__ly_merge_slots(%kind: i64, %items: memref<?xi64>, %items_ptr: !llvm.ptr, %values: memref<?xi64>, %paired: i1, %scratch: memref<?xi64>, %vscratch: memref<?xi64>, %decisions: memref<?xi8>, %lo: i64, %mid: i64, %hi: i64) {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
@@ -368,31 +424,43 @@ module attributes {
         %kk = arith.index_cast %k : i64 to index
         %mark = arith.select %take_right, %one8, %zero8 : i8
         memref.store %mark, %decisions[%kk] : memref<?xi8>
-        %i_next = arith.addi %i, %one : i64
-        %j_next = arith.addi %j, %one : i64
-        %ni = arith.select %take_right, %i, %i_next : i64
-        %nj = arith.select %take_right, %j_next, %j : i64
+        // ⭐ A BRANCH, KEPT ONE BY THE EMPTY ASM IN ITS ARM. As a select (what
+        // the optimizer makes of two arms that only bump a cursor) the next
+        // comparison's loads waited for this one's answer, so the comparisons
+        // ran one after another; as a branch the processor guesses the side
+        // and starts the next comparison while this one finishes, which is
+        // also how CPython's merge_lo runs. Measured on 200,000 strs: 134 ns
+        // per element as a select, 102 as a branch (CPython 86), and immediate
+        // ints 38 against 19 -- a wrong guess costs less than the wait.
+        %nij:2 = scf.if %take_right -> (i64, i64) {
+          llvm.inline_asm has_side_effects "", "" : () -> ()
+          %j_next = arith.addi %j, %one : i64
+          scf.yield %i, %j_next : i64, i64
+        } else {
+          %i_next = arith.addi %i, %one : i64
+          scf.yield %i_next, %j : i64, i64
+        }
         %nk = arith.addi %k, %one : i64
-        scf.yield %ni, %nj, %nk : i64, i64, i64
+        scf.yield %nij#0, %nij#1, %nk : i64, i64, i64
       }
       %n1 = arith.subi %mid, %lo : i64
       %n1_index = arith.index_cast %n1 : i64 to index
       scf.for %t = %c0 to %n1_index step %c1 {
         %tt = arith.index_cast %t : index to i64
         %src = arith.addi %lo, %tt : i64
-        func.call @__ly_box_move_slot(%scratch, %tt, %items, %src) : (memref<?xi64>, i64, memref<?xi64>, i64) -> ()
+        func.call @__ly_move_pair(%scratch, %vscratch, %tt, %items, %values, %src, %paired) : (memref<?xi64>, memref<?xi64>, i64, memref<?xi64>, memref<?xi64>, i64, i1) -> ()
       }
       %ndec_index = arith.index_cast %walk#2 : i64 to index
       %after:3 = scf.for %d = %c0 to %ndec_index step %c1 iter_args(%i2 = %zero, %j2 = %mid, %k2 = %lo) -> (i64, i64, i64) {
         %mark = memref.load %decisions[%d] : memref<?xi8>
         %right = arith.cmpi ne, %mark, %zero8 : i8
         %next:3 = scf.if %right -> (i64, i64, i64) {
-          func.call @__ly_box_move_slot(%items, %k2, %items, %j2) : (memref<?xi64>, i64, memref<?xi64>, i64) -> ()
+          func.call @__ly_move_pair(%items, %values, %k2, %items, %values, %j2, %paired) : (memref<?xi64>, memref<?xi64>, i64, memref<?xi64>, memref<?xi64>, i64, i1) -> ()
           %nj = arith.addi %j2, %one : i64
           %nk = arith.addi %k2, %one : i64
           scf.yield %i2, %nj, %nk : i64, i64, i64
         } else {
-          func.call @__ly_box_move_slot(%items, %k2, %scratch, %i2) : (memref<?xi64>, i64, memref<?xi64>, i64) -> ()
+          func.call @__ly_move_pair(%items, %values, %k2, %scratch, %vscratch, %i2, %paired) : (memref<?xi64>, memref<?xi64>, i64, memref<?xi64>, memref<?xi64>, i64, i1) -> ()
           %ni = arith.addi %i2, %one : i64
           %nk = arith.addi %k2, %one : i64
           scf.yield %ni, %j2, %nk : i64, i64, i64
@@ -406,7 +474,7 @@ module attributes {
         %tt = arith.index_cast %t : index to i64
         %delta = arith.subi %tt, %after#0 : i64
         %dst = arith.addi %after#2, %delta : i64
-        func.call @__ly_box_move_slot(%items, %dst, %scratch, %tt) : (memref<?xi64>, i64, memref<?xi64>, i64) -> ()
+        func.call @__ly_move_pair(%items, %values, %dst, %scratch, %vscratch, %tt, %paired) : (memref<?xi64>, memref<?xi64>, i64, memref<?xi64>, memref<?xi64>, i64, i1) -> ()
       }
     }
     func.return
@@ -425,6 +493,13 @@ module attributes {
   // shapes this does not exploit -- long pre-sorted runs that are not block
   // aligned, and merges where one side is far longer than the other.
   func.func private @__ly_sort_slots(%items: memref<?xi64>, %len: i64) {
+    %false = arith.constant false
+    func.call @__ly_sort_pairs(%items, %items, %false, %len) : (memref<?xi64>, memref<?xi64>, i1, i64) -> ()
+    func.return
+  }
+
+  // The sort above over `keys`, with `values` moved along when `paired`.
+  func.func private @__ly_sort_pairs(%items: memref<?xi64>, %values: memref<?xi64>, %paired: i1, %len: i64) {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %two = arith.constant 2 : i64
@@ -444,7 +519,7 @@ module attributes {
         %want = arith.addi %lo_i64, %minrun : i64
         %past = arith.cmpi sgt, %want, %len : i64
         %hi = arith.select %past, %len, %want : i64
-        func.call @__ly_sort_block(%kind, %items, %items_ptr, %lo_i64, %hi) : (i64, memref<?xi64>, !llvm.ptr, i64, i64) -> ()
+        func.call @__ly_sort_block(%kind, %items, %items_ptr, %values, %paired, %lo_i64, %hi) : (i64, memref<?xi64>, !llvm.ptr, memref<?xi64>, i1, i64, i64) -> ()
       }
       %needs_merge = arith.cmpi slt, %minrun, %len : i64
       scf.if %needs_merge {
@@ -452,6 +527,12 @@ module attributes {
         %scratch_index = arith.index_cast %scratch_words : i64 to index
         %scratch = memref.alloc(%scratch_index) : memref<?xi64>
         %decisions = memref.alloc(%len_index) : memref<?xi8>
+        %vscratch = scf.if %paired -> (memref<?xi64>) {
+          %v = memref.alloc(%scratch_index) : memref<?xi64>
+          scf.yield %v : memref<?xi64>
+        } else {
+          scf.yield %scratch : memref<?xi64>
+        }
         %final = scf.while (%width = %minrun) : (i64) -> i64 {
           %more = arith.cmpi slt, %width, %len : i64
           scf.condition(%more) %width : i64
@@ -469,7 +550,7 @@ module attributes {
             %hi = arith.select %hi_past, %len, %hi_want : i64
             %has_right = arith.cmpi slt, %mid, %hi : i64
             scf.if %has_right {
-              func.call @__ly_merge_slots(%kind, %items, %items_ptr, %scratch, %decisions, %lo_i64, %mid, %hi) : (i64, memref<?xi64>, !llvm.ptr, memref<?xi64>, memref<?xi8>, i64, i64, i64) -> ()
+              func.call @__ly_merge_slots(%kind, %items, %items_ptr, %values, %paired, %scratch, %vscratch, %decisions, %lo_i64, %mid, %hi) : (i64, memref<?xi64>, !llvm.ptr, memref<?xi64>, i1, memref<?xi64>, memref<?xi64>, memref<?xi8>, i64, i64, i64) -> ()
             }
           }
           scf.yield %step_i64 : i64
@@ -480,6 +561,11 @@ module attributes {
         %decisions_addr = arith.index_cast %decisions_addr_index : index to i64
         func.call @free_raw_i64_ptr(%decisions_addr) : (i64) -> ()
         func.call @free_raw_i64_ptr(%scratch_addr) : (i64) -> ()
+        scf.if %paired {
+          %vscratch_addr_index = memref.extract_aligned_pointer_as_index %vscratch : memref<?xi64> -> index
+          %vscratch_addr = arith.index_cast %vscratch_addr_index : index to i64
+          func.call @free_raw_i64_ptr(%vscratch_addr) : (i64) -> ()
+        }
       }
     }
     func.return
@@ -490,6 +576,44 @@ module attributes {
     %len = memref.load %self[%length_slot] : memref<5xi64>
     %items = func.call @__ly_list_items(%self) : (memref<5xi64>) -> memref<?xi64>
     func.call @__ly_sort_slots(%items, %len) : (memref<?xi64>, i64) -> ()
+    func.return
+  }
+
+  // `xs.sort(key=f, reverse=r)` once the emitter has called `f` on every
+  // element in order and collected the answers in `keys`: CPython's list_sort
+  // with keys -- the keys are compared, the elements ride along, and a reverse
+  // sort reverses both before and after a stable ascending one, which keeps
+  // equal keys in input order.
+  // ⛔ Not a public name: the emitter calls it without a written attribute, so
+  // `xs.__sort_by_keys__` in a program never resolves here.
+  // A key function that changed the list's length while the keys were taken
+  // meets CPython's ValueError; CPython also refuses one that changed it
+  // without changing the length, and this cannot see that.
+  memref.global "private" constant @__ly_list_msg_modified_during_sort : memref<25xi8> = dense<[108, 105, 115, 116, 32, 109, 111, 100, 105, 102, 105, 101, 100, 32, 100, 117, 114, 105, 110, 103, 32, 115, 111, 114, 116]>
+  func.func @LyList_SortByKeys(%self: memref<5xi64> {ly.ownership.object_header}, %keys: memref<5xi64> {ly.ownership.object_header}, %reverse: i1) attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__sort_by_keys__"} {
+    %zero = arith.constant 0 : i64
+    %length_slot = arith.constant 2 : index
+    %len = memref.load %self[%length_slot] : memref<5xi64>
+    %key_len = memref.load %keys[%length_slot] : memref<5xi64>
+    %changed = arith.cmpi ne, %len, %key_len : i64
+    scf.if %changed {
+      %value_error = arith.constant {ly.class_of = "builtins.ValueError"} 53 : i64
+      %msg_static = memref.get_global @__ly_list_msg_modified_during_sort : memref<25xi8>
+      %msg = memref.cast %msg_static : memref<25xi8> to memref<?xi8>
+      %msg_len = arith.constant 25 : i64
+      func.call @__ly_raise_static_message(%value_error, %msg, %msg_len) : (i64, memref<?xi8>, i64) -> ()
+    } else {
+      %items = func.call @__ly_list_items(%self) : (memref<5xi64>) -> memref<?xi64>
+      %key_items = func.call @__ly_list_items(%keys) : (memref<5xi64>) -> memref<?xi64>
+      %paired = arith.constant true
+      scf.if %reverse {
+        func.call @__ly_reverse_pair(%key_items, %items, %paired, %zero, %len) : (memref<?xi64>, memref<?xi64>, i1, i64, i64) -> ()
+      }
+      func.call @__ly_sort_pairs(%key_items, %items, %paired, %len) : (memref<?xi64>, memref<?xi64>, i1, i64) -> ()
+      scf.if %reverse {
+        func.call @__ly_reverse_pair(%key_items, %items, %paired, %zero, %len) : (memref<?xi64>, memref<?xi64>, i1, i64, i64) -> ()
+      }
+    }
     func.return
   }
 

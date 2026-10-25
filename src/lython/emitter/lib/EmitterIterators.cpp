@@ -1724,7 +1724,7 @@ NodePtr cloneSubstituting(const parser::Node &node, llvm::StringRef name,
 // Emits the DSU statements; returns the name holding the sorted result list.
 std::optional<std::string> ModuleEmitter::emitDsuSortStatements(
     const parser::Node &anchor, NodePtr source, const LazyCallable *key,
-    bool reverse, unsigned serial,
+    bool reverse, bool inPlace, unsigned serial,
     llvm::SmallVectorImpl<std::string> &scratchNames) {
   parser::SourceRange range = anchor.range;
   auto scratch = [&](const char *stem) {
@@ -1735,10 +1735,14 @@ std::optional<std::string> ModuleEmitter::emitDsuSortStatements(
   };
   std::string listName = scratch("lst");
   std::string copyElement = scratch("c");
-  // __lst = SRC.copy() for lists (the comprehension-built copy's bundle
-  // trips the unwind release placement when a rebind loop follows), the
-  // [__c for __c in SRC] materialization for every other iterable.
-  {
+  // list.sort sorts the receiver itself, evaluated once: `__lst = SRC`.
+  // sorted: __lst = SRC.copy() for lists (the comprehension-built copy's
+  // bundle trips the unwind release placement when a rebind loop follows),
+  // the [__c for __c in SRC] materialization for every other iterable.
+  if (inPlace) {
+    emitStatement(*synth::assign(synth::name(listName, range),
+                                 std::move(source), range));
+  } else {
     auto contract = mlir::dyn_cast_if_present<py::ContractType>(
         types.widenLiteral(types.inferExpr(source.get())));
     if (contract && contract.getContractName() == "builtins.list") {
@@ -1808,31 +1812,20 @@ std::optional<std::string> ModuleEmitter::emitDsuSortStatements(
                              argument);
   };
 
-  std::string pairsName = scratch("ps");
-  std::string indexName = scratch("i");
-  std::string lengthName = scratch("n");
-  emitStatement(*synth::assign(synth::name(lengthName, range),
-                            synth::lenCall(synth::name(listName, range), range),
-                            range));
-
-  // The scratch lists start empty, so their element types must be SPELLED —
-  // an append-refined empty literal types at the bundle level only, and the
-  // undecorate step statically indexes the pair tuples. The concrete key and
-  // element types are inferred from probe expressions and bound to scratch
-  // type names the annotations reference (the generic-specialization trick).
+  // The key list starts empty, so its element type must be SPELLED — an
+  // append-refined empty literal types at the bundle level only. The key type
+  // is inferred from a probe expression and bound to a scratch type name the
+  // annotation references (the generic-specialization trick).
   std::string keyTypeName = scratch("K");
-  std::string elementTypeName = scratch("T");
   {
     NodePtr elementProbe = synth::subscript(synth::name(listName, range),
                                          synth::intConstant(0, range), range);
     std::optional<NodePtr> keyProbe = keyExprFor(elementProbe);
     if (!keyProbe)
       return std::nullopt;
-    mlir::Type elementType =
-        types.widenLiteral(types.inferExpr(elementProbe.get()));
     mlir::Type keyType =
         types.widenLiteral(types.inferExpr(keyProbe->get()));
-    if (!elementType || !keyType) {
+    if (!keyType) {
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, anchor.range.start,
           "cannot infer the sort key type for this iterable"});
@@ -1841,7 +1834,6 @@ std::optional<std::string> ModuleEmitter::emitDsuSortStatements(
     // bindSymbol, not bindLocalSymbol: at module scope there is no local
     // scope stack, and the serial-unique names cannot collide.
     types.bindSymbol(keyTypeName, keyType);
-    types.bindSymbol(elementTypeName, elementType);
   }
   auto emitTypedEmptyList = [&](const std::string &name,
                                 NodePtr annotation) {
@@ -1855,43 +1847,36 @@ std::optional<std::string> ModuleEmitter::emitDsuSortStatements(
     emitStatement(*annAssign);
   };
 
-  // Statement-level decoration (comprehensions would need the strict
-  // inference to type the pairs, and a may-raise key call inside a
-  // comprehension trips the range-iterator unwind bookkeeping):
-  //   __ps: list[tuple[K, int]] = []; __i = 0
-  //   while __i < __n: __ps.append((KEY(__lst[__i]), IDX)); __i += 1
+  // CPython's list_sort with a key: every key is taken first, in element
+  // order, then the keys are sorted with the elements moved alongside
+  // (`list.__sort_by_keys__`, which also does reverse= as CPython does).
+  // ⛔ Not (key, index) tuples sorted and then undone: that built a tuple per
+  // element and copied the list twice, and sorted(words, key=len) ran at 0.4x
+  // CPython.
+  //   __ks: list[K] = []; __i = 0
+  //   while __i < __n: __ks.append(KEY(__lst[__i])); __i += 1
+  std::string keysName = scratch("ks");
+  std::string indexName = scratch("i");
+  std::string lengthName = scratch("n");
+  emitStatement(*synth::assign(synth::name(lengthName, range),
+                            synth::lenCall(synth::name(listName, range), range),
+                            range));
   {
-    emitTypedEmptyList(
-        pairsName,
-        synth::subscript(synth::name("list", range),
-                      synth::subscript(synth::name("tuple", range),
-                                    synth::tuple({synth::name(keyTypeName, range),
-                                               synth::name("int", range)},
-                                              range),
-                                    range),
-                      range));
+    emitTypedEmptyList(keysName,
+                       synth::subscript(synth::name("list", range),
+                                        synth::name(keyTypeName, range),
+                                        range));
     emitStatement(*synth::assign(synth::name(indexName, range),
                               synth::intConstant(0, range), range));
-    NodePtr decoratedIndex =
-        reverse ? synth::binOp(synth::binOp(synth::name(lengthName, range), "Sub",
-                                      synth::intConstant(1, range), range),
-                            "Sub", synth::name(indexName, range), range)
-                : synth::binOp(synth::name(indexName, range), "Add",
-                            synth::intConstant(0, range), range);
     std::optional<NodePtr> keyExpr = keyExprFor(synth::subscript(
         synth::name(listName, range), synth::name(indexName, range), range));
     if (!keyExpr)
       return std::nullopt;
-    NodePtr appendStatement = parser::makeNode("Expr", range);
-    parser::addField(
-        *appendStatement, "value",
-        synth::methodCall(synth::name(pairsName, range), "append",
-                       {synth::tuple({std::move(*keyExpr),
-                                   std::move(decoratedIndex)},
-                                  range)},
-                       range));
     std::vector<NodePtr> loopBody;
-    loopBody.push_back(std::move(appendStatement));
+    loopBody.push_back(synth::exprStmt(
+        synth::methodCall(synth::name(keysName, range), "append",
+                          {std::move(*keyExpr)}, range),
+        range));
     loopBody.push_back(synth::assign(
         synth::name(indexName, range),
         synth::binOp(synth::name(indexName, range), "Add", synth::intConstant(1, range),
@@ -1902,68 +1887,32 @@ std::optional<std::string> ModuleEmitter::emitDsuSortStatements(
                          std::move(loopBody), {}, range));
   }
   {
-    parser::NodePtr sortStatement = synth::exprStmt(synth::methodCall(synth::name(pairsName, range), "sort", {},
-                                    range), range);
-    emitStatement(*sortStatement);
-  }
-
-  // Undecorate by index. reverse=True walks the sorted pairs BACKWARD (the
-  // decorated indices were reversed, so backward emission both restores the
-  // descending key order and lands equal keys in original order — no
-  // list.reverse() call, no iterator over the pairs).
-  //   __out = []; __q = 0|__n
-  //   while ...: __out.append(__lst[<undecorated __ps[__q][1]>])
-  std::string outName = scratch("out");
-  std::string cursorName = scratch("q");
-  {
-    emitTypedEmptyList(outName,
-                       synth::subscript(synth::name("list", range),
-                                     synth::name(elementTypeName, range),
-                                     range));
-    emitStatement(*synth::assign(synth::name(cursorName, range),
-                              reverse ? synth::name(lengthName, range)
-                                      : synth::intConstant(0, range),
-                              range));
-    NodePtr storedIndex = synth::subscript(
-        synth::subscript(synth::name(pairsName, range), synth::name(cursorName, range),
-                      range),
-        synth::intConstant(1, range), range);
-    NodePtr sourceIndex =
-        reverse ? synth::binOp(synth::binOp(synth::name(lengthName, range), "Sub",
-                                      synth::intConstant(1, range), range),
-                            "Sub", std::move(storedIndex), range)
-                : std::move(storedIndex);
-    NodePtr appendStatement = parser::makeNode("Expr", range);
-    parser::addField(
-        *appendStatement, "value",
-        synth::methodCall(synth::name(outName, range), "append",
-                       {synth::subscript(synth::name(listName, range),
-                                      std::move(sourceIndex), range)},
-                       range));
-    std::vector<NodePtr> body;
-    if (reverse) {
-      body.push_back(synth::assign(
-          synth::name(cursorName, range),
-          synth::binOp(synth::name(cursorName, range), "Sub",
-                    synth::intConstant(1, range), range),
-          range));
-      body.push_back(std::move(appendStatement));
-      emitWhile(*synth::whileStmt(synth::compare(synth::name(cursorName, range), "Gt",
-                                       synth::intConstant(0, range), range),
-                           std::move(body), {}, range));
-    } else {
-      body.push_back(std::move(appendStatement));
-      body.push_back(synth::assign(
-          synth::name(cursorName, range),
-          synth::binOp(synth::name(cursorName, range), "Add",
-                    synth::intConstant(1, range), range),
-          range));
-      emitWhile(*synth::whileStmt(synth::compare(synth::name(cursorName, range), "Lt",
-                                       synth::name(lengthName, range), range),
-                           std::move(body), {}, range));
+    // Called without a written attribute, so a program's own
+    // `xs.__sort_by_keys__` is never this method.
+    NodePtr listNode = synth::name(listName, range);
+    NodePtr keysNode = synth::name(keysName, range);
+    NodePtr reverseNode = synth::constantBool(reverse, range);
+    Value list = emitExpr(listNode.get());
+    Value keys = emitExpr(keysNode.get());
+    Value flag = emitExpr(reverseNode.get());
+    CallInferenceResult inference = types.inferMethodCallWithEvidence(
+        list.type, "__sort_by_keys__", {keys.type, flag.type});
+    if (!inference || !requireStaticEvidence(anchor, inference)) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, anchor.range.start,
+          "cannot sort this list by its keys"});
+      return std::nullopt;
     }
+    Value posPack = emitPack({keys, flag});
+    Value namePack = emitPack({});
+    Value valuePack = emitPack({});
+    auto op = py::CallOp::create(
+        builder, loc(anchor), mlir::TypeRange{inference.resultType},
+        callProtocolFor(inference), list.value, posPack.value, namePack.value,
+        valuePack.value);
+    op->setAttr("ly.bound_method", builder.getStringAttr("__sort_by_keys__"));
   }
-  return outName;
+  return listName;
 }
 
 std::optional<Value>
@@ -2092,7 +2041,8 @@ ModuleEmitter::tryEmitSortSugar(const parser::Node &expr,
     // a second scope.
     llvm::SmallVector<std::string, 8> innerNames;
     std::optional<std::string> outName = emitDsuSortStatements(
-        expr, source, hasKey ? &key : nullptr, reverse, serial, innerNames);
+        expr, source, hasKey ? &key : nullptr, reverse, isListSort, serial,
+        innerNames);
     runWithScratchNames(innerNames, [&] {
       if (!outName) {
         result = emitNone(expr);
@@ -2107,18 +2057,7 @@ ModuleEmitter::tryEmitSortSugar(const parser::Node &expr,
           result = emitNone(expr);
         return;
       }
-      // list.sort(): write the permutation back in place through
-      // clear+extend (loop-free: a per-element setitem loop followed by a
-      // later may-raise use trips the unwind release placement).
-      parser::SourceRange range = expr.range;
-      parser::NodePtr clearStatement = synth::exprStmt(synth::methodCall(receiver, "clear", {}, range), range);
-      emitStatement(*clearStatement);
-      NodePtr extendStatement = parser::makeNode("Expr", range);
-      parser::addField(
-          *extendStatement, "value",
-          synth::methodCall(receiver, "extend", {synth::name(*outName, range)},
-                         range));
-      emitStatement(*extendStatement);
+      // list.sort(): the receiver was sorted in place.
       result = emitNone(expr);
     });
   });

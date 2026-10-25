@@ -186,4 +186,14 @@ void markCannotRaiseNoUnwind(mlir::ModuleOp module) {
   }
 }
 
+// A manifest body marked `ly.runtime.out_of_line` keeps its own function.
+// ⛔ Not `no_inline` on the func.func: func-to-llvm does not carry that
+// inherent attribute over, and a function with one caller is inlined into it
+// whatever its size.
+void markOutOfLineNoInline(mlir::ModuleOp module) {
+  for (auto function : module.getOps<mlir::LLVM::LLVMFuncOp>())
+    if (function->hasAttr(kOutOfLineAttr))
+      function.setNoInline(true);
+}
+
 } // namespace py::lowering::runtime::cleanup
