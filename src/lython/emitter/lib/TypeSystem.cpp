@@ -272,24 +272,6 @@ void collectReturnTypes(const TypeSystem &types, const parser::Node *node,
   }
 }
 
-// Where a type stands in the numeric tower: bool below int below float below
-// complex, and -1 for anything that is not one of them (a union included).
-int numericTowerRung(const TypeSystem &types, mlir::Type type) {
-  if (!type)
-    return -1;
-  if (type == types.boolType())
-    return 0;
-  if (type == types.intType())
-    return 1;
-  if (type == types.floatType())
-    return 2;
-  auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
-  if (contract && contract.getArguments().empty() &&
-      contract.getContractName() == "builtins.complex")
-    return 3;
-  return -1;
-}
-
 mlir::Type inferredFunctionResult(const TypeSystem &types,
                                   const parser::Node &function,
                                   llvm::SmallVectorImpl<std::string>
@@ -838,13 +820,12 @@ void collectGeneratorFunctionAnalysis(
       // over a complex value. Same measurement as the return walk's.
       if (value)
         if (int declaredRung = numericTowerRung(types, type);
-            declaredRung > 0 && declaredRung <= 2) {
-          mlir::Type supplied =
-              types.widenLiteral(lenientWalkInfer(types, value, analysis));
-          if (int suppliedRung = numericTowerRung(types, supplied);
-              suppliedRung >= 0 && suppliedRung < declaredRung)
-            type = supplied;
-        }
+            declaredRung > 0 && declaredRung <= 2)
+          if (mlir::Type below = belowDeclaredRung(
+                  types,
+                  types.widenLiteral(lenientWalkInfer(types, value, analysis)),
+                  type))
+            type = below;
       if (!type && value)
         type = lenientWalkInfer(types, value, analysis);
       if (type)
@@ -1806,6 +1787,46 @@ bool appendStarredArgumentTypes(const TypeSystem &types, mlir::Type type,
     }
   }
   return false;
+}
+
+int numericTowerRung(const TypeSystem &types, mlir::Type type) {
+  if (!type)
+    return -1;
+  if (type == types.boolType())
+    return 0;
+  if (type == types.intType())
+    return 1;
+  if (type == types.floatType())
+    return 2;
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+  if (contract && contract.getArguments().empty() &&
+      contract.getContractName() == "builtins.complex")
+    return 3;
+  return -1;
+}
+
+mlir::Type belowDeclaredRung(const TypeSystem &types, mlir::Type supplied,
+                             mlir::Type declared) {
+  int declaredRung = numericTowerRung(types, declared);
+  if (declaredRung < 0)
+    return {};
+  if (int suppliedRung = numericTowerRung(types, supplied); suppliedRung >= 0)
+    return suppliedRung < declaredRung ? supplied : mlir::Type();
+  // ⭐ A UNION OF RUNGS TOO: `{1: 5, 4: True}` holds `bool | int`, and
+  // reading one into `x: int` met the declaration with a bool arm and an int
+  // arm. ⛔ Not the declaration for the whole union: the bool arm cannot be
+  // retyped as an int, and the merge of the two arms was invalid IR.
+  auto unionType = mlir::dyn_cast_if_present<py::UnionType>(supplied);
+  if (!unionType)
+    return {};
+  bool anyBelow = false;
+  for (mlir::Type member : unionType.getMemberTypes()) {
+    int rung = numericTowerRung(types, types.widenLiteral(member));
+    if (rung < 0 || rung > declaredRung)
+      return {};
+    anyBelow |= rung < declaredRung;
+  }
+  return anyBelow ? supplied : mlir::Type();
 }
 
 
@@ -7062,10 +7083,10 @@ TypeSystem::functionSignature(const parser::Node &function,
     // ⛔ NOT by converting: `print(half(7))` would answer 3.0. The annotation
     // does not convert in CPython either.
     //
-    // ⛔ And only a LOWER rung of the same tower. A body whose arms return
-    // different rungs joins to a union, whose rung is -1, so it keeps the
-    // annotation and keeps its refusal -- the py ABI cannot return a union and
-    // collapsing it along the tower would print 0 for False.
+    // ⛔ And only rungs at or below the annotation, which a body whose arms
+    // return different rungs gives as a union (`7 if c else True` is
+    // `bool | int`), returned as the union: collapsing it along the tower
+    // would print 1 for True.
     //
     // ⛔ NOT for a `complex` annotation, and this is a measurement, not a
     // caution: `inferExpr` answers `builtins.float` for `1.0 + 0.0j`, so
@@ -7083,9 +7104,8 @@ TypeSystem::functionSignature(const parser::Node &function,
                                                  &generator.localSymbols);
       returnRungWalks.erase(&function);
       mlir::Type widened = walked ? widenLiteral(walked) : mlir::Type();
-      if (int walkedRung = numericTowerRung(*this, widened);
-          walkedRung >= 0 && walkedRung < declaredRung)
-        sig.resultType = widened;
+      if (mlir::Type below = belowDeclaredRung(*this, widened, annotated))
+        sig.resultType = below;
     }
   } else if (ast::nameSpelling(function) == "__init__") {
     sig.resultType = none();

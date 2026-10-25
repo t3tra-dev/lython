@@ -3714,6 +3714,22 @@ TEST(DriverTest, AnIntARuntimeCallAnswersTakesTheOperatorsI64Arm) {
   EXPECT_TRUE(deferredAdd);
 }
 
+// What: two choices over one borrowed parameter, each between it and a
+// computed int, pass the ownership verifier whichever side of each choice the
+// parameter is on -- `min(x * 2, hi) + max(hi, x * 2)` and its permutations.
+TEST(DriverTest, TwoChoicesOverOneBorrowedParameterPassTheOwnershipVerifier) {
+  for (const char *body :
+       {"min(x * 2, hi) + max(hi, x * 2)", "max(hi, x * 2) + max(hi, x * 3)",
+        "min(hi, x * 2) + max(hi, x * 2)",
+        "max(hi, x * 2) + min(x * 2, hi) + max(hi, x * 5)"}) {
+    CompileResult result =
+        compileSource(std::string("def f(x: int, hi: int) -> int:\n"
+                                  "    return ") +
+                      body + "\n\n\nprint(f(3, 5))\n");
+    EXPECT_TRUE(result.succeeded) << body << "\n" << result.diagnostics;
+  }
+}
+
 // What: a value is kept referenced to the end of its frame only when its
 // release can be observed. A list of ints and a plain class instance are
 // released at their last use -- no keep-alive call anywhere. An instance of a

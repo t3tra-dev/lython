@@ -33,25 +33,6 @@ namespace {
 
 using common::constantBool;
 
-// CPython's numeric tower as a total order on the four rungs that are
-// implicitly acceptable where a higher one is declared (PEP 484 §"The numeric
-// tower"). -1 is "not on the tower", which never compares.
-int numericTowerRung(const TypeSystem &types, mlir::Type type) {
-  if (!type)
-    return -1;
-  if (type == types.boolType())
-    return 0;
-  if (type == types.intType())
-    return 1;
-  if (type == types.floatType())
-    return 2;
-  auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
-  if (contract && contract.getArguments().empty() &&
-      contract.getContractName() == "builtins.complex")
-    return 3;
-  return -1;
-}
-
 
 Value boxedBool(mlir::OpBuilder &builder, mlir::Location loc, TypeSystem &types,
                 mlir::Value bit) {
@@ -3283,12 +3264,11 @@ bool ModuleEmitter::specializationArgumentNodes(
 // Callable contract for function target f", a union having no place for it.
 static mlir::Type lowerRungParameter(TypeSystem &types, mlir::Type declared,
                                      mlir::Type supplied) {
+  if (numericTowerRung(types, declared) >= 0)
+    return belowDeclaredRung(types, supplied, declared);
   int suppliedRung = numericTowerRung(types, supplied);
   if (suppliedRung < 0)
     return {};
-  int declaredRung = numericTowerRung(types, declared);
-  if (declaredRung >= 0)
-    return suppliedRung < declaredRung ? supplied : mlir::Type();
   auto unionType = mlir::dyn_cast_if_present<py::UnionType>(declared);
   if (!unionType || unionType.hasMember(supplied))
     return {};

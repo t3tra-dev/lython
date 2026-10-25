@@ -276,6 +276,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AnIntOrFloatAContainerOnlyStoresGoesInAsItsSlotWord"
     "DriverTest.AnIntReadThatIsChosenComputedOrStoredMakesNoObject"
     "DriverTest.AnIntARuntimeCallAnswersTakesTheOperatorsI64Arm"
+    "DriverTest.TwoChoicesOverOneBorrowedParameterPassTheOwnershipVerifier"
     "DriverTest.ALibrarysModuleAliasIsNotTheProgramsName"
     "DriverTest.AFinalizerOnAnExceptionClassIsRefused"
     "DriverTest.AListOfObjectIsNotSolvedAsAnEmptyLiteral"
