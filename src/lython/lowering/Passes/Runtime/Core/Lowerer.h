@@ -826,6 +826,8 @@ private:
                                             mlir::Value resultValue,
                                             const RuntimeValue &value);
   static bool admitsDeferredIntParameter(mlir::BlockArgument parameter);
+  bool returnsDeferredInt(mlir::func::FuncOp function) const;
+  mlir::LogicalResult verifyDeferredIntResultCalls();
   bool takesDeferredIntParameter(mlir::func::FuncOp function,
                                  unsigned logicalIndex) const;
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>

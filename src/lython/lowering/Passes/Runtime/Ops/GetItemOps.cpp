@@ -10,6 +10,8 @@
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
+#include <cstdlib>
+
 namespace py::lowering {
 
 namespace {
@@ -912,6 +914,57 @@ bool RuntimeBundleLowerer::takesDeferredIntParameter(
   auto found = deferredIntParameters.find(function.getOperation());
   return found != deferredIntParameters.end() &&
          logicalIndex < found->second.size() && found->second.test(logicalIndex);
+}
+
+// ⭐ AN INT RESULT IS RETURNED AS THE DEFERRED INT IT IS -- the held object, or
+// the stand-in while the i64 is the value -- and the call reads it as one.
+// Asked of the function alone, so the return and every call agree.
+// ⛔ Not a dunder: a hook is called from code this lowering synthesizes, which
+// reads the object. Nor a function whose result carries a summary (an
+// argument, a callable, a static object): those consumers read the object
+// too. Nor a generator's functions, a clone, or a non-private function, for
+// the reasons a parameter is not deferred there.
+bool RuntimeBundleLowerer::returnsDeferredInt(
+    mlir::func::FuncOp function) const {
+  static const bool ablated =
+      std::getenv("LYTHON_ABLATE_DEFERRED_INT_RESULTS") != nullptr;
+  if (ablated || !function || function.isDeclaration() ||
+      !function.isPrivate() ||
+      RuntimeBundleLowerer::isPrimitiveI64CallableClone(function) ||
+      function->hasAttr("ly.generator.resume") ||
+      function->hasAttr("ly.generator.body_result") ||
+      generatorResumeClones.count(function.getSymName()))
+    return false;
+  auto name = function->getAttrOfType<mlir::StringAttr>("ly.function.name");
+  if (!name || (name.getValue().starts_with("__") &&
+                name.getValue().ends_with("__")))
+    return false;
+  py::CallableType callable = callableTypeOf(function);
+  if (!callable || callable.getResultTypes().size() != 1 ||
+      !isPlainIntType(callable.getResultTypes().front()))
+    return false;
+  llvm::StringRef symbol = function.getSymName();
+  return !returnedStaticObjectSummaries.count(symbol) &&
+         !returnedValueSummaries.count(symbol) &&
+         !returnedCallableSummaries.count(symbol);
+}
+
+// Every call of a function that returns a deferred int was made by a reader
+// that takes it as one; any other would read the stand-in as the int 0.
+mlir::LogicalResult RuntimeBundleLowerer::verifyDeferredIntResultCalls() {
+  mlir::LogicalResult result = mlir::success();
+  module.walk([&](mlir::func::CallOp call) {
+    if (call->removeAttr(kDeferredIntResultAttr))
+      return;
+    auto callee =
+        lookupModuleSymbol<mlir::func::FuncOp>(module, call.getCallee());
+    if (!callee || !RuntimeBundleLowerer::returnsDeferredInt(callee))
+      return;
+    call.emitError() << "internal: a call of '" << callee.getSymName()
+                     << "' reads its deferred int result as an object";
+    result = mlir::failure();
+  });
+  return result;
 }
 
 // The view a read built from a slot word, through the `scf.if` an

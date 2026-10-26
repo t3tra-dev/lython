@@ -488,6 +488,37 @@ TEST(DriverTest, AnIntArgumentReadOnlyAsAnIntMakesNoObject) {
   EXPECT_EQ(calls, 2u);
 }
 
+// What: an int a function computes is returned as it is held: the function
+// makes no object of its result to return, and the caller makes none to add
+// it to its own.
+TEST(DriverTest, AnIntResultMakesNoObject) {
+  CompileResult result = compileSource("def plus(xs: list[int], x: int) -> int:\n"
+                                       "    return x + len(xs)\n\n\n"
+                                       "def run(n: int) -> int:\n"
+                                       "    xs = [1, 2]\n"
+                                       "    t = 0\n"
+                                       "    for i in range(n):\n"
+                                       "        t = t + plus(xs, i)\n"
+                                       "    return t\n\n\n"
+                                       "print(run(10))\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  for (const char *name : {"plus", "run"}) {
+    const llvm::Function *function =
+        result.verified.llvmModule->getFunction(mainSymbol(name));
+    ASSERT_NE(function, nullptr) << name;
+    unsigned made = 0;
+    for (const llvm::BasicBlock &block : *function)
+      for (const llvm::Instruction &instruction : block)
+        if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+          if (const llvm::Function *callee = call->getCalledFunction())
+            if (callee->getName() == "LyLong_MaterializeRead")
+              ++made;
+    // `run` returns its own total too: the module body makes the object it
+    // prints.
+    EXPECT_EQ(made, 0u) << name;
+  }
+}
+
 // What: in a loop whose header carries a value the body computes, an object
 // built by a constructor is used after its `__init__`, not before: the body
 // is lowered on the header's behalf, and the method call reads the instance

@@ -80,6 +80,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
     return mlir::failure();
   if (mlir::failed(lowerFunctionReturns()))
     return mlir::failure();
+  if (mlir::failed(verifyDeferredIntResultCalls()))
+    return mlir::failure();
   if (mlir::failed(eraseCallableProtocolTemplateFunctions()))
     return mlir::failure();
   if (mlir::failed(dropControlFlowLogicalBranchOperands()))
