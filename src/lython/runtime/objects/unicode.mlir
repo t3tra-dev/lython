@@ -1179,7 +1179,7 @@ module attributes {
   // O(1) code-point indexing: fixed-width code units make the scan-free load
   // possible; the result re-canonicalizes to the smallest width for that one
   // code point.
-  func.func @LyUnicode_GetItem(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %raw_index: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__getitem__", ly.runtime.result_contract = "builtins.str"} {
+  func.func @LyUnicode_GetItem(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %raw_index: i64 {ly.runtime.index_i64}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__getitem__", ly.runtime.result_contract = "builtins.str"} {
     %codepoints = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64

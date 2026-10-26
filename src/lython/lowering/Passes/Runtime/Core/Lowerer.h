@@ -618,8 +618,9 @@ private:
   // A DEFERRED int's value as an i64 (`read_value_checked`): its lane where
   // the flag says so, its object's otherwise. Nothing for a bundle with no
   // object beside its lane.
-  std::optional<mlir::Value> deferredIntValueChecked(mlir::Operation *op,
-                                                     const RuntimeBundle &bundle);
+  std::optional<mlir::Value>
+  deferredIntValueChecked(mlir::Operation *op, const RuntimeBundle &bundle,
+                          llvm::StringRef read = "read_value_checked");
   mlir::FailureOr<RuntimeValue>
   materializePrimitiveI64ObjectAtCurrentInsertion(mlir::Operation *op,
                                                   const RuntimeBundle &bundle);
@@ -808,7 +809,7 @@ private:
   void demoteMutableContainerArgumentEvidence(py::CallOp op);
   mlir::FailureOr<mlir::Value>
   rawSequenceIndexValue(mlir::Operation *op, mlir::Value indexValue,
-                        const RuntimeBundle &index);
+                        const RuntimeBundle &index, bool subscript = false);
   mlir::FailureOr<RuntimeBundle>
   materializePayloadObjectBundle(mlir::Operation *op,
                                  const RuntimeBundle &value,

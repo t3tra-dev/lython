@@ -48,6 +48,10 @@ inline constexpr llvm::StringLiteral kManifestDefaultI64Attr{
 // word, not an OverflowError (a slice bound, str.find's window).
 inline constexpr llvm::StringLiteral kManifestClipI64Attr{
     "ly.runtime.clip_i64"};
+// An i64 input that is a sequence subscript, read the way CPython does with
+// PyNumber_AsSsize_t(v, PyExc_IndexError): past the word it is an IndexError.
+inline constexpr llvm::StringLiteral kManifestIndexI64Attr{
+    "ly.runtime.index_i64"};
 inline constexpr llvm::StringLiteral kManifestDefaultF64Attr{
     "ly.runtime.default_f64"};
 inline constexpr llvm::StringLiteral kManifestDefaultStrAttr{

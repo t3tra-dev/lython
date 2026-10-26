@@ -690,7 +690,7 @@ module attributes {
 
   // ===== the sequence (bytearray_getitem, bytearray_ass_subscript) =====
 
-  func.func @LyByteArray_GetItem(%self: memref<4xi64> {ly.ownership.object_header}, %raw_index: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytearray", ly.runtime.method = "__getitem__", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyByteArray_GetItem(%self: memref<4xi64> {ly.ownership.object_header}, %raw_index: i64 {ly.runtime.index_i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytearray", ly.runtime.method = "__getitem__", ly.runtime.result_contract = "builtins.int"} {
     %index = func.call @__ly_bytearray_index(%self, %raw_index) : (memref<4xi64>, i64) -> i64
     %payload = func.call @__ly_bytes_payload(%self) : (memref<4xi64>) -> memref<?xi8>
     %at = arith.index_cast %index : i64 to index
@@ -701,7 +701,7 @@ module attributes {
   }
 
   // b[i] = v: the index is checked before the value, as CPython checks them.
-  func.func @LyByteArray_SetItem(%self: memref<4xi64> {ly.ownership.object_header}, %raw_index: i64, %value: i64 {ly.runtime.clip_i64}) attributes {ly.runtime.contract = "builtins.bytearray", ly.runtime.method = "__setitem__"} {
+  func.func @LyByteArray_SetItem(%self: memref<4xi64> {ly.ownership.object_header}, %raw_index: i64 {ly.runtime.index_i64}, %value: i64 {ly.runtime.clip_i64}) attributes {ly.runtime.contract = "builtins.bytearray", ly.runtime.method = "__setitem__"} {
     %index = func.call @__ly_bytearray_index(%self, %raw_index) : (memref<4xi64>, i64) -> i64
     func.call @__ly_bytearray_check_byte(%value) : (i64) -> ()
     %payload = func.call @__ly_bytes_payload(%self) : (memref<4xi64>) -> memref<?xi8>
@@ -711,7 +711,7 @@ module attributes {
     func.return
   }
 
-  func.func @LyByteArray_DelItem(%self: memref<4xi64> {ly.ownership.object_header}, %raw_index: i64) attributes {ly.runtime.contract = "builtins.bytearray", ly.runtime.method = "__delitem__"} {
+  func.func @LyByteArray_DelItem(%self: memref<4xi64> {ly.ownership.object_header}, %raw_index: i64 {ly.runtime.index_i64}) attributes {ly.runtime.contract = "builtins.bytearray", ly.runtime.method = "__delitem__"} {
     %one = arith.constant 1 : i64
     %length_slot = arith.constant 3 : index
     %index = func.call @__ly_bytearray_index(%self, %raw_index) : (memref<4xi64>, i64) -> i64

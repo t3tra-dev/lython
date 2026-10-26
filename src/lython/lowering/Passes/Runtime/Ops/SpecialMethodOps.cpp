@@ -418,8 +418,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerLen(py::LenOp op) {
 // primitive-int evidence, or an unbox call, in that preference order (the
 // same ladder the runtime-mode __getitem__ walks). The caller positions the
 // builder.
+// `subscript`: `xs[i]`, whose index past the word is an IndexError; an index
+// argument of a method (`pop`, `insert`) is an OverflowError, as in CPython.
 mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::rawSequenceIndexValue(
-    mlir::Operation *op, mlir::Value indexValue, const RuntimeBundle &index) {
+    mlir::Operation *op, mlir::Value indexValue, const RuntimeBundle &index,
+    bool subscript) {
   // `indexValue` is optional: bound-method callers pass the index through a
   // pack, which has no per-argument SSA value when it is starred.
   if (indexValue)
@@ -431,8 +434,11 @@ mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::rawSequenceIndexValue(
   if (primitiveI64LaneKnownValid(index.primitiveI64) &&
       index.primitiveI64->value.getType().isInteger(64))
     return index.primitiveI64->value;
-  std::optional<RuntimeSymbol> unbox =
-      manifest.primitive(index.contractName(), "unbox.i64");
+  std::optional<RuntimeSymbol> unbox;
+  if (subscript)
+    unbox = manifest.primitive(index.contractName(), "unbox.i64.index");
+  if (!unbox)
+    unbox = manifest.primitive(index.contractName(), "unbox.i64");
   if (unbox &&
       unbox->function.getNumArguments() == index.physicalValues().size()) {
     mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
@@ -442,7 +448,8 @@ mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::rawSequenceIndexValue(
   // A deferred int's lane is stale where its flag is false; its object holds
   // the value then.
   if (std::optional<mlir::Value> deferred =
-          RuntimeBundleLowerer::deferredIntValueChecked(op, index))
+          RuntimeBundleLowerer::deferredIntValueChecked(
+              op, index, subscript ? "read_value_index" : "read_value_checked"))
     return *deferred;
   // No boxed payload to fall back to (primitive-i64 clone lanes carry only
   // the (value, valid) pair): the lane is the sole carrier.
@@ -1055,8 +1062,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
       builder.setInsertionPoint(op);
       mlir::Location loc = op.getLoc();
       mlir::FailureOr<mlir::Value> raw =
-          RuntimeBundleLowerer::rawSequenceIndexValue(op.getOperation(),
-                                                      op.getIndex(), index);
+          RuntimeBundleLowerer::rawSequenceIndexValue(
+              op.getOperation(), op.getIndex(), index, /*subscript=*/true);
       if (mlir::failed(raw))
         return mlir::failure();
       mlir::FailureOr<RuntimeBundle> payload =
@@ -1469,8 +1476,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
       builder.setInsertionPoint(op);
       mlir::Location loc = op.getLoc();
       mlir::FailureOr<mlir::Value> raw =
-          RuntimeBundleLowerer::rawSequenceIndexValue(op.getOperation(),
-                                                      op.getIndex(), index);
+          RuntimeBundleLowerer::rawSequenceIndexValue(
+              op.getOperation(), op.getIndex(), index, /*subscript=*/true);
       if (mlir::failed(raw))
         return mlir::failure();
       llvm::SmallVector<mlir::Value, 4> operands(

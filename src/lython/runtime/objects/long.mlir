@@ -173,6 +173,7 @@ module attributes {
   memref.global "private" constant @__ly_long_msg_integer_modulo_by_zero : memref<22xi8> = dense<[105, 110, 116, 101, 103, 101, 114, 32, 109, 111, 100, 117, 108, 111, 32, 98, 121, 32, 122, 101, 114, 111]>
   memref.global "private" constant @__ly_long_msg_negative_shift_count : memref<20xi8> = dense<[110, 101, 103, 97, 116, 105, 118, 101, 32, 115, 104, 105, 102, 116, 32, 99, 111, 117, 110, 116]>
   // "int too large to convert to a native 64-bit integer"
+  memref.global "private" constant @__ly_long_msg_index_sized : memref<44xi8> = dense<[99, 97, 110, 110, 111, 116, 32, 102, 105, 116, 32, 39, 105, 110, 116, 39, 32, 105, 110, 116, 111, 32, 97, 110, 32, 105, 110, 100, 101, 120, 45, 115, 105, 122, 101, 100, 32, 105, 110, 116, 101, 103, 101, 114]>
   memref.global "private" constant @__ly_long_msg_int_too_large : memref<51xi8> = dense<[105, 110, 116, 32, 116, 111, 111, 32, 108, 97, 114, 103, 101, 32, 116, 111, 32, 99, 111, 110, 118, 101, 114, 116, 32, 116, 111, 32, 97, 32, 110, 97, 116, 105, 118, 101, 32, 54, 52, 45, 98, 105, 116, 32, 105, 110, 116, 101, 103, 101, 114]>
   // "invalid literal for int() with base 10" (CPython appends the repr of the
   // input; message concatenation needs the str-track's formatting work)
@@ -1214,6 +1215,34 @@ module attributes {
     func.return %result : i64
   }
 
+  // PyNumber_AsSsize_t(v, PyExc_IndexError): a sequence subscript reads an int
+  // wider than the word as the IndexError CPython raises there; every other
+  // i64 input raises OverflowError (LyLong_AsI64).
+  func.func @LyLong_AsIndexI64(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "unbox.i64.index"} {
+    %meta, %digits = func.call @__ly_long_parts(%header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
+    %fits = func.call @__ly_long_view_fits_i64(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i1
+    cf.cond_br %fits, ^ok, ^too_large
+
+  ^too_large:
+    func.call @__ly_long_raise_index_sized() : () -> ()
+    cf.br ^ok
+
+  ^ok:
+    %result = func.call @__ly_long_view_as_i64(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i64
+    func.return %result : i64
+  }
+
+  // The i64 a deferred read stands for, for a sequence subscript.
+  func.func @LyLong_ReadValueIndex(%value: i64, %valid: i1, %held: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "read_value_index"} {
+    %result = scf.if %valid -> (i64) {
+      scf.yield %value : i64
+    } else {
+      %v = func.call @LyLong_AsIndexI64(%held) : (memref<2xi64>) -> i64
+      scf.yield %v : i64
+    }
+    func.return %result : i64
+  }
+
   // The i64 a slot's entity word names when it has one: the immediate, or an
   // object's value when it fits. `fits` false means the object is wider.
   func.func @LyLong_SlotWordAsI64(%word: i64) -> (i64, i1) attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "slot_word_as_i64"} {
@@ -1712,6 +1741,15 @@ module attributes {
       scf.yield %three_limb_fits : i1
     }
     func.return %fits : i1
+  }
+
+  func.func private @__ly_long_raise_index_sized() {
+    %class_word = arith.constant {ly.class_of = "builtins.IndexError"} 55 : i64
+    %length = arith.constant 44 : i64
+    %message_static = memref.get_global @__ly_long_msg_index_sized : memref<44xi8>
+    %message = memref.cast %message_static : memref<44xi8> to memref<?xi8>
+    func.call @__ly_raise_static_message(%class_word, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.return
   }
 
   func.func private @__ly_long_raise_too_large() {

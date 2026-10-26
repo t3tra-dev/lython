@@ -444,7 +444,7 @@ module attributes {
   }
 
   // bytes[i] is the byte VALUE (an int), unlike str's one-element slice.
-  func.func @LyBytes_GetItem(%header: memref<4xi64> {ly.ownership.object_header}, %raw_index: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__getitem__", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyBytes_GetItem(%header: memref<4xi64> {ly.ownership.object_header}, %raw_index: i64 {ly.runtime.index_i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__getitem__", ly.runtime.result_contract = "builtins.int"} {
     %bytes = func.call @__ly_bytes_payload(%header) : (memref<4xi64>) -> memref<?xi8>
     %zero = arith.constant 0 : i64
     %c0 = arith.constant 0 : index

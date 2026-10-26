@@ -58,14 +58,8 @@ class ArgumentTest(unittest.TestCase):
                          ("d", 9))
         with self.assertRaises(IndexError):
             pick(xs, i * 3)
-        # Too wide for a word, the index raises rather than reading as another
-        # (CPython's IndexError is an OverflowError here).
-        try:
+        with self.assertRaises(IndexError):
             pick(xs, WIDE)
-            raised = False
-        except (IndexError, OverflowError):
-            raised = True
-        self.assertTrue(raised)
 
     def test_a_bool_where_int_is_declared(self) -> None:
         flags = [True, False]

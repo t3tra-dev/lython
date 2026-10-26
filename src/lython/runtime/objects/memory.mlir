@@ -395,7 +395,7 @@ module attributes {
     func.return %length : i64
   }
 
-  func.func @LyMemoryView_GetItem(%self: memref<8xi64> {ly.ownership.object_header}, %raw_index: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.memoryview", ly.runtime.method = "__getitem__", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyMemoryView_GetItem(%self: memref<8xi64> {ly.ownership.object_header}, %raw_index: i64 {ly.runtime.index_i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.memoryview", ly.runtime.method = "__getitem__", ly.runtime.result_contract = "builtins.int"} {
     func.call @__ly_memoryview_check(%self) : (memref<8xi64>) -> ()
     %address = func.call @__ly_memoryview_item_address(%self, %raw_index) : (memref<8xi64>, i64) -> i64
     %value = func.call @__ly_memoryview_load(%address) : (i64) -> i64
@@ -455,7 +455,7 @@ module attributes {
   }
 
   // m[i] = v: released, then read-only, then the index, then the value.
-  func.func @LyMemoryView_SetItem(%self: memref<8xi64> {ly.ownership.object_header}, %raw_index: i64, %value: i64 {ly.runtime.clip_i64}) attributes {ly.runtime.contract = "builtins.memoryview", ly.runtime.method = "__setitem__"} {
+  func.func @LyMemoryView_SetItem(%self: memref<8xi64> {ly.ownership.object_header}, %raw_index: i64 {ly.runtime.index_i64}, %value: i64 {ly.runtime.clip_i64}) attributes {ly.runtime.contract = "builtins.memoryview", ly.runtime.method = "__setitem__"} {
     %zero = arith.constant 0 : i64
     %end = arith.constant 256 : i64
     func.call @__ly_memoryview_check(%self) : (memref<8xi64>) -> ()
