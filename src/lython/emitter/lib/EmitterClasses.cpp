@@ -6979,6 +6979,15 @@ Value ModuleEmitter::emitInlineMethodBody(
           packKeywords.push_back(
               CallKeywordType{entry.getKey().str(),
                               types.widenLiteral(entry.getValue().type)});
+      if (std::string mismatch = paramSpecCallableMismatch(
+              *method.method, *specializedSig,
+              static_cast<unsigned>(firstSlot), positional, packPositional,
+              packKeywords);
+          !mismatch.empty()) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, anchor.range.start, mismatch});
+        return emitNone(anchor);
+      }
       llvm::SmallVector<bool, 4> forwarded(firstSlot, false);
       for (const Value &argument : positional)
         forwarded.push_back(needsCallableForwarder(argument));

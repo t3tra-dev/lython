@@ -779,7 +779,7 @@ class TestCase(object):
                                        msg: str | None = None) -> _AssertRaisesContext[E]: ...
     def assertRaises[E: BaseException, **P](self, expected_exception: type[E] | tuple[type[E], ...],
                                             callable_obj: Callable[P, object] | None = None,
-                                            *args: P.args, msg: str | None = None,
+                                            *args: P.args,
                                             **kwargs: P.kwargs) -> _AssertRaisesContext[E] | None:
         """Fail unless an exception of class expected_exception is raised
            by the callable when invoked with specified positional and
@@ -806,9 +806,9 @@ class TestCase(object):
                the_exception = cm.exception
                self.assertEqual(the_exception.error_code, 3)
         """
-        context = _AssertRaisesContext[E](expected_exception, self, msg)
         if callable_obj is None:
-            return context
+            return _AssertRaisesContext[E](expected_exception, self, kwargs.get('msg'))
+        context = _AssertRaisesContext[E](expected_exception, self, None)
         context.obj_name = callable_obj.__name__
         with context:
             callable_obj(*args, **kwargs)
@@ -826,7 +826,7 @@ class TestCase(object):
     def assertRaisesRegex[E: BaseException, **P](self, expected_exception: type[E] | tuple[type[E], ...],
                                                  expected_regex: str | re.Pattern,
                                                  callable_obj: Callable[P, object] | None = None,
-                                                 *args: P.args, msg: str | None = None,
+                                                 *args: P.args,
                                                  **kwargs: P.kwargs) -> _AssertRaisesRegexContext[E] | None:
         """Asserts that the message in a raised exception matches a regex.
 
@@ -839,9 +839,10 @@ class TestCase(object):
             msg: Optional message used in case of failure. Can only be used
                     when assertRaisesRegex is used as a context manager.
         """
-        context = _AssertRaisesRegexContext[E](expected_exception, self, expected_regex, msg)
         if callable_obj is None:
-            return context
+            return _AssertRaisesRegexContext[E](expected_exception, self, expected_regex,
+                                                kwargs.get('msg'))
+        context = _AssertRaisesRegexContext[E](expected_exception, self, expected_regex, None)
         context.raises.obj_name = callable_obj.__name__
         with context:
             callable_obj(*args, **kwargs)
@@ -856,7 +857,7 @@ class TestCase(object):
                                 msg: str | None = None) -> _AssertWarnsContext[W]: ...
     def assertWarns[W: Warning, **P](self, expected_warning: type[W],
                                      callable_obj: Callable[P, object] | None = None,
-                                     *args: P.args, msg: str | None = None,
+                                     *args: P.args,
                                      **kwargs: P.kwargs) -> _AssertWarnsContext[W] | None:
         """Fail unless a warning of class warnClass is triggered
            by the callable when invoked with specified positional and
@@ -885,9 +886,9 @@ class TestCase(object):
                the_warning = cm.warning
                self.assertEqual(the_warning.some_attribute, 147)
         """
-        context = _AssertWarnsContext[W](expected_warning, self, None, msg)
         if callable_obj is None:
-            return context
+            return _AssertWarnsContext[W](expected_warning, self, None, kwargs.get('msg'))
+        context = _AssertWarnsContext[W](expected_warning, self, None, None)
         context.obj_name = callable_obj.__name__
         with context:
             callable_obj(*args, **kwargs)
@@ -905,7 +906,7 @@ class TestCase(object):
     def assertWarnsRegex[W: Warning, **P](self, expected_warning: type[W],
                                           expected_regex: str | re.Pattern,
                                           callable_obj: Callable[P, object] | None = None,
-                                          *args: P.args, msg: str | None = None,
+                                          *args: P.args,
                                           **kwargs: P.kwargs) -> _AssertWarnsContext[W] | None:
         """Asserts that the message in a triggered warning matches a regexp.
         Basic functioning is similar to assertWarns() with the addition
@@ -921,9 +922,10 @@ class TestCase(object):
             msg: Optional message used in case of failure. Can only be used
                     when assertWarnsRegex is used as a context manager.
         """
-        context = _AssertWarnsContext[W](expected_warning, self, expected_regex, msg)
         if callable_obj is None:
-            return context
+            return _AssertWarnsContext[W](expected_warning, self, expected_regex,
+                                          kwargs.get('msg'))
+        context = _AssertWarnsContext[W](expected_warning, self, expected_regex, None)
         context.obj_name = callable_obj.__name__
         with context:
             callable_obj(*args, **kwargs)

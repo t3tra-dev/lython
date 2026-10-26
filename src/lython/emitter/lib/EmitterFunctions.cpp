@@ -403,6 +403,47 @@ llvm::SmallVector<unsigned, 2> ModuleEmitter::concretizeParamSpecCallables(
   return typed;
 }
 
+// ⛔ NOT LEFT TO THE BODY'S `fn(*args, **kwargs)`: the parameter is erased to
+// `Callable[..., R]`, so a program function that does not take a keyword the
+// call passes on was accepted here and reached the lowering, which refused
+// the forwarded call with no line of the caller in it.
+std::string ModuleEmitter::paramSpecCallableMismatch(
+    const parser::Node &def, const FunctionSignature &sig, unsigned firstSlot,
+    llvm::ArrayRef<Value> arguments, llvm::ArrayRef<mlir::Type> packPositional,
+    llvm::ArrayRef<CallKeywordType> packKeywords) const {
+  const parser::Node *parameters = ast::node(def, "args");
+  if (!sig.paramSpecArgs || !parameters)
+    return {};
+  for (auto [index, parameter] :
+       llvm::enumerate(positionalArgumentNodes(*parameters))) {
+    if (index < firstSlot || index - firstSlot >= arguments.size())
+      continue;
+    if (!spellsCallableOfParamSpec(ast::node(*parameter, "annotation"),
+                                   *sig.paramSpecArgs))
+      continue;
+    auto given = mlir::dyn_cast_if_present<py::CallableType>(
+        types.widenLiteral(arguments[index - firstSlot].type));
+    if (!given || isGradualCallable(given))
+      continue;
+    CallInferenceResult applied =
+        types.inferCallWithEvidence(given, packPositional, packKeywords);
+    if (applied)
+      continue;
+    std::string passed;
+    llvm::raw_string_ostream stream(passed);
+    llvm::ListSeparator separator;
+    for (mlir::Type type : packPositional)
+      stream << separator << type;
+    for (const CallKeywordType &keyword : packKeywords)
+      stream << separator << keyword.name << "=" << keyword.type;
+    return "the callable given for '" +
+           std::string(ast::string(*parameter, "arg").value_or("")) +
+           "' does not take what this call passes on to it: (" + passed +
+           ")";
+  }
+  return {};
+}
+
 // ⭐ A LAMBDA HAS NO TYPE UNTIL AN EXPECTATION GIVES IT ONE, and `Callable[P,
 // R]` is erased to `Callable[..., R]`, which names no parameter: `call(lambda
 // x: x + 1, 2)` was "lambda requires a Callable annotation". The call says

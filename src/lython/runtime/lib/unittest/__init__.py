@@ -40,9 +40,7 @@ Deviations from CPython:
   assertTupleEqual and assertSetEqual take two arguments of ONE static type,
   so a list is not compared with a tuple through them.
 - assertRaisesRegex's context is a class of its own
-  (_AssertRaisesRegexContext) so that assertRaises does not reach re. In the
-  callable form of assertRaises* and assertWarns*, a `msg=` keyword is the
-  assertion's own and is not passed to the callable.
+  (_AssertRaisesRegexContext) so that assertRaises does not reach re.
 - cleanups are stored as closures over their arguments, not as triples.
 - a subtest's params are a dict holding its own keys first and then its
   parent's others, not an _OrderedChainMap over the parent's.
