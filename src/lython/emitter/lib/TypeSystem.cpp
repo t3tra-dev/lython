@@ -5637,6 +5637,9 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           subject = widenLiteral(subject);
           if (subject == none())
             return typeObject(contract("types.NoneType"));
+          // A class's class is `type`: no class here declares a metaclass.
+          if (mlir::isa<py::TypeType>(subject))
+            return typeObject(contract("builtins.type"));
           if (auto contractType =
                   mlir::dyn_cast_if_present<py::ContractType>(subject))
             return typeObject(contractType.getContractName() == "typing.Any"

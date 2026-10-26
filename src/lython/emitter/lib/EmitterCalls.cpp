@@ -6383,6 +6383,8 @@ Value ModuleEmitter::emitClassOfValue(const parser::Node &anchor, Value value,
     if (isNoneTypeLike(widened) || !contract) {
       mlir::Type instance = isNoneTypeLike(widened)
                                 ? types.contract("types.NoneType")
+                            : mlir::isa<py::TypeType>(widened)
+                                ? types.contract("builtins.type")
                                 : types.object();
       classType = types.typeObject(instance);
       classValue =
@@ -6477,6 +6479,15 @@ ModuleEmitter::tryEmitTypeCall(const parser::Node &expr,
     if (!mlir::isa_and_nonnull<py::TypeType>(resultType))
       resultType = types.typeObject(types.object());
     return emitClassOfValue(expr, receiver, resultType);
+  }
+  // A class's class is `type`: no class here declares a metaclass.
+  if (mlir::isa_and_nonnull<py::TypeType>(subject)) {
+    (void)emitExpr(subjectNode);
+    mlir::Type metaclass = types.contract("builtins.type");
+    mlir::Type typeType = types.typeObject(metaclass);
+    auto object =
+        py::TypeObjectOp::create(builder, loc(expr), typeType, metaclass);
+    return Value{object.getResult(), typeType};
   }
   if (!contract)
     return refuse("type(x) needs a statically resolved class, and " +
