@@ -34,6 +34,14 @@ void ModuleEmitter::emitStatements(
   llvm::SaveAndRestore<std::size_t> savedSuiteIndex(currentSuiteIndex, 0);
   suiteStack.push_back({statements, 0});
   auto popSuite = llvm::scope_exit([&] { suiteStack.pop_back(); });
+  // ⭐ A SUITE OF A MODULE COMPOUND IS ENTERED FROM MORE THAN THE STATEMENT
+  // BEFORE IT -- a back edge, a raise anywhere in a `try`, the other arm -- and
+  // a module name lives in a cell, which no merge rebinds the way a
+  // function's local is. So `q = describe` kept its overloads across
+  // `q = same` on the loop's next trip and raised a false TypeError.
+  if (atModuleScope && !moduleCompoundBindings.empty())
+    for (const auto &name : moduleCompoundBindings.back())
+      types.forgetFunctionOverloads(name.getKey());
   for (const parser::NodePtr &statement : *statements) {
     if (insertionBlockTerminated(builder))
       break;
@@ -761,6 +769,31 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
   // last inlined statement's.
   llvm::SaveAndRestore<const parser::Node *> anchorless(
       anchorlessCall, anchorlessCallOf(statement));
+  // ⭐ A MODULE STATEMENT FORGETS THE OVERLOADS OF EVERY NAME IT BINDS, before
+  // it runs: the module frame is the root, where binding a name does not
+  // forget them as a function's frame does. An alias it makes takes them back
+  // once it is bound (bindOverloadAlias).
+  static const llvm::StringSet<> kCompounds = {
+      "If", "For", "AsyncFor", "While", "Try", "TryStar", "With", "AsyncWith",
+      "Match"};
+  bool moduleCompound = atModuleScope && kCompounds.contains(statement.kind);
+  llvm::StringSet<> moduleBound;
+  // A top-level def keeps the overloads it was declared with.
+  if (atModuleScope)
+    collectNameBindings(&statement, moduleBound,
+                        /*bindsNestedDefinitions=*/moduleCompound);
+  for (const auto &name : moduleBound)
+    types.forgetFunctionOverloads(name.getKey());
+  if (moduleCompound)
+    moduleCompoundBindings.push_back(std::move(moduleBound));
+  auto leaveModuleCompound = llvm::scope_exit([&] {
+    if (!moduleCompound)
+      return;
+    // And after it, which any of its paths may reach.
+    for (const auto &name : moduleCompoundBindings.back())
+      types.forgetFunctionOverloads(name.getKey());
+    moduleCompoundBindings.pop_back();
+  });
   if (statement.kind == "Expr") {
     // ⭐ `...` AS A STATEMENT IS `pass`, which is what Python uses it for:
     //

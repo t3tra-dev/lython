@@ -35,6 +35,37 @@ def same(x: int | str) -> int | str:
 
 spell = describe
 
+# A module name bound to an overloaded function on one path and to another
+# function on the next is typed by what it holds at each read.
+module_loop_results: list[str] = []
+for use_same in (False, True):
+    chosen = describe
+    if use_same:
+        chosen = same
+    module_loop_results.append(repr(chosen(5)))
+for _ in range(2):
+    typed = describe
+    module_loop_results.append(typed(6).upper())
+looped = describe
+for _ in range(2):
+    module_loop_results.append(repr(looped(7)))
+    looped = same
+matched = describe
+match len(module_loop_results):
+    case 6:
+        matched = same
+module_loop_results.append(repr(matched(8)))
+
+
+def call_rebound[T](x: T) -> str:
+    return repr(rebound(3))
+
+
+rebound = describe
+rebound_results = [call_rebound(1)]
+rebound = same
+rebound_results.append(call_rebound(1))
+
 
 class Shelf:
     @overload
@@ -83,6 +114,13 @@ class OverloadTest(unittest.TestCase):
         self.assertEqual(read("2").bit_length(), 2)
         through_module = overload_shapes.parse
         self.assertEqual(through_module("2").bit_length(), 2)
+
+    def test_a_module_name_rebound_in_a_loop_or_a_branch(self) -> None:
+        self.assertEqual(module_loop_results,
+                         ["'int 5'", "5", "INT 6", "INT 6", "'int 7'", "7", "8"])
+
+    def test_a_body_emitted_once_reads_what_the_module_name_holds(self) -> None:
+        self.assertEqual(rebound_results, ["'int 3'", "3"])
 
     def test_a_local_of_the_same_name_is_not_the_overloaded_function(self) -> None:
         describe = same

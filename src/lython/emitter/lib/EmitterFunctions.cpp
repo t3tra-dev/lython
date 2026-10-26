@@ -1337,10 +1337,15 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
                                 : nonlocalBoxedNames(callable);
   bool savedModuleScope = atModuleScope;
   atModuleScope = false;
+  // ⭐ Emitted once and run at every call: `h[int]` specialized while the
+  // module's `q` was an alias of an overloaded function kept its overloads
+  // after `q = same`, and raised a false TypeError.
+  TypeSystem::HiddenOverloads moduleBodyAliases = types.hideModuleBodyAliases();
   llvm::scope_exit restoreGlobalScope([&] {
     currentGlobalDecls = std::move(savedGlobalDecls);
     currentBoxedLocals = std::move(savedBoxedLocals);
     atModuleScope = savedModuleScope;
+    types.restoreModuleBodyAliases(std::move(moduleBodyAliases));
   });
   currentReturnType = sig.resultType;
   currentGeneratorSendType =

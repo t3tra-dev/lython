@@ -2427,6 +2427,9 @@ private:
   // around each callable body.
   llvm::StringSet<> currentBoxedLocals;
   bool atModuleScope = false;
+  // Per module compound statement being emitted, the names it binds
+  // anywhere inside: each suite of it starts without their overloads.
+  llvm::SmallVector<llvm::StringSet<>, 4> moduleCompoundBindings;
   // Module-level names the module binds more than once, computed on first
   // use: a lambda that captures one of them would freeze a value the
   // program goes on to replace.

@@ -545,6 +545,26 @@ public:
                              llvm::SmallVector<py::CallableType, 2> overloads);
   const llvm::SmallVector<py::CallableType, 2> *
   functionOverloads(llvm::StringRef name, mlir::Type implementation) const;
+  // The innermost frame no longer knows which overloads `name` has: a path
+  // that binds it something else may reach the next read.
+  void forgetFunctionOverloads(llvm::StringRef name);
+  // An alias a statement of the module body makes. A body emitted as a
+  // function of its own runs whenever it is called, when the module name may
+  // hold another function, so it does not see these overloads.
+  void bindModuleBodyAlias(llvm::StringRef name, mlir::Type implementation,
+                           llvm::SmallVector<py::CallableType, 2> overloads);
+  struct HiddenOverloads {
+    // (frame, or -1 for the root; name; its sets)
+    llvm::SmallVector<std::tuple<int, std::string,
+                                 llvm::SmallVector<std::pair<
+                                     mlir::Type,
+                                     llvm::SmallVector<py::CallableType, 2>>,
+                                                   1>>,
+                      2>
+        entries;
+  };
+  HiddenOverloads hideModuleBodyAliases();
+  void restoreModuleBodyAliases(HiddenOverloads hidden);
   // A module name bound once to the module function `target`: it answers
   // `target`'s overloads before the binding is emitted.
   void bindFunctionOverloadAlias(llvm::StringRef name,
@@ -861,6 +881,7 @@ private:
   // overloads it never declared.
   llvm::StringMap<FunctionOverloadSets> functionOverloadSets;
   llvm::StringMap<std::string> functionOverloadAliases;
+  llvm::StringSet<> moduleBodyAliasNames;
   llvm::StringMap<std::string> canonicalBindings;
   // The canonical bindings the builtins scope itself makes, so an import
   // under the same name can be told from them.

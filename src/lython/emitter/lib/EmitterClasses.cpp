@@ -5726,15 +5726,16 @@ void ModuleEmitter::bindOverloadAlias(const parser::Node &assign) {
   llvm::StringRef name = ast::nameSpelling(*targets->front());
   if (types.lookupSymbol(name) != implementation)
     return;
-  // ⛔ A module binding is read by function bodies emitted in any order, so
-  // it keeps the overloads only when nothing else ever binds the name; a
-  // function's frame forgets them at its next binding of the name.
-  if (atModuleScope && (reboundModuleNames().contains(name) ||
-                        moduleGlobalDeclarations(moduleNode).contains(name)))
+  llvm::SmallVector<py::CallableType, 2> copied(overloads->begin(),
+                                                overloads->end());
+  if (!atModuleScope) {
+    types.bindFunctionOverloads(name, *implementation, std::move(copied));
     return;
-  types.bindFunctionOverloads(name, *implementation,
-                              llvm::SmallVector<py::CallableType, 2>(
-                                  overloads->begin(), overloads->end()));
+  }
+  // ⛔ Not a name a function declares `global`: a call anywhere may rebind it.
+  if (moduleGlobalDeclarations(moduleNode).contains(name))
+    return;
+  types.bindModuleBodyAlias(name, *implementation, std::move(copied));
 }
 
 // ⭐ BEFORE ANY BODY, because a function reads a module alias and every
