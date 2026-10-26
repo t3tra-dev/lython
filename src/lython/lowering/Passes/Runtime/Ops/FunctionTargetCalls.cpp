@@ -659,10 +659,24 @@ mlir::LogicalResult RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
                 mlir::FlatSymbolRefAttr::get(context, clone.getSymName()));
 
   builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+  // An original that returns a deferred int is answered the same way here:
+  // the clone's i64 with the stand-in, read as a deferred int after the merge.
+  bool deferredResult =
+      !floatResult && RuntimeBundleLowerer::returnsDeferredInt(original);
   RuntimeBundle fastObject;
-  if (mlir::failed(RuntimeBundleLowerer::initializeObjectFromRawValues(
-          op, resultType, mlir::ValueRange{cloneAnswer->first},
-          fastObject)))
+  if (deferredResult) {
+    std::optional<RuntimeSymbol> standIn =
+        manifest.primitive("builtins.int", "deferred_stand_in");
+    if (!standIn)
+      return op.emitError() << "runtime manifest has no int deferred_stand_in";
+    fastObject = RuntimeBundle::object(
+        resultType,
+        RuntimeBundleLowerer::createRuntimeCall(loc, *standIn,
+                                                mlir::ValueRange{})
+            ->getResults());
+  } else if (mlir::failed(RuntimeBundleLowerer::initializeObjectFromRawValues(
+                 op, resultType, mlir::ValueRange{cloneAnswer->first},
+                 fastObject)))
     return mlir::failure();
   llvm::SmallVector<mlir::Value, 10> fastYield(
       fastObject.physicalValues().begin(), fastObject.physicalValues().end());
@@ -722,6 +736,27 @@ mlir::LogicalResult RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
   mlir::scf::YieldOp::create(builder, loc, (*fallbackCall).getResults());
 
   builder.setInsertionPointAfter(ifOp);
+  if (deferredResult && objectTypes->size() == 1) {
+    (*fallbackCall)->setAttr(kDeferredIntResultAttr, builder.getUnitAttr());
+    result = RuntimeBundle::objectWithOwnership(
+        resultType, mlir::ValueRange{},
+        ownership::logicalOwnershipKind(resultType, /*ownsObject=*/false));
+    result.primitiveI64 =
+        RuntimePrimitiveI64Evidence{ifOp.getResult(1), ifOp.getResult(2)};
+    result.deferredObject = ifOp.getResult(0);
+    if (viewed && !mlir::isa<py::UnionType>(declared)) {
+      mlir::FailureOr<RuntimeValue> materialized =
+          RuntimeBundleLowerer::materializePrimitiveI64ObjectAtCurrentInsertion(
+              op, result);
+      if (mlir::failed(materialized))
+        return mlir::failure();
+      RuntimeBundle object =
+          RuntimeBundle::object(resultType, materialized->values);
+      object.primitiveI64 = result.primitiveI64;
+      result = std::move(object);
+    }
+    return seenAsDeclared();
+  }
   llvm::SmallVector<mlir::Value, 8> objectValues;
   for (unsigned index = 0, end = static_cast<unsigned>(objectTypes->size());
        index < end; ++index)
@@ -1072,6 +1107,18 @@ mlir::LogicalResult RuntimeBundleLowerer::bundleFunctionTargetCallResult(
     return mlir::failure();
   if (!viewed)
     return mlir::success();
+  if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(result) &&
+      !mlir::isa<py::UnionType>(declared)) {
+    mlir::FailureOr<RuntimeValue> materialized =
+        RuntimeBundleLowerer::materializePrimitiveI64ObjectAtCurrentInsertion(
+            op, result);
+    if (mlir::failed(materialized))
+      return mlir::failure();
+    RuntimeBundle object =
+        RuntimeBundle::object(result.contract, materialized->values);
+    object.primitiveI64 = result.primitiveI64;
+    result = std::move(object);
+  }
   mlir::FailureOr<RuntimeBundle> view =
       RuntimeBundleLowerer::viewCallResultAsDeclared(op, result, actual,
                                                      declared);
@@ -1314,6 +1361,24 @@ mlir::LogicalResult RuntimeBundleLowerer::consumeFunctionTargetCallResult(
                           << " physical values, but call result bundling "
                              "consumed "
                           << resultIndex;
+  // The object a deferred int result comes with is its held object (the
+  // stand-in while the i64 is the value), so it is read as one.
+  if (auto callee = lookupModuleSymbol<mlir::func::FuncOp>(
+          module, call.getCallee());
+      callee && RuntimeBundleLowerer::returnsDeferredInt(callee)) {
+    if (result.kind != RuntimeBundle::Kind::Object ||
+        result.contractName() != "builtins.int" ||
+        result.physicalValues().size() != 1 || !result.primitiveI64)
+      return op->emitError() << "internal: the deferred int result of '"
+                             << targetName << "' has no int bundle";
+    RuntimeBundle lazy = RuntimeBundle::objectWithOwnership(
+        result.contract, mlir::ValueRange{},
+        ownership::logicalOwnershipKind(result.contract, /*ownsObject=*/false));
+    lazy.primitiveI64 = result.primitiveI64;
+    lazy.deferredObject = result.physicalValues().front();
+    result = std::move(lazy);
+    call->setAttr(kDeferredIntResultAttr, builder.getUnitAttr());
+  }
   return mlir::success();
 }
 

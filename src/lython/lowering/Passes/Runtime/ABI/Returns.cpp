@@ -1,5 +1,6 @@
 #include "Runtime/Core/Lowerer.h"
 #include "ArithBuilders.h"
+#include "mlir/IR/Matchers.h"
 
 #include "Runtime/ABI/ConstantData.h"
 
@@ -548,6 +549,28 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
             mlir::Type expectedLogicalType) -> mlir::LogicalResult {
       llvm::ArrayRef<mlir::Value> values = bundle.physicalValues();
       std::optional<RuntimeValue> materializedObject;
+      // ⭐ A DEFERRED INT IS RETURNED AS IT IS: its held object, or the
+      // stand-in (owned, in name only) while the i64 is the value. Every call
+      // reads it as a deferred int (`returnsDeferredInt`).
+      if (values.empty() &&
+          RuntimeBundleLowerer::hasLazyPrimitiveI64Object(bundle) &&
+          !isErasedObjectResult(expectedLogicalType) &&
+          RuntimeBundleLowerer::returnsDeferredInt(function) &&
+          resultIndex + 3 <= functionType.getNumResults()) {
+        mlir::Value held = bundle.deferredObject;
+        if (!held && mlir::matchPattern(bundle.primitiveI64->valid,
+                                        mlir::m_One()))
+          if (std::optional<RuntimeSymbol> standIn = manifest.primitive(
+                  "builtins.int", "deferred_stand_in"))
+            held = RuntimeBundleLowerer::createRuntimeCall(
+                       op.getLoc(), *standIn, mlir::ValueRange{})
+                       .getResult(0);
+        if (held && held.getType() == functionType.getResult(resultIndex)) {
+          operands.push_back(held);
+          ++resultIndex;
+          return appendPrimitiveReturnEvidence(bundle);
+        }
+      }
       if (values.empty() &&
           RuntimeBundleLowerer::hasLazyPrimitiveI64Object(bundle)) {
         mlir::FailureOr<RuntimeValue> value =

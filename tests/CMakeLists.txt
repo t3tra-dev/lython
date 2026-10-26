@@ -203,6 +203,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AnIntLoopInAnOrdinaryFunctionBoxesNoComputedValue"
     "DriverTest.AnIntSlowArmIsOneDeferredCall"
     "DriverTest.AnIntArgumentReadOnlyAsAnIntMakesNoObject"
+    "DriverTest.AnIntResultMakesNoObject"
     "DriverTest.AGeneratorFrameKeepsAnIntAsItsWord"
     "DriverTest.BigIntLiteralInALoopStaysOutOfTheFrame"
     "DriverTest.CompilesHelloToVerifiedLLVMIR"

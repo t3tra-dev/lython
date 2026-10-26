@@ -339,6 +339,10 @@ struct CallableLogicalEntryArgs {
 // object types.
 inline constexpr llvm::StringLiteral kPrimitiveI64CloneAttr{
     "ly.primitive_i64_clone"};
+// Marks a call whose deferred int result was read as one
+// (`returnsDeferredInt`); checked and dropped by verifyDeferredIntResultCalls.
+inline constexpr llvm::StringLiteral kDeferredIntResultAttr{
+    "ly.deferred_int_result"};
 // Marks the scf.if that speculates a primitive-i64 clone call and recovers a
 // `valid=false` answer by re-running the boxed original. Consumed (and, unless
 // the clone is provably total, folded away) by
