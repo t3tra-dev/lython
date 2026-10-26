@@ -38,6 +38,7 @@
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "mlir/Support/LogicalResult.h"
 #define GET_OP_CLASSES
 #include "PyOps.h.inc"
@@ -824,6 +825,9 @@ private:
   mlir::FailureOr<bool> bindDeferredIntRead(mlir::Operation *op,
                                             mlir::Value resultValue,
                                             const RuntimeValue &value);
+  static bool admitsDeferredIntParameter(mlir::BlockArgument parameter);
+  bool takesDeferredIntParameter(mlir::func::FuncOp function,
+                                 unsigned logicalIndex) const;
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
   objectPayloadClassEntity(mlir::Operation *op, const RuntimeBundle &value,
                            bool ownsPayload = true);
@@ -2122,6 +2126,11 @@ private:
   llvm::StringMap<CallableArgumentEvidenceABI> callableArgumentEvidenceABIs;
   llvm::StringMap<CallableAggregateEvidenceABI> callableAggregateEvidenceABIs;
   llvm::StringMap<std::string> primitiveI64CallableClones;
+  // The int parameters a function binds as a deferred int, by its logical
+  // input index: such a parameter takes the caller's (held, i64, valid) as it
+  // is, the held being the stand-in while the i64 is the value
+  // (`admitsDeferredIntParameter`).
+  llvm::DenseMap<mlir::Operation *, llvm::SmallBitVector> deferredIntParameters;
   // Clones whose raw lane cannot be trusted to drive their own control flow;
   // every speculation on one is dropped (see refusePrimitiveI64Clone).
   llvm::DenseSet<mlir::Operation *> refusedPrimitiveI64Clones;

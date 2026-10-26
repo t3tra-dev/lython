@@ -448,6 +448,46 @@ TEST(DriverTest, IteratingATupleOfBoolsCompiles) {
   EXPECT_TRUE(passed.succeeded) << passed.diagnostics;
 }
 
+// What: an int argument for a parameter the function only reads as an int --
+// arithmetic and a list index -- is handed over as the caller holds it: the
+// call receives no int object made for it, from a literal or from an
+// operator's result.
+TEST(DriverTest, AnIntArgumentReadOnlyAsAnIntMakesNoObject) {
+  CompileResult result = compileSource("def scale(xs: list[int], i: int) -> int:\n"
+                                       "    return xs[i] * 3 + 1\n\n\n"
+                                       "def run(n: int) -> int:\n"
+                                       "    xs = [1, 2, 3, 4]\n"
+                                       "    t = scale(xs, 2)\n"
+                                       "    for i in range(n):\n"
+                                       "        t = t + scale(xs, i & 3)\n"
+                                       "    return t\n\n\n"
+                                       "print(run(10))\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  const llvm::Function *run =
+      result.verified.llvmModule->getFunction(mainSymbol("run"));
+  ASSERT_NE(run, nullptr);
+  unsigned calls = 0;
+  for (const llvm::BasicBlock &block : *run)
+    for (const llvm::Instruction &instruction : block)
+      if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+        if (const llvm::Function *callee = call->getCalledFunction())
+          if (callee->getName() == mainSymbol("scale")) {
+            ++calls;
+            // (xs, i's held object, i's i64, i's validity)
+            ASSERT_EQ(call->arg_size(), 4u);
+            const llvm::Value *held = call->getArgOperand(1);
+            while (const auto *extract =
+                       llvm::dyn_cast<llvm::ExtractValueInst>(held))
+              held = extract->getAggregateOperand();
+            if (const auto *made = llvm::dyn_cast<llvm::CallBase>(held))
+              if (const llvm::Function *maker = made->getCalledFunction()) {
+                EXPECT_NE(maker->getName(), "LyLong_MaterializeRead");
+                EXPECT_NE(maker->getName(), "LyLong_FromI64");
+              }
+          }
+  EXPECT_EQ(calls, 2u);
+}
+
 // What: in a loop whose header carries a value the body computes, an object
 // built by a constructor is used after its `__init__`, not before: the body
 // is lowered on the header's behalf, and the method call reads the instance

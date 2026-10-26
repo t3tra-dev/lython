@@ -1610,6 +1610,14 @@ mlir::LogicalResult RuntimeBundleLowerer::seedCallableEntryArgumentBundles(
     return mlir::success();
   };
 
+  // ⛔ Not a generator's frames, whose int lanes are a protocol of their own,
+  // nor a function anything but this lowering may call.
+  bool takesDeferred =
+      function.isPrivate() &&
+      !RuntimeBundleLowerer::isPrimitiveI64CallableClone(function) &&
+      !function->hasAttr("ly.generator.resume") &&
+      !function->hasAttr("ly.generator.body_result") &&
+      !generatorResumeClones.count(function.getSymName());
   unsigned logicalArgCount = entry.getNumArguments();
   for (auto [index, logicalType] : llvm::enumerate(logicalTypes)) {
     mlir::Type abiType = abiTypes[index];
@@ -1647,6 +1655,22 @@ mlir::LogicalResult RuntimeBundleLowerer::seedCallableEntryArgumentBundles(
     if (mlir::failed(seedHiddenPrimitiveI64Evidence(abiType, bundle,
                                                     logicalArg.getLoc())))
       return mlir::failure();
+    // The held is the caller's object, or the stand-in while the i64 is the
+    // value, and is read only by what `admitsDeferredIntParameter` admits.
+    if (bundle.primitiveI64 && physicalArgs.size() == 1 && takesDeferred &&
+        RuntimeBundleLowerer::admitsDeferredIntParameter(logicalArg)) {
+      RuntimeBundle lazy = RuntimeBundle::objectWithOwnership(
+          abiType, mlir::ValueRange{},
+          ownership::logicalOwnershipKind(abiType, /*ownsObject=*/false));
+      lazy.primitiveI64 = bundle.primitiveI64;
+      lazy.deferredObject = physicalArgs.front();
+      bundle = std::move(lazy);
+      llvm::SmallBitVector &deferred =
+          deferredIntParameters[function.getOperation()];
+      if (deferred.size() < logicalTypes.size())
+        deferred.resize(logicalTypes.size());
+      deferred.set(index);
+    }
     valueBundles[logicalArg] = std::move(bundle);
   }
   auto appendHiddenObject =
