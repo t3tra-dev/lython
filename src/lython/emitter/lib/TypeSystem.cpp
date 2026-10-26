@@ -2067,6 +2067,7 @@ TypeSystem::ScopeIsolation::ScopeIsolation(ScopeIsolation &&other) noexcept
       savedClasses(std::move(other.savedClasses)),
       savedTypeParameters(std::move(other.savedTypeParameters)),
       savedModuleNames(std::move(other.savedModuleNames)),
+      savedOverloads(std::move(other.savedOverloads)),
       savedUnderlay(std::move(other.savedUnderlay)) {
   other.owner = nullptr;
 }
@@ -2082,6 +2083,7 @@ TypeSystem::ScopeIsolation::operator=(ScopeIsolation &&other) noexcept {
   savedClasses = std::move(other.savedClasses);
   savedTypeParameters = std::move(other.savedTypeParameters);
   savedModuleNames = std::move(other.savedModuleNames);
+  savedOverloads = std::move(other.savedOverloads);
   savedUnderlay = std::move(other.savedUnderlay);
   other.owner = nullptr;
   return *this;
@@ -2097,6 +2099,7 @@ void TypeSystem::ScopeIsolation::reset() {
   owner->scopedClasses = std::move(savedClasses);
   owner->scopedTypeParameters = std::move(savedTypeParameters);
   owner->scopedModuleNames = std::move(savedModuleNames);
+  owner->scopedFunctionOverloads = std::move(savedOverloads);
   owner->underlay = std::move(savedUnderlay);
   owner = nullptr;
 }
@@ -2134,9 +2137,11 @@ TypeSystem::ScopeIsolation TypeSystem::isolateScopes() const {
   isolation.savedClasses = std::move(scopedClasses);
   isolation.savedTypeParameters = std::move(scopedTypeParameters);
   isolation.savedModuleNames = std::move(scopedModuleNames);
+  isolation.savedOverloads = std::move(scopedFunctionOverloads);
   isolation.savedUnderlay = std::move(underlay);
   underlay.reset();
   scopedModuleNames.clear();
+  scopedFunctionOverloads.clear();
   scopes.clear();
   scopedCanonicalBindings.clear();
   scopedClasses.clear();
@@ -2818,6 +2823,7 @@ TypeSystem::Scope TypeSystem::pushScope() const {
   scopedClasses.emplace_back();
   scopedTypeParameters.emplace_back();
   scopedModuleNames.emplace_back();
+  scopedFunctionOverloads.emplace_back();
   return Scope(*this);
 }
 
@@ -2828,6 +2834,7 @@ void TypeSystem::popScope() const {
     scopedClasses.pop_back();
     scopedTypeParameters.pop_back();
     scopedModuleNames.pop_back();
+    scopedFunctionOverloads.pop_back();
     if (scopes.empty())
       underlay.reset();
   }
@@ -2844,6 +2851,7 @@ void TypeSystem::bindLocalSymbol(llvm::StringRef name, mlir::Type type) const {
   if (scopes.empty())
     return;
   scopes.back()[name] = type ? type : object();
+  scopedFunctionOverloads.back().erase(name);
   forgetModuleNameInScope(name);
 }
 
@@ -2859,6 +2867,7 @@ void TypeSystem::bindSymbol(llvm::StringRef name, mlir::Type type) {
   if (!scopes.empty()) {
     scopes.back()[name] = type ? type : object();
     scopedCanonicalBindings.back().erase(name);
+    scopedFunctionOverloads.back().erase(name);
     return;
   }
   symbols[name] = type ? type : object();
@@ -2914,7 +2923,8 @@ bool TypeSystem::atFreshIsolatedFrame() const {
   return scopes.size() == 1 && !underlay && scopes.back().empty() &&
          scopedCanonicalBindings.back().empty() &&
          scopedClasses.back().empty() && scopedTypeParameters.back().empty() &&
-         scopedModuleNames.back().empty();
+         scopedModuleNames.back().empty() &&
+         scopedFunctionOverloads.back().empty();
 }
 
 void TypeSystem::captureFrame(FrameRecord &record) const {
@@ -2923,6 +2933,7 @@ void TypeSystem::captureFrame(FrameRecord &record) const {
   record.classes = scopedClasses.back();
   record.typeParameters = scopedTypeParameters.back();
   record.moduleNames = scopedModuleNames.back();
+  record.overloads = scopedFunctionOverloads.back();
 }
 
 void TypeSystem::replayFrame(std::shared_ptr<const FrameRecord> shared) {
@@ -2981,6 +2992,8 @@ std::string TypeSystem::compareFrame(const FrameRecord &replayed) const {
   }
   if (scopedModuleNames.back().size() != replayed.moduleNames.size())
     return "module names";
+  if (scopedFunctionOverloads.back().size() != replayed.overloads.size())
+    return "overloads";
   for (const auto &entry : scopedModuleNames.back())
     if (!replayed.moduleNames.contains(entry.getKey()))
       return "module names";
@@ -3127,6 +3140,7 @@ void TypeSystem::bindClass(llvm::StringRef name, mlir::Type instanceType) {
     scopedClasses.back()[name] = resolved;
     scopes.back()[name] = typeObject(resolved);
     scopedCanonicalBindings.back().erase(name);
+    scopedFunctionOverloads.back().erase(name);
     return;
   }
   classes[name] = resolved;
@@ -5937,14 +5951,19 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         }
       }
       std::optional<mlir::Type> symbol;
+      bool local = false;
       if (ctx && ctx->localSymbols) {
-        auto local = ctx->localSymbols->find(name);
-        if (local != ctx->localSymbols->end())
-          symbol = local->second;
+        auto found = ctx->localSymbols->find(name);
+        if (found != ctx->localSymbols->end()) {
+          symbol = found->second;
+          local = true;
+        }
       }
       if (!symbol)
         symbol = lookupSymbol(name);
-      if (symbol)
+      // ⛔ Not a local's: no frame holds what it was assigned, and the
+      // module's overloads of the same spelling are not its.
+      if (symbol && !local)
         if (const auto *overloads = functionOverloads(name, *symbol)) {
           if (std::optional<CallSolution> matched = selectFirstApplicable(
                   *this, *overloads, positional, keywords))
@@ -6465,7 +6484,9 @@ TypeSystem::solveCurriedGenericCall(
 void TypeSystem::bindFunctionOverloads(
     llvm::StringRef name, mlir::Type implementation,
     llvm::SmallVector<py::CallableType, 2> overloads) {
-  auto &sets = functionOverloadSets[name];
+  auto &sets = scopedFunctionOverloads.empty()
+                   ? functionOverloadSets[name]
+                   : scopedFunctionOverloads.back()[name];
   for (auto &[bound, declared] : sets)
     if (bound == implementation) {
       declared = std::move(overloads);
@@ -6477,13 +6498,43 @@ void TypeSystem::bindFunctionOverloads(
 const llvm::SmallVector<py::CallableType, 2> *
 TypeSystem::functionOverloads(llvm::StringRef name,
                               mlir::Type implementation) const {
-  auto sets = functionOverloadSets.find(name);
-  if (sets == functionOverloadSets.end())
+  auto declaredBy =
+      [&](const FunctionOverloadSets &sets)
+      -> const llvm::SmallVector<py::CallableType, 2> * {
+    for (const auto &[bound, declared] : sets)
+      if (bound == implementation)
+        return &declared;
     return nullptr;
-  for (const auto &[bound, declared] : sets->second)
-    if (bound == implementation)
-      return &declared;
+  };
+  // The frame that binds the name answers, as lookupCanonicalBinding.
+  auto overloadIt = scopedFunctionOverloads.rbegin();
+  for (auto scopeIt = scopes.rbegin(), scopeEnd = scopes.rend();
+       scopeIt != scopeEnd; ++scopeIt, ++overloadIt) {
+    if (auto found = overloadIt->find(name); found != overloadIt->end())
+      return declaredBy(found->second);
+    if (scopeIt->count(name))
+      return nullptr;
+  }
+  if (underlay) {
+    if (auto found = underlay->overloads.find(name);
+        found != underlay->overloads.end())
+      return declaredBy(found->second);
+    if (underlay->symbols.count(name))
+      return nullptr;
+  }
+  auto sets = functionOverloadSets.find(name);
+  if (sets != functionOverloadSets.end())
+    return declaredBy(sets->second);
+  // The def's overloads are in whichever frame bound it.
+  if (auto alias = functionOverloadAliases.find(name);
+      alias != functionOverloadAliases.end())
+    return functionOverloads(alias->second, implementation);
   return nullptr;
+}
+
+void TypeSystem::bindFunctionOverloadAlias(llvm::StringRef name,
+                                           llvm::StringRef target) {
+  functionOverloadAliases[name] = target.str();
 }
 
 CallInferenceResult TypeSystem::inferCallWithEvidence(

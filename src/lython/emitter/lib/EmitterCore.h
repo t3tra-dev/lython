@@ -2027,6 +2027,9 @@ private:
   // def has any.
   void bindFunctionOverloads(const parser::Node &function,
                              llvm::StringRef name, mlir::Type implementation);
+  // `g = f` for an `@overload`ed `f`: `g` keeps `f`'s overloads.
+  void bindOverloadAlias(const parser::Node &assign);
+  void bindModuleOverloadAliases(const parser::Node &moduleNode);
   void bindImportedFunctionOverloads(const EmitOptions::SourceModule &source,
                                      const std::vector<parser::NodePtr> &body,
                                      const parser::Node &function,
