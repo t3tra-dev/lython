@@ -596,6 +596,14 @@ public:
     return defaultsDescribeParameters;
   }
   mlir::Type annotationType(const parser::Node *node) const;
+  // The expression a string annotation spells (parsed once, by its text);
+  // any other node, or a string that does not parse, is returned as is.
+  const parser::Node *unquotedAnnotation(const parser::Node *node) const;
+  // The ParamSpec whose `P.args` / `P.kwargs` (per `component`) the
+  // annotation spells, quoted or not.
+  std::optional<std::string>
+  paramSpecComponent(const parser::Node *annotation,
+                     llvm::StringRef component) const;
   // True when the expression NAMES A TYPE rather than a value: a builtin
   // spelling, a declared class, a protocol or contract name, an alias already
   // bound, or a subscript or `|` union of those. This is what tells

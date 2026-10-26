@@ -985,6 +985,27 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
           if (auto expectedType = types.lookupSymbol(name))
             expectedCallable =
                 mlir::dyn_cast_if_present<py::CallableType>(*expectedType);
+          // ⛔ Not the whole shape of a function the name held before when
+          // the lambda takes fewer parameters: `k = b` with `b(x, y=10)` then
+          // `k = lambda x: x - 1` is a rebinding, which the merge after it
+          // joins, not a lambda written against `b`. Its parameters are
+          // typed as `b`'s first ones; more than `b` has are left to the
+          // calls below.
+          const parser::Node *lambdaParameters = ast::node(*rhs, "args");
+          if (expectedCallable && lambdaParameters &&
+              !ast::node(*lambdaParameters, "vararg") &&
+              !ast::node(*lambdaParameters, "kwarg")) {
+            std::size_t taken =
+                positionalArgumentNodes(*lambdaParameters).size();
+            llvm::ArrayRef<mlir::Type> held =
+                expectedCallable.getPositionalTypes();
+            if (taken > held.size())
+              expectedCallable = {};
+            else if (taken < held.size())
+              expectedCallable = py::CallableType::get(
+                  &context, held.take_front(taken), {}, {}, {},
+                  expectedCallable.getResultTypes());
+          }
           if (!expectedCallable)
             expectedCallable = lambdaCallSeedContract(name, *rhs);
           if (expectedCallable) {

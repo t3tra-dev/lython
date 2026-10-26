@@ -256,6 +256,40 @@ llvm::SmallVector<CarriedLoopLocal, 4> ModuleEmitter::collectCarriedLoopLocals(
   for (const std::string &name : names) {
     Value initial = values.find(name)->second;
     mlir::Type carriedType = types.widenLiteral(initial.type);
+    // ⭐ A FUNCTION LANE IS THE SHAPE EVERY FUNCTION THE BODY BINDS TAKES.
+    // `k = a` before the loop and `k = c` in it, with `c(z)` against `a(x)`,
+    // kept `a`'s shape for the lane and upcast `c` into it unchecked, and the
+    // call through `k` raised "callable target is not available" where
+    // CPython calls `c`. The body's own bindings are read ahead and joined
+    // with the pre-loop one, the join an `if` makes at its merge.
+    // ⛔ Only `name = value` statements: a binding this read cannot type
+    // leaves the lane as it was, and the back edge refuses what does not fit.
+    if (mlir::isa<py::CallableType>(carriedType)) {
+      llvm::SmallVector<mlir::Type, 4> bound{carriedType};
+      for (llvm::StringRef suite : {"body", "orelse"})
+        if (const auto *statements = ast::nodeList(statement, suite))
+          for (const parser::NodePtr &child : *statements)
+            ast::walk(child.get(), [&](const parser::Node &node) {
+              if (node.kind == "FunctionDef" ||
+                  node.kind == "AsyncFunctionDef" || node.kind == "ClassDef" ||
+                  node.kind == "Lambda")
+                return ast::Walk::SkipChildren;
+              const auto *targets = node.kind == "Assign"
+                                        ? ast::nodeList(node, "targets")
+                                        : nullptr;
+              if (targets &&
+                  llvm::any_of(*targets, [&](const parser::NodePtr &t) {
+                    return t && t->kind == "Name" &&
+                           llvm::StringRef(ast::nameSpelling(*t)) == name;
+                  }))
+                bound.push_back(types.widenLiteral(
+                    types.inferExpr(ast::node(node, "value"))));
+              return ast::Walk::Continue;
+            });
+      if (auto joined =
+              mlir::dyn_cast_if_present<py::CallableType>(types.join(bound)))
+        carriedType = joined;
+    }
     mlir::Value initialValue =
         coerceValue(initial, carriedType, statement).value;
     mlir::Value pinBuffer;
@@ -460,7 +494,13 @@ llvm::SmallVector<mlir::Value, 4> ModuleEmitter::carriedLoopEdgeOperands(
     bool unionIntoScalarLane =
         mlir::isa_and_nonnull<py::UnionType>(assignedType) &&
         !mlir::isa_and_nonnull<py::UnionType>(local.type);
-    if ((bothManifest || unionIntoScalarLane) && assignedType != local.type &&
+    // ⭐ AND A FUNCTION INTO A FUNCTION LANE IT DOES NOT FIT, which the
+    // upcast below retyped all the same, so the call through the lane found
+    // no target.
+    bool functionLane = mlir::isa_and_nonnull<py::CallableType>(local.type) &&
+                        mlir::isa_and_nonnull<py::CallableType>(assignedType);
+    if ((bothManifest || unionIntoScalarLane || functionLane) &&
+        assignedType != local.type &&
         !py::isAssignableTo(assignedType, local.type, module) &&
         !py::isAssignableTo(found->second.type, local.type, module)) {
       std::string carriedText;

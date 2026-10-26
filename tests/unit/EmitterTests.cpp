@@ -1886,6 +1886,15 @@ TEST(EmitterTest, AParamSpecForwarderIsSpecializedAtEachCall) {
            Case{std::string(forwarder) + "print(call(add, 1, c=2))\n",
                 "the callable given for 'f' does not take what this call "
                 "passes on to it"},
+           Case{"from collections.abc import Callable\n"
+                "def call[**P](f: \"Callable[P, int]\", *args: \"P.args\",\n"
+                "                **kwargs: \"P.kwargs\") -> int:\n"
+                "    return f(*args, **kwargs)\n"
+                "def add(a: int, b: int) -> int:\n"
+                "    return a + b\n"
+                "print(call(add, 1, c=2))\n",
+                "the callable given for 'f' does not take what this call "
+                "passes on to it"},
            Case{"from typing import Concatenate\n"
                 "def f(x: Concatenate[int, str]) -> None:\n"
                 "    pass\n",
@@ -2399,6 +2408,31 @@ TEST(EmitterTest, RefusesAUnionRebindOfALoopCarriedLocal) {
                          "loop-carried local 'cur' is bound to") !=
                          std::string::npos;
   EXPECT_TRUE(named);
+}
+
+// What: a function bound in a loop body through a name the read-ahead cannot
+// type, which does not fit the lane the pre-loop function gave the name. It was
+// upcast into that lane unchecked, and the call through the name raised
+// "callable target is not available" where CPython calls the function.
+TEST(EmitterTest, RefusesAFunctionThatDoesNotFitALoopCarriedFunction) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult result = emitSource(
+      "def a(x: int) -> int:\n"
+      "    return x + 1\n"
+      "def c(z: int) -> int:\n"
+      "    return z - 100\n"
+      "def f() -> int:\n"
+      "    k = a\n"
+      "    total = 0\n"
+      "    for i in range(2):\n"
+      "        total += k(i)\n"
+      "        g = c\n"
+      "        k = g\n"
+      "    return total\n"
+      "print(f())\n",
+      context);
+  EXPECT_FALSE(result.ok());
+  EXPECT_TRUE(reportsDiagnostic(result, "loop-carried local 'k' is bound to"));
 }
 
 // What: a statement in a class body that would have run. A class body executes

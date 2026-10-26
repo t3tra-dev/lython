@@ -1,6 +1,7 @@
 # A lambda handed to a generic function's `Callable[[T], R]`, or to a
 # ParamSpec forwarder's `Callable[P, R]`, takes the parameter types the other
-# arguments of the call give it, and its result is its own.
+# arguments of the call give it, and its result is its own -- with the
+# annotations quoted as well.
 import unittest
 from typing import Callable
 
@@ -21,6 +22,16 @@ def apply[T, R](fn: Callable[[T], R], x: T) -> R:
     return fn(x)
 
 
+def call_quoted[**P](
+    fn: "Callable[P, int]", *args: "P.args", **kwargs: "P.kwargs"
+) -> int:
+    return fn(*args, **kwargs)
+
+
+def add(a: int, b: int) -> int:
+    return a + b
+
+
 class LambdaArgumentTest(unittest.TestCase):
 
     def test_a_generic_callable_parameter(self) -> None:
@@ -33,6 +44,11 @@ class LambdaArgumentTest(unittest.TestCase):
         self.assertEqual(call(lambda x, y: x * y, 3, y=4), 12)
         self.assertEqual(call(lambda *, sep: sep.join("ab"), sep="-"), "a-b")
         self.assertEqual(maybe(lambda s: s * 2, "ab"), "abab")
+
+    def test_a_quoted_param_spec_callable_parameter(self) -> None:
+        self.assertEqual(call_quoted(add, 1, 2), 3)
+        self.assertEqual(call_quoted(add, 1, b=5), 6)
+        self.assertEqual(call_quoted(lambda x: x + 1, 2) << 1, 6)
 
     def test_assert_raises_given_a_lambda(self) -> None:
         self.assertRaises(ValueError, lambda s: int(s), "x")
