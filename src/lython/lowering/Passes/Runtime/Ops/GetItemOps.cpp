@@ -874,6 +874,46 @@ static bool deferrableIntRead(mlir::Value result) {
   return walk.admits(result);
 }
 
+// ⭐ A PARAMETER IS A DEFERRED INT WHEN EVERY USE READS IT AS ONE: an operator
+// with an i64 form, an index into a list, tuple or str, and one return. Its
+// caller then hands over the (held, i64, valid) it has, and makes no object.
+// ⛔ Not the read rule above: a parameter's held is the caller's, borrowed, so
+// a field store or a merge -- both of which keep the held past the use -- is
+// left to the object the caller makes. And a use that needs the object is not
+// admitted either, for the reason the read rule gives: every such use would
+// make the object again.
+bool RuntimeBundleLowerer::admitsDeferredIntParameter(
+    mlir::BlockArgument parameter) {
+  if (parameter.use_empty() || !isPlainIntType(parameter.getType()))
+    return false;
+  bool returned = false;
+  for (mlir::OpOperand &use : parameter.getUses()) {
+    mlir::Operation *user = use.getOwner();
+    if (isIntOperatorUse(user))
+      continue;
+    if (auto item = mlir::dyn_cast<py::GetItemOp>(user)) {
+      std::string container = runtimeContractName(item.getContainer().getType());
+      if (item.getIndex() == parameter && item.getContainer() != parameter &&
+          (container == "builtins.list" || container == "builtins.tuple" ||
+           container == "builtins.str"))
+        continue;
+    }
+    if (mlir::isa<mlir::func::ReturnOp>(user) && !returned) {
+      returned = true;
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+bool RuntimeBundleLowerer::takesDeferredIntParameter(
+    mlir::func::FuncOp function, unsigned logicalIndex) const {
+  auto found = deferredIntParameters.find(function.getOperation());
+  return found != deferredIntParameters.end() &&
+         logicalIndex < found->second.size() && found->second.test(logicalIndex);
+}
+
 // The view a read built from a slot word, through the `scf.if` an
 // iteration guards its read with (the other arm is the dead stand-in, which
 // reads as the int 0 and is never consumed).

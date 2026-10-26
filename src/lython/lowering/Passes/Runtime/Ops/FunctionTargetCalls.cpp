@@ -1,6 +1,7 @@
 #include "Runtime/Core/Lowerer.h"
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Matchers.h"
 
 namespace py::lowering {
 namespace {
@@ -909,6 +910,35 @@ RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
             static_cast<unsigned>(sourceIndex), std::move(*boxed),
             /*releaseAfterCall=*/!consumesObjectInput});
         sourceForAppend = &boxedObjectSources.back().bundle;
+      }
+    }
+    // ⭐ A DEFERRED INT TO A PARAMETER THAT TAKES ONE GOES AS IT IS: its held
+    // and its lanes, and no object made for the call. A held-less one (a
+    // literal) is its i64, so the stand-in goes with a lane that says so.
+    if (sourceForAppend && RuntimeBundleLowerer::takesDeferredIntParameter(
+                               target, static_cast<unsigned>(sourceIndex)) &&
+        RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*sourceForAppend) &&
+        inputIndex + 3 <= functionType.getNumInputs() &&
+        functionType.getInput(inputIndex + 1).isInteger(64) &&
+        functionType.getInput(inputIndex + 2).isInteger(1)) {
+      mlir::Value held = sourceForAppend->deferredObject;
+      mlir::Value valid = sourceForAppend->primitiveI64->valid;
+      // ⛔ Not for a held-less int whose lane may say "not the value": such a
+      // lane is a clone's answer before its guard, and with no held the
+      // stand-in would be read as the int.
+      if (!held && mlir::matchPattern(valid, mlir::m_One())) {
+        if (std::optional<RuntimeSymbol> standIn = manifest.primitive(
+                "builtins.int", "deferred_stand_in_borrowed"))
+          held = RuntimeBundleLowerer::createRuntimeCall(op.getLoc(), *standIn,
+                                                         mlir::ValueRange{})
+                     .getResult(0);
+      }
+      if (held && held.getType() == functionType.getInput(inputIndex)) {
+        operands.push_back(held);
+        operands.push_back(sourceForAppend->primitiveI64->value);
+        operands.push_back(valid);
+        inputIndex += 3;
+        continue;
       }
     }
     mlir::LogicalResult appended =
