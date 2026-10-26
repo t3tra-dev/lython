@@ -6694,8 +6694,14 @@ Value ModuleEmitter::emitInlineMethodBody(
                packPositional, packKeywords, forwarded)) {
         if (index < firstSlot || index - firstSlot >= adoptedPositional.size())
           continue;
-        auto target = mlir::cast<py::CallableType>(
-            specializedSig->positionalTypes[index]);
+        mlir::Type declared = specializedSig->positionalTypes[index];
+        auto target = mlir::dyn_cast<py::CallableType>(declared);
+        if (auto optional = mlir::dyn_cast<py::UnionType>(declared))
+          for (mlir::Type member : optional.getMemberTypes())
+            if (auto callable = mlir::dyn_cast<py::CallableType>(member))
+              target = callable;
+        if (!target)
+          continue;
         Value &argument = adoptedPositional[index - firstSlot];
         std::optional<Value> wrapped =
             tryWrapBuiltinFunctionValue(argument, target, anchor);

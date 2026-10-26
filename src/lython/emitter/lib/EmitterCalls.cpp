@@ -3712,10 +3712,14 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
   // R]` -- or the erased `Callable[..., R]` of a `Callable[P, R]` -- and the
   // specialization is what gave it parameters.
   for (auto [index, argument] : llvm::enumerate(operands.positional)) {
-    auto target = index < parameterTypes.size()
-                      ? mlir::dyn_cast_if_present<py::CallableType>(
-                            parameterTypes[index])
-                      : py::CallableType();
+    mlir::Type declared =
+        index < parameterTypes.size() ? parameterTypes[index] : mlir::Type();
+    auto target = mlir::dyn_cast_if_present<py::CallableType>(declared);
+    // `Callable[P, R] | None`: the forwarder is the member's.
+    if (auto optional = mlir::dyn_cast_if_present<py::UnionType>(declared))
+      for (mlir::Type member : optional.getMemberTypes())
+        if (auto callable = mlir::dyn_cast<py::CallableType>(member))
+          target = callable;
     if (!target)
       continue;
     std::optional<Value> wrapped =
