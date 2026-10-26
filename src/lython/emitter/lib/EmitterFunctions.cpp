@@ -385,8 +385,9 @@ llvm::SmallVector<unsigned, 2> ModuleEmitter::concretizeParamSpecCallables(
         if (auto callable = mlir::dyn_cast<py::CallableType>(member))
           erased = callable;
     if (!erased || !isGradualCallable(erased) ||
-        !spellsCallableOfParamSpec(ast::node(*argument, "annotation"),
-                                   *sig.paramSpecArgs))
+        !spellsCallableOfParamSpec(
+            types.unquotedAnnotation(ast::node(*argument, "annotation")),
+            *sig.paramSpecArgs))
       continue;
     mlir::Type concrete = py::CallableType::get(
         &context, packPositional, keywordTypes, {}, {},
@@ -418,8 +419,9 @@ std::string ModuleEmitter::paramSpecCallableMismatch(
        llvm::enumerate(positionalArgumentNodes(*parameters))) {
     if (index < firstSlot || index - firstSlot >= arguments.size())
       continue;
-    if (!spellsCallableOfParamSpec(ast::node(*parameter, "annotation"),
-                                   *sig.paramSpecArgs))
+    if (!spellsCallableOfParamSpec(
+            types.unquotedAnnotation(ast::node(*parameter, "annotation")),
+            *sig.paramSpecArgs))
       continue;
     auto given = mlir::dyn_cast_if_present<py::CallableType>(
         types.widenLiteral(arguments[index - firstSlot].type));
@@ -505,7 +507,8 @@ ModuleEmitter::paramSpecLambdaExpectations(const parser::Node &call,
       break;
     if (!arg || arg->kind != "Lambda" ||
         !spellsCallableOfParamSpec(
-            ast::node(*declaredParameters[index], "annotation"),
+            types.unquotedAnnotation(
+                ast::node(*declaredParameters[index], "annotation")),
             *sig.paramSpecArgs))
       continue;
     py::CallableType erased =

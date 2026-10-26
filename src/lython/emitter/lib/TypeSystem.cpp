@@ -3977,11 +3977,61 @@ mlir::Type TypeSystem::iterationElementType(const parser::Node *arg) const {
       std::get<parser::NodePtr>(eltField->value).get()));
 }
 
+const parser::Node *
+TypeSystem::unquotedAnnotation(const parser::Node *node) const {
+  std::optional<std::string_view> text = node && node->kind == "Constant"
+                                             ? ast::string(*node, "value")
+                                             : std::nullopt;
+  if (!text)
+    return node;
+  llvm::StringRef name = llvm::StringRef(text->data(), text->size()).trim();
+  auto cached = parsedAnnotations.find(name);
+  if (cached == parsedAnnotations.end()) {
+    parser::ParseResult parsed =
+        parser::parse(name, "<annotation>",
+                      parser::ParseOptions{parser::ParseMode::Expression,
+                                           /*typeComments=*/false});
+    parsedAnnotations[name] =
+        parsed.diagnostics.empty() ? parsed.tree : parser::NodePtr();
+    cached = parsedAnnotations.find(name);
+  }
+  const parser::Node *body =
+      cached->second ? ast::node(*cached->second, "body") : nullptr;
+  return body ? body : node;
+}
+
+std::optional<std::string>
+TypeSystem::paramSpecComponent(const parser::Node *annotation,
+                               llvm::StringRef component) const {
+  annotation = unquotedAnnotation(annotation);
+  if (!annotation || annotation->kind != "Attribute")
+    return std::nullopt;
+  auto attr = ast::string(*annotation, "attr");
+  if (!attr || llvm::StringRef(*attr) != component)
+    return std::nullopt;
+  const parser::Node *owner = ast::node(*annotation, "value");
+  if (!owner || owner->kind != "Name")
+    return std::nullopt;
+  std::optional<mlir::Type> bound = lookupSymbol(ast::nameSpelling(*owner));
+  if (!bound || !mlir::isa<py::ParamSpecType>(*bound))
+    return std::nullopt;
+  return std::string(ast::nameSpelling(*owner));
+}
+
 mlir::Type TypeSystem::annotationType(const parser::Node *node) const {
   if (!node)
     return object();
   if (node->kind == "Name")
     return annotationTypeForName(ast::nameSpelling(*node));
+  // ⭐ `P.args` AND `P.kwargs` ARE WHAT `Callable[P, R]` ERASES P TO: any
+  // arguments. They were fabricated into contracts named "P.args", which no
+  // argument is, so `addCleanup(f, "x")` against `*args: P.args` was "this
+  // call does not determine the type arguments". The arguments are checked
+  // where the body forwards them to the callable, against its real
+  // signature. ⛔ Asked before the quoted simple-name path below: `"P.args"`
+  // is a dotted simple name, and that path fabricated the same contract.
+  if (paramSpecComponent(node, "args") || paramSpecComponent(node, "kwargs"))
+    return any();
   if (node->kind == "Constant") {
     if (isNoneConstant(node))
       return none();
@@ -4051,19 +4101,9 @@ mlir::Type TypeSystem::annotationType(const parser::Node *node) const {
       // carry positions inside the annotation TEXT, which is a different file
       // from the program -- they are re-pointed at the string itself, or a
       // reader gets a line number from a source that does not exist.
-      auto cached = parsedAnnotations.find(name);
-      if (cached == parsedAnnotations.end()) {
-        parser::ParseResult parsed =
-            parser::parse(name, "<annotation>",
-                          parser::ParseOptions{parser::ParseMode::Expression,
-                                               /*typeComments=*/false});
-        parsedAnnotations[name] =
-            parsed.diagnostics.empty() ? parsed.tree : parser::NodePtr();
-        cached = parsedAnnotations.find(name);
-      }
-      if (cached->second) {
-        const parser::Node *body = ast::node(*cached->second, "body");
-        if (body && body->kind != "Constant") {
+      {
+        const parser::Node *body = unquotedAnnotation(node);
+        if (body != node && body->kind != "Constant") {
           std::size_t before = annotationDiagnostics.size();
           mlir::Type resolved = annotationType(body);
           for (std::size_t index = before; index < annotationDiagnostics.size();
@@ -4091,20 +4131,6 @@ mlir::Type TypeSystem::annotationType(const parser::Node *node) const {
     return literal(literalSpelling(*node));
   }
   if (node->kind == "Attribute") {
-    // ⭐ `P.args` AND `P.kwargs` ARE WHAT `Callable[P, R]` ERASES P TO: any
-    // arguments. They were fabricated into contracts named "P.args", which no
-    // argument is, so `addCleanup(f, "x")` against `*args: P.args` was "this
-    // call does not determine the type arguments". The arguments are checked
-    // where the body forwards them to the callable, against its real
-    // signature.
-    if (const parser::Node *owner = ast::node(*node, "value");
-        owner && owner->kind == "Name")
-      if (auto attr = ast::string(*node, "attr");
-          attr && (*attr == "args" || *attr == "kwargs"))
-        if (std::optional<mlir::Type> bound =
-                lookupSymbol(ast::nameSpelling(*owner));
-            bound && mlir::isa<py::ParamSpecType>(*bound))
-          return any();
     std::string qualified = ast::qualifiedName(node);
     std::string_view spelling = ast::nameSpelling(*node);
     std::string resolved = resolveAnnotationName(
@@ -6952,11 +6978,11 @@ mlir::Type TypeSystem::join(mlir::ArrayRef<mlir::Type> types) const {
 // list written with two `def`s already worked, because their annotated
 // results were already the one type.
 //
-// ⛔ ONLY when the parameter shapes are identical, which is checked by
-// rebuilding each member with the joined result and requiring the rebuilds to
-// agree: a real join over differing parameters is a MEET on each one
-// (contravariance), and a callable that claims to accept more than a member
-// does would be unsound at the call the union member cannot serve.
+// ⛔ NOT a join that claims more than a member takes: a real join over
+// differing parameters is a MEET on each one (contravariance), and a callable
+// that claims to accept more than a member does would be unsound at the call
+// the union member cannot serve. Identical shapes join as themselves; differing
+// ones only at a shape every member accepts (below).
 mlir::Type
 TypeSystem::commonCallableJoin(mlir::ArrayRef<mlir::Type> members) const {
   llvm::SmallVector<py::CallableType, 4> callables;
@@ -6992,10 +7018,41 @@ TypeSystem::commonCallableJoin(mlir::ArrayRef<mlir::Type> members) const {
         callable.getPositionalOnlyCount());
   };
   py::CallableType joined = withResult(callables.front());
-  for (py::CallableType callable : llvm::ArrayRef(callables).drop_front())
-    if (withResult(callable) != joined)
-      return {};
-  return joined;
+  if (llvm::all_of(llvm::ArrayRef(callables).drop_front(),
+                   [&](py::CallableType callable) {
+                     return withResult(callable) == joined;
+                   }))
+    return joined;
+  // ⭐ OR AT A SHAPE EVERY MEMBER TAKES. `k = a` then `k = b` in an arm, with
+  // `b(x, y=10)`, was a union of the two and refused at `k(3)`, which both
+  // serve. A member's own shape keeps its names, so `k(x=3)` still binds; the
+  // shape erased to its required positionals is the fallback when the names
+  // differ (`a(x)` and `c(z)`).
+  // ⛔ Still not a meet of the parameters: the candidate is a shape some
+  // member has, and every member must accept every call it allows, so the
+  // value claims no call a member cannot serve.
+  llvm::SmallVector<py::CallableType, 8> candidates;
+  for (py::CallableType callable : callables)
+    candidates.push_back(withResult(callable));
+  for (py::CallableType callable : callables) {
+    llvm::SmallVector<mlir::Type, 4> required;
+    for (auto [index, type] : llvm::enumerate(callable.getPositionalTypes())) {
+      llvm::ArrayRef<mlir::BoolAttr> defaults =
+          callable.getPositionalDefaults();
+      if (index < defaults.size() && defaults[index] &&
+          defaults[index].getValue())
+        break;
+      required.push_back(type);
+    }
+    candidates.push_back(
+        py::CallableType::get(&context, required, {}, {}, {}, {joinedResult}));
+  }
+  for (py::CallableType candidate : candidates)
+    if (llvm::all_of(callables, [&](py::CallableType callable) {
+          return py::isAssignableTo(withResult(callable), candidate);
+        }))
+      return candidate;
+  return {};
 }
 
 mlir::Type
@@ -7324,23 +7381,6 @@ TypeSystem::functionSignature(const parser::Node &function,
         ++index;
       }
     }
-    // The ParamSpec `P.args` / `P.kwargs` spells, if it is one.
-    auto paramSpecComponent =
-        [&](const parser::Node *annotationNode,
-            llvm::StringRef component) -> std::optional<std::string> {
-      if (!annotationNode || annotationNode->kind != "Attribute")
-        return std::nullopt;
-      auto attr = ast::string(*annotationNode, "attr");
-      if (!attr || llvm::StringRef(*attr) != component)
-        return std::nullopt;
-      const parser::Node *owner = ast::node(*annotationNode, "value");
-      if (!owner || owner->kind != "Name")
-        return std::nullopt;
-      std::optional<mlir::Type> bound = lookupSymbol(ast::nameSpelling(*owner));
-      if (!bound || !mlir::isa<py::ParamSpecType>(*bound))
-        return std::nullopt;
-      return std::string(ast::nameSpelling(*owner));
-    };
     if (const parser::Node *vararg = ast::node(*arguments, "vararg")) {
       sig.varargName = std::string(ast::nameSpelling(*vararg));
       const parser::Node *annotationNode = ast::node(*vararg, "annotation");
