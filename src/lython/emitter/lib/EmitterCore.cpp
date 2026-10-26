@@ -103,10 +103,12 @@ EmitResult ModuleEmitter::emit() {
       inSourceModule(source, [&] {
         desugarContextManagers(*source.moduleNode);
         desugarMethodDecorators(*source.moduleNode, &source);
+        extractFunctionOverloads(*source.moduleNode);
         scopeComprehensionTargets(*source.moduleNode);
       });
   desugarContextManagers(moduleNode);
   desugarMethodDecorators(moduleNode);
+  extractFunctionOverloads(moduleNode);
   scopeComprehensionTargets(moduleNode);
   // Once the trees are rewritten: which `sys.exc_info()` calls are written in
   // an `except` block's body (TypeSystem::excInfoInsideHandler).

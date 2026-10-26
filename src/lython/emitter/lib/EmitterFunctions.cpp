@@ -118,6 +118,7 @@ void ModuleEmitter::emitFunctionDecl(const parser::Node &function) {
     }
   }
   types.bindSymbol(*name, sig.publicCallable);
+  bindFunctionOverloads(function, *name, sig.publicCallable);
 }
 
 void ModuleEmitter::recordMonomorphicFunction(
@@ -379,20 +380,43 @@ llvm::SmallVector<unsigned, 2> ModuleEmitter::concretizeParamSpecCallables(
       return false;
     return ast::nameSpelling(*elements->front()) == *sig.paramSpecArgs;
   };
+  // ⭐ AND `Callable[P, R] | None`, the optional callable of an API that is
+  // also called without one (`assertRaises(E)` / `assertRaises(E, f, x)`):
+  // the member is typed, the None stays.
+  auto spellsOptionalCallableOfP = [&](const parser::Node *annotation) {
+    if (!annotation)
+      return false;
+    if (annotation->kind == "BinOp")
+      return spellsCallableOfP(ast::node(*annotation, "left")) ||
+             spellsCallableOfP(ast::node(*annotation, "right"));
+    return spellsCallableOfP(annotation);
+  };
   for (auto [index, argument] :
        llvm::enumerate(positionalArgumentNodes(*arguments))) {
     if (index >= declaredCount || index >= sig.positionalTypes.size())
       break;
     if (index >= needsForwarder.size() || !needsForwarder[index])
       continue;
-    auto erased =
-        mlir::dyn_cast_if_present<py::CallableType>(sig.positionalTypes[index]);
+    mlir::Type declared = sig.positionalTypes[index];
+    auto erased = mlir::dyn_cast_if_present<py::CallableType>(declared);
+    auto optional = mlir::dyn_cast_if_present<py::UnionType>(declared);
+    if (optional)
+      for (mlir::Type member : optional.getMemberTypes())
+        if (auto callable = mlir::dyn_cast<py::CallableType>(member))
+          erased = callable;
     if (!erased || !isGradualCallable(erased) ||
-        !spellsCallableOfP(ast::node(*argument, "annotation")))
+        !spellsOptionalCallableOfP(ast::node(*argument, "annotation")))
       continue;
-    sig.positionalTypes[index] = py::CallableType::get(
+    mlir::Type concrete = py::CallableType::get(
         &context, packPositional, keywordTypes, {}, {},
         erased.getResultTypes(), {}, keywordNames, {}, {});
+    if (optional) {
+      llvm::SmallVector<mlir::Type, 2> members;
+      for (mlir::Type member : optional.getMemberTypes())
+        members.push_back(member == erased ? concrete : member);
+      concrete = types.join(members);
+    }
+    sig.positionalTypes[index] = concrete;
     typed.push_back(static_cast<unsigned>(index));
   }
   return typed;
@@ -2105,6 +2129,11 @@ Value ModuleEmitter::emitLambda(const parser::Node &expr,
                                 py::CallableType expected) {
   if (parser::NodePtr spelled = lambdaWithPacksSpelledOut(expr))
     return emitLambda(*spelled, expected);
+  // `Callable[..., R]` -- and `Callable[P, R]`, which a union erases to it --
+  // says nothing of the parameters, so it has no shape for the lambda to
+  // match: the lambda's own is the answer, as a def's would be.
+  if (expected && isGradualCallable(expected))
+    expected = py::CallableType();
   llvm::SmallVector<Capture, 4> captures;
   // ⭐ A capture is the value the name holds NOW, and at module scope a
   // rebound name goes stale in it. CPython reads the binding at CALL time:

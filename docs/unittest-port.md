@@ -227,9 +227,10 @@ CPython の Lib/unittest を逐語的に移すのではなく、well-typed に�
   キーにした `_type_equality_funcs` を引く。ここでは
   `def assertEqual[T](self, first: T, second: T)` の中で `isinstance` により
   分ける。特殊化された T に合わない枝は、型検査の前に刈られる。
-- **assertRaises の 2 つの形は名前を分ける。** 1 つの名前で、context manager
-  を返すことと呼び出しを転送することの両方はできないので、呼び出しの形は
-  `assertRaisesCall[E, **P]` とした。
+- **assertRaises* と assertWarns* の 2 つの形は、CPython と同じく 1 つの名前の
+  `@overload` 2 つで書く** (2026-10-26。それまでは呼び出しの形を
+  `assertRaisesCall[E, **P]` に分けていた)。逸脱は 1 つだけで、呼び出しの形で
+  `msg=` を渡すとアサーション自身のものになり、callable には渡らない。
 - **cleanup は引数を閉じ込めたクロージャで持つ。** `addCleanup[**P]` が
   `lambda: function(*args, **kwargs)` を積む。CPython の (関数, args, kwargs)
   の三つ組は、型が呼び出しごとに違うので 1 つのリストに入らない。

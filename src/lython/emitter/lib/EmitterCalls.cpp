@@ -1145,6 +1145,23 @@ ModuleEmitter::tryEmitSubclassesCall(const parser::Node &expr) {
 }
 
 Value ModuleEmitter::emitCall(const parser::Node &expr) {
+  Value result = emitCallAsImplemented(expr);
+  // A call of an `@overload`ed function is typed by the overload it matched.
+  const parser::Node *calleeNode = ast::node(expr, "func");
+  std::string name;
+  if (calleeNode && calleeNode->kind == "Name")
+    name = std::string(ast::nameSpelling(*calleeNode));
+  else if (calleeNode && calleeNode->kind == "Attribute")
+    name = ast::qualifiedName(calleeNode);
+  if (!name.empty())
+    if (std::optional<mlir::Type> bound = types.lookupSymbol(name))
+      if (types.functionOverloads(name, *bound))
+        return narrowToOverloadResult(expr, result, types.inferExpr(&expr),
+                                      name);
+  return result;
+}
+
+Value ModuleEmitter::emitCallAsImplemented(const parser::Node &expr) {
   const parser::Node *calleeNode = ast::node(expr, "func");
   // `__ly$target_is(f, "symbol")`, which only a function-docstring dispatcher
   // writes (EmitterDocstrings.cpp): whether the function value `f` was made
@@ -3712,10 +3729,14 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
   // R]` -- or the erased `Callable[..., R]` of a `Callable[P, R]` -- and the
   // specialization is what gave it parameters.
   for (auto [index, argument] : llvm::enumerate(operands.positional)) {
-    auto target = index < parameterTypes.size()
-                      ? mlir::dyn_cast_if_present<py::CallableType>(
-                            parameterTypes[index])
-                      : py::CallableType();
+    mlir::Type declared =
+        index < parameterTypes.size() ? parameterTypes[index] : mlir::Type();
+    auto target = mlir::dyn_cast_if_present<py::CallableType>(declared);
+    // `Callable[P, R] | None`: the forwarder is the member's.
+    if (auto optional = mlir::dyn_cast_if_present<py::UnionType>(declared))
+      for (mlir::Type member : optional.getMemberTypes())
+        if (auto callable = mlir::dyn_cast<py::CallableType>(member))
+          target = callable;
     if (!target)
       continue;
     std::optional<Value> wrapped =
@@ -6383,6 +6404,8 @@ Value ModuleEmitter::emitClassOfValue(const parser::Node &anchor, Value value,
     if (isNoneTypeLike(widened) || !contract) {
       mlir::Type instance = isNoneTypeLike(widened)
                                 ? types.contract("types.NoneType")
+                            : mlir::isa<py::TypeType>(widened)
+                                ? types.contract("builtins.type")
                                 : types.object();
       classType = types.typeObject(instance);
       classValue =
@@ -6477,6 +6500,15 @@ ModuleEmitter::tryEmitTypeCall(const parser::Node &expr,
     if (!mlir::isa_and_nonnull<py::TypeType>(resultType))
       resultType = types.typeObject(types.object());
     return emitClassOfValue(expr, receiver, resultType);
+  }
+  // A class's class is `type`: no class here declares a metaclass.
+  if (mlir::isa_and_nonnull<py::TypeType>(subject)) {
+    (void)emitExpr(subjectNode);
+    mlir::Type metaclass = types.contract("builtins.type");
+    mlir::Type typeType = types.typeObject(metaclass);
+    auto object =
+        py::TypeObjectOp::create(builder, loc(expr), typeType, metaclass);
+    return Value{object.getResult(), typeType};
   }
   if (!contract)
     return refuse("type(x) needs a statically resolved class, and " +

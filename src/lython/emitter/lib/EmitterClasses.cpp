@@ -30,16 +30,31 @@ namespace {
 // A method's contract, as the protocol table stores it. One spelling for both
 // registrations of a class: the progressive one that makes a method visible
 // to the next method's body walk, and the complete one at the end.
-void addProtocolMethod(py::protocols::ProtocolInfo &info,
-                       llvm::StringRef methodName, mlir::Type methodContract) {
-  auto pushSignature = [&](py::CallableType signature) {
+// A method declared with `@overload`s is its overloads, tried in their order
+// as PEP 484 says; its implementation is not one of them.
+void addProtocolMethod(
+    py::protocols::ProtocolInfo &info, llvm::StringRef methodName,
+    mlir::Type methodContract,
+    const llvm::StringMap<llvm::SmallVector<mlir::Type, 2>> *overloads =
+        nullptr) {
+  auto pushSignature = [&](py::CallableType signature,
+                           bool firstApplicable = false) {
     if (!signature)
       return;
     py::protocols::ProtocolMethod method;
     method.signature = signature;
     method.mayThrow = true;
+    method.firstApplicable = firstApplicable;
     info.methods[methodName.str()].push_back(method);
   };
+  if (overloads)
+    if (auto declared = overloads->find(methodName);
+        declared != overloads->end()) {
+      for (mlir::Type overload : declared->second)
+        pushSignature(mlir::dyn_cast_if_present<py::CallableType>(overload),
+                      /*firstApplicable=*/true);
+      return;
+    }
   if (auto signature =
           mlir::dyn_cast_if_present<py::CallableType>(methodContract)) {
     pushSignature(signature);
@@ -273,6 +288,17 @@ bool bodyMentionsAttribute(const parser::Node &node, llvm::StringRef attr) {
 llvm::StringRef decoratorLeafName(llvm::StringRef spelling) {
   std::size_t dot = spelling.rfind('.');
   return dot == llvm::StringRef::npos ? spelling : spelling.drop_front(dot + 1);
+}
+
+// A def decorated `@overload`: a signature its implementation answers for.
+bool isOverloadDeclaration(const parser::Node &def) {
+  const auto *decorators = ast::nodeList(def, "decorator_list");
+  if (!decorators)
+    return false;
+  return llvm::any_of(*decorators, [](const parser::NodePtr &decorator) {
+    return decorator &&
+           decoratorLeafName(decoratorCallee(*decorator).second) == "overload";
+  });
 }
 
 // A `<prop>.setter` accessor decorator: Attribute whose attr is `setter`
@@ -2992,6 +3018,11 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   // than added to when the turn comes: the table holds a method's overloads
   // as a list, and the early entry would stay as a second overload.
   llvm::StringSet<> provisionalMethods;
+  // The `@overload` signatures of each method, in declaration order: what a
+  // call of the method is checked and typed against.
+  llvm::StringMap<llvm::SmallVector<mlir::Type, 2>> &overloads =
+      classMethodOverloads[contractName];
+  overloads.clear();
   if (const auto *body = ast::nodeList(classDef, "body")) {
     for (const parser::NodePtr &statement : *body) {
       // ⭐ A NESTED CLASS IS DROPPED, and only its USE said so. The refusals
@@ -3113,6 +3144,19 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
         return computed;
       };
       FunctionSignature bodySig = computeBodySignature();
+      // ⭐ AN `@overload` DECLARES; ONLY ITS IMPLEMENTATION RUNS. Each was a
+      // method of its own -- a body of `...` -- and the table scored all of
+      // them with the implementation, so a call typed by the wider
+      // implementation reached the lowering as an unnarrowed union.
+      if (isOverloadDeclaration(*statement)) {
+        if (kind != "instance" && kind != "static" && kind != "classmethod")
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, statement->range.start,
+              "@overload on a " + kind + " is not supported"});
+        else if (bodySig.publicCallable)
+          overloads[*methodName].push_back(bodySig.publicCallable);
+        continue;
+      }
       // ⭐ A GENERATOR THAT CALLS ITSELF NEEDS TO BE PUBLISHED FIRST. Computing
       // a generator's signature WALKS its body to infer the yield type, and a
       // recursive `k.walk()` in there resolves against a table that does not
@@ -3260,7 +3304,8 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       // other still need the annotation.
       if (provisionalMethods.erase(*methodName))
         progressiveInfo.methods.erase(std::string(*methodName));
-      addProtocolMethod(progressiveInfo, *methodName, bodySig.publicCallable);
+      addProtocolMethod(progressiveInfo, *methodName, bodySig.publicCallable,
+                        &overloads);
       publishProgress();
 
       std::string symbolName =
@@ -3303,6 +3348,14 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
                         std::string(contractName)};
     }
   }
+  for (const auto &declared : overloads)
+    if (!llvm::is_contained(methodNames, declared.getKey()))
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, classDef.range.start,
+          "'" + declared.getKey().str() +
+              "' is declared with @overload and has no implementation: the "
+              "overloads only describe calls, and the def after them is what "
+              "runs"});
   // ⭐ AN INHERITED BODY THAT CALLS AN OVERRIDDEN METHOD NEEDS ITS OWN COPY.
   // A class inherits its base's method by pointing at the BASE's symbol, and
   // that symbol's body typed `self` as the base -- so a call inside it bound
@@ -3915,7 +3968,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
     protocolInfo.fields[fieldName] = fieldType;
   for (auto [methodName, methodContract] :
        llvm::zip_equal(methodNames, methodContracts))
-    addProtocolMethod(protocolInfo, methodName, methodContract);
+    addProtocolMethod(protocolInfo, methodName, methodContract, &overloads);
   py::protocols::Table::getMutable(context).registerClass(
       contractName, std::move(protocolInfo));
 
@@ -5555,13 +5608,168 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
     collectedVararg = collected->vararg;
     collectedKwargs = collected->kwargs;
   }
+  // The overload this call matched, asked of the table with the arguments
+  // as emitted: what the call is typed by.
+  mlir::Type overloadResult;
+  bool overloaded = methodHasOverloads(method);
+  if (overloaded) {
+    llvm::SmallVector<mlir::Type, 8> positionalTypes;
+    for (const Value &argument : positional)
+      positionalTypes.push_back(argument.type);
+    llvm::SmallVector<CallKeywordType, 4> keywordTypes;
+    for (const auto &entry : keywords)
+      keywordTypes.push_back(CallKeywordType{entry.name, entry.value.type});
+    if (!collectedVararg && !collectedKwargs)
+      if (CallInferenceResult matched = types.inferMethodCallWithEvidence(
+              receiver.type, ast::string(*method.method, "name").value_or(""),
+              positionalTypes, keywordTypes))
+        overloadResult = matched.resultType;
+  }
+  auto asCalled = [&](Value result) {
+    if (!overloaded)
+      return result;
+    return narrowToOverloadResult(
+        expr, result, overloadResult,
+        ast::string(*method.method, "name").value_or(""));
+  };
   if (bindReceiver && !collectedVararg && !collectedKwargs)
     if (std::optional<Value> called = tryCallLargeMethod(
             expr, descriptorReceiver, method, positional, keywords))
-      return *called;
-  return emitInlineMethodBody(expr, descriptorReceiver, bindReceiver, method,
-                              positional, keywords, collectedVararg,
-                              collectedKwargs);
+      return asCalled(*called);
+  return asCalled(emitInlineMethodBody(expr, descriptorReceiver, bindReceiver,
+                                       method, positional, keywords,
+                                       collectedVararg, collectedKwargs));
+}
+
+// ⭐ A MODULE FUNCTION'S `@overload`s LEAVE THE MODULE BODY. Each was a def
+// of its own, rebinding the name to a body of `...` until the implementation
+// rebound it last, and the implementation's wider signature typed every call:
+// `f(1).upper()` for an overload returning str was refused as a method of
+// `str | int`. Kept under the implementation, they type its calls instead,
+// and nothing else in the compiler sees a def that never runs.
+// ⛔ Only a module body's: a nested def's overloads stay defs, typed by the
+// implementation as before.
+void ModuleEmitter::extractFunctionOverloads(const parser::Node &moduleNode) {
+  auto *body = const_cast<std::vector<parser::NodePtr> *>(
+      ast::nodeList(moduleNode, "body"));
+  if (!body)
+    return;
+  llvm::StringMap<std::vector<parser::NodePtr>> pending;
+  std::vector<parser::NodePtr> kept;
+  kept.reserve(body->size());
+  for (parser::NodePtr &statement : *body) {
+    bool function = statement && (statement->kind == "FunctionDef" ||
+                                  statement->kind == "AsyncFunctionDef");
+    std::string name =
+        function ? std::string(ast::string(*statement, "name").value_or(""))
+                 : std::string();
+    if (function && !name.empty() && isOverloadDeclaration(*statement)) {
+      pending[name].push_back(statement);
+      continue;
+    }
+    if (function && !name.empty())
+      if (auto declared = pending.find(name); declared != pending.end()) {
+        functionOverloadDeclarations[statement.get()] =
+            std::move(declared->second);
+        pending.erase(declared);
+      }
+    kept.push_back(statement);
+  }
+  for (const auto &declared : pending)
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, declared.second.front()->range.start,
+        "'" + declared.getKey().str() +
+            "' is declared with @overload and has no implementation: the "
+            "overloads only describe calls, and the def after them is what "
+            "runs"});
+  *body = std::move(kept);
+}
+
+void ModuleEmitter::bindFunctionOverloads(const parser::Node &function,
+                                          llvm::StringRef name,
+                                          mlir::Type implementation) {
+  auto declared = functionOverloadDeclarations.find(&function);
+  if (declared == functionOverloadDeclarations.end() || !implementation)
+    return;
+  llvm::SmallVector<py::CallableType, 2> overloads;
+  for (const parser::NodePtr &overload : declared->second)
+    if (auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+            types.functionSignature(*overload).publicCallable))
+      overloads.push_back(callable);
+  types.bindFunctionOverloads(name, implementation, std::move(overloads));
+}
+
+bool ModuleEmitter::methodHasOverloads(const MethodBinding &method) const {
+  if (!method.method)
+    return false;
+  auto declaring = classMethodOverloads.find(method.definingClass);
+  if (declaring == classMethodOverloads.end())
+    return false;
+  auto name = ast::string(*method.method, "name");
+  return name && declaring->second.count(*name);
+}
+
+// ⭐ THE OVERLOAD THE CALL MATCHED IS ITS TYPE; THE IMPLEMENTATION IS ITS
+// VALUE. The implementation answers for every overload, so its result is the
+// wider type -- a union whose member this call's overload names.
+// ⛔ Not an unchecked unwrap: an implementation that returns what the matched
+// overload does not declare is a value this call's type cannot hold, and
+// CPython would hand it on. That is a TypeError here, never a misread union.
+Value ModuleEmitter::narrowToOverloadResult(const parser::Node &anchor,
+                                            Value result, mlir::Type declared,
+                                            llvm::StringRef name) {
+  // ⛔ Not the implementation's answer for a call no overload takes: the
+  // overloads are the function's whole signature to its callers, and the
+  // implementation's wider one is what they describe, not an extra one.
+  if (!declared) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, anchor.range.start,
+        "no @overload of '" + name.str() + "' accepts these arguments"});
+    return emitNone(anchor);
+  }
+  if (!result.value || result.type == declared)
+    return result;
+  if (py::isAssignableTo(result.type, declared, module))
+    return coerceValue(result, declared, anchor);
+  auto unionType =
+      mlir::dyn_cast_if_present<py::UnionType>(types.widenLiteral(result.type));
+  if (!unionType)
+    return coerceValue(result, declared, anchor);
+  llvm::SmallVector<mlir::Type, 4> members(unionType.getMemberTypes().begin(),
+                                           unionType.getMemberTypes().end());
+  auto memberResult = [&](mlir::Type member) -> mlir::Value {
+    if (!py::isAssignableTo(member, declared, module)) {
+      parser::NodePtr raise = raisingCall(
+          anchor.range, "TypeError",
+          "the implementation of '" + name.str() + "' returned " +
+              pythonTypeSpelling(member) +
+              ", which the overload this call matched (" +
+              pythonTypeSpelling(declared) + ") does not return",
+          declared);
+      synthesizedIteratorDefs.push_back(raise);
+      return emitExpr(raise.get()).value;
+    }
+    Value unwrapped{py::UnionUnwrapOp::create(builder, loc(anchor), member,
+                                              result.value)
+                        .getResult(),
+                    member};
+    return coerceValue(unwrapped, declared, anchor).value;
+  };
+  std::function<mlir::Value(std::size_t)> chain =
+      [&](std::size_t index) -> mlir::Value {
+    if (index + 1 == members.size())
+      return memberResult(members[index]);
+    mlir::Value active =
+        py::UnionTestOp::create(builder, loc(anchor), builder.getI1Type(),
+                                result.value,
+                                mlir::TypeAttr::get(members[index]))
+            .getResult();
+    return emitValueDiamond(
+        loc(anchor), active, declared,
+        [&] { return memberResult(members[index]); },
+        [&] { return chain(index + 1); });
+  };
+  return Value{chain(0), declared};
 }
 
 namespace {
@@ -6694,8 +6902,14 @@ Value ModuleEmitter::emitInlineMethodBody(
                packPositional, packKeywords, forwarded)) {
         if (index < firstSlot || index - firstSlot >= adoptedPositional.size())
           continue;
-        auto target = mlir::cast<py::CallableType>(
-            specializedSig->positionalTypes[index]);
+        mlir::Type declared = specializedSig->positionalTypes[index];
+        auto target = mlir::dyn_cast<py::CallableType>(declared);
+        if (auto optional = mlir::dyn_cast<py::UnionType>(declared))
+          for (mlir::Type member : optional.getMemberTypes())
+            if (auto callable = mlir::dyn_cast<py::CallableType>(member))
+              target = callable;
+        if (!target)
+          continue;
         Value &argument = adoptedPositional[index - firstSlot];
         std::optional<Value> wrapped =
             tryWrapBuiltinFunctionValue(argument, target, anchor);

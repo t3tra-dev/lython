@@ -95,6 +95,13 @@ std::optional<CallSolution> selectCallableApplication(
     mlir::ArrayRef<CallKeywordType> keywords, TypeBindingMap bindings = {},
     std::size_t firstParameter = 0);
 
+// PEP 484's rule for `@overload`s: the first, in declaration order, that
+// accepts the call -- however a later one would score.
+std::optional<CallSolution> selectFirstApplicable(
+    const TypeSystem &types, llvm::ArrayRef<py::CallableType> candidates,
+    mlir::ArrayRef<mlir::Type> positional,
+    mlir::ArrayRef<CallKeywordType> keywords);
+
 std::optional<CallSolution>
 tryManifestMethod(const TypeSystem &types, mlir::Type receiverType,
                   llvm::StringRef methodName,

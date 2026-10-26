@@ -1283,6 +1283,23 @@ std::optional<CallSolution> selectCallableApplication(
                                 std::move(bindings), firstParameter);
 }
 
+std::optional<CallSolution> selectFirstApplicable(
+    const TypeSystem &types, llvm::ArrayRef<py::CallableType> candidates,
+    mlir::ArrayRef<mlir::Type> positional,
+    mlir::ArrayRef<CallKeywordType> keywords) {
+  for (py::CallableType candidate : candidates) {
+    bool applies = false;
+    {
+      InferenceContext::Speculation attempt(types.inference());
+      applies = static_cast<bool>(
+          tryCallableApplication(types, candidate, positional, keywords));
+    }
+    if (applies)
+      return tryCallableApplication(types, candidate, positional, keywords);
+  }
+  return std::nullopt;
+}
+
 std::optional<CallSolution>
 tryManifestMethod(const TypeSystem &types, mlir::Type receiverType,
                   llvm::StringRef methodName,

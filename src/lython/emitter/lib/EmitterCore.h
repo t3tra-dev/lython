@@ -949,6 +949,7 @@ private:
   Value emitExprExpected(const parser::Node *expr, mlir::Type expected);
   Value emitConstant(const parser::Node &expr);
   Value emitCall(const parser::Node &expr);
+  Value emitCallAsImplemented(const parser::Node &expr);
   // Monomorphization: generic (statically type-parameterized) top-level
   // functions have no direct emission — the py ABI has no runtime
   // representation for a type parameter. Each ground instantiation demanded
@@ -1548,6 +1549,11 @@ private:
                                const parser::Node &anchor);
   Value emitInlineMethodCall(const parser::Node &expr, Value receiver,
                              const MethodBinding &method);
+  // The implementation's result of an `@overload`ed call, as the overload the
+  // call matched declares it: `declared` is the call's inferred type.
+  Value narrowToOverloadResult(const parser::Node &anchor, Value result,
+                               mlir::Type declared, llvm::StringRef name);
+  bool methodHasOverloads(const MethodBinding &method) const;
   // A large method CALLED through a symbol instead of copied into the call
   // site; nullopt when the copy is what this call needs (EmitterClasses.cpp).
   // A generic method's solution at one call: its signature with the type
@@ -2014,6 +2020,23 @@ private:
   const std::string *frozenInitContract = nullptr;
   llvm::StringMap<llvm::StringMap<mlir::Type>> classStaticAttrBindings;
   llvm::StringMap<llvm::StringMap<MethodBinding>> classMethodBindings;
+  // A module function's `@overload` declarations, taken out of the module
+  // body and kept under the def that implements them.
+  void extractFunctionOverloads(const parser::Node &moduleNode);
+  // Binds `name`'s overloads to `implementation`, its bound type, when the
+  // def has any.
+  void bindFunctionOverloads(const parser::Node &function,
+                             llvm::StringRef name, mlir::Type implementation);
+  void bindImportedFunctionOverloads(const EmitOptions::SourceModule &source,
+                                     const std::vector<parser::NodePtr> &body,
+                                     const parser::Node &function,
+                                     llvm::StringRef bindingName,
+                                     mlir::Type implementation);
+  llvm::DenseMap<const parser::Node *, std::vector<parser::NodePtr>>
+      functionOverloadDeclarations;
+  // Per class, the `@overload` signatures of each method that declares them.
+  llvm::StringMap<llvm::StringMap<llvm::SmallVector<mlir::Type, 2>>>
+      classMethodOverloads;
   // ⭐ A METHOD BODY EMITTED AFTER EVERY CLASS IS DECLARED. Two sibling
   // subclasses that both call a base-typed method could not be compiled in any
   // order: the first one's body needs the second's method bindings, which its

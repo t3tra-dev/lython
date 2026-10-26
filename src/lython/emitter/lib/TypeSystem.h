@@ -532,6 +532,12 @@ public:
   // The emitter registers their signatures here as it emits the class.
   void bindClassStaticMethod(llvm::StringRef className,
                              llvm::StringRef methodName, mlir::Type callable);
+  // A module function declared with `@overload`s: a call of `name` bound to
+  // `implementation` is typed by the first overload that accepts it.
+  void bindFunctionOverloads(llvm::StringRef name, mlir::Type implementation,
+                             llvm::SmallVector<py::CallableType, 2> overloads);
+  const llvm::SmallVector<py::CallableType, 2> *
+  functionOverloads(llvm::StringRef name, mlir::Type implementation) const;
   std::optional<mlir::Type>
   lookupClassStaticMethod(llvm::StringRef className,
                           llvm::StringRef methodName) const;
@@ -839,6 +845,12 @@ private:
   llvm::DenseMap<const parser::Node *, mlir::Type> pinnedResultTypes;
   // Static-method signatures, keyed "<class>.<method>".
   llvm::StringMap<mlir::Type> classStaticMethodTypes;
+  // ⛔ Keyed by the name AND the implementation's type, not the type alone:
+  // an unrelated function whose signature is the same would be typed by
+  // overloads it never declared.
+  llvm::StringMap<llvm::SmallVector<
+      std::pair<mlir::Type, llvm::SmallVector<py::CallableType, 2>>, 1>>
+      functionOverloadSets;
   llvm::StringMap<std::string> canonicalBindings;
   // The canonical bindings the builtins scope itself makes, so an import
   // under the same name can be told from them.

@@ -928,6 +928,8 @@ bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
     FunctionSignature sig =
         importedFunctionSignature(*source, *body, *statement);
     types.bindCanonicalSymbol(local, canonical, sig.publicCallable);
+    bindImportedFunctionOverloads(*source, *body, *statement, local,
+                                  sig.publicCallable);
     continue;
   }
   for (const parser::NodePtr &statement : *body) {
@@ -1527,6 +1529,8 @@ bool ModuleEmitter::bindSourceModuleName(llvm::StringRef module,
     FunctionSignature sig =
         importedFunctionSignature(*source, *body, *statement);
     types.bindCanonicalSymbol(localName, canonical, sig.publicCallable);
+    bindImportedFunctionOverloads(*source, *body, *statement, localName,
+                                  sig.publicCallable);
     return true;
   }
   if (definitions.classes.count(exportedName)) {
@@ -1994,6 +1998,7 @@ void ModuleEmitter::bindSourceModuleLocals(llvm::StringRef moduleName,
       types.bindCanonicalSymbol(*name,
                                 sourceModuleFunctionSymbol(moduleName, *name),
                                 sig.publicCallable);
+      bindFunctionOverloads(*statement, *name, sig.publicCallable);
       continue;
     }
   }
@@ -3493,6 +3498,24 @@ void ModuleEmitter::wrapJsCallbackArguments(const parser::Node &anchor,
 //
 // ⛔ A module already being read here falls back to the classes alone: two
 // modules that import each other would otherwise read each other forever.
+// The overloads of an imported def, read in its module's scope as its own
+// signature is, under the name the importer calls it by.
+void ModuleEmitter::bindImportedFunctionOverloads(
+    const EmitOptions::SourceModule &source,
+    const std::vector<parser::NodePtr> &body, const parser::Node &function,
+    llvm::StringRef bindingName, mlir::Type implementation) {
+  auto declared = functionOverloadDeclarations.find(&function);
+  if (declared == functionOverloadDeclarations.end() || !implementation)
+    return;
+  llvm::SmallVector<py::CallableType, 2> overloads;
+  for (const parser::NodePtr &overload : declared->second)
+    if (auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+            importedFunctionSignature(source, body, *overload).publicCallable))
+      overloads.push_back(callable);
+  types.bindFunctionOverloads(bindingName, implementation,
+                              std::move(overloads));
+}
+
 FunctionSignature ModuleEmitter::importedFunctionSignature(
     const EmitOptions::SourceModule &source,
     const std::vector<parser::NodePtr> &body, const parser::Node &function) {

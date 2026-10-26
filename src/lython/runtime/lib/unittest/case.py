@@ -10,6 +10,7 @@ import logging
 import time
 import types
 from collections.abc import Callable, Iterator
+from typing import overload
 
 from . import result
 from .util import strclass, safe_repr, _common_shorten_repr
@@ -204,14 +205,7 @@ class _AssertRaisesContext[E: BaseException]:
 
     def __init__(self, expected: type[E] | tuple[type[E], ...],
                  test_case: TestCase, msg: str | None = None) -> None:
-        # One class is kept as a tuple of one, so the tests below ask one shape.
-        self.expected: tuple[type[E], ...]
-        if isinstance(expected, tuple):
-            self.expected = expected
-            self._expected_name = str(expected)
-        else:
-            self.expected = (expected,)
-            self._expected_name = expected.__name__
+        self.expected = expected
         self.test_case = test_case
         self.msg = msg
         self.obj_name: str | None = None
@@ -229,8 +223,14 @@ class _AssertRaisesContext[E: BaseException]:
 
     def __exit__(self, exc_type: type[BaseException] | None, exc_value: BaseException | None,
                  tb: types.TracebackType | None) -> bool:
+        expected = self.expected
         if exc_type is None:
-            exc_name = self._expected_name
+            # ⛔ Not CPython's `__name__` with AttributeError caught: the
+            # union says which of the two it is.
+            if isinstance(expected, tuple):
+                exc_name = str(expected)
+            else:
+                exc_name = expected.__name__
             obj_name = self.obj_name
             if obj_name is not None:
                 self.test_case.fail(self.test_case._formatMessage(
@@ -239,15 +239,18 @@ class _AssertRaisesContext[E: BaseException]:
                 self.test_case.fail(self.test_case._formatMessage(
                     self.msg, "{} not raised".format(exc_name)))
             return False
+        # ⛔ Not `issubclass(exc_type, self.expected)`: issubclass takes a
+        # class or a tuple here, not a union of the two.
+        classes = expected if isinstance(expected, tuple) else (expected,)
         matched = False
-        for expected in self.expected:
-            if issubclass(exc_type, expected):
+        for cls in classes:
+            if issubclass(exc_type, cls):
                 matched = True
         if not matched:
             # let unexpected exceptions pass through
             return False
-        for expected in self.expected:
-            if isinstance(exc_value, expected):
+        for cls in classes:
+            if isinstance(exc_value, cls):
                 self._exception = exc_value
         return True
 
@@ -767,56 +770,164 @@ class TestCase(object):
         except UnicodeDecodeError:
             return  '%s : %s' % (safe_repr(standardMsg), safe_repr(msg))
 
-    def assertRaises[E: BaseException](self, expected_exception: type[E] | tuple[type[E], ...],
-                                       msg: str | None = None) -> _AssertRaisesContext[E]:
+    @overload
+    def assertRaises[**P](self, expected_exception: type[BaseException] | tuple[type[BaseException], ...],
+                          callable: Callable[P, object], /,
+                          *args: P.args, **kwargs: P.kwargs) -> None: ...
+    @overload
+    def assertRaises[E: BaseException](self, expected_exception: type[E] | tuple[type[E], ...], *,
+                                       msg: str | None = None) -> _AssertRaisesContext[E]: ...
+    def assertRaises[E: BaseException, **P](self, expected_exception: type[E] | tuple[type[E], ...],
+                                            callable_obj: Callable[P, object] | None = None,
+                                            *args: P.args, msg: str | None = None,
+                                            **kwargs: P.kwargs) -> _AssertRaisesContext[E] | None:
         """Fail unless an exception of class expected_exception is raised
-           in the `with` block this returns the context manager for.
-        """
-        return _AssertRaisesContext[E](expected_exception, self, msg)
+           by the callable when invoked with specified positional and
+           keyword arguments. If a different type of exception is
+           raised, it will not be caught, and the test case will be
+           deemed to have suffered an error, exactly as for an
+           unexpected exception.
 
-    def assertRaisesCall[E: BaseException, **P](self, expected_exception: type[E] | tuple[type[E], ...],
-                                                callable_obj: Callable[P, object],
-                                                *args: P.args, **kwargs: P.kwargs) -> None:
-        """assertRaises' callable form: call callable_obj(*args, **kwargs)."""
-        context = _AssertRaisesContext[E](expected_exception, self)
+           If called with the callable and arguments omitted, will return a
+           context object used like this::
+
+                with self.assertRaises(SomeException):
+                    do_something()
+
+           An optional keyword argument 'msg' can be provided when assertRaises
+           is used as a context object.
+
+           The context manager keeps a reference to the exception as
+           the 'exception' attribute. This allows you to inspect the
+           exception after the assertion::
+
+               with self.assertRaises(SomeException) as cm:
+                   do_something()
+               the_exception = cm.exception
+               self.assertEqual(the_exception.error_code, 3)
+        """
+        context = _AssertRaisesContext[E](expected_exception, self, msg)
+        if callable_obj is None:
+            return context
+        context.obj_name = callable_obj.__name__
         with context:
             callable_obj(*args, **kwargs)
+        return None
 
+    @overload
+    def assertRaisesRegex[**P](self, expected_exception: type[BaseException] | tuple[type[BaseException], ...],
+                               expected_regex: str | re.Pattern,
+                               callable: Callable[P, object], /,
+                               *args: P.args, **kwargs: P.kwargs) -> None: ...
+    @overload
     def assertRaisesRegex[E: BaseException](self, expected_exception: type[E] | tuple[type[E], ...],
-                                            expected_regex: str | re.Pattern,
-                                            msg: str | None = None) -> _AssertRaisesRegexContext[E]:
+                                            expected_regex: str | re.Pattern, *,
+                                            msg: str | None = None) -> _AssertRaisesRegexContext[E]: ...
+    def assertRaisesRegex[E: BaseException, **P](self, expected_exception: type[E] | tuple[type[E], ...],
+                                                 expected_regex: str | re.Pattern,
+                                                 callable_obj: Callable[P, object] | None = None,
+                                                 *args: P.args, msg: str | None = None,
+                                                 **kwargs: P.kwargs) -> _AssertRaisesRegexContext[E] | None:
         """Asserts that the message in a raised exception matches a regex.
 
         Args:
             expected_exception: Exception class expected to be raised.
             expected_regex: Regex (re.Pattern object or string) expected
                     to be found in error message.
+            args: Function to be called and extra positional args.
+            kwargs: Extra kwargs.
             msg: Optional message used in case of failure. Can only be used
                     when assertRaisesRegex is used as a context manager.
         """
-        return _AssertRaisesRegexContext[E](expected_exception, self, expected_regex, msg)
+        context = _AssertRaisesRegexContext[E](expected_exception, self, expected_regex, msg)
+        if callable_obj is None:
+            return context
+        context.raises.obj_name = callable_obj.__name__
+        with context:
+            callable_obj(*args, **kwargs)
+        return None
 
-    def assertWarns[W: Warning](self, expected_warning: type[W],
-                                msg: str | None = None) -> _AssertWarnsContext[W]:
+    @overload
+    def assertWarns[**P](self, expected_warning: type[Warning],
+                         callable: Callable[P, object], /,
+                         *args: P.args, **kwargs: P.kwargs) -> None: ...
+    @overload
+    def assertWarns[W: Warning](self, expected_warning: type[W], *,
+                                msg: str | None = None) -> _AssertWarnsContext[W]: ...
+    def assertWarns[W: Warning, **P](self, expected_warning: type[W],
+                                     callable_obj: Callable[P, object] | None = None,
+                                     *args: P.args, msg: str | None = None,
+                                     **kwargs: P.kwargs) -> _AssertWarnsContext[W] | None:
         """Fail unless a warning of class warnClass is triggered
-           in the `with` block this returns the context manager for.
+           by the callable when invoked with specified positional and
+           keyword arguments.  If a different type of warning is
+           triggered, it will not be handled: depending on the other
+           warning filtering rules in effect, it might be silenced, printed
+           out, or raised as an exception.
+
+           If called with the callable and arguments omitted, will return a
+           context object used like this::
+
+                with self.assertWarns(SomeWarning):
+                    do_something()
+
+           An optional keyword argument 'msg' can be provided when assertWarns
+           is used as a context object.
 
            The context manager keeps a reference to the first matching
            warning as the 'warning' attribute; similarly, the 'filename'
            and 'lineno' attributes give you information about the line
            of Python code from which the warning was triggered.
-        """
-        return _AssertWarnsContext[W](expected_warning, self, None, msg)
+           This allows you to inspect the warning after the assertion::
 
+               with self.assertWarns(SomeWarning) as cm:
+                   do_something()
+               the_warning = cm.warning
+               self.assertEqual(the_warning.some_attribute, 147)
+        """
+        context = _AssertWarnsContext[W](expected_warning, self, None, msg)
+        if callable_obj is None:
+            return context
+        context.obj_name = callable_obj.__name__
+        with context:
+            callable_obj(*args, **kwargs)
+        return None
+
+    @overload
+    def assertWarnsRegex[**P](self, expected_warning: type[Warning],
+                              expected_regex: str | re.Pattern,
+                              callable: Callable[P, object], /,
+                              *args: P.args, **kwargs: P.kwargs) -> None: ...
+    @overload
     def assertWarnsRegex[W: Warning](self, expected_warning: type[W],
-                                     expected_regex: str | re.Pattern,
-                                     msg: str | None = None) -> _AssertWarnsContext[W]:
+                                     expected_regex: str | re.Pattern, *,
+                                     msg: str | None = None) -> _AssertWarnsContext[W]: ...
+    def assertWarnsRegex[W: Warning, **P](self, expected_warning: type[W],
+                                          expected_regex: str | re.Pattern,
+                                          callable_obj: Callable[P, object] | None = None,
+                                          *args: P.args, msg: str | None = None,
+                                          **kwargs: P.kwargs) -> _AssertWarnsContext[W] | None:
         """Asserts that the message in a triggered warning matches a regexp.
         Basic functioning is similar to assertWarns() with the addition
         that only warnings whose messages also match the regular expression
         are considered successful matches.
+
+        Args:
+            expected_warning: Warning class expected to be triggered.
+            expected_regex: Regex (re.Pattern object or string) expected
+                    to be found in error message.
+            args: Function to be called and extra positional args.
+            kwargs: Extra kwargs.
+            msg: Optional message used in case of failure. Can only be used
+                    when assertWarnsRegex is used as a context manager.
         """
-        return _AssertWarnsContext[W](expected_warning, self, expected_regex, msg)
+        context = _AssertWarnsContext[W](expected_warning, self, expected_regex, msg)
+        if callable_obj is None:
+            return context
+        context.obj_name = callable_obj.__name__
+        with context:
+            callable_obj(*args, **kwargs)
+        return None
 
     def assertLogs(self, logger: str | logging.Logger | None = None,
                    level: int | str | None = None) -> _AssertLogsContext:
