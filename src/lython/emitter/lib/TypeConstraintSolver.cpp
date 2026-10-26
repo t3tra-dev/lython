@@ -417,6 +417,21 @@ bool bindContractView(const TypeSystem &types, py::ContractType expected,
       // `into: list[T]` is T from `source`, not `object` from the literal.
       if (erasedEmptyContainer(actualContract))
         return true;
+      // ⭐ A TUPLE OF ONE ARGUMENT IS ITS ELEMENTS' TYPE, AT ANY LENGTH -- the
+      // reading every assignment here already gives `tuple[int]` -- so a
+      // longer tuple binds it once per element: `first((1, 2))` for
+      // `t: tuple[T, ...]` is T = int, and `(KeyError, IndexError)` for
+      // `tuple[type[E], ...]` is E = KeyError | IndexError. Matched pairwise,
+      // as any other contract, both were "call arguments do not match".
+      if (expected.getContractName() == "builtins.tuple" &&
+          expected.getArguments().size() == 1 &&
+          actualContract.getArguments().size() > 1) {
+        for (mlir::Type element : actualContract.getArguments())
+          if (!bindExpectedType(types, expected.getArguments().front(),
+                                element, bindings))
+            return false;
+        return true;
+      }
       return expected.getArguments().empty() ||
              bindTypeList(types, expected.getArguments(),
                           actualContract.getArguments(), bindings);
@@ -562,6 +577,38 @@ bool bindExpectedType(const TypeSystem &types, mlir::Type expected,
         !mlir::isa<py::LiteralType>(bindings.find(*name)->second))
       return bindTypeParameter(types, *name, actual, bindings);
   }
+  // ⭐ AND SO IS ONE UNDER `type[...]`, which is covariant: `two(A, B)` for
+  // `(a: type[E], b: type[E])` is E = the nearest class both are, as a
+  // `type[Base]` value is any subclass's. Substituted first, the second
+  // argument met `type[A]` and was refused -- which is also what kept
+  // `assertRaises((KeyError, IndexError))` from solving (E = LookupError).
+  // ⛔ Not E = A | B, as for instances: a class value is one word naming its
+  // class, and `type[A | B]` has no such word to be ("callable ABI type has
+  // no concrete runtime contract"). Nor under an invariant container:
+  // `list[E]` with a `list[A]` and a `list[B]` has no answer.
+  if (auto expectedType = mlir::dyn_cast_if_present<py::TypeType>(expected))
+    if (std::optional<std::string> name =
+            staticParameterName(expectedType.getInstanceType());
+        name && bindings.count(*name))
+      if (auto actualType = mlir::dyn_cast_if_present<py::TypeType>(
+              types.inference().zonk(actual))) {
+        mlir::Type &bound = bindings.find(*name)->second;
+        mlir::Type instance = types.widenLiteral(actualType.getInstanceType());
+        auto ground = [](mlir::Type type) {
+          return mlir::isa_and_nonnull<py::ContractType>(type);
+        };
+        if (ground(bound) && ground(instance)) {
+          if (typeAccepts(types, bound, instance))
+            return true;
+          if (typeAccepts(types, instance, bound)) {
+            bound = instance;
+            return true;
+          }
+          mlir::Type common = types.nearestCommonClass({bound, instance});
+          bound = common ? common : types.object();
+          return true;
+        }
+      }
   expected = substituteType(types, expected, bindings);
   expected = types.inference().zonk(expected);
   actual = types.inference().zonk(actual);

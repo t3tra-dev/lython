@@ -202,9 +202,16 @@ def expectedFailure[T: TestCase](test_item: Callable[[T], None]) -> Callable[[T]
 class _AssertRaisesContext[E: BaseException]:
     """A context manager used to implement TestCase.assertRaises* methods."""
 
-    def __init__(self, expected: type[E], test_case: TestCase,
-                 msg: str | None = None) -> None:
-        self.expected = expected
+    def __init__(self, expected: type[E] | tuple[type[E], ...],
+                 test_case: TestCase, msg: str | None = None) -> None:
+        # One class is kept as a tuple of one, so the tests below ask one shape.
+        self.expected: tuple[type[E], ...]
+        if isinstance(expected, tuple):
+            self.expected = expected
+            self._expected_name = str(expected)
+        else:
+            self.expected = (expected,)
+            self._expected_name = expected.__name__
         self.test_case = test_case
         self.msg = msg
         self.obj_name: str | None = None
@@ -223,7 +230,7 @@ class _AssertRaisesContext[E: BaseException]:
     def __exit__(self, exc_type: type[BaseException] | None, exc_value: BaseException | None,
                  tb: types.TracebackType | None) -> bool:
         if exc_type is None:
-            exc_name = self.expected.__name__
+            exc_name = self._expected_name
             obj_name = self.obj_name
             if obj_name is not None:
                 self.test_case.fail(self.test_case._formatMessage(
@@ -232,11 +239,16 @@ class _AssertRaisesContext[E: BaseException]:
                 self.test_case.fail(self.test_case._formatMessage(
                     self.msg, "{} not raised".format(exc_name)))
             return False
-        if not issubclass(exc_type, self.expected):
+        matched = False
+        for expected in self.expected:
+            if issubclass(exc_type, expected):
+                matched = True
+        if not matched:
             # let unexpected exceptions pass through
             return False
-        if isinstance(exc_value, self.expected):
-            self._exception = exc_value
+        for expected in self.expected:
+            if isinstance(exc_value, expected):
+                self._exception = exc_value
         return True
 
 
@@ -244,8 +256,8 @@ class _AssertRaisesRegexContext[E: BaseException]:
     """assertRaisesRegex's context manager: _AssertRaisesContext's, and the
     raised exception's text searched for expected_regex."""
 
-    def __init__(self, expected: type[E], test_case: TestCase,
-                 expected_regex: str | re.Pattern,
+    def __init__(self, expected: type[E] | tuple[type[E], ...],
+                 test_case: TestCase, expected_regex: str | re.Pattern,
                  msg: str | None = None) -> None:
         self.raises = _AssertRaisesContext[E](expected, test_case, msg)
         self.expected_regex = re.compile(expected_regex)
@@ -755,14 +767,14 @@ class TestCase(object):
         except UnicodeDecodeError:
             return  '%s : %s' % (safe_repr(standardMsg), safe_repr(msg))
 
-    def assertRaises[E: BaseException](self, expected_exception: type[E],
+    def assertRaises[E: BaseException](self, expected_exception: type[E] | tuple[type[E], ...],
                                        msg: str | None = None) -> _AssertRaisesContext[E]:
         """Fail unless an exception of class expected_exception is raised
            in the `with` block this returns the context manager for.
         """
         return _AssertRaisesContext[E](expected_exception, self, msg)
 
-    def assertRaisesCall[E: BaseException, **P](self, expected_exception: type[E],
+    def assertRaisesCall[E: BaseException, **P](self, expected_exception: type[E] | tuple[type[E], ...],
                                                 callable_obj: Callable[P, object],
                                                 *args: P.args, **kwargs: P.kwargs) -> None:
         """assertRaises' callable form: call callable_obj(*args, **kwargs)."""
@@ -770,7 +782,7 @@ class TestCase(object):
         with context:
             callable_obj(*args, **kwargs)
 
-    def assertRaisesRegex[E: BaseException](self, expected_exception: type[E],
+    def assertRaisesRegex[E: BaseException](self, expected_exception: type[E] | tuple[type[E], ...],
                                             expected_regex: str | re.Pattern,
                                             msg: str | None = None) -> _AssertRaisesRegexContext[E]:
         """Asserts that the message in a raised exception matches a regex.

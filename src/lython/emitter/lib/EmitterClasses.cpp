@@ -5312,11 +5312,26 @@ Value ModuleEmitter::adoptSolvedDisplay(Value value, mlir::Type declared,
         return value;
   auto actual = mlir::dyn_cast_if_present<py::ContractType>(
       types.widenLiteral(value.type));
-  auto expected = mlir::dyn_cast_if_present<py::ContractType>(declared);
+  // ⭐ AND A UNION FORMAL TAKES IT AS ITS ONE MEMBER OF THAT KIND:
+  // `(KeyError, IndexError)` for `type[E] | tuple[type[E], ...]` is built as
+  // the tuple of class values, then widened to the union.
+  mlir::Type member = declared;
+  if (auto unionType = mlir::dyn_cast<py::UnionType>(declared)) {
+    member = mlir::Type();
+    for (mlir::Type candidate : unionType.getMemberTypes())
+      if (auto contract = mlir::dyn_cast<py::ContractType>(candidate);
+          contract && contract.getContractName() == wanted) {
+        if (member)
+          return value;
+        member = candidate;
+      }
+  }
+  auto expected = mlir::dyn_cast_if_present<py::ContractType>(member);
   if (!actual || !expected || actual.getContractName() != wanted ||
       expected.getContractName() != wanted)
     return value;
-  return coerceValue(value, declared, *node);
+  Value adopted = coerceValue(value, member, *node);
+  return member == declared ? adopted : coerceValue(adopted, declared, *node);
 }
 
 // The parameters an inlined method's call fills, its receiver's slot excluded,
