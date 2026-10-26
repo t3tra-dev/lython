@@ -4,12 +4,11 @@
 # so binding a local is the one answer it cannot have.
 #
 # This was a `list[int]` until container globals got cells, then a
-# `list[int] | None` until a union a function uses got one, and then a
-# `type[X]` until class values carried their type object. What is left is a
-# name the module binds more than once without an annotation: it stays
-# value-bound, since a cell has one representation and the bindings promise
-# none.
-G = 0
+# `list[int] | None` until a union a function uses got one, then a `type[X]`
+# until class values carried their type object, and then a name bound twice
+# without an annotation until such a name got a cell of its values' join.
+# What is left is a name bound by unpacking: no single value types the cell.
+G, H = 0, 0
 G = 1
 
 
@@ -19,4 +18,4 @@ def f() -> None:
 
 
 f()
-print(G)
+print(G, H)
