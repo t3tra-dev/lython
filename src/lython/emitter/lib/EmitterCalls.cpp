@@ -187,11 +187,14 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
         positionalAligned = false;
       const parser::Node *valueNode =
           unpacked ? ast::node(*arg, "value") : arg.get();
-      Value value = positionalAligned
-                        ? emitExprExpected(
-                              valueNode,
-                              expectedFor(operands.positionalTypes.size()))
-                        : emitExpr(valueNode);
+      auto shaped = lambdaArgumentExpectations.find(valueNode);
+      Value value =
+          shaped != lambdaArgumentExpectations.end()
+              ? emitExprExpected(valueNode, shaped->second)
+          : positionalAligned
+              ? emitExprExpected(valueNode,
+                                 expectedFor(operands.positionalTypes.size()))
+              : emitExpr(valueNode);
       // ⭐ A UNION OF bool AND int WHERE int IS EXPECTED is the int it is:
       // `xs.append(d[k])` over `{1: 5, 4: True}` had no signature for the
       // union, and the element keeps the bool's own object either way.
@@ -3543,9 +3546,13 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
                                      GenericFunctionInfo &generic) {
   // The generic contract still distributes as the argument expectation: its
   // ground formals propagate, and expectedFor skips the type-parameter ones.
+  auto outerLambdaExpectations = std::exchange(
+      lambdaArgumentExpectations,
+      paramSpecLambdaExpectations(expr, generic.node, generic.signature));
   CallOperands operands =
       emitCallOperands(expr, {}, /*includeAstArguments=*/true,
                        generic.signature.publicCallable);
+  lambdaArgumentExpectations = std::move(outerLambdaExpectations);
   bool paramSpec = forwardsParamSpec(generic.signature);
   // ⭐ A SEQUENCE OF UNKNOWN LENGTH OR A MAPPING OF UNKNOWN KEYS solves the
   // type parameters like any argument -- `*xs` with xs a `list[int]` binds

@@ -256,6 +256,27 @@ positionalArgumentNodes(const parser::Node &arguments) {
   return result;
 }
 
+bool spellsCallableOfParamSpec(const parser::Node *annotation,
+                               llvm::StringRef paramSpec) {
+  if (!annotation)
+    return false;
+  if (annotation->kind == "BinOp")
+    return spellsCallableOfParamSpec(ast::node(*annotation, "left"),
+                                     paramSpec) ||
+           spellsCallableOfParamSpec(ast::node(*annotation, "right"),
+                                     paramSpec);
+  if (annotation->kind != "Subscript")
+    return false;
+  const parser::Node *slice = ast::node(*annotation, "slice");
+  const auto *elements = slice && slice->kind == "Tuple"
+                             ? ast::nodeList(*slice, "elts")
+                             : nullptr;
+  if (!elements || elements->size() != 2 || !elements->front() ||
+      elements->front()->kind != "Name")
+    return false;
+  return llvm::StringRef(ast::nameSpelling(*elements->front())) == paramSpec;
+}
+
 bool blockHasTerminator(mlir::Block &block) {
   return !block.empty() && block.back().hasTrait<mlir::OpTrait::IsTerminator>();
 }

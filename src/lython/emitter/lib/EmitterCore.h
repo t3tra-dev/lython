@@ -996,6 +996,16 @@ private:
   // Per parameter of the generic call being specialized: whether its
   // argument needs a forwarder (emitGenericCall sets it).
   llvm::SmallVector<bool, 4> paramSpecForwarderArguments;
+  // The parameters each lambda argument of a call to a ParamSpec forwarder
+  // takes: what the call passes on to its `Callable[P, R]`.
+  llvm::DenseMap<const parser::Node *, py::CallableType>
+  paramSpecLambdaExpectations(const parser::Node &call,
+                              const parser::Node *def,
+                              const FunctionSignature &sig,
+                              unsigned receiverSlots = 0) const;
+  // Read by emitCallOperands in place of the callee's formal.
+  llvm::DenseMap<const parser::Node *, py::CallableType>
+      lambdaArgumentExpectations;
   ParamSpecCallShape paramSpecCallShape(const FunctionSignature &sig,
                                         const CallOperands &operands) const;
   // Binds the `*args` and `**kwargs` of a body specialized at one call's

@@ -5464,6 +5464,9 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
     return {};
   };
 
+  llvm::DenseMap<const parser::Node *, py::CallableType> lambdaShapes =
+      paramSpecLambdaExpectations(expr, method.method, argumentSig,
+                                  receiverTakesSlotZero ? 1 : 0);
   llvm::SmallVector<Value, 8> positional;
   // A starred sequence, and a `**` mapping, whose size only the run time
   // knows: collected into the method's *args and **kwargs below
@@ -5527,6 +5530,11 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
             parser::Severity::Error, arg->range.start,
             "starred arguments are not supported for inlined class methods "
             "unless they are a tuple or a list"});
+        continue;
+      }
+      if (auto shaped = lambdaShapes.find(arg.get());
+          shaped != lambdaShapes.end()) {
+        positional.push_back(emitExprExpected(arg.get(), shaped->second));
         continue;
       }
       mlir::Type expected = declaredPositional(positional.size());
