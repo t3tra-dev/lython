@@ -581,6 +581,25 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
                   walk(ast::nodeList(*handler, "body"));
                 }
             walk(ast::nodeList(*statement, "finalbody"));
+          } else if (kind == "Match") {
+            // ⛔ A case body was not walked, so a name bound before the match
+            // and again in a case counted once, kept its value binding, and
+            // was "unresolved" in every function that read it. A capture
+            // binds what the pattern destructures, as unpacking does.
+            if (const auto *cases = ast::nodeList(*statement, "cases"))
+              for (const parser::NodePtr &matchCase : *cases)
+                if (matchCase) {
+                  ast::walk(ast::node(*matchCase, "pattern"),
+                            [&](const parser::Node &pattern) {
+                              if (auto captured =
+                                      ast::string(pattern, "name"))
+                                unpackable.insert(*captured);
+                              if (auto rest = ast::string(pattern, "rest"))
+                                unpackable.insert(*rest);
+                              return ast::Walk::Continue;
+                            });
+                  walk(ast::nodeList(*matchCase, "body"));
+                }
           } else if (kind == "Import" || kind == "ImportFrom" ||
                      kind == "FunctionDef" || kind == "AsyncFunctionDef" ||
                      kind == "ClassDef") {

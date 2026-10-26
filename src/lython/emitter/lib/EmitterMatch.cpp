@@ -133,12 +133,22 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
       // ⛔ The same storability rule the conditional-slot path ends with: a
       // cell whose content is the erased top accepts every write and refuses
       // every read, which trades a wrong answer for a lowering sentence.
-      if (!mlir::isa_and_nonnull<py::ContractType>(content) ||
-          py::isPyObjectType(content))
-        continue;
-      Value initial = coerceValue(outer, content, statement);
-      if (initial.type != content)
-        continue;
+      // ⛔ But not skipped: the name would keep the value it had before the
+      // match, which is the wrong answer this block exists to remove. A
+      // function value was skipped that way (`k = b` in a case, then `k(3)`
+      // called `a`), because the rule asked for a contract.
+      Value initial = content && !py::isPyObjectType(content)
+                          ? coerceValue(outer, content, statement)
+                          : Value{};
+      if (!initial.value || initial.type != content) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, statement.range.start,
+            "local '" + name +
+                "' is reassigned in a match case, and the value it holds "
+                "before the match and the ones the cases give it have no "
+                "common type a write in a case could store"});
+        return;
+      }
       Value cell = emitCellAlloc(statement, initial, /*tracksBinding=*/false);
       values[name] = cell;
       types.bindSymbol(name, content);
