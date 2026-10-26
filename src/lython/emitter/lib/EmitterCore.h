@@ -996,6 +996,16 @@ private:
   // Per parameter of the generic call being specialized: whether its
   // argument needs a forwarder (emitGenericCall sets it).
   llvm::SmallVector<bool, 4> paramSpecForwarderArguments;
+  // The parameters each lambda argument of a call to a ParamSpec forwarder
+  // takes: what the call passes on to its `Callable[P, R]`.
+  llvm::DenseMap<const parser::Node *, py::CallableType>
+  paramSpecLambdaExpectations(const parser::Node &call,
+                              const parser::Node *def,
+                              const FunctionSignature &sig,
+                              unsigned receiverSlots = 0) const;
+  // Read by emitCallOperands in place of the callee's formal.
+  llvm::DenseMap<const parser::Node *, py::CallableType>
+      lambdaArgumentExpectations;
   ParamSpecCallShape paramSpecCallShape(const FunctionSignature &sig,
                                         const CallOperands &operands) const;
   // Binds the `*args` and `**kwargs` of a body specialized at one call's
@@ -1300,6 +1310,12 @@ private:
   // An isinstance/issubclass operand, or an element of a tuple of them, that
   // is a class value the static type does not decide.
   bool targetHasDynamicClassValue(const parser::Node *node);
+  // `issubclass(t, e)` / `isinstance(x, e)` with `e` a tuple of classes
+  // whose length the type does not say, or a union of a class and such a
+  // tuple: rewritten to the tests that type can answer.
+  std::optional<Value> emitSubclassTestOverClassTuple(
+      const parser::Node &expr, const parser::Node *subjectNode,
+      const parser::Node *targetNode, bool subjectIsInstance);
   std::optional<Value>
   emitClassValueSubclassTest(const parser::Node &expr,
                              const parser::Node *subjectNode,
@@ -2027,6 +2043,9 @@ private:
   // def has any.
   void bindFunctionOverloads(const parser::Node &function,
                              llvm::StringRef name, mlir::Type implementation);
+  // `g = f` for an `@overload`ed `f`: `g` keeps `f`'s overloads.
+  void bindOverloadAlias(const parser::Node &assign);
+  void bindModuleOverloadAliases(const parser::Node &moduleNode);
   void bindImportedFunctionOverloads(const EmitOptions::SourceModule &source,
                                      const std::vector<parser::NodePtr> &body,
                                      const parser::Node &function,

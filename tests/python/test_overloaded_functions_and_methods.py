@@ -6,6 +6,7 @@ from typing import overload
 
 import overload_shapes
 from overload_shapes import parse
+from overload_shapes import parse as read
 
 
 @overload
@@ -30,6 +31,9 @@ def first[T](xs: list[T], default: T | None = None) -> T | None:
 
 def same(x: int | str) -> int | str:
     return x
+
+
+spell = describe
 
 
 class Shelf:
@@ -71,6 +75,27 @@ class OverloadTest(unittest.TestCase):
         store = overload_shapes.Store()
         self.assertEqual(store.get("b", 9).bit_length(), 4)
         self.assertIsNone(store.get("b"))
+
+    def test_a_name_bound_to_an_overloaded_function(self) -> None:
+        self.assertEqual(spell(3).upper(), "INT 3")
+        local = describe
+        self.assertEqual(local("ab") + 1, 3)
+        self.assertEqual(read("2").bit_length(), 2)
+        through_module = overload_shapes.parse
+        self.assertEqual(through_module("2").bit_length(), 2)
+
+    def test_a_local_of_the_same_name_is_not_the_overloaded_function(self) -> None:
+        describe = same
+        self.assertEqual(describe(1), 1)
+
+    def test_a_name_rebound_on_one_path_calls_what_it_holds(self) -> None:
+        results: list[str] = []
+        for use_same in (False, True):
+            chosen = describe
+            if use_same:
+                chosen = same
+            results.append(repr(chosen(5)))
+        self.assertEqual(results, ["'int 5'", "5"])
 
 
 if __name__ == "__main__":

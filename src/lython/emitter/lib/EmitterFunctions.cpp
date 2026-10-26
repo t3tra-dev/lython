@@ -368,29 +368,9 @@ llvm::SmallVector<unsigned, 2> ModuleEmitter::concretizeParamSpecCallables(
     keywordTypes.push_back(member.type);
     keywordNames.push_back(builder.getStringAttr(member.name));
   }
-  auto spellsCallableOfP = [&](const parser::Node *annotation) {
-    if (!annotation || annotation->kind != "Subscript")
-      return false;
-    const parser::Node *slice = ast::node(*annotation, "slice");
-    const auto *elements =
-        slice && slice->kind == "Tuple" ? ast::nodeList(*slice, "elts")
-                                        : nullptr;
-    if (!elements || elements->size() != 2 || !elements->front() ||
-        elements->front()->kind != "Name")
-      return false;
-    return ast::nameSpelling(*elements->front()) == *sig.paramSpecArgs;
-  };
   // ⭐ AND `Callable[P, R] | None`, the optional callable of an API that is
   // also called without one (`assertRaises(E)` / `assertRaises(E, f, x)`):
   // the member is typed, the None stays.
-  auto spellsOptionalCallableOfP = [&](const parser::Node *annotation) {
-    if (!annotation)
-      return false;
-    if (annotation->kind == "BinOp")
-      return spellsCallableOfP(ast::node(*annotation, "left")) ||
-             spellsCallableOfP(ast::node(*annotation, "right"));
-    return spellsCallableOfP(annotation);
-  };
   for (auto [index, argument] :
        llvm::enumerate(positionalArgumentNodes(*arguments))) {
     if (index >= declaredCount || index >= sig.positionalTypes.size())
@@ -405,7 +385,8 @@ llvm::SmallVector<unsigned, 2> ModuleEmitter::concretizeParamSpecCallables(
         if (auto callable = mlir::dyn_cast<py::CallableType>(member))
           erased = callable;
     if (!erased || !isGradualCallable(erased) ||
-        !spellsOptionalCallableOfP(ast::node(*argument, "annotation")))
+        !spellsCallableOfParamSpec(ast::node(*argument, "annotation"),
+                                   *sig.paramSpecArgs))
       continue;
     mlir::Type concrete = py::CallableType::get(
         &context, packPositional, keywordTypes, {}, {},
@@ -420,6 +401,125 @@ llvm::SmallVector<unsigned, 2> ModuleEmitter::concretizeParamSpecCallables(
     typed.push_back(static_cast<unsigned>(index));
   }
   return typed;
+}
+
+// ⭐ A LAMBDA HAS NO TYPE UNTIL AN EXPECTATION GIVES IT ONE, and `Callable[P,
+// R]` is erased to `Callable[..., R]`, which names no parameter: `call(lambda
+// x: x + 1, 2)` was "lambda requires a Callable annotation". The call says
+// what P is -- the arguments after the declared ones, and the keywords no
+// declared parameter takes -- so the lambda's parameters are matched to them
+// by position and then by name, as the body's `fn(*args, **kwargs)` will.
+// ⛔ Nothing for a lambda the call's arguments do not fill exactly (a default
+// left to itself, a pack, an argument left over): it keeps its own shape and
+// the refusal it had.
+llvm::DenseMap<const parser::Node *, py::CallableType>
+ModuleEmitter::paramSpecLambdaExpectations(const parser::Node &call,
+                                           const parser::Node *def,
+                                           const FunctionSignature &sig,
+                                           unsigned receiverSlots) const {
+  llvm::DenseMap<const parser::Node *, py::CallableType> expectations;
+  const parser::Node *parameters = def ? ast::node(*def, "args") : nullptr;
+  const auto *args = ast::nodeList(call, "args");
+  if (!sig.paramSpecArgs || !parameters || !args ||
+      llvm::none_of(*args, [](const parser::NodePtr &arg) {
+        return arg && arg->kind == "Lambda";
+      }) ||
+      sig.positionalTypes.size() < receiverSlots)
+    return expectations;
+  std::size_t declared = sig.positionalTypes.size() - receiverSlots;
+  llvm::SmallVector<mlir::Type, 4> packed;
+  for (std::size_t index = declared; index < args->size(); ++index) {
+    const parser::Node *arg = (*args)[index].get();
+    mlir::Type type =
+        arg && arg->kind != "Starred" ? types.inferExpr(arg) : mlir::Type();
+    if (!type)
+      return expectations;
+    packed.push_back(types.widenLiteral(type));
+  }
+  llvm::StringSet<> named;
+  for (auto [index, name] : llvm::enumerate(sig.positionalNames))
+    if (index >= sig.positionalOnlyCount)
+      named.insert(name);
+  for (const std::string &name : sig.kwOnlyNames)
+    named.insert(name);
+  llvm::StringMap<mlir::Type> packedKeywords;
+  if (const auto *keywords = ast::nodeList(call, "keywords"))
+    for (const parser::NodePtr &keyword : *keywords) {
+      std::optional<std::string_view> name =
+          keyword ? ast::string(*keyword, "arg") : std::nullopt;
+      if (!name)
+        return expectations;
+      if (named.contains(*name))
+        continue;
+      mlir::Type type = types.inferExpr(ast::node(*keyword, "value"));
+      if (!type)
+        return expectations;
+      packedKeywords[*name] = types.widenLiteral(type);
+    }
+  llvm::SmallVector<const parser::Node *, 8> declaredParameters =
+      positionalArgumentNodes(*parameters);
+  for (auto [position, arg] : llvm::enumerate(*args)) {
+    std::size_t index = position + receiverSlots;
+    if (position >= declared || index >= declaredParameters.size())
+      break;
+    if (!arg || arg->kind != "Lambda" ||
+        !spellsCallableOfParamSpec(
+            ast::node(*declaredParameters[index], "annotation"),
+            *sig.paramSpecArgs))
+      continue;
+    py::CallableType erased =
+        mlir::dyn_cast_if_present<py::CallableType>(sig.positionalTypes[index]);
+    if (auto optional = mlir::dyn_cast_if_present<py::UnionType>(
+            sig.positionalTypes[index]))
+      for (mlir::Type member : optional.getMemberTypes())
+        if (auto callable = mlir::dyn_cast<py::CallableType>(member))
+          erased = callable;
+    const parser::Node *lambdaParameters = ast::node(*arg, "args");
+    if (!erased || !lambdaParameters ||
+        ast::node(*lambdaParameters, "vararg") ||
+        ast::node(*lambdaParameters, "kwarg"))
+      continue;
+    llvm::SmallVector<const parser::Node *, 8> lambdaPositional =
+        positionalArgumentNodes(*lambdaParameters);
+    if (packed.size() > lambdaPositional.size())
+      continue;
+    llvm::SmallVector<mlir::Type, 4> positional;
+    llvm::SmallVector<mlir::Type, 4> kwOnly;
+    llvm::SmallVector<mlir::StringAttr, 4> positionalNames;
+    llvm::SmallVector<mlir::StringAttr, 4> kwOnlyNames;
+    std::size_t byName = 0;
+    bool filled = true;
+    auto take = [&](const parser::Node *parameter,
+                    llvm::SmallVectorImpl<mlir::Type> &into) {
+      auto found = packedKeywords.find(ast::nameSpelling(*parameter));
+      if (found == packedKeywords.end())
+        return false;
+      into.push_back(found->second);
+      ++byName;
+      return true;
+    };
+    for (auto [slot, parameter] : llvm::enumerate(lambdaPositional)) {
+      positionalNames.push_back(
+          mlir::StringAttr::get(&context, ast::nameSpelling(*parameter)));
+      if (slot < packed.size())
+        positional.push_back(packed[slot]);
+      else
+        filled = filled && take(parameter, positional);
+    }
+    if (const auto *keywordOnly = ast::nodeList(*lambdaParameters, "kwonlyargs"))
+      for (const parser::NodePtr &parameter : *keywordOnly) {
+        filled = filled && parameter && take(parameter.get(), kwOnly);
+        if (parameter)
+          kwOnlyNames.push_back(
+              mlir::StringAttr::get(&context, ast::nameSpelling(*parameter)));
+      }
+    if (!filled || byName != packedKeywords.size())
+      continue;
+    expectations[arg.get()] = py::CallableType::get(
+        &context, positional, kwOnly, {}, {}, erased.getResultTypes(),
+        positionalNames, kwOnlyNames, {}, {});
+  }
+  return expectations;
 }
 
 ModuleEmitter::ParamSpecCallShape
@@ -2178,6 +2278,19 @@ Value ModuleEmitter::emitLambda(const parser::Node &expr,
   }
 
   FunctionSignature sig = types.functionSignature(expr, std::nullopt, expected);
+  // ⭐ A RESULT THE CALL HAS NOT SOLVED IS THE LAMBDA'S TO SAY. `apply(lambda
+  // x: x + 1, 2)` against `Callable[[T], R]` has T from the 2 and R from
+  // nothing but this body, so the expectation's R refused the lambda as "not
+  // compatible" with what it alone decides.
+  if (expected && expected.getResultTypes().size() == 1 &&
+      unboundStaticParameterCount(expected.getResultTypes().front()) != 0) {
+    TypeBindingMap bindings;
+    if (bindExpectedType(types, expected.getResultTypes().front(),
+                         types.widenLiteral(sig.resultType), bindings))
+      if (auto solved = mlir::dyn_cast_if_present<py::CallableType>(
+              substituteType(types, expected, bindings)))
+        expected = solved;
+  }
   if (expected) {
     if (sig.positionalTypes.size() != expected.getPositionalTypes().size() ||
         sig.kwOnlyTypes.size() != expected.getKwOnlyTypes().size() ||

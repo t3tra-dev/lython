@@ -1172,6 +1172,7 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     if (const auto *targets = ast::nodeList(statement, "targets"))
       for (const parser::NodePtr &target : *targets)
         emitAssignTarget(*target, value);
+    bindOverloadAlias(statement);
   } else if (statement.kind == "AnnAssign") {
     mlir::Type annotated =
         types.annotationType(ast::node(statement, "annotation"));

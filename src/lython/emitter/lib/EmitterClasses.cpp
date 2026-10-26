@@ -5464,6 +5464,9 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
     return {};
   };
 
+  llvm::DenseMap<const parser::Node *, py::CallableType> lambdaShapes =
+      paramSpecLambdaExpectations(expr, method.method, argumentSig,
+                                  receiverTakesSlotZero ? 1 : 0);
   llvm::SmallVector<Value, 8> positional;
   // A starred sequence, and a `**` mapping, whose size only the run time
   // knows: collected into the method's *args and **kwargs below
@@ -5527,6 +5530,11 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
             parser::Severity::Error, arg->range.start,
             "starred arguments are not supported for inlined class methods "
             "unless they are a tuple or a list"});
+        continue;
+      }
+      if (auto shaped = lambdaShapes.find(arg.get());
+          shaped != lambdaShapes.end()) {
+        positional.push_back(emitExprExpected(arg.get(), shaped->second));
         continue;
       }
       mlir::Type expected = declaredPositional(positional.size());
@@ -5697,6 +5705,84 @@ void ModuleEmitter::bindFunctionOverloads(const parser::Node &function,
             types.functionSignature(*overload).publicCallable))
       overloads.push_back(callable);
   types.bindFunctionOverloads(name, implementation, std::move(overloads));
+}
+
+void ModuleEmitter::bindOverloadAlias(const parser::Node &assign) {
+  const auto *targets = ast::nodeList(assign, "targets");
+  const parser::Node *value = ast::node(assign, "value");
+  if (!targets || targets->size() != 1 || !targets->front() ||
+      targets->front()->kind != "Name" || !value ||
+      (value->kind != "Name" && value->kind != "Attribute"))
+    return;
+  std::string aliased = value->kind == "Name"
+                            ? std::string(ast::nameSpelling(*value))
+                            : ast::qualifiedName(value);
+  std::optional<mlir::Type> implementation = types.lookupSymbol(aliased);
+  if (!implementation)
+    return;
+  const auto *overloads = types.functionOverloads(aliased, *implementation);
+  if (!overloads)
+    return;
+  llvm::StringRef name = ast::nameSpelling(*targets->front());
+  if (types.lookupSymbol(name) != implementation)
+    return;
+  // ⛔ A module binding is read by function bodies emitted in any order, so
+  // it keeps the overloads only when nothing else ever binds the name; a
+  // function's frame forgets them at its next binding of the name.
+  if (atModuleScope && (reboundModuleNames().contains(name) ||
+                        moduleGlobalDeclarations(moduleNode).contains(name)))
+    return;
+  types.bindFunctionOverloads(name, *implementation,
+                              llvm::SmallVector<py::CallableType, 2>(
+                                  overloads->begin(), overloads->end()));
+}
+
+// ⭐ BEFORE ANY BODY, because a function reads a module alias and every
+// function body is emitted ahead of the module's own statements: `k = f` bound
+// there reached no call in a def.
+void ModuleEmitter::bindModuleOverloadAliases(const parser::Node &moduleNode) {
+  const auto *body = ast::nodeList(moduleNode, "body");
+  if (!body)
+    return;
+  llvm::StringSet<> overloaded;
+  // ⛔ singleAssignmentNames counts assignments only; a def, class or import
+  // of the name is another binding of it.
+  llvm::StringSet<> declared;
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement)
+      continue;
+    if (functionOverloadDeclarations.count(statement.get()))
+      overloaded.insert(ast::string(*statement, "name").value_or(""));
+    if (std::optional<std::string_view> name = ast::string(*statement, "name"))
+      declared.insert(*name);
+    if (statement->kind == "Import" || statement->kind == "ImportFrom")
+      if (const auto *names = ast::nodeList(*statement, "names"))
+        for (const parser::NodePtr &alias : *names)
+          if (alias) {
+            std::string_view bound = ast::string(*alias, "asname")
+                                         .value_or(ast::string(*alias, "name")
+                                                       .value_or(""));
+            declared.insert(bound.substr(0, bound.find('.')));
+          }
+  }
+  if (overloaded.empty())
+    return;
+  llvm::StringSet<> boundOnce = singleAssignmentNames(moduleNode);
+  llvm::StringSet<> declaredGlobal = moduleGlobalDeclarations(moduleNode);
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement || statement->kind != "Assign")
+      continue;
+    const auto *targets = ast::nodeList(*statement, "targets");
+    const parser::Node *value = ast::node(*statement, "value");
+    if (!targets || targets->size() != 1 || !targets->front() ||
+        targets->front()->kind != "Name" || !value || value->kind != "Name" ||
+        !overloaded.contains(ast::nameSpelling(*value)))
+      continue;
+    llvm::StringRef name = ast::nameSpelling(*targets->front());
+    if (boundOnce.contains(name) && !declaredGlobal.contains(name) &&
+        !declared.contains(name))
+      types.bindFunctionOverloadAlias(name, ast::nameSpelling(*value));
+  }
 }
 
 bool ModuleEmitter::methodHasOverloads(const MethodBinding &method) const {

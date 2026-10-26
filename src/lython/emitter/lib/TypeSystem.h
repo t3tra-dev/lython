@@ -218,8 +218,13 @@ public:
     mlir::Type type;        // null with typeAlias: the alias was dropped
     std::string target;
   };
+  // The `@overload`s each binding of a name declares, keyed by the
+  // implementation's type.
+  using FunctionOverloadSets = llvm::SmallVector<
+      std::pair<mlir::Type, llvm::SmallVector<py::CallableType, 2>>, 1>;
   struct FrameRecord {
     llvm::StringMap<mlir::Type> symbols;
+    llvm::StringMap<FunctionOverloadSets> overloads;
     llvm::StringMap<std::string> canonical;
     llvm::StringMap<mlir::Type> classes;
     llvm::StringMap<mlir::Type> typeParameters;
@@ -251,6 +256,8 @@ public:
     llvm::SmallVector<llvm::StringMap<mlir::Type>, 8> savedClasses;
     llvm::SmallVector<llvm::StringMap<mlir::Type>, 8> savedTypeParameters;
     llvm::SmallVector<llvm::StringSet<>, 8> savedModuleNames;
+    llvm::SmallVector<llvm::StringMap<FunctionOverloadSets>, 8>
+        savedOverloads;
     std::shared_ptr<const FrameRecord> savedUnderlay;
   };
 
@@ -538,6 +545,10 @@ public:
                              llvm::SmallVector<py::CallableType, 2> overloads);
   const llvm::SmallVector<py::CallableType, 2> *
   functionOverloads(llvm::StringRef name, mlir::Type implementation) const;
+  // A module name bound once to the module function `target`: it answers
+  // `target`'s overloads before the binding is emitted.
+  void bindFunctionOverloadAlias(llvm::StringRef name,
+                                 llvm::StringRef target);
   std::optional<mlir::Type>
   lookupClassStaticMethod(llvm::StringRef className,
                           llvm::StringRef methodName) const;
@@ -848,9 +859,8 @@ private:
   // ⛔ Keyed by the name AND the implementation's type, not the type alone:
   // an unrelated function whose signature is the same would be typed by
   // overloads it never declared.
-  llvm::StringMap<llvm::SmallVector<
-      std::pair<mlir::Type, llvm::SmallVector<py::CallableType, 2>>, 1>>
-      functionOverloadSets;
+  llvm::StringMap<FunctionOverloadSets> functionOverloadSets;
+  llvm::StringMap<std::string> functionOverloadAliases;
   llvm::StringMap<std::string> canonicalBindings;
   // The canonical bindings the builtins scope itself makes, so an import
   // under the same name can be told from them.
@@ -862,6 +872,11 @@ private:
   mutable llvm::SmallVector<llvm::StringMap<std::string>, 8>
       scopedCanonicalBindings;
   mutable llvm::SmallVector<llvm::StringMap<mlir::Type>, 8> scopedClasses;
+  // ⛔ Per frame, like the canonical bindings, and forgotten when the frame
+  // binds the name again: a local `f = other` in a function read the module's
+  // `@overload`ed `f` overloads by name and raised on what `other` returned.
+  mutable llvm::SmallVector<llvm::StringMap<FunctionOverloadSets>, 8>
+      scopedFunctionOverloads;
   mutable llvm::SmallVector<llvm::StringMap<mlir::Type>, 8>
       scopedTypeParameters;
   // Annotation resolution runs from const contexts (registerModule pre-pass

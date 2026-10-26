@@ -48,6 +48,10 @@ mlir::Attribute defaultValueAttr(mlir::Builder &builder,
                                  const parser::Node *node);
 llvm::SmallVector<const parser::Node *, 8>
 positionalArgumentNodes(const parser::Node &arguments);
+// `Callable[P, R]`, or a union with it (`Callable[P, R] | None`), for the
+// ParamSpec `paramSpec`.
+bool spellsCallableOfParamSpec(const parser::Node *annotation,
+                               llvm::StringRef paramSpec);
 
 bool blockHasTerminator(mlir::Block &block);
 mlir::Operation *blockTerminator(mlir::Block &block);
