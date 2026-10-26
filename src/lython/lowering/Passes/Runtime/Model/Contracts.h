@@ -29,6 +29,7 @@ using py::contracts::kManifestDeallocatorAttr;
 using py::contracts::kManifestDefaultBytesAttr;
 using py::contracts::kManifestDefaultF64Attr;
 using py::contracts::kManifestClipI64Attr;
+using py::contracts::kManifestIndexI64Attr;
 using py::contracts::kManifestDefaultI64Attr;
 using py::contracts::kManifestDefaultStrAttr;
 using py::contracts::kManifestElementContractAttr;

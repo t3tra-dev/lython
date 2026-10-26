@@ -986,7 +986,7 @@ module attributes {
   //     # leaked 52 B, one allocation, per execution
   //
   // The delete path keeps the shared normalizer: it has no value box to own.
-  func.func @LyList_SetItemBox(%self: memref<5xi64> {ly.ownership.object_header}, %raw_index: i64, %value_box: memref<5xi64>) attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "setitem_box"} {
+  func.func @LyList_SetItemBox(%self: memref<5xi64> {ly.ownership.object_header}, %raw_index: i64 {ly.runtime.index_i64}, %value_box: memref<5xi64>) attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "setitem_box"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16_words = func.call @__ly_box_word_count() : () -> i64
@@ -1021,7 +1021,7 @@ module attributes {
     func.return
   }
 
-  func.func @LyList_DelItemIndex(%self: memref<5xi64> {ly.ownership.object_header}, %raw_index: i64) attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "delitem_index"} {
+  func.func @LyList_DelItemIndex(%self: memref<5xi64> {ly.ownership.object_header}, %raw_index: i64 {ly.runtime.index_i64}) attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "delitem_index"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index

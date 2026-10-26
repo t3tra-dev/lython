@@ -2222,11 +2222,12 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
     //
     // Refused rather than made to work: the declaration is an explicit
     // statement that this assignment is not a local one, so binding a local is
-    // the one answer it cannot have. The population it names shrank when every
-    // contract got a cell -- the example above was `list[int]` until then --
-    // and what is left is the annotations with no runtime value group to store
-    // (a union, a protocol, a callable, `type[X]`), plus every UNannotated
-    // module name, which is value-bound by the opt-in rule.
+    // the one answer it cannot have. The population it names shrank each time
+    // a kind of global got a cell -- the example above was `list[int]` until
+    // containers did, and unions, callables, class values and names bound
+    // twice have since -- and what is left is a name no single value types: one
+    // bound by unpacking, an import, `with ... as` or `except ... as`, or to a
+    // value whose type is not a class (`collectModuleGlobals`).
     if (!atModuleScope && currentGlobalDecls.count(name) &&
         !moduleGlobals.count(name)) {
       diagnostics.push_back(parser::Diagnostic{
@@ -2234,8 +2235,10 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
           "'global " + name.str() +
               "' names a module global this compiler does not give storage "
               "to, so the assignment cannot reach it; a module global is "
-              "writable from a function when it is annotated with a concrete "
-              "type, which a union, a protocol and a callable are not"});
+              "writable from a function when each of its module-level "
+              "bindings assigns it one value of a class type, which an "
+              "unpacking, an import, `with ... as` or `except ... as` does "
+              "not"});
       return;
     }
     if (isModuleGlobalWrite(name)) {

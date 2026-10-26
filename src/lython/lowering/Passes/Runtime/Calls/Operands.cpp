@@ -168,6 +168,9 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
   bool clipsToWord =
       mlir::func::FuncOp(symbol.function)
           .getArgAttr(inputIndex, kManifestClipI64Attr) != nullptr;
+  bool subscripts =
+      mlir::func::FuncOp(symbol.function)
+          .getArgAttr(inputIndex, kManifestIndexI64Attr) != nullptr;
   if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(source) &&
       expected.isInteger(64)) {
     mlir::Value word = source.primitiveI64->value;
@@ -175,7 +178,9 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
     if (source.deferredObject)
       if (std::optional<RuntimeSymbol> checked = manifest.primitive(
               "builtins.int",
-              clipsToWord ? "read_value_clipped" : "read_value_checked"))
+              clipsToWord  ? "read_value_clipped"
+              : subscripts ? "read_value_index"
+                           : "read_value_checked"))
         word = RuntimeBundleLowerer::createRuntimeCall(
                    op->getLoc(), *checked,
                    mlir::ValueRange{source.primitiveI64->value,
@@ -335,6 +340,8 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
     std::optional<RuntimeSymbol> unbox;
     if (clipsToWord)
       unbox = manifest.primitive(source.contractName(), "unbox.i64.clip");
+    else if (subscripts)
+      unbox = manifest.primitive(source.contractName(), "unbox.i64.index");
     if (!unbox)
       unbox = manifest.primitive(source.contractName(), "unbox.i64");
     if (unbox) {

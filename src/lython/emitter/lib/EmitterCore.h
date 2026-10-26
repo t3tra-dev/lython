@@ -179,7 +179,8 @@ private:
   bool isStubSourceModuleSymbol(llvm::StringRef symbol) const;
   bool bindSourceModuleNamespace(llvm::StringRef module,
                                  llvm::StringRef localName,
-                                 unsigned namespaceDepth = 0);
+                                 unsigned namespaceDepth = 0,
+                                 bool bindsName = true);
   bool bindSourceModuleName(llvm::StringRef module,
                             llvm::StringRef exportedName,
                             llvm::StringRef localName,
@@ -2088,6 +2089,7 @@ private:
   parser::NodePtr docAnswerStatement(const DocAnswer &answer,
                                      parser::SourceRange range);
   std::optional<Value> tryEmitDocRead(const parser::Node &expr);
+  std::optional<Value> refuseUnboundAttributeRoot(const parser::Node &expr);
   Value emitDocConstant(const parser::Node &anchor, const DocAnswer &answer);
   std::string docDispatcher(llvm::StringRef key, llvm::StringRef prefix,
                             llvm::ArrayRef<std::pair<std::string, mlir::Type>>

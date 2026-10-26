@@ -486,6 +486,142 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
     moduleGlobals[name] = inferred;
     types.bindSymbol(name, inferred);
   }
+
+  // ⭐ AND A NAME BOUND MORE THAN ONCE, WHICH A FUNCTION READS, gets a cell of
+  // every value it is bound to -- their join, a union when they differ, which
+  // a cell holds as an annotated `int | str` one does. `n = 1` followed by
+  // `for i in ...: n = n + i`, a `tag = "g"` rebound under a module-level
+  // `if`, `x = 1` then `x = 2`: each was "unresolved name" in every function
+  // that read it, though CPython runs them all. The "bound once" rule above
+  // stays the rule for a name no function reads, for the evidence reason it
+  // gives.
+  // ⛔ Only plain `NAME = value`, an augmented assignment and a `for NAME`
+  // loop: a binding that unpacks, imports, catches or opens a context gives
+  // no single value to type here, and such a name keeps its value binding.
+  llvm::StringMap<llvm::SmallVector<mlir::Type, 4>> rebound;
+  llvm::StringMap<unsigned> bindings;
+  llvm::StringSet<> unpackable;
+  auto candidate = [&](llvm::StringRef name) {
+    return !boundOnce.contains(name) && !moduleGlobals.count(name) &&
+           !moduleConstantBindings.count(name) &&
+           readFromAFunction.contains(name);
+  };
+  auto bind = [&](llvm::StringRef name, mlir::Type type) {
+    if (!candidate(name))
+      return;
+    ++bindings[name];
+    rebound[name].push_back(type);
+    if (!types.lookupSymbol(name))
+      boundAbove[name] = type;
+  };
+  std::function<void(const parser::Node *)> disqualify =
+      [&](const parser::Node *target) {
+        if (!target)
+          return;
+        if (target->kind == "Name") {
+          unpackable.insert(ast::nameSpelling(*target));
+          return;
+        }
+        if (target->kind == "Starred") {
+          disqualify(ast::node(*target, "value"));
+          return;
+        }
+        if (const auto *elements = ast::nodeList(*target, "elts"))
+          for (const parser::NodePtr &element : *elements)
+            disqualify(element.get());
+      };
+  std::function<void(const std::vector<parser::NodePtr> *)> walk =
+      [&](const std::vector<parser::NodePtr> *statements) {
+        if (!statements)
+          return;
+        for (const parser::NodePtr &statement : *statements) {
+          if (!statement)
+            continue;
+          llvm::StringRef kind = statement->kind;
+          if (kind == "Assign") {
+            const auto *targets = ast::nodeList(*statement, "targets");
+            const parser::Node *value = ast::node(*statement, "value");
+            if (targets && targets->size() == 1 && targets->front() &&
+                targets->front()->kind == "Name" && value) {
+              bind(ast::nameSpelling(*targets->front()), inferBelow(value));
+            } else if (targets) {
+              for (const parser::NodePtr &target : *targets)
+                disqualify(target.get());
+            }
+          } else if (kind == "AugAssign") {
+            // The same value kind as the name holds: counted, not typed.
+            const parser::Node *target = ast::node(*statement, "target");
+            if (!target || target->kind != "Name")
+              disqualify(target);
+            else if (candidate(ast::nameSpelling(*target)))
+              ++bindings[ast::nameSpelling(*target)];
+          } else if (kind == "AnnAssign") {
+            disqualify(ast::node(*statement, "target"));
+          } else if (kind == "For" || kind == "AsyncFor") {
+            const parser::Node *target = ast::node(*statement, "target");
+            if (target && target->kind == "Name") {
+              mlir::Type element =
+                  types.iterationElementType(ast::node(*statement, "iter"));
+              bind(ast::nameSpelling(*target),
+                   element ? types.widenLiteral(element) : types.object());
+            } else {
+              disqualify(target);
+            }
+          } else if (kind == "With" || kind == "AsyncWith") {
+            if (const auto *items = ast::nodeList(*statement, "items"))
+              for (const parser::NodePtr &item : *items)
+                if (item)
+                  disqualify(ast::node(*item, "optional_vars"));
+          } else if (kind == "Try" || kind == "TryStar") {
+            if (const auto *handlers = ast::nodeList(*statement, "handlers"))
+              for (const parser::NodePtr &handler : *handlers)
+                if (handler) {
+                  if (auto caught = ast::string(*handler, "name"))
+                    unpackable.insert(*caught);
+                  walk(ast::nodeList(*handler, "body"));
+                }
+            walk(ast::nodeList(*statement, "finalbody"));
+          } else if (kind == "Import" || kind == "ImportFrom" ||
+                     kind == "FunctionDef" || kind == "AsyncFunctionDef" ||
+                     kind == "ClassDef") {
+            if (auto defined = ast::string(*statement, "name"))
+              unpackable.insert(*defined);
+            if (const auto *aliases = ast::nodeList(*statement, "names"))
+              for (const parser::NodePtr &alias : *aliases) {
+                if (!alias)
+                  continue;
+                std::optional<std::string_view> spelled =
+                    ast::string(*alias, "asname");
+                if (!spelled)
+                  spelled = ast::string(*alias, "name");
+                if (spelled)
+                  unpackable.insert(
+                      llvm::StringRef(*spelled).split('.').first);
+              }
+            continue;
+          }
+          if (kind == "FunctionDef" || kind == "AsyncFunctionDef" ||
+              kind == "ClassDef")
+            continue;
+          walk(ast::nodeList(*statement, "body"));
+          walk(ast::nodeList(*statement, "orelse"));
+        }
+      };
+  walk(body);
+  for (const auto &entry : rebound) {
+    llvm::StringRef name = entry.getKey();
+    if (unpackable.contains(name) || bindings.lookup(name) < 2)
+      continue;
+    mlir::Type joined = types.join(entry.getValue());
+    if (!mlir::isa_and_nonnull<py::ContractType>(joined) &&
+        !mlir::isa_and_nonnull<py::CallableType>(joined) &&
+        !mlir::isa_and_nonnull<py::UnionType>(joined))
+      continue;
+    if (joined == types.object())
+      continue;
+    moduleGlobals[name] = joined;
+    types.bindSymbol(name, joined);
+  }
 }
 
 llvm::StringSet<>

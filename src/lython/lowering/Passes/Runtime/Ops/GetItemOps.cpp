@@ -1583,8 +1583,8 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerSequenceEvidenceGetItem(
   // same question three other sites already ask, and it answers a literal and
   // a primitive-i64 lane before reaching for the primitive at all.
   mlir::FailureOr<mlir::Value> dynamicIndex =
-      RuntimeBundleLowerer::rawSequenceIndexValue(op.getOperation(),
-                                                  op.getIndex(), index);
+      RuntimeBundleLowerer::rawSequenceIndexValue(
+          op.getOperation(), op.getIndex(), index, /*subscript=*/true);
   if (mlir::failed(dynamicIndex))
     return mlir::failure();
 
@@ -1970,14 +1970,17 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
     raw = mlir::arith::ConstantIntOp::create(builder, loc, *literal, 64);
   } else {
     std::optional<RuntimeSymbol> unbox =
-        manifest.primitive(index.contractName(), "unbox.i64");
+        manifest.primitive(index.contractName(), "unbox.i64.index");
+    if (!unbox)
+      unbox = manifest.primitive(index.contractName(), "unbox.i64");
     if (unbox &&
         unbox->function.getNumArguments() == index.physicalValues().size()) {
       mlir::func::CallOp indexCall = RuntimeBundleLowerer::createRuntimeCall(
           loc, *unbox, index.physicalValues());
       raw = indexCall.getResult(0);
     } else if (std::optional<mlir::Value> deferred =
-                   RuntimeBundleLowerer::deferredIntValueChecked(op, index)) {
+                   RuntimeBundleLowerer::deferredIntValueChecked(
+                       op, index, "read_value_index")) {
       // ⛔ Not the lane alone: a DEFERRED int carries its object beside it,
       // and where the flag is false (an int that came boxed -- `ord(c)`, an
       // element read from a list) the lane is a stale 0. `xs[ch >> 5]` read

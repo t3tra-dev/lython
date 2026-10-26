@@ -874,7 +874,8 @@ ModuleEmitter::sourceModuleTypeAliasesByName(
 
 bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
                                               llvm::StringRef localName,
-                                              unsigned namespaceDepth) {
+                                              unsigned namespaceDepth,
+                                              bool bindsName) {
   const EmitOptions::SourceModule *source = lookupSourceModule(module);
   if (!source)
     return false;
@@ -884,7 +885,8 @@ bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
   // The `object` top here is an AGENTS.md namespace placeholder; a bare module
   // value carries no protocol contract, so any attempt to dispatch on it (call,
   // len, iteration) is rejected for lack of evidence rather than erased.
-  types.bindCanonicalSymbol(localName, module, types.object());
+  if (bindsName)
+    types.bindCanonicalSymbol(localName, module, types.object());
   if (isJsHostModule(*source))
     for (const auto &function : jsHostGlobalFunctions)
       if (!moduleGlobals.count(
@@ -894,7 +896,8 @@ bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
   // A source stdlib module is a module too, and the attribute check needs to
   // know it: without this, `os.nonexistent` and `time.nonexistent` fell
   // through to the dynamic read the manifest modules no longer take.
-  types.noteImportedModuleName(localName);
+  if (bindsName)
+    types.noteImportedModuleName(localName);
   const auto *rawBody = ast::nodeList(*source->moduleNode, "body");
   if (!rawBody)
     return true;
@@ -2175,7 +2178,8 @@ void ModuleEmitter::predeclareSourceModules() {
   for (const EmitOptions::SourceModule &source : options.sourceModules) {
     if (!source.moduleNode)
       continue;
-    bindSourceModuleNamespace(source.moduleName, source.moduleName);
+    bindSourceModuleNamespace(source.moduleName, source.moduleName,
+                              /*namespaceDepth=*/0, /*bindsName=*/false);
     // Generic classes must be registered before ANY signature is resolved:
     // a `deque[int]` annotation is what allocates the specialization, and a
     // signature memoized against the unspecialized reading would never be

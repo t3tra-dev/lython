@@ -358,6 +358,8 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
       }
   }
   if (expr->kind == "Attribute") {
+    if (std::optional<Value> refused = refuseUnboundAttributeRoot(*expr))
+      return *refused;
     // Before the module attributes below: `lib.__doc__` is the module's.
     if (std::optional<Value> doc = tryEmitDocRead(*expr))
       return *doc;
@@ -613,6 +615,29 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     return emitComprehension(*expr, /*isDict=*/false, /*isSet=*/true);
   if (expr->kind == "DictComp")
     return emitDictComp(*expr);
+  if (expr->kind == "BoolOp" || expr->kind == "IfExp") {
+    // ⭐ A `:=` IN AN OPERAND THAT MAY NOT RUN binds a name the code after the
+    // expression still reads, so it takes the slot a name bound in a region
+    // takes -- as a comprehension's does. The operand is its own block, and
+    // its value reached `if len(xs) > 5 and (tag := xs[0]):` ... `return tag`
+    // as an SSA value defined there: "operand #0 does not dominate this use".
+    llvm::SmallVector<const parser::Node *, 4> conditional;
+    if (expr->kind == "BoolOp") {
+      if (const auto *operands = ast::nodeList(*expr, "values"))
+        for (std::size_t index = 1; index < operands->size(); ++index)
+          conditional.push_back((*operands)[index].get());
+    } else {
+      conditional.push_back(ast::node(*expr, "body"));
+      conditional.push_back(ast::node(*expr, "orelse"));
+    }
+    llvm::StringMap<mlir::Type> walrusLocals;
+    for (const parser::Node *operand : conditional)
+      if (operand)
+        for (const auto &entry : walrusTargetsToBind(*operand, {}))
+          walrusLocals.try_emplace(entry.getKey(), entry.getValue());
+    if (!walrusLocals.empty())
+      bindConditionallyAssignedLocals(*expr, {}, nullptr, &walrusLocals);
+  }
   if (expr->kind == "IfExp") {
     // Conditional expression via the same cf-block merge the if STATEMENT
     // uses (one merge mechanism; region-based scf.if results are invisible
@@ -4180,6 +4205,40 @@ ModuleEmitter::walrusTargetsToBind(const parser::Node &node,
       if (mlir::Type type = types.widenLiteral(types.inferExpr(value)))
         bound[name] = type;
   return bound;
+}
+
+// ⭐ AN ATTRIBUTE CHAIN NEEDS ITS ROOT BOUND HERE. Every source module the
+// program reaches is declared under its own qualified names for the whole
+// program, so `re.sub(...)` resolved by its spelling in a program that never
+// imported `re` -- because unittest does -- and ran where CPython raises
+// NameError. The root is asked as a bare name is: a local, a global, a
+// constant, a symbol or class or module this module binds.
+// ⛔ Not an annotation: CPython 3.14 does not evaluate one where it is
+// written, and those are typed, not emitted, so they never reach here.
+std::optional<Value>
+ModuleEmitter::refuseUnboundAttributeRoot(const parser::Node &expr) {
+  const parser::Node *base = &expr;
+  while (base && base->kind == "Attribute")
+    base = ast::node(*base, "value");
+  if (!base || base->kind != "Name")
+    return std::nullopt;
+  llvm::StringRef root = ast::nameSpelling(*base);
+  if (root.empty() || values.count(root) || moduleGlobals.count(root) ||
+      moduleConstantBindings.count(root) || primitiveConstants.count(root) ||
+      types.lookupSymbol(root) || types.lookupClass(root) ||
+      types.isImportedModuleName(root) || types.lookupCanonicalBinding(root))
+    return std::nullopt;
+  // ⛔ Only a root that names a source module: what the declarations leak.
+  // Every other root this does not find -- the builtin classes the emitter
+  // answers by name (`dict.fromkeys`), a module's dunders (`__file__`) -- is
+  // answered where the chain is read, as it was.
+  if (!lookupSourceModule(root))
+    return std::nullopt;
+  diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
+                                           base->range.start,
+                                           "unresolved name '" + root.str() +
+                                               "'"});
+  return emitNone(expr);
 }
 
 Value ModuleEmitter::emitComprehension(const parser::Node &expr,
