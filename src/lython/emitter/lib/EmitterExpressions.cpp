@@ -613,6 +613,29 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     return emitComprehension(*expr, /*isDict=*/false, /*isSet=*/true);
   if (expr->kind == "DictComp")
     return emitDictComp(*expr);
+  if (expr->kind == "BoolOp" || expr->kind == "IfExp") {
+    // ⭐ A `:=` IN AN OPERAND THAT MAY NOT RUN binds a name the code after the
+    // expression still reads, so it takes the slot a name bound in a region
+    // takes -- as a comprehension's does. The operand is its own block, and
+    // its value reached `if len(xs) > 5 and (tag := xs[0]):` ... `return tag`
+    // as an SSA value defined there: "operand #0 does not dominate this use".
+    llvm::SmallVector<const parser::Node *, 4> conditional;
+    if (expr->kind == "BoolOp") {
+      if (const auto *operands = ast::nodeList(*expr, "values"))
+        for (std::size_t index = 1; index < operands->size(); ++index)
+          conditional.push_back((*operands)[index].get());
+    } else {
+      conditional.push_back(ast::node(*expr, "body"));
+      conditional.push_back(ast::node(*expr, "orelse"));
+    }
+    llvm::StringMap<mlir::Type> walrusLocals;
+    for (const parser::Node *operand : conditional)
+      if (operand)
+        for (const auto &entry : walrusTargetsToBind(*operand, {}))
+          walrusLocals.try_emplace(entry.getKey(), entry.getValue());
+    if (!walrusLocals.empty())
+      bindConditionallyAssignedLocals(*expr, {}, nullptr, &walrusLocals);
+  }
   if (expr->kind == "IfExp") {
     // Conditional expression via the same cf-block merge the if STATEMENT
     // uses (one merge mechanism; region-based scf.if results are invisible
