@@ -186,6 +186,31 @@ TEST(EmitterTest, NamesTheProgramForAnErrorInAMethodImportedCodeCalls) {
       << emitted.diagnostics;
 }
 
+// What: a module the program does not import is not a name in it, though a
+// module it imports imports it: `re.sub(...)`, `re.sub` as a value and `re`
+// alone are each an unresolved name; with `import re` they compile.
+TEST(EmitterTest, AModuleAnImportedModuleImportsIsNotANameHere) {
+  const char *helper = "import re\n\n\n"
+                       "def tidy(s: str) -> str:\n"
+                       "    return re.sub(\"a\", \"b\", s)\n";
+  for (const char *use :
+       {"print(re.sub(\"x\", \"y\", \"xx\"))\n", "f = re.sub\nprint(f)\n",
+        "x = re\n"}) {
+    ImportedModuleEmit emitted = emitWithImportedModule(
+        "tidier", helper,
+        std::string("import tidier\n\nprint(tidier.tidy(\"a\"))\n") + use);
+    EXPECT_FALSE(emitted.succeeded) << use;
+    EXPECT_NE(emitted.diagnostics.find("unresolved name 're'"),
+              std::string::npos)
+        << use << emitted.diagnostics;
+  }
+  ImportedModuleEmit imported = emitWithImportedModule(
+      "tidier", helper,
+      "import re\nimport tidier\n\nprint(tidier.tidy(\"a\"), "
+      "re.sub(\"x\", \"y\", \"xx\"))\n");
+  EXPECT_TRUE(imported.succeeded) << imported.diagnostics;
+}
+
 // What: an imported module's `assert` whose test the compiler can decide is
 // decided: a true one compiles, a false one is refused as the AssertionError
 // the import raises, and one over a run-time value is refused.

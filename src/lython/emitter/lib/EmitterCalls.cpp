@@ -1237,6 +1237,9 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
       synthesizedIteratorDefs.push_back(rewritten);
       return emitCall(*rewritten);
     }
+  if (calleeNode && calleeNode->kind == "Attribute")
+    if (std::optional<Value> refused = refuseUnboundAttributeRoot(*calleeNode))
+      return *refused;
   std::string calleeQualified = ast::qualifiedName(calleeNode);
   // ⭐ A LOCAL WINS OVER AN IMPORTED NAMESPACE. `from os import path` binds the
   // canonical symbol `path`, and that binding is visible while the STDLIB module
