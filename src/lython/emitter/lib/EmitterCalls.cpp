@@ -1147,6 +1147,42 @@ ModuleEmitter::tryEmitSubclassesCall(const parser::Node &expr) {
   return Value{chain(0), listType};
 }
 
+std::optional<Value>
+ModuleEmitter::tryEmitStaticKeywordPackGet(const parser::Node &call) {
+  const parser::Node *callee = ast::node(call, "func");
+  if (!callee || callee->kind != "Attribute" ||
+      ast::string(*callee, "attr") != std::optional<std::string_view>("get"))
+    return std::nullopt;
+  const parser::Node *receiver = ast::node(*callee, "value");
+  const auto *args = ast::nodeList(call, "args");
+  const auto *keywords = ast::nodeList(call, "keywords");
+  if (!receiver || receiver->kind != "Name" || !args || args->empty() ||
+      args->size() > 2 || (keywords && !keywords->empty()))
+    return std::nullopt;
+  const parser::Node *key = (*args)[0].get();
+  std::optional<std::string_view> name =
+      key && key->kind == "Constant" ? ast::string(*key, "value")
+                                     : std::nullopt;
+  if (!name)
+    return std::nullopt;
+  auto bound = values.find(ast::nameSpelling(*receiver));
+  if (bound == values.end())
+    return std::nullopt;
+  auto pack = staticKeywordPacks.find(bound->second.value);
+  if (pack == staticKeywordPacks.end())
+    return std::nullopt;
+  // ⛔ NOT the dict's own `get`: the dict holds the members at their join,
+  // so a pack of one `str` read back as `str | int`, and an empty pack as
+  // its erased `object` -- where the call gave a `str` or nothing at all.
+  for (const auto &[packedName, packedValue] : pack->second)
+    if (llvm::StringRef(packedName) ==
+        llvm::StringRef(name->data(), name->size()))
+      return packedValue;
+  if (args->size() == 2)
+    return emitExpr((*args)[1].get());
+  return emitNone(call);
+}
+
 Value ModuleEmitter::emitCall(const parser::Node &expr) {
   Value result = emitCallAsImplemented(expr);
   // A call of an `@overload`ed function is typed by the overload it matched.
@@ -1189,6 +1225,8 @@ Value ModuleEmitter::emitCallAsImplemented(const parser::Node &expr) {
     return emitNone(expr);
   if (std::optional<Value> subclasses = tryEmitSubclassesCall(expr))
     return *subclasses;
+  if (std::optional<Value> packed = tryEmitStaticKeywordPackGet(expr))
+    return *packed;
   if (std::optional<Value> exited = tryEmitSysExit(expr))
     return *exited;
   // ⛔ A METHOD OF A CLASS THAT DEFINES `__getattribute__` IS NOT CALLED
@@ -3694,6 +3732,15 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
   std::optional<ParamSpecCallShape> shape;
   if (paramSpec)
     shape = paramSpecCallShape(generic.signature, operands);
+  if (shape && generic.node)
+    if (std::string mismatch = paramSpecCallableMismatch(
+            *generic.node, generic.signature, 0, operands.positional,
+            shape->positional, shape->keywords);
+        !mismatch.empty()) {
+      diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
+                                               expr.range.start, mismatch});
+      return emitNone(expr);
+    }
   if (generic.node && !operands.dynamicTail && !operands.dynamicMapping)
     if (std::string mismatch = genericOmittedDefaultMismatch(
             *generic.node, resolved,

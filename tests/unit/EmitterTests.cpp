@@ -1853,8 +1853,9 @@ TEST(EmitterTest, AStarredSequenceOfUnknownLengthReachesOnlyArgs) {
 }
 
 // A function forwarding `*args: P.args` and `**kwargs: P.kwargs` is compiled
-// at each call's shape; a call whose shape only the run knows, and a use that
-// is not a call, are refused, as is `Concatenate` outside `Callable`.
+// at each call's shape; a call whose shape only the run knows, a callable that
+// does not take what the call passes on, and a use that is not a call, are
+// refused, as is `Concatenate` outside `Callable`.
 TEST(EmitterTest, AParamSpecForwarderIsSpecializedAtEachCall) {
   const char *forwarder =
       "from collections.abc import Callable\n"
@@ -1882,6 +1883,9 @@ TEST(EmitterTest, AParamSpecForwarderIsSpecializedAtEachCall) {
                 "cannot fill `*args: P.args` or `**kwargs: P.kwargs`"},
            Case{std::string(forwarder) + "g: Callable[..., int] = call\n",
                 "specialized at a call and has no value of its own"},
+           Case{std::string(forwarder) + "print(call(add, 1, c=2))\n",
+                "the callable given for 'f' does not take what this call "
+                "passes on to it"},
            Case{"from typing import Concatenate\n"
                 "def f(x: Concatenate[int, str]) -> None:\n"
                 "    pass\n",

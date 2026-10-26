@@ -990,6 +990,14 @@ private:
                                llvm::ArrayRef<mlir::Type> packPositional,
                                llvm::ArrayRef<CallKeywordType> packKeywords,
                                llvm::ArrayRef<bool> needsForwarder);
+  // Why a callable argument given for a `Callable[P, R]` cannot take what
+  // the call passes on through P; empty when every such argument can.
+  // `arguments[i]` is the argument of parameter `firstSlot + i`.
+  std::string paramSpecCallableMismatch(
+      const parser::Node &def, const FunctionSignature &sig,
+      unsigned firstSlot, llvm::ArrayRef<Value> arguments,
+      llvm::ArrayRef<mlir::Type> packPositional,
+      llvm::ArrayRef<CallKeywordType> packKeywords) const;
   // Whether a value is a builtin function or a class: what only a forwarder
   // makes a callable value of.
   bool needsCallableForwarder(Value value);
@@ -1875,6 +1883,9 @@ private:
   // names wherever the body forwards it.
   static bool keywordPackIsOnlyRead(const parser::Node &def,
                                     llvm::StringRef name);
+  // `kwargs.get("name")` / `kwargs.get("name", default)` on a static
+  // keyword pack: the value the call gave under that name, or the default.
+  std::optional<Value> tryEmitStaticKeywordPackGet(const parser::Node &call);
   Value emitKeywordPackDict(
       const parser::Node &anchor,
       llvm::ArrayRef<std::pair<std::string, Value>> members,
@@ -2416,6 +2427,9 @@ private:
   // around each callable body.
   llvm::StringSet<> currentBoxedLocals;
   bool atModuleScope = false;
+  // Per module compound statement being emitted, the names it binds
+  // anywhere inside: each suite of it starts without their overloads.
+  llvm::SmallVector<llvm::StringSet<>, 4> moduleCompoundBindings;
   // Module-level names the module binds more than once, computed on first
   // use: a lambda that captures one of them would freeze a value the
   // program goes on to replace.

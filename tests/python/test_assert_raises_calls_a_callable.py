@@ -18,6 +18,17 @@ class Box:
         raise KeyError(key)
 
 
+def check(text: str, msg: str = "") -> int:
+    if msg == "bad":
+        raise ValueError(text)
+    return 0
+
+
+def warn_if(msg: str = "") -> None:
+    if msg == "w":
+        warnings.warn("careful", UserWarning)
+
+
 class CallableFormTest(unittest.TestCase):
 
     def test_assert_raises_calls_the_callable(self) -> None:
@@ -61,6 +72,29 @@ class CallableFormTest(unittest.TestCase):
         with self.assertWarns(UserWarning) as wcm:
             warn("ctx")
         self.assertEqual(str(wcm.warning), "ctx")
+
+    def test_msg_is_passed_to_the_callable(self) -> None:
+        self.assertRaises(ValueError, check, "x", msg="bad")
+        self.assertRaisesRegex(ValueError, "^x$", check, "x", msg="bad")
+        self.assertWarns(UserWarning, warn_if, msg="w")
+        self.assertWarnsRegex(UserWarning, "care", warn_if, msg="w")
+        with self.assertRaises(AssertionError) as cm:
+            self.assertRaises(ValueError, check, "x", msg="fine")
+        self.assertEqual(str(cm.exception), "ValueError not raised by check")
+
+    def test_msg_of_the_context_form_is_the_assertion_message(self) -> None:
+        with self.assertRaises(AssertionError) as raised:
+            with self.assertRaisesRegex(ValueError, "a", msg="m3"):
+                pass
+        self.assertEqual(str(raised.exception), "ValueError not raised : m3")
+        with self.assertRaises(AssertionError) as warned:
+            with self.assertWarns(UserWarning, msg="w2"):
+                pass
+        self.assertEqual(str(warned.exception), "UserWarning not triggered : w2")
+        with self.assertRaises(AssertionError) as warned_regex:
+            with self.assertWarnsRegex(UserWarning, "a", msg="m4"):
+                pass
+        self.assertEqual(str(warned_regex.exception), "UserWarning not triggered : m4")
 
 
 if __name__ == "__main__":

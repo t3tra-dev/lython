@@ -6495,6 +6495,48 @@ void TypeSystem::bindFunctionOverloads(
   sets.push_back({implementation, std::move(overloads)});
 }
 
+void TypeSystem::forgetFunctionOverloads(llvm::StringRef name) {
+  if (scopedFunctionOverloads.empty())
+    functionOverloadSets.erase(name);
+  else
+    scopedFunctionOverloads.back().erase(name);
+}
+
+void TypeSystem::bindModuleBodyAlias(
+    llvm::StringRef name, mlir::Type implementation,
+    llvm::SmallVector<py::CallableType, 2> overloads) {
+  moduleBodyAliasNames.insert(name);
+  bindFunctionOverloads(name, implementation, std::move(overloads));
+}
+
+TypeSystem::HiddenOverloads TypeSystem::hideModuleBodyAliases() {
+  HiddenOverloads hidden;
+  for (const auto &entry : moduleBodyAliasNames) {
+    llvm::StringRef name = entry.getKey();
+    if (auto found = functionOverloadSets.find(name);
+        found != functionOverloadSets.end()) {
+      hidden.entries.emplace_back(-1, name.str(), std::move(found->second));
+      functionOverloadSets.erase(found);
+    }
+    for (auto [index, frame] : llvm::enumerate(scopedFunctionOverloads))
+      if (auto found = frame.find(name); found != frame.end()) {
+        hidden.entries.emplace_back(static_cast<int>(index), name.str(),
+                                    std::move(found->second));
+        frame.erase(found);
+      }
+  }
+  return hidden;
+}
+
+void TypeSystem::restoreModuleBodyAliases(HiddenOverloads hidden) {
+  for (auto &[frame, name, sets] : hidden.entries) {
+    if (frame < 0)
+      functionOverloadSets[name] = std::move(sets);
+    else if (static_cast<std::size_t>(frame) < scopedFunctionOverloads.size())
+      scopedFunctionOverloads[frame][name] = std::move(sets);
+  }
+}
+
 const llvm::SmallVector<py::CallableType, 2> *
 TypeSystem::functionOverloads(llvm::StringRef name,
                               mlir::Type implementation) const {
