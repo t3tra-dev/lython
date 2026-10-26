@@ -4153,3 +4153,54 @@ TEST(EmitterTest, AnInternalManifestMethodIsNotAnAttributeOfABuiltin) {
       context);
   EXPECT_TRUE(own.ok());
 }
+
+// What: `@overload` declarations without the def that implements them are
+// refused, for a module function and for a method, and a call that no
+// overload accepts is refused even where the implementation's own signature
+// would take it.
+TEST(EmitterTest, AnOverloadIsTheWholeSignatureItsCallsSee) {
+  mlir::MLIRContext context(testRegistry());
+  auto refusedWith = [&](llvm::StringRef source, llvm::StringRef message) {
+    lython::emitter::EmitResult emitted = emitSource(source, context);
+    EXPECT_FALSE(emitted.ok()) << source.str();
+    bool found = false;
+    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+      found = found || diagnostic.message.find(message.str()) != std::string::npos;
+    EXPECT_TRUE(found) << source.str();
+  };
+  refusedWith("from typing import overload\n"
+              "@overload\n"
+              "def f(x: int) -> str: ...\n"
+              "@overload\n"
+              "def f(x: str) -> int: ...\n",
+              "'f' is declared with @overload and has no implementation");
+  refusedWith("from typing import overload\n"
+              "class C:\n"
+              "    @overload\n"
+              "    def m(self, x: int) -> str: ...\n"
+              "    def n(self) -> int:\n"
+              "        return 1\n"
+              "print(C().n())\n",
+              "'m' is declared with @overload and has no implementation");
+  const char *declared = "from typing import overload\n"
+                         "@overload\n"
+                         "def f(x: int) -> str: ...\n"
+                         "@overload\n"
+                         "def f(x: str) -> int: ...\n"
+                         "def f(x: int | str | bytes) -> int | str:\n"
+                         "    return 1\n"
+                         "class C:\n"
+                         "    @overload\n"
+                         "    def m(self, x: int) -> str: ...\n"
+                         "    @overload\n"
+                         "    def m(self, x: str) -> int: ...\n"
+                         "    def m(self, x: int | str | bytes) -> int | str:\n"
+                         "        return 1\n";
+  refusedWith(std::string(declared) + "print(f(b'x'))\n",
+              "no @overload of 'f' accepts these arguments");
+  refusedWith(std::string(declared) + "print(C().m(b'x'))\n",
+              "no @overload of 'm' accepts these arguments");
+  lython::emitter::EmitResult accepted = emitSource(
+      std::string(declared) + "print(f(1).upper(), C().m('s') + 1)\n", context);
+  EXPECT_TRUE(accepted.ok());
+}

@@ -1493,6 +1493,8 @@ constexpr NameAliasImport kNameAliasImports[] = {
     // Protocol (desugarProtocols).
     {"typing", "final", "typing.final", false},
     {"typing_extensions", "final", "typing.final", false},
+    {"typing", "overload", "typing.overload", false},
+    {"typing_extensions", "overload", "typing.overload", false},
     {"typing", "override", "typing.override", false},
     {"typing_extensions", "override", "typing.override", false},
     {"typing", "runtime_checkable", "typing.runtime_checkable", false},
@@ -5616,6 +5618,13 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       // its spelling (`range` is `builtins.range`, `len` an int), and an
       // imported function under that spelling is what the call reaches.
       if (std::optional<py::CallableType> imported = importedCallable(name)) {
+        if (const auto *overloads = functionOverloads(name, *imported)) {
+          if (std::optional<CallSolution> matched = selectFirstApplicable(
+                  *this, *overloads, positional, keywords))
+            return matched->result;
+          return fail("no @overload of '" + name.str() +
+                      "' accepts these arguments");
+        }
         CallInferenceResult inference =
             inferCallWithEvidence(*imported, positional, keywords);
         if (inference)
@@ -5935,6 +5944,16 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       }
       if (!symbol)
         symbol = lookupSymbol(name);
+      if (symbol)
+        if (const auto *overloads = functionOverloads(name, *symbol)) {
+          if (std::optional<CallSolution> matched = selectFirstApplicable(
+                  *this, *overloads, positional, keywords))
+            return matched->result;
+          if (strict)
+            return fail("no @overload of '" + name.str() +
+                        "' accepts these arguments");
+          return {};
+        }
       if (symbol) {
         if (strict) {
           CallInferenceResult inference =
@@ -5973,6 +5992,15 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         }
       }
       if (auto symbol = lookupSymbol(qualified)) {
+        if (const auto *overloads = functionOverloads(qualified, *symbol)) {
+          if (std::optional<CallSolution> matched = selectFirstApplicable(
+                  *this, *overloads, positional, keywords))
+            return matched->result;
+          if (strict)
+            return fail("no @overload of '" + qualified +
+                        "' accepts these arguments");
+          return {};
+        }
         if (strict) {
           CallInferenceResult inference =
               inferCallWithEvidence(*symbol, positional, keywords);
@@ -6432,6 +6460,30 @@ TypeSystem::solveCurriedGenericCall(
   if (!groundApplied)
     return std::nullopt;
   return CurriedCallSolution{solved->result, ground, groundApplied};
+}
+
+void TypeSystem::bindFunctionOverloads(
+    llvm::StringRef name, mlir::Type implementation,
+    llvm::SmallVector<py::CallableType, 2> overloads) {
+  auto &sets = functionOverloadSets[name];
+  for (auto &[bound, declared] : sets)
+    if (bound == implementation) {
+      declared = std::move(overloads);
+      return;
+    }
+  sets.push_back({implementation, std::move(overloads)});
+}
+
+const llvm::SmallVector<py::CallableType, 2> *
+TypeSystem::functionOverloads(llvm::StringRef name,
+                              mlir::Type implementation) const {
+  auto sets = functionOverloadSets.find(name);
+  if (sets == functionOverloadSets.end())
+    return nullptr;
+  for (const auto &[bound, declared] : sets->second)
+    if (bound == implementation)
+      return &declared;
+  return nullptr;
 }
 
 CallInferenceResult TypeSystem::inferCallWithEvidence(

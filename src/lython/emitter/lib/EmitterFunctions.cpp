@@ -118,6 +118,7 @@ void ModuleEmitter::emitFunctionDecl(const parser::Node &function) {
     }
   }
   types.bindSymbol(*name, sig.publicCallable);
+  bindFunctionOverloads(function, *name, sig.publicCallable);
 }
 
 void ModuleEmitter::recordMonomorphicFunction(

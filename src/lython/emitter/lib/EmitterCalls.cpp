@@ -1145,6 +1145,23 @@ ModuleEmitter::tryEmitSubclassesCall(const parser::Node &expr) {
 }
 
 Value ModuleEmitter::emitCall(const parser::Node &expr) {
+  Value result = emitCallAsImplemented(expr);
+  // A call of an `@overload`ed function is typed by the overload it matched.
+  const parser::Node *calleeNode = ast::node(expr, "func");
+  std::string name;
+  if (calleeNode && calleeNode->kind == "Name")
+    name = std::string(ast::nameSpelling(*calleeNode));
+  else if (calleeNode && calleeNode->kind == "Attribute")
+    name = ast::qualifiedName(calleeNode);
+  if (!name.empty())
+    if (std::optional<mlir::Type> bound = types.lookupSymbol(name))
+      if (types.functionOverloads(name, *bound))
+        return narrowToOverloadResult(expr, result, types.inferExpr(&expr),
+                                      name);
+  return result;
+}
+
+Value ModuleEmitter::emitCallAsImplemented(const parser::Node &expr) {
   const parser::Node *calleeNode = ast::node(expr, "func");
   // `__ly$target_is(f, "symbol")`, which only a function-docstring dispatcher
   // writes (EmitterDocstrings.cpp): whether the function value `f` was made
