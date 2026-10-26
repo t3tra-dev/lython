@@ -1310,6 +1310,12 @@ private:
   // An isinstance/issubclass operand, or an element of a tuple of them, that
   // is a class value the static type does not decide.
   bool targetHasDynamicClassValue(const parser::Node *node);
+  // `issubclass(t, e)` / `isinstance(x, e)` with `e` a tuple of classes
+  // whose length the type does not say, or a union of a class and such a
+  // tuple: rewritten to the tests that type can answer.
+  std::optional<Value> emitSubclassTestOverClassTuple(
+      const parser::Node &expr, const parser::Node *subjectNode,
+      const parser::Node *targetNode, bool subjectIsInstance);
   std::optional<Value>
   emitClassValueSubclassTest(const parser::Node &expr,
                              const parser::Node *subjectNode,

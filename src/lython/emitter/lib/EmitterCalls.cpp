@@ -6563,6 +6563,10 @@ ModuleEmitter::tryEmitIsInstanceCall(const parser::Node &expr,
   // the target names its bound or any subclass of it, so the static answer
   // for the bound -- what a `t: type[Base]` used to get -- is wrong for a
   // value naming a subclass. The value's own class walks its MRO for it.
+  if (std::optional<Value> walked = emitSubclassTestOverClassTuple(
+          expr, args->front().get(), (*args)[1].get(),
+          /*subjectIsInstance=*/true))
+    return walked;
   if (targetHasDynamicClassValue((*args)[1].get()))
     return emitClassValueSubclassTest(expr, args->front().get(),
                                       (*args)[1].get(),
@@ -8371,6 +8375,86 @@ bool ModuleEmitter::targetHasDynamicClassValue(const parser::Node *node) {
   return mlir::isa<py::TypeType>(type) && !classValueIsExact(node, type);
 }
 
+// ⭐ A TUPLE OF CLASSES IS ANY OF THEM, also when only the run says how many:
+// `issubclass(t, expected)` with `expected: tuple[type[E], ...]` -- what
+// `except` and assertRaises are handed -- was "needs class values on both
+// sides", and so was the `type[E] | tuple[type[E], ...]` CPython's own
+// signature spells. The tuple is walked (`any(... for c in e)`) and the
+// union is split by `isinstance(e, tuple)`, the spellings that already run.
+// ⛔ Only over names and attribute reads: the subject is read once per
+// class, and the target once to test it and once to use it, which a call
+// with effects would not survive. Anything else keeps the refusal.
+std::optional<Value> ModuleEmitter::emitSubclassTestOverClassTuple(
+    const parser::Node &expr, const parser::Node *subjectNode,
+    const parser::Node *targetNode, bool subjectIsInstance) {
+  if (!subjectNode || !targetNode || targetNode->kind == "Tuple")
+    return std::nullopt;
+  auto isClassTuple = [&](mlir::Type type) {
+    auto tuple = mlir::dyn_cast_if_present<py::ContractType>(type);
+    return tuple && tuple.getContractName() == "builtins.tuple" &&
+           !tuple.getArguments().empty() &&
+           llvm::all_of(tuple.getArguments(), [](mlir::Type element) {
+             return mlir::isa<py::TypeType>(element);
+           });
+  };
+  mlir::Type targetType = types.widenLiteral(types.inferExpr(targetNode));
+  auto targetUnion = mlir::dyn_cast_if_present<py::UnionType>(targetType);
+  bool splitsUnion =
+      targetUnion &&
+      llvm::any_of(targetUnion.getMemberTypes(), isClassTuple) &&
+      llvm::all_of(targetUnion.getMemberTypes(), [&](mlir::Type member) {
+        return isClassTuple(member) || mlir::isa<py::TypeType>(member);
+      });
+  if (!isClassTuple(targetType) && !splitsUnion)
+    return std::nullopt;
+  std::function<bool(const parser::Node *)> isRead =
+      [&](const parser::Node *node) {
+        if (!node)
+          return false;
+        if (node->kind == "Name")
+          return true;
+        return node->kind == "Attribute" && isRead(ast::node(*node, "value"));
+      };
+  if (!isRead(subjectNode) || !isRead(targetNode))
+    return std::nullopt;
+  parser::SourceRange range = expr.range;
+  llvm::StringRef test = subjectIsInstance ? "isinstance" : "issubclass";
+  auto testAgainst = [&](parser::NodePtr target) {
+    return synth::call(synth::name(test, range),
+                       {synth::cloneTree(*subjectNode), std::move(target)},
+                       range);
+  };
+  parser::NodePtr rewritten;
+  if (splitsUnion) {
+    parser::NodePtr tupleName = synth::name("tuple", range);
+    if (!callsUnshadowedBuiltin(tupleName.get(), "tuple"))
+      return std::nullopt;
+    rewritten = synth::ifExp(
+        synth::call(synth::name("isinstance", range),
+                    {synth::cloneTree(*targetNode), std::move(tupleName)},
+                    range),
+        testAgainst(synth::cloneTree(*targetNode)),
+        testAgainst(synth::cloneTree(*targetNode)), range);
+  } else {
+    parser::NodePtr any = synth::name("any", range);
+    if (!callsUnshadowedBuiltin(any.get(), "any"))
+      return std::nullopt;
+    parser::NodePtr generator = parser::makeNode("comprehension", range);
+    parser::addField(*generator, "target", synth::name("__ly$class", range));
+    parser::addField(*generator, "iter", synth::cloneTree(*targetNode));
+    parser::addField(*generator, "ifs", std::vector<parser::NodePtr>{});
+    parser::addField(*generator, "is_async", std::int64_t{0});
+    parser::NodePtr walk = parser::makeNode("GeneratorExp", range);
+    parser::addField(*walk, "elt",
+                     testAgainst(synth::name("__ly$class", range)));
+    parser::addField(*walk, "generators",
+                     std::vector<parser::NodePtr>{generator});
+    rewritten = synth::call(std::move(any), {std::move(walk)}, range);
+  }
+  synthesizedHelperTrees.push_back(rewritten);
+  return emitExpr(rewritten.get());
+}
+
 std::optional<Value> ModuleEmitter::emitClassValueSubclassTest(
     const parser::Node &expr, const parser::Node *subjectNode,
     const parser::Node *targetNode, bool subjectIsInstance) {
@@ -8436,6 +8520,10 @@ ModuleEmitter::tryEmitIssubclassCall(const parser::Node &expr,
   };
   if (!args || args->size() != 2 || (keywords && !keywords->empty()))
     return rejectIssubclass("issubclass() takes exactly two arguments");
+  if (std::optional<Value> walked = emitSubclassTestOverClassTuple(
+          expr, (*args)[0].get(), (*args)[1].get(),
+          /*subjectIsInstance=*/false))
+    return walked;
   // A class value on either side that the static type does not decide is
   // answered at run time, from the MRO of the class it names.
   if (targetHasDynamicClassValue((*args)[0].get()) ||
