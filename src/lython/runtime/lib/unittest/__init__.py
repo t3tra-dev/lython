@@ -43,8 +43,6 @@ Deviations from CPython:
   context manager factory and a call forwarder here); assertRaisesRegex is
   the context manager form only, and its context is a class of its own
   (_AssertRaisesRegexContext) so that assertRaises does not reach re.
-- an assertRaises context's `expected` is always a tuple of classes (one
-  class is a tuple of one).
 - cleanups are stored as closures over their arguments, not as triples.
 - a subtest's params are a dict holding its own keys first and then its
   parent's others, not an _OrderedChainMap over the parent's.

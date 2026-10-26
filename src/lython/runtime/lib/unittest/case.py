@@ -204,14 +204,7 @@ class _AssertRaisesContext[E: BaseException]:
 
     def __init__(self, expected: type[E] | tuple[type[E], ...],
                  test_case: TestCase, msg: str | None = None) -> None:
-        # One class is kept as a tuple of one, so the tests below ask one shape.
-        self.expected: tuple[type[E], ...]
-        if isinstance(expected, tuple):
-            self.expected = expected
-            self._expected_name = str(expected)
-        else:
-            self.expected = (expected,)
-            self._expected_name = expected.__name__
+        self.expected = expected
         self.test_case = test_case
         self.msg = msg
         self.obj_name: str | None = None
@@ -229,8 +222,14 @@ class _AssertRaisesContext[E: BaseException]:
 
     def __exit__(self, exc_type: type[BaseException] | None, exc_value: BaseException | None,
                  tb: types.TracebackType | None) -> bool:
+        expected = self.expected
         if exc_type is None:
-            exc_name = self._expected_name
+            # ⛔ Not CPython's `__name__` with AttributeError caught: the
+            # union says which of the two it is.
+            if isinstance(expected, tuple):
+                exc_name = str(expected)
+            else:
+                exc_name = expected.__name__
             obj_name = self.obj_name
             if obj_name is not None:
                 self.test_case.fail(self.test_case._formatMessage(
@@ -239,15 +238,18 @@ class _AssertRaisesContext[E: BaseException]:
                 self.test_case.fail(self.test_case._formatMessage(
                     self.msg, "{} not raised".format(exc_name)))
             return False
+        # ⛔ Not `issubclass(exc_type, self.expected)`: issubclass takes a
+        # class or a tuple here, not a union of the two.
+        classes = expected if isinstance(expected, tuple) else (expected,)
         matched = False
-        for expected in self.expected:
-            if issubclass(exc_type, expected):
+        for cls in classes:
+            if issubclass(exc_type, cls):
                 matched = True
         if not matched:
             # let unexpected exceptions pass through
             return False
-        for expected in self.expected:
-            if isinstance(exc_value, expected):
+        for cls in classes:
+            if isinstance(exc_value, cls):
                 self._exception = exc_value
         return True
 
