@@ -39,10 +39,10 @@ Deviations from CPython:
   same six types reach the same six assertions. assertSequenceEqual,
   assertTupleEqual and assertSetEqual take two arguments of ONE static type,
   so a list is not compared with a tuple through them.
-- assertRaises' callable form is assertRaisesCall (one name cannot be both a
-  context manager factory and a call forwarder here); assertRaisesRegex is
-  the context manager form only, and its context is a class of its own
-  (_AssertRaisesRegexContext) so that assertRaises does not reach re.
+- assertRaisesRegex's context is a class of its own
+  (_AssertRaisesRegexContext) so that assertRaises does not reach re. In the
+  callable form of assertRaises* and assertWarns*, a `msg=` keyword is the
+  assertion's own and is not passed to the callable.
 - cleanups are stored as closures over their arguments, not as triples.
 - a subtest's params are a dict holding its own keys first and then its
   parent's others, not an _OrderedChainMap over the parent's.
