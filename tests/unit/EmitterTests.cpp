@@ -2435,16 +2435,17 @@ TEST(EmitterTest, RefusesAFunctionThatDoesNotFitALoopCarriedFunction) {
       result, "'__call__' runs on whichever member the value holds"));
 }
 
-// What: a match case that rebinds a name to a function returning another type.
-// The name is held in a cell, which cannot store a choice of functions, and
-// the lowering refused it with no source name; the emitter says so instead.
+// What: a match case that rebinds a name to a function returning another type
+// and taking another shape, so no one function type holds both. The name is
+// held in a cell, which cannot store a choice of functions, and the lowering
+// refused it with no source name; the emitter says so instead.
 TEST(EmitterTest, RefusesAMatchCaseRebindingToAFunctionOfAnotherResult) {
   mlir::MLIRContext context(testRegistry());
   lython::emitter::EmitResult result = emitSource(
       "def a(x: int) -> int:\n"
       "    return x + 1\n"
-      "def f(x: int) -> float:\n"
-      "    return x / 2\n"
+      "def f(x: int, y: int) -> float:\n"
+      "    return x / y\n"
       "def pick(n: int) -> int | float:\n"
       "    k = a\n"
       "    match n:\n"
@@ -2457,8 +2458,8 @@ TEST(EmitterTest, RefusesAMatchCaseRebindingToAFunctionOfAnotherResult) {
       context);
   EXPECT_FALSE(result.ok());
   EXPECT_TRUE(reportsDiagnostic(
-      result, "is reassigned in a match case to functions that return "
-              "different types"));
+      result, "is reassigned in a match case to functions no one function "
+              "type can hold"));
 }
 
 // What: a statement in a class body that would have run. A class body executes

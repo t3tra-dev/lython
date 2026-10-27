@@ -150,6 +150,73 @@ bool containsNamedExpr(const parser::Node *node) {
 
 } // namespace
 
+// ⛔ Only `name = value` statements: a binding this read cannot type is left
+// out of the join, and the store that meets it refuses what does not fit.
+// Each one is bound in a scratch frame as it is read, so `g = c` then `k = g`
+// types `k` as `c`; a `for` target, `loop`'s own included, is bound to what
+// its iterable yields.
+mlir::Type ModuleEmitter::readAheadBindingJoin(
+    llvm::ArrayRef<const std::vector<parser::NodePtr> *> suites,
+    llvm::StringRef name, mlir::Type initial, const parser::Node *loop) {
+  TypeSystem::Scope readAhead = types.pushScope();
+  llvm::SmallVector<mlir::Type, 4> bound{initial};
+  auto bindLoopTarget = [&](const parser::Node &statement) {
+    const parser::Node *target = ast::node(statement, "target");
+    if (!target || target->kind != "Name")
+      return;
+    if (mlir::Type element = types.widenLiteral(
+            types.iterationElementType(ast::node(statement, "iter"))))
+      types.bindLocalSymbol(ast::nameSpelling(*target), element);
+  };
+  if (loop && (loop->kind == "For" || loop->kind == "AsyncFor"))
+    bindLoopTarget(*loop);
+  for (const std::vector<parser::NodePtr> *statements : suites)
+    for (const parser::NodePtr &child : *statements)
+      ast::walk(child.get(), [&](const parser::Node &node) {
+        if (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
+            node.kind == "ClassDef" || node.kind == "Lambda")
+          return ast::Walk::SkipChildren;
+        if (node.kind == "For" || node.kind == "AsyncFor")
+          bindLoopTarget(node);
+        const auto *targets =
+            node.kind == "Assign" ? ast::nodeList(node, "targets") : nullptr;
+        if (!targets)
+          return ast::Walk::Continue;
+        const parser::Node *value = ast::node(node, "value");
+        auto bind = [&](const parser::Node &target,
+                        const parser::Node *source) {
+          if (target.kind != "Name")
+            return;
+          mlir::Type assigned = types.widenLiteral(types.inferExpr(source));
+          llvm::StringRef spelled = ast::nameSpelling(target);
+          if (spelled == name)
+            bound.push_back(assigned);
+          if (assigned)
+            types.bindLocalSymbol(spelled, assigned);
+        };
+        // `k, n = c, 0`: a display on both sides pairs by position.
+        const auto *sources = value && value->kind == "Tuple"
+                                  ? ast::nodeList(*value, "elts")
+                                  : nullptr;
+        for (const parser::NodePtr &target : *targets) {
+          if (!target)
+            continue;
+          const auto *parts = target->kind == "Tuple"
+                                  ? ast::nodeList(*target, "elts")
+                                  : nullptr;
+          if (parts && sources && parts->size() == sources->size()) {
+            for (auto [part, source] : llvm::zip(*parts, *sources))
+              if (part)
+                bind(*part, source.get());
+            continue;
+          }
+          bind(*target, value);
+        }
+        return ast::Walk::Continue;
+      });
+  return types.join(bound);
+}
+
 llvm::SmallVector<CarriedLoopLocal, 4> ModuleEmitter::collectCarriedLoopLocals(
     const parser::Node &statement, const llvm::StringSet<> *excludedNames,
     llvm::SmallVectorImpl<mlir::Value> &initialValues) {
@@ -273,75 +340,14 @@ llvm::SmallVector<CarriedLoopLocal, 4> ModuleEmitter::collectCarriedLoopLocals(
     // call through `k` raised "callable target is not available" where
     // CPython calls `c`. The body's own bindings are read ahead and joined
     // with the pre-loop one, the join an `if` makes at its merge.
-    // ⛔ Only `name = value` statements: a binding this read cannot type
-    // leaves the lane as it was, and the back edge refuses what does not fit.
-    // Each one is bound in a scratch frame as it is read, so `g = c` then
-    // `k = g` types `k` as `c`; a `for` target, this loop's own included, is
-    // bound to what its iterable yields.
     if (isFunctionLane(carriedType)) {
-      TypeSystem::Scope readAhead = types.pushScope();
-      llvm::SmallVector<mlir::Type, 4> bound{carriedType};
-      auto bindLoopTarget = [&](const parser::Node &loop) {
-        const parser::Node *target = ast::node(loop, "target");
-        if (!target || target->kind != "Name")
-          return;
-        if (mlir::Type element = types.widenLiteral(
-                types.iterationElementType(ast::node(loop, "iter"))))
-          types.bindLocalSymbol(ast::nameSpelling(*target), element);
-      };
-      if (statement.kind == "For" || statement.kind == "AsyncFor")
-        bindLoopTarget(statement);
+      llvm::SmallVector<const std::vector<parser::NodePtr> *, 2> suites;
       for (llvm::StringRef suite : {"body", "orelse"})
         if (const auto *statements = ast::nodeList(statement, suite))
-          for (const parser::NodePtr &child : *statements)
-            ast::walk(child.get(), [&](const parser::Node &node) {
-              if (node.kind == "FunctionDef" ||
-                  node.kind == "AsyncFunctionDef" || node.kind == "ClassDef" ||
-                  node.kind == "Lambda")
-                return ast::Walk::SkipChildren;
-              if (node.kind == "For" || node.kind == "AsyncFor")
-                bindLoopTarget(node);
-              const auto *targets = node.kind == "Assign"
-                                        ? ast::nodeList(node, "targets")
-                                        : nullptr;
-              if (!targets)
-                return ast::Walk::Continue;
-              const parser::Node *value = ast::node(node, "value");
-              auto bind = [&](const parser::Node &target,
-                              const parser::Node *source) {
-                if (target.kind != "Name")
-                  return;
-                mlir::Type assigned =
-                    types.widenLiteral(types.inferExpr(source));
-                llvm::StringRef spelled = ast::nameSpelling(target);
-                if (spelled == name)
-                  bound.push_back(assigned);
-                if (assigned)
-                  types.bindLocalSymbol(spelled, assigned);
-              };
-              // `k, n = c, 0`: a display on both sides pairs by position.
-              const auto *sources = value && value->kind == "Tuple"
-                                        ? ast::nodeList(*value, "elts")
-                                        : nullptr;
-              for (const parser::NodePtr &target : *targets) {
-                if (!target)
-                  continue;
-                const auto *parts = target->kind == "Tuple"
-                                        ? ast::nodeList(*target, "elts")
-                                        : nullptr;
-                if (parts && sources && parts->size() == sources->size()) {
-                  for (auto [part, source] : llvm::zip(*parts, *sources))
-                    if (part)
-                      bind(*part, source.get());
-                  continue;
-                }
-                bind(*target, value);
-              }
-              return ast::Walk::Continue;
-            });
-      // A union of functions too, when no one shape returns what all of them
-      // do: a call through the lane then asks which one it holds.
-      if (mlir::Type joined = types.join(bound); isFunctionLane(joined))
+          suites.push_back(statements);
+      if (mlir::Type joined =
+              readAheadBindingJoin(suites, name, carriedType, &statement);
+          isFunctionLane(joined))
         carriedType = joined;
     }
     mlir::Value initialValue =

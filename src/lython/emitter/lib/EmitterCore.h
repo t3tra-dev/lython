@@ -1724,6 +1724,18 @@ private:
   // ones under "<type>|<callable>".
   std::optional<Value> tryWrapClassValue(Value value, py::CallableType target,
                                          const parser::Node &anchor);
+  // A function held where a callable returning a union with its result is
+  // declared: the forwarder `return fn(a0, ...)` with `fn` captured, whose
+  // declared result is the union, memoized under "<function>|<callable>".
+  // The join of `initial` and every type `name = value` statements in
+  // `suites` give the name, read ahead of emitting them (EmitterLoops.cpp).
+  mlir::Type readAheadBindingJoin(
+      llvm::ArrayRef<const std::vector<parser::NodePtr> *> suites,
+      llvm::StringRef name, mlir::Type initial,
+      const parser::Node *loop = nullptr);
+  std::optional<Value> tryWrapFunctionResult(Value value,
+                                             py::CallableType target,
+                                             const parser::Node &anchor);
   std::optional<Value> tryEmitManifestMethodObject(const parser::Node &anchor,
                                                    Value object,
                                                    llvm::StringRef methodName);

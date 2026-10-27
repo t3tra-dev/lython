@@ -8464,8 +8464,12 @@ Value ModuleEmitter::emitCellLoad(const parser::Node &anchor,
   return {op.getResult(), content};
 }
 
-void ModuleEmitter::emitCellStore(const parser::Node &anchor, const Value &cell,
-                                  Value value) {
+void ModuleEmitter::emitCellStore(const parser::Node &anchor,
+                                  const Value &heldCell, Value value) {
+  // ⛔ Not the caller's reference: it is usually an entry of `values`, and the
+  // coercion below may emit a forwarder function, whose body rebinds `values`
+  // and leaves the reference dangling.
+  const Value cell = heldCell;
   mlir::Type content = cellContentType(cell.type);
   if (!content) {
     diagnostics.push_back(parser::Diagnostic{

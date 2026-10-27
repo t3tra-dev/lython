@@ -174,6 +174,41 @@ def result_or_none(n: int) -> int | None:
     return k(1)
 
 
+def result_by_match(n: int) -> int | float | str:
+    k = a
+    match n:
+        case 1:
+            k = half
+        case 2:
+            k = stars
+        case _:
+            pass
+    return k(3)
+
+
+def result_returned(n: int):
+    k = a
+    if n == 1:
+        k = half
+    return k
+
+
+def result_captured(n: int) -> int | float:
+    k = a
+    if n == 1:
+        k = half
+
+    def inner() -> int | float:
+        return k(3)
+
+    return inner()
+
+
+class HoldsAResult:
+    def __init__(self, n: int) -> None:
+        self.k = result_returned(n)
+
+
 module_result_k = a
 if len("ab") == 2:
     module_result_k = half
@@ -231,6 +266,21 @@ class FunctionsOfDifferentShapesTest(unittest.TestCase):
         )
         self.assertEqual([result_or_none(0), result_or_none(1)], [2, None])
         self.assertEqual(module_result_k(5), 2.5)
+        self.assertEqual(
+            [result_by_match(0), result_by_match(1), result_by_match(2)],
+            [4, 1.5, "***"],
+        )
+
+    def test_results_that_differ_stored(self) -> None:
+        self.assertEqual([result_returned(0)(3), result_returned(1)(3)], [4, 1.5])
+        self.assertEqual([result_captured(0), result_captured(1)], [4, 1.5])
+        self.assertEqual([HoldsAResult(0).k(3), HoldsAResult(1).k(3)], [4, 1.5])
+        held = [result_returned(0), result_returned(1)]
+        self.assertEqual([g(3) for g in held], [4, 1.5])
+        self.assertEqual({"x": result_returned(1)}["x"](4), 2.0)
+        self.assertEqual(
+            [type(g(3)).__name__ for g in held], ["int", "float"]
+        )
         self.assertEqual(read_module_result_k(), 2.5)
 
     def test_a_list(self) -> None:
