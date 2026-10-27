@@ -2282,8 +2282,21 @@ void collectAssignedNames(const parser::Node *node, llvm::StringSet<> &names) {
 bool containsNameLoad(const parser::Node *node, llvm::StringRef name) {
   if (!node)
     return false;
-  if (node->kind == "Name")
+  // ⛔ Not a name STORED inside a tuple or list target (`value, _, count =
+  // ...`), which the direct-target set below does not reach: it read as a
+  // load of `_`. A synthesized name has no ctx and stays a load.
+  if (node->kind == "Name") {
+    const parser::Node *ctx = ast::node(*node, "ctx");
+    if (ctx && (ctx->kind == "Store" || ctx->kind == "Del"))
+      return false;
     return llvm::StringRef(ast::nameSpelling(*node)) == name;
+  }
+  // `k += 1` reads `k`, though its target is spelled as a store.
+  if (node->kind == "AugAssign")
+    if (const parser::Node *target = ast::node(*node, "target");
+        target && target->kind == "Name" &&
+        llvm::StringRef(ast::nameSpelling(*target)) == name)
+      return true;
   llvm::SmallPtrSet<const parser::Node *, 4> stores;
   auto noteStoreTarget = [&](const parser::Node *target) {
     if (target && target->kind == "Name")

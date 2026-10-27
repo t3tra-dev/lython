@@ -264,7 +264,10 @@ llvm::SmallVector<CarriedLoopLocal, 4> ModuleEmitter::collectCarriedLoopLocals(
     // with the pre-loop one, the join an `if` makes at its merge.
     // ⛔ Only `name = value` statements: a binding this read cannot type
     // leaves the lane as it was, and the back edge refuses what does not fit.
+    // Each one is bound in a scratch frame as it is read, so `g = c` then
+    // `k = g` types `k` as `c`.
     if (mlir::isa<py::CallableType>(carriedType)) {
+      TypeSystem::Scope readAhead = types.pushScope();
       llvm::SmallVector<mlir::Type, 4> bound{carriedType};
       for (llvm::StringRef suite : {"body", "orelse"})
         if (const auto *statements = ast::nodeList(statement, suite))
@@ -277,13 +280,39 @@ llvm::SmallVector<CarriedLoopLocal, 4> ModuleEmitter::collectCarriedLoopLocals(
               const auto *targets = node.kind == "Assign"
                                         ? ast::nodeList(node, "targets")
                                         : nullptr;
-              if (targets &&
-                  llvm::any_of(*targets, [&](const parser::NodePtr &t) {
-                    return t && t->kind == "Name" &&
-                           llvm::StringRef(ast::nameSpelling(*t)) == name;
-                  }))
-                bound.push_back(types.widenLiteral(
-                    types.inferExpr(ast::node(node, "value"))));
+              if (!targets)
+                return ast::Walk::Continue;
+              const parser::Node *value = ast::node(node, "value");
+              auto bind = [&](const parser::Node &target,
+                              const parser::Node *source) {
+                if (target.kind != "Name")
+                  return;
+                mlir::Type assigned =
+                    types.widenLiteral(types.inferExpr(source));
+                llvm::StringRef spelled = ast::nameSpelling(target);
+                if (spelled == name)
+                  bound.push_back(assigned);
+                if (assigned)
+                  types.bindLocalSymbol(spelled, assigned);
+              };
+              // `k, n = c, 0`: a display on both sides pairs by position.
+              const auto *sources = value && value->kind == "Tuple"
+                                        ? ast::nodeList(*value, "elts")
+                                        : nullptr;
+              for (const parser::NodePtr &target : *targets) {
+                if (!target)
+                  continue;
+                const auto *parts = target->kind == "Tuple"
+                                        ? ast::nodeList(*target, "elts")
+                                        : nullptr;
+                if (parts && sources && parts->size() == sources->size()) {
+                  for (auto [part, source] : llvm::zip(*parts, *sources))
+                    if (part)
+                      bind(*part, source.get());
+                  continue;
+                }
+                bind(*target, value);
+              }
               return ast::Walk::Continue;
             });
       if (auto joined =

@@ -1466,6 +1466,18 @@ bool ModuleEmitter::nameMayBeReadAfterCurrentStatement(
     const auto &[suite, index] = suiteStack[level - 1];
     if (!suite)
       return true;
+    // ⭐ A LOOP BEING EMITTED RUNS AGAIN after the suite inside it ends, so a
+    // read ANYWHERE in it -- before this statement too -- comes after. Only the
+    // rest of each suite was read, so `total += k` at the top of an outer loop
+    // did not see `k = 100` in an inner loop, the inner loop did not carry `k`,
+    // and the outer loop's next trip read the value from before the inner one.
+    if (index > 0 && index <= suite->size())
+      if (const parser::Node *current = (*suite)[index - 1].get();
+          current &&
+          (current->kind == "For" || current->kind == "AsyncFor" ||
+           current->kind == "While") &&
+          containsNameLoad(current, name))
+        return true;
     for (std::size_t position = index; position < suite->size(); ++position)
       if (containsNameLoad((*suite)[position].get(), name))
         return true;

@@ -81,6 +81,25 @@ def by_for(start: int) -> list[int]:
     return out
 
 
+def by_name_bound_in_the_body() -> list[int]:
+    out: list[int] = []
+    k = a
+    for i in range(3):
+        out.append(k(i))
+        g = c
+        k = g
+    return out
+
+
+def by_pair() -> list[int]:
+    out: list[int] = []
+    k = a
+    for i in range(3):
+        out.append(k(i))
+        k, n = c, i
+    return out
+
+
 def by_while() -> list[int]:
     out: list[int] = []
     k = a
@@ -123,6 +142,8 @@ class FunctionsOfDifferentShapesTest(unittest.TestCase):
         self.assertEqual(by_for(0), [1, -99, -98])
         self.assertEqual(by_for(1), [0, -99, -98])
         self.assertEqual(by_while(), [1, 10, -98])
+        self.assertEqual(by_name_bound_in_the_body(), [1, -99, -98])
+        self.assertEqual(by_pair(), [1, -99, -98])
         self.assertEqual(module_results, [1, -99, -98])
 
     def test_a_list(self) -> None:
