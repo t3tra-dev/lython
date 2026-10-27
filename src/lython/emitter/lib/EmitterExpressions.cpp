@@ -6100,6 +6100,106 @@ ModuleEmitter::tryWrapClassValue(Value value, py::CallableType target,
                             {});
 }
 
+// ⭐ A FUNCTION WHOSE RESULT IS ONE MEMBER OF THE UNION A CALLABLE DECLARES is
+// held through a forwarder that returns the union. `k = a` or `k = f`, with
+// `a() -> int` and `f() -> float`, is one callable returning `int | float`,
+// and an indirect call through it answers with that union -- a plain retyping
+// left `a`'s int where the union was read, and the lowering refused it. The
+// result enters the union as itself: the int stays an int, as CPython's `k()`
+// returns it.
+// ⛔ Not the union of the two functions instead, which a call can dispatch on
+// by tag: both are the same class at run time, so a box (a cell, a container
+// slot, a field, a returned value) cannot say which one it holds.
+// ⛔ Only a target of required positional parameters, the shape
+// `commonCallableJoin` makes: a default or a keyword-only parameter would need
+// the forwarder to know a value only the function's own signature has.
+std::optional<Value>
+ModuleEmitter::tryWrapFunctionResult(Value value, py::CallableType target,
+                                     const parser::Node &anchor) {
+  auto source = mlir::dyn_cast_if_present<py::CallableType>(value.type);
+  if (!source || source.getResultTypes().size() != 1 ||
+      target.getResultTypes().size() != 1)
+    return std::nullopt;
+  auto declared =
+      mlir::dyn_cast<py::UnionType>(target.getResultTypes().front());
+  mlir::Type held = types.widenLiteral(source.getResultTypes().front());
+  if (!declared || held == declared || target.hasVararg() ||
+      target.hasKwarg() || !target.getKwOnlyTypes().empty() ||
+      llvm::any_of(target.getPositionalDefaults(),
+                   [](mlir::BoolAttr attr) { return attr && attr.getValue(); }) ||
+      !py::isAssignableTo(source, target))
+    return std::nullopt;
+  std::string key = "fwd:" + typeText(value.type) + "|" + typeText(target);
+  auto memo = builtinFunctionObjects.find(key);
+  if (memo == builtinFunctionObjects.end()) {
+    parser::SourceRange range = anchor.range;
+    llvm::ArrayRef<mlir::Type> parameterTypes = target.getPositionalTypes();
+    llvm::ArrayRef<mlir::StringAttr> names = target.getPositionalNames();
+    llvm::SmallVector<synth::Param, 4> params;
+    std::vector<parser::NodePtr> arguments;
+    for (unsigned index = 0; index < parameterTypes.size(); ++index) {
+      std::string name = index < names.size() && names[index] &&
+                                 !names[index].getValue().empty()
+                             ? names[index].getValue().str()
+                             : "__ly_a" + std::to_string(index);
+      params.push_back(synth::Param{name, nullptr});
+      arguments.push_back(synth::name(name, range));
+    }
+    std::vector<parser::NodePtr> body;
+    body.push_back(synth::returnStmt(
+        synth::call(synth::name("__ly_fn", range), std::move(arguments),
+                    range),
+        range));
+    std::string symbol =
+        "__lyfwd$" + std::to_string(++syntheticFunctionCounter);
+    llvm::SmallVector<const parser::Node *, 4> paramNodes;
+    parser::NodePtr def = synth::functionDef(
+        symbol, params, {}, std::move(body), nullptr, {}, range, &paramNodes);
+    synthesizedIteratorDefs.push_back(def);
+    for (auto [index, type] : llvm::enumerate(parameterTypes))
+      types.overrideParameterType(paramNodes[index], type);
+    FunctionSignature sig;
+    {
+      TypeSystem::Scope scope = types.pushScope();
+      types.bindLocalSymbol("__ly_fn", value.type);
+      sig = types.functionSignature(*def);
+    }
+    sig.resultType = declared;
+    sig.positionalOnlyCount = target.getPositionalOnlyCount();
+    types.refreshCallable(sig);
+    if (!sig.publicCallable)
+      return std::nullopt;
+    types.bindRootSymbol(symbol, sig.publicCallable);
+    {
+      auto savedLoops = std::move(loopControlContexts);
+      loopControlContexts.clear();
+      auto savedInlineReturns = std::move(inlineReturnContexts);
+      inlineReturnContexts.clear();
+      auto savedSupers = std::move(superContexts);
+      superContexts.clear();
+      auto savedInlining = std::move(methodsBeingInlined);
+      methodsBeingInlined.clear();
+      auto savedInlineFrames = std::move(inlineFrames);
+      inlineFrames.clear();
+      auto restoreContexts = llvm::scope_exit([&] {
+        loopControlContexts = std::move(savedLoops);
+        inlineReturnContexts = std::move(savedInlineReturns);
+        superContexts = std::move(savedSupers);
+        methodsBeingInlined = std::move(savedInlining);
+        inlineFrames = std::move(savedInlineFrames);
+      });
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      emitCallableFunction(*def, symbol, sig, {Capture{"__ly_fn", value}},
+                           /*isLambda=*/false);
+    }
+    memo = builtinFunctionObjects
+               .try_emplace(key, std::make_pair(symbol, sig.publicCallable))
+               .first;
+  }
+  return emitFunctionObject(anchor, memo->second.first, memo->second.second,
+                            {Capture{"__ly_fn", value}});
+}
+
 Value ModuleEmitter::emitFunctionObject(const parser::Node &anchor,
                                         llvm::StringRef symbolName,
                                         mlir::Type type,
@@ -6472,6 +6572,9 @@ Value ModuleEmitter::coerceValue(Value value, mlir::Type targetType,
       return *wrapped;
     if (std::optional<Value> wrapped =
             tryWrapClassValue(value, targetCallable, anchor))
+      return *wrapped;
+    if (std::optional<Value> wrapped =
+            tryWrapFunctionResult(value, targetCallable, anchor))
       return *wrapped;
     // ⭐ A CALLABLE IS A CELL FOR ITS RESULT AND ITS PARAMETERS. `f:
     // Callable[[], float] = one` with `one() -> int` is well typed, but an int

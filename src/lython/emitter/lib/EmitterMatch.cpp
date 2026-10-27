@@ -137,9 +137,11 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
       // match, which is the wrong answer this block exists to remove. A
       // function value was skipped that way (`k = b` in a case, then `k(3)`
       // called `a`), because the rule asked for a contract.
-      // ⛔ Nor a union holding a function: a cell boxes its content, and a
-      // function member has no box a union's lanes can be rebuilt from, so
-      // the lowering refused it with no source name. Said here instead.
+      // ⛔ Nor a union holding a function, which is what is left when no one
+      // function type holds them all (`commonCallableJoin`): a cell boxes its
+      // content, and two functions are the same class at run time, so the
+      // box cannot say which one it holds. The lowering refused it with no
+      // source name; said here instead.
       if (auto unionContent =
               mlir::dyn_cast_if_present<py::UnionType>(content);
           unionContent &&
@@ -149,10 +151,11 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
         diagnostics.push_back(parser::Diagnostic{
             parser::Severity::Error, statement.range.start,
             "local '" + name +
-                "' is reassigned in a match case to functions that return "
-                "different types, and a name a case rebinds is held in a cell "
-                "that cannot store a choice of functions; use if/elif, or "
-                "give the functions one result type"});
+                "' is reassigned in a match case to functions no one function "
+                "type can hold (their parameters and results both differ), "
+                "and a name a case rebinds is held in a cell that cannot store "
+                "a choice of functions; use if/elif, or give the functions "
+                "one shape"});
         return;
       }
       Value initial = content && !py::isPyObjectType(content)

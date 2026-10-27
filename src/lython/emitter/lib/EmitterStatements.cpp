@@ -2387,6 +2387,18 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
     }
     if (bound == values.end() && currentBoxedLocals.contains(name)) {
       // First binding of a boxed local: its storage is a fresh shared cell.
+      // ⭐ A FUNCTION CELL HOLDS EVERY FUNCTION THE SCOPE BINDS, so it is
+      // typed by all of them, read ahead: `k = a` then `k = f` with a nested
+      // def reading `k` made a cell of `a`'s type and refused the second
+      // store as a function that "cannot be held as the callable declared
+      // here".
+      if (mlir::isa<py::CallableType>(types.widenLiteral(value.type)) &&
+          suiteStack.size() > suiteStackFloor)
+        if (const auto *body = suiteStack[suiteStackFloor].first)
+          if (auto joined = mlir::dyn_cast_if_present<py::CallableType>(
+                  readAheadBindingJoin({body}, name,
+                                       types.widenLiteral(value.type))))
+            value = coerceValue(value, joined, target);
       Value cell = emitCellAlloc(target, value);
       values[name] = cell;
       types.bindSymbol(name, cellContentType(cell.type));

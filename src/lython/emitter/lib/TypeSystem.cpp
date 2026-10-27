@@ -907,6 +907,13 @@ void collectGeneratorFunctionAnalysis(
                                  : std::optional<mlir::Type>(existing->second));
           analysis.localSymbols[name] = narrowed;
         });
+    // ⭐ EACH ARM STARTS FROM WHAT THE NAMES HELD BEFORE IT, and where both
+    // reach the end the names hold the join of the two -- the merge the
+    // emitter's `if` makes. The walk kept the body's binding for the code
+    // after the statement and for the `else` arm, so `k = a; if c: k = f;
+    // return k` was typed as returning `f`, and the emitter's `a`-or-`f` value
+    // was retyped to it: a call through the result found no function.
+    llvm::StringMap<mlir::Type> before = analysis.localSymbols;
     if (const auto *body = ast::nodeList(*node, "body"))
       for (const parser::NodePtr &statement : *body)
         collectGeneratorFunctionAnalysis(types, statement.get(), localCallables,
@@ -917,6 +924,42 @@ void collectGeneratorFunctionAnalysis(
       else
         analysis.localSymbols.erase(entry.first);
     }
+    llvm::StringMap<mlir::Type> afterBody = std::move(analysis.localSymbols);
+    analysis.localSymbols = before;
+    auto leaves = [](const std::vector<parser::NodePtr> *suite) {
+      return suite && !suite->empty() && suite->back() &&
+             (suite->back()->kind == "Return" ||
+              suite->back()->kind == "Raise" ||
+              suite->back()->kind == "Continue" ||
+              suite->back()->kind == "Break");
+    };
+    const bool bodyLeaves = leaves(ast::nodeList(*node, "body"));
+    const bool elseLeaves = leaves(ast::nodeList(*node, "orelse"));
+    auto mergeArms = llvm::scope_exit([&] {
+      if (bodyLeaves)
+        return;
+      if (elseLeaves) {
+        analysis.localSymbols = std::move(afterBody);
+        return;
+      }
+      llvm::StringMap<mlir::Type> afterElse = analysis.localSymbols;
+      llvm::StringSet<> names;
+      for (const auto &entry : afterBody)
+        names.insert(entry.getKey());
+      for (const auto &entry : afterElse)
+        names.insert(entry.getKey());
+      for (const auto &entry : names) {
+        llvm::StringRef name = entry.getKey();
+        mlir::Type taken = afterBody.lookup(name);
+        mlir::Type other = afterElse.lookup(name);
+        if (!taken || !other || taken == other) {
+          analysis.localSymbols[name] = taken ? taken : other;
+          continue;
+        }
+        analysis.localSymbols[name] =
+            types.join({types.widenLiteral(taken), types.widenLiteral(other)});
+      }
+    });
     // ⭐ AND THE SURVIVING SIDE, which the emitter's own `if` has carried for a
     // while and this walk had not. `if rows is None: return` leaves everything
     // below it reading a proved value, and without the fact the LOOP over it
@@ -6199,10 +6242,22 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           // ⛔ Asked only after the method lookup has FAILED: it re-infers the
           // attribute expression, and doing that ahead of every method call
           // would pay for a question almost none of them ask.
-          if (auto attributeType = mlir::dyn_cast_if_present<py::TypeType>(
-                  widenLiteral(recurse(callee))))
+          mlir::Type attribute = widenLiteral(recurse(callee));
+          if (auto attributeType =
+                  mlir::dyn_cast_if_present<py::TypeType>(attribute))
             if (mlir::Type instance = attributeType.getInstanceType())
               return inferClassInstantiation(instance, positional, keywords);
+          // ⭐ AND AN ATTRIBUTE HOLDING A FUNCTION IS CALLED AS ONE. `b.k(3)`
+          // with `self.k: Callable[[int], int | None]` answered `object` here,
+          // so `print(b.k(3))` took the one-argument path for an object and
+          // handed the union to the lowering ("unnarrowed !py.union<...>
+          // cannot be used where a concrete object is required"), while
+          // `r = b.k(3)` then `print(r)` -- typed from the emitted value --
+          // rendered it.
+          if (mlir::isa_and_nonnull<py::CallableType>(attribute))
+            if (CallInferenceResult called =
+                    inferCallWithEvidence(attribute, positional, keywords))
+              return called.resultType;
           return strict ? fail(inference.failureReason) : object();
         }
       }
@@ -7003,15 +7058,51 @@ TypeSystem::commonCallableJoin(mlir::ArrayRef<mlir::Type> members) const {
   }
   if (callables.size() < 2)
     return {};
-  // ⛔ And only when the RESULTS agree too. `[lambda: 1, lambda: 2.0]` joins
-  // to `Callable[[], int | float]`, and an indirect call cannot return a union
-  // -- the program left the emitter and died in the lowering ("runtime bundle
-  // value 0 for builtins.bool"). The union of callables stays a union, and a
-  // call through it asks which function it holds (ModuleEmitter::emitCall).
+  // ⭐ RESULTS THAT DIFFER JOIN AT A CALLABLE RETURNING THEIR UNION, and each
+  // function enters it through a forwarder that returns the union
+  // (`ModuleEmitter::tryWrapFunctionResult`): a bare retyping left `a`'s int
+  // where `int | float` was read, and the lowering refused it ("runtime bundle
+  // value 0 for builtins.bool"). The shape is required positionals only, which
+  // is what a forwarder can pass on.
+  // ⛔ Not at the erased top: a result that may be anything has no lanes a
+  // forwarder could return through.
   mlir::Type joinedResult = join(results);
-  if (!joinedResult || mlir::isa<py::UnionType>(joinedResult) ||
-      isObjectTop(*this, joinedResult))
+  if (!joinedResult || isObjectTop(*this, joinedResult))
     return {};
+  if (mlir::isa<py::UnionType>(joinedResult)) {
+    llvm::SmallVector<py::CallableType, 8> required;
+    for (bool named : {true, false})
+      for (py::CallableType callable : callables) {
+        llvm::SmallVector<mlir::Type, 4> types;
+        llvm::SmallVector<mlir::StringAttr, 4> names;
+        llvm::ArrayRef<mlir::BoolAttr> defaults =
+            callable.getPositionalDefaults();
+        llvm::ArrayRef<mlir::StringAttr> spelled =
+            callable.getPositionalNames();
+        for (auto [index, type] :
+             llvm::enumerate(callable.getPositionalTypes())) {
+          if (index < defaults.size() && defaults[index] &&
+              defaults[index].getValue())
+            break;
+          types.push_back(type);
+          if (named && index < spelled.size() && spelled[index])
+            names.push_back(spelled[index]);
+        }
+        if (named && names.size() != types.size())
+          continue;
+        llvm::SmallVector<mlir::BoolAttr, 4> noDefaults(
+            names.size(), mlir::BoolAttr::get(&context, false));
+        required.push_back(py::CallableType::get(
+            &context, types, {}, {}, {}, {joinedResult}, names, {},
+            noDefaults, {}, {}, {}, 0));
+      }
+    for (py::CallableType candidate : required)
+      if (llvm::all_of(callables, [&](py::CallableType callable) {
+            return py::isAssignableTo(callable, candidate);
+          }))
+        return candidate;
+    return {};
+  }
   auto withResult = [&](py::CallableType callable) {
     llvm::SmallVector<mlir::Type, 1> single{joinedResult};
     return py::CallableType::get(
