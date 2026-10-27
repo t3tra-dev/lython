@@ -1014,8 +1014,12 @@ ModuleEmitter::tryEmitUnionMethodCall(const parser::Node &expr, Value receiver,
         std::vector<parser::NodePtr> keywordNodes;
         for (const auto &[name, value] : named)
           keywordNodes.push_back(synth::keyword(name, bind(value), expr.range));
+        bool function =
+            methodName == "__call__" && mlir::isa<py::CallableType>(member.type);
         parser::NodePtr call = synth::callWithKeywords(
-            synth::attribute(std::move(memberNode), methodName, expr.range),
+            function ? std::move(memberNode)
+                     : synth::attribute(std::move(memberNode), methodName,
+                                        expr.range),
             std::move(argumentNodes), std::move(keywordNodes), expr.range);
         Value result = emitExpr(call.get());
         synthesizedIteratorDefs.push_back(std::move(call));
@@ -1272,15 +1276,21 @@ Value ModuleEmitter::emitCallAsImplemented(const parser::Node &expr) {
   // unittest's suite runs what it holds, and the union method path answers
   // `test.__call__(result)` already. Re-spelled as that, the callee is still
   // evaluated once -- it is the call's receiver.
-  // ⛔ Only when every member declares `__call__`: a member that does not is
-  // a TypeError CPython raises at run time, and the refusal says which.
+  // ⭐ AND A UNION OF FUNCTIONS, which a name holding functions whose results
+  // differ is (`k = a` or `k = f`, with `a() -> int` and `f() -> float`): no
+  // one shape returns both, so the join keeps them apart and each arm calls
+  // its own function, its result entering the union as itself.
+  // ⛔ Only when every member declares `__call__` or is a function: a member
+  // that does not is a TypeError CPython raises at run time, and the refusal
+  // says which.
   if (calleeNode && calleeNode->kind != "Lambda")
     if (auto unionCallee = mlir::dyn_cast_if_present<py::UnionType>(
             types.widenLiteral(types.inferExpr(calleeNode)));
         unionCallee &&
         llvm::all_of(unionCallee.getMemberTypes(), [&](mlir::Type member) {
-          return mlir::isa<py::ContractType>(member) &&
-                 lookupClassMethod(member, "__call__").has_value();
+          return mlir::isa<py::CallableType>(member) ||
+                 (mlir::isa<py::ContractType>(member) &&
+                  lookupClassMethod(member, "__call__").has_value());
         })) {
       parser::NodePtr callee;
       if (const parser::Field *func = parser::findField(expr, "func"))

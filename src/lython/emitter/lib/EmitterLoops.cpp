@@ -131,6 +131,17 @@ bool containsLoopLevelBreak(const std::vector<parser::NodePtr> *body) {
   return containsStatementKind(body, kinds, /*stopAtLoops=*/true);
 }
 
+// A function, or a union of nothing but functions.
+bool isFunctionLane(mlir::Type type) {
+  if (mlir::isa_and_nonnull<py::CallableType>(type))
+    return true;
+  auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type);
+  return unionType &&
+         llvm::all_of(unionType.getMemberTypes(), [](mlir::Type member) {
+           return mlir::isa<py::CallableType>(member);
+         });
+}
+
 bool containsNamedExpr(const parser::Node *node) {
   return ast::walk(node, [](const parser::Node &current) {
     return current.kind == "NamedExpr" ? ast::Walk::Stop : ast::Walk::Continue;
@@ -265,10 +276,21 @@ llvm::SmallVector<CarriedLoopLocal, 4> ModuleEmitter::collectCarriedLoopLocals(
     // ⛔ Only `name = value` statements: a binding this read cannot type
     // leaves the lane as it was, and the back edge refuses what does not fit.
     // Each one is bound in a scratch frame as it is read, so `g = c` then
-    // `k = g` types `k` as `c`.
-    if (mlir::isa<py::CallableType>(carriedType)) {
+    // `k = g` types `k` as `c`; a `for` target, this loop's own included, is
+    // bound to what its iterable yields.
+    if (isFunctionLane(carriedType)) {
       TypeSystem::Scope readAhead = types.pushScope();
       llvm::SmallVector<mlir::Type, 4> bound{carriedType};
+      auto bindLoopTarget = [&](const parser::Node &loop) {
+        const parser::Node *target = ast::node(loop, "target");
+        if (!target || target->kind != "Name")
+          return;
+        if (mlir::Type element = types.widenLiteral(
+                types.iterationElementType(ast::node(loop, "iter"))))
+          types.bindLocalSymbol(ast::nameSpelling(*target), element);
+      };
+      if (statement.kind == "For" || statement.kind == "AsyncFor")
+        bindLoopTarget(statement);
       for (llvm::StringRef suite : {"body", "orelse"})
         if (const auto *statements = ast::nodeList(statement, suite))
           for (const parser::NodePtr &child : *statements)
@@ -277,6 +299,8 @@ llvm::SmallVector<CarriedLoopLocal, 4> ModuleEmitter::collectCarriedLoopLocals(
                   node.kind == "AsyncFunctionDef" || node.kind == "ClassDef" ||
                   node.kind == "Lambda")
                 return ast::Walk::SkipChildren;
+              if (node.kind == "For" || node.kind == "AsyncFor")
+                bindLoopTarget(node);
               const auto *targets = node.kind == "Assign"
                                         ? ast::nodeList(node, "targets")
                                         : nullptr;
@@ -315,8 +339,9 @@ llvm::SmallVector<CarriedLoopLocal, 4> ModuleEmitter::collectCarriedLoopLocals(
               }
               return ast::Walk::Continue;
             });
-      if (auto joined =
-              mlir::dyn_cast_if_present<py::CallableType>(types.join(bound)))
+      // A union of functions too, when no one shape returns what all of them
+      // do: a call through the lane then asks which one it holds.
+      if (mlir::Type joined = types.join(bound); isFunctionLane(joined))
         carriedType = joined;
     }
     mlir::Value initialValue =
@@ -526,7 +551,7 @@ llvm::SmallVector<mlir::Value, 4> ModuleEmitter::carriedLoopEdgeOperands(
     // ⭐ AND A FUNCTION INTO A FUNCTION LANE IT DOES NOT FIT, which the
     // upcast below retyped all the same, so the call through the lane found
     // no target.
-    bool functionLane = mlir::isa_and_nonnull<py::CallableType>(local.type) &&
+    bool functionLane = isFunctionLane(local.type) &&
                         mlir::isa_and_nonnull<py::CallableType>(assignedType);
     if ((bothManifest || unionIntoScalarLane || functionLane) &&
         assignedType != local.type &&

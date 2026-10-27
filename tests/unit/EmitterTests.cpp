@@ -2410,30 +2410,55 @@ TEST(EmitterTest, RefusesAUnionRebindOfALoopCarriedLocal) {
   EXPECT_TRUE(named);
 }
 
-// What: a function bound in a loop body through a name the read-ahead cannot
-// type (an inner loop's target), which does not fit the lane the pre-loop
-// function gave the name. It was
-// upcast into that lane unchecked, and the call through the name raised
-// "callable target is not available" where CPython calls the function.
+// What: a function bound in a loop body that cannot take the call made through
+// the loop's name. It was upcast into the pre-loop function's lane unchecked,
+// and the call raised "callable target is not available"; the lane now holds
+// either function, and the call is refused for the member that cannot take it.
 TEST(EmitterTest, RefusesAFunctionThatDoesNotFitALoopCarriedFunction) {
   mlir::MLIRContext context(testRegistry());
   lython::emitter::EmitResult result = emitSource(
       "def a(x: int) -> int:\n"
       "    return x + 1\n"
-      "def c(z: int) -> int:\n"
-      "    return z - 100\n"
+      "def two(x: int, y: int) -> int:\n"
+      "    return x * y\n"
       "def f() -> int:\n"
       "    k = a\n"
       "    total = 0\n"
       "    for i in range(2):\n"
       "        total += k(i)\n"
-      "        for g in [c]:\n"
-      "            k = g\n"
+      "        k = two\n"
       "    return total\n"
       "print(f())\n",
       context);
   EXPECT_FALSE(result.ok());
-  EXPECT_TRUE(reportsDiagnostic(result, "loop-carried local 'k' is bound to"));
+  EXPECT_TRUE(reportsDiagnostic(
+      result, "'__call__' runs on whichever member the value holds"));
+}
+
+// What: a match case that rebinds a name to a function returning another type.
+// The name is held in a cell, which cannot store a choice of functions, and
+// the lowering refused it with no source name; the emitter says so instead.
+TEST(EmitterTest, RefusesAMatchCaseRebindingToAFunctionOfAnotherResult) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult result = emitSource(
+      "def a(x: int) -> int:\n"
+      "    return x + 1\n"
+      "def f(x: int) -> float:\n"
+      "    return x / 2\n"
+      "def pick(n: int) -> int | float:\n"
+      "    k = a\n"
+      "    match n:\n"
+      "        case 1:\n"
+      "            k = f\n"
+      "        case _:\n"
+      "            pass\n"
+      "    return k(3)\n"
+      "print(pick(1))\n",
+      context);
+  EXPECT_FALSE(result.ok());
+  EXPECT_TRUE(reportsDiagnostic(
+      result, "is reassigned in a match case to functions that return "
+              "different types"));
 }
 
 // What: a statement in a class body that would have run. A class body executes
