@@ -989,8 +989,9 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
           // the lambda takes fewer parameters: `k = b` with `b(x, y=10)` then
           // `k = lambda x: x - 1` is a rebinding, which the merge after it
           // joins, not a lambda written against `b`. Its parameters are
-          // typed as `b`'s first ones; more than `b` has are left to the
-          // calls below.
+          // typed as `b`'s first ones, and its result is its body's (a float
+          // lambda after an int `a` is a function that returns a float);
+          // more parameters than `b` has are left to the calls below.
           const parser::Node *lambdaParameters = ast::node(*rhs, "args");
           if (expectedCallable && lambdaParameters &&
               !ast::node(*lambdaParameters, "vararg") &&
@@ -999,12 +1000,17 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
                 positionalArgumentNodes(*lambdaParameters).size();
             llvm::ArrayRef<mlir::Type> held =
                 expectedCallable.getPositionalTypes();
-            if (taken > held.size())
-              expectedCallable = {};
-            else if (taken < held.size())
-              expectedCallable = py::CallableType::get(
-                  &context, held.take_front(taken), {}, {}, {},
-                  expectedCallable.getResultTypes());
+            expectedCallable = {};
+            if (taken <= held.size()) {
+              py::CallableType parameters = py::CallableType::get(
+                  &context, held.take_front(taken), {}, {}, {}, {});
+              if (mlir::Type resultType =
+                      types.functionSignature(*rhs, std::nullopt, parameters)
+                          .resultType)
+                expectedCallable = py::CallableType::get(
+                    &context, held.take_front(taken), {}, {}, {},
+                    {resultType});
+            }
           }
           if (!expectedCallable)
             expectedCallable = lambdaCallSeedContract(name, *rhs);

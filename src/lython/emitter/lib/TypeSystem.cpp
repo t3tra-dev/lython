@@ -6823,8 +6823,13 @@ TypeSystem::unionMethodResult(mlir::Type receiver, llvm::StringRef method,
     return {};
   llvm::SmallVector<mlir::Type, 4> results;
   for (mlir::Type member : unionType.getMemberTypes()) {
-    CallInferenceResult inference = inferMethodCallWithEvidence(
-        widenLiteral(member), method, positional, keywords);
+    // A function value's `__call__` is the function: it has no class to
+    // look the method up on.
+    CallInferenceResult inference =
+        method == "__call__" && mlir::isa<py::CallableType>(member)
+            ? inferCallWithEvidence(member, positional, keywords)
+            : inferMethodCallWithEvidence(widenLiteral(member), method,
+                                          positional, keywords);
     if (!inference || !inference.resultType)
       return {};
     results.push_back(widenLiteral(inference.resultType));
@@ -7001,8 +7006,8 @@ TypeSystem::commonCallableJoin(mlir::ArrayRef<mlir::Type> members) const {
   // ⛔ And only when the RESULTS agree too. `[lambda: 1, lambda: 2.0]` joins
   // to `Callable[[], int | float]`, and an indirect call cannot return a union
   // -- the program left the emitter and died in the lowering ("runtime bundle
-  // value 0 for builtins.bool"). A union of callables keeps the emit-boundary
-  // refusal it already had, which is the honest answer for it.
+  // value 0 for builtins.bool"). The union of callables stays a union, and a
+  // call through it asks which function it holds (ModuleEmitter::emitCall).
   mlir::Type joinedResult = join(results);
   if (!joinedResult || mlir::isa<py::UnionType>(joinedResult) ||
       isObjectTop(*this, joinedResult))
