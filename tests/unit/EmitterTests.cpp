@@ -2411,7 +2411,8 @@ TEST(EmitterTest, RefusesAUnionRebindOfALoopCarriedLocal) {
 }
 
 // What: a function bound in a loop body through a name the read-ahead cannot
-// type, which does not fit the lane the pre-loop function gave the name. It was
+// type (an inner loop's target), which does not fit the lane the pre-loop
+// function gave the name. It was
 // upcast into that lane unchecked, and the call through the name raised
 // "callable target is not available" where CPython calls the function.
 TEST(EmitterTest, RefusesAFunctionThatDoesNotFitALoopCarriedFunction) {
@@ -2426,8 +2427,8 @@ TEST(EmitterTest, RefusesAFunctionThatDoesNotFitALoopCarriedFunction) {
       "    total = 0\n"
       "    for i in range(2):\n"
       "        total += k(i)\n"
-      "        g = c\n"
-      "        k = g\n"
+      "        for g in [c]:\n"
+      "            k = g\n"
       "    return total\n"
       "print(f())\n",
       context);
