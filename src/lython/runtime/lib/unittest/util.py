@@ -1,4 +1,10 @@
-"""Various utility functions."""
+"""Various utility functions.
+
+Deviations from CPython 3.14 (Lib/unittest/util.py): `_count_diff_all_purpose`
+returns plain (actual, expected, value) tuples rather than `_Mismatch` named
+tuples, and `_count_diff_hashable` is not provided (case.py counts with the
+all-purpose walk alone).
+"""
 
 from os.path import commonprefix
 
@@ -52,3 +58,39 @@ def safe_repr(obj: object, short: bool = False) -> str:
 
 def strclass(cls: type) -> str:
     return "%s.%s" % (cls.__module__, cls.__qualname__)
+
+def _count_diff_all_purpose[T, U](actual: list[T], expected: list[U]) -> list[tuple[int, int, T | U]]:
+    'Returns list of (cnt_act, cnt_exp, elem) triples where the counts differ'
+    # elements need not be hashable
+    s, t = list(actual), list(expected)
+    m, n = len(s), len(t)
+    # CPython overwrites a counted element with a NULL sentinel; a list here
+    # holds one element type, so the counted positions are marked beside it.
+    s_counted = [False] * m
+    t_counted = [False] * n
+    result: list[tuple[int, int, T | U]] = []
+    for i, elem in enumerate(s):
+        if s_counted[i]:
+            continue
+        cnt_s = cnt_t = 0
+        for j in range(i, m):
+            if not s_counted[j] and s[j] == elem:
+                cnt_s += 1
+                s_counted[j] = True
+        for j, other_elem in enumerate(t):
+            if not t_counted[j] and other_elem == elem:
+                cnt_t += 1
+                t_counted[j] = True
+        if cnt_s != cnt_t:
+            result.append((cnt_s, cnt_t, elem))
+
+    for i, elem in enumerate(t):
+        if t_counted[i]:
+            continue
+        cnt_t = 0
+        for j in range(i, n):
+            if not t_counted[j] and t[j] == elem:
+                cnt_t += 1
+                t_counted[j] = True
+        result.append((0, cnt_t, elem))
+    return result
