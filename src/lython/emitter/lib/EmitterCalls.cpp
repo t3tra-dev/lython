@@ -1014,8 +1014,8 @@ ModuleEmitter::tryEmitUnionMethodCall(const parser::Node &expr, Value receiver,
         std::vector<parser::NodePtr> keywordNodes;
         for (const auto &[name, value] : named)
           keywordNodes.push_back(synth::keyword(name, bind(value), expr.range));
-        bool function =
-            methodName == "__call__" && mlir::isa<py::CallableType>(member.type);
+        bool function = methodName == "__call__" &&
+                        mlir::isa<py::CallableType, py::TypeType>(member.type);
         parser::NodePtr call = synth::callWithKeywords(
             function ? std::move(memberNode)
                      : synth::attribute(std::move(memberNode), methodName,
@@ -1092,6 +1092,280 @@ ModuleEmitter::tryEmitUnionArgumentCall(const parser::Node &expr) {
   return emitUnionMemberDispatch(
       expr, unionValue, unionType, joined,
       [&](Value member) -> Value { return callWith(member); });
+}
+
+// ⭐ A UNION GIVEN TO A BUILTIN TYPE'S METHOD RUNS AS THE MEMBER IT HOLDS,
+// where the method takes it through a protocol: `"-".join(u)` for a
+// `u: list[str] | tuple[str, ...]`, `s.update(u)`, `xs.extend(u)`. The
+// signature accepts every member, so the call typed -- and then reached the
+// lowering, which hands such a parameter one object of one class and has none
+// to give for a value that is one of two ("cannot adapt ... to runtime
+// input"). This says which argument, when every member's call types.
+std::optional<ModuleEmitter::UnionArgumentSplit>
+ModuleEmitter::unionArgumentMethodSplit(const parser::Node &call,
+                                        const parser::Node &receiverNode,
+                                        llvm::StringRef methodName) {
+  mlir::Type receiverType = types.widenLiteral(types.inferExpr(&receiverNode));
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(receiverType);
+  if (!contract || isSourceClassContract(contract))
+    return std::nullopt;
+  const auto *args = ast::nodeList(call, "args");
+  const auto *keywords = ast::nodeList(call, "keywords");
+  if (!args || args->empty())
+    return std::nullopt;
+  llvm::SmallVector<mlir::Type, 4> positionalTypes;
+  std::optional<std::size_t> unionIndex;
+  for (auto [position, argument] : llvm::enumerate(*args)) {
+    if (!argument || argument->kind == "Starred")
+      return std::nullopt;
+    mlir::Type type = types.inferExpr(argument.get());
+    positionalTypes.push_back(type);
+    if (!unionIndex && mlir::isa_and_nonnull<py::UnionType>(
+                           types.widenLiteral(type)))
+      unionIndex = position;
+  }
+  if (!unionIndex)
+    return std::nullopt;
+  llvm::SmallVector<CallKeywordType, 2> keywordTypes;
+  if (keywords)
+    for (const parser::NodePtr &keyword : *keywords) {
+      std::optional<std::string_view> name =
+          keyword ? ast::string(*keyword, "arg") : std::nullopt;
+      if (!name)
+        return std::nullopt;
+      keywordTypes.push_back(CallKeywordType{
+          std::string(*name), types.inferExpr(ast::node(*keyword, "value"))});
+    }
+  CallInferenceResult inference = types.inferMethodCallWithEvidence(
+      receiverType, methodName, positionalTypes, keywordTypes);
+  auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+      inference.evidence.callableContract);
+  if (!inference || !callable)
+    return std::nullopt;
+  llvm::ArrayRef<mlir::Type> parameters = callable.getPositionalTypes();
+  mlir::Type parameter =
+      *unionIndex + 1 < parameters.size() ? parameters[*unionIndex + 1]
+      : callable.hasVararg()              ? callable.getVarargType()
+                                          : mlir::Type();
+  if (!mlir::isa_and_nonnull<py::ProtocolType>(parameter))
+    return std::nullopt;
+  auto unionType = mlir::cast<py::UnionType>(
+      types.widenLiteral(positionalTypes[*unionIndex]));
+  for (mlir::Type member : unionType.getMemberTypes()) {
+    llvm::SmallVector<mlir::Type, 4> memberTypes(positionalTypes);
+    memberTypes[*unionIndex] = member;
+    if (!types.inferMethodCallWithEvidence(receiverType, methodName,
+                                           memberTypes, keywordTypes))
+      return std::nullopt;
+  }
+  return UnionArgumentSplit{
+      *unionIndex, unionType, inference.resultType,
+      types.isStructuralMutatorMethod(contract, methodName)};
+}
+
+// The call per member, as an expression: the receiver and the arguments are
+// evaluated once, in order, before the tag is asked.
+// ⛔ NOT a method that can reallocate its receiver: it rebinds the NAME it was
+// called through, and a rebinding made in one arm of an expression does not
+// reach past it. Its statement form is split as a statement
+// (tryEmitUnionArgumentMutation); anywhere else it is refused.
+std::optional<Value> ModuleEmitter::tryEmitUnionArgumentMethodCall(
+    const parser::Node &expr, const parser::Node &receiverNode,
+    llvm::StringRef methodName) {
+  std::optional<UnionArgumentSplit> split =
+      unionArgumentMethodSplit(expr, receiverNode, methodName);
+  if (!split)
+    return std::nullopt;
+  if (split->rebindsReceiver) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "'" + std::string(methodName) +
+            "' can reallocate the object it is called on and rebinds the "
+            "name that holds it, and here it is given a union, which runs "
+            "the call once per member: call it as a statement of its own, "
+            "on a name"});
+    return emitNone(expr);
+  }
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  llvm::SmallVector<std::string, 6> held;
+  auto release = llvm::scope_exit([&] {
+    for (const std::string &name : held)
+      values.erase(name);
+  });
+  auto hold = [&](Value value) {
+    std::string name =
+        "__lyunionarg" + std::to_string(++syntheticFunctionCounter);
+    values[name] = value;
+    types.bindSymbol(name, value.type);
+    held.push_back(name);
+    return name;
+  };
+  std::string receiverName = hold(emitExpr(&receiverNode));
+  llvm::SmallVector<std::string, 4> positional;
+  for (const parser::NodePtr &argument : *args)
+    positional.push_back(hold(emitExpr(argument.get())));
+  llvm::SmallVector<std::pair<std::string, std::string>, 2> named;
+  if (keywords)
+    for (const parser::NodePtr &keyword : *keywords)
+      named.emplace_back(std::string(*ast::string(*keyword, "arg")),
+                         hold(emitExpr(ast::node(*keyword, "value"))));
+  auto callWith = [&](std::optional<Value> member) -> Value {
+    std::vector<parser::NodePtr> argumentNodes;
+    for (auto [position, name] : llvm::enumerate(positional))
+      argumentNodes.push_back(synth::name(
+          member && position == split->index ? hold(*member) : name,
+          expr.range));
+    std::vector<parser::NodePtr> keywordNodes;
+    for (const auto &[keyword, name] : named)
+      keywordNodes.push_back(
+          synth::keyword(keyword, synth::name(name, expr.range), expr.range));
+    parser::NodePtr call = synth::callWithKeywords(
+        synth::attribute(synth::name(receiverName, expr.range), methodName,
+                         expr.range),
+        std::move(argumentNodes), std::move(keywordNodes), expr.range);
+    synthesizedIteratorDefs.push_back(call);
+    return emitExpr(call.get());
+  };
+  Value unionValue = values[positional[split->index]];
+  auto heldUnion =
+      mlir::dyn_cast<py::UnionType>(types.widenLiteral(unionValue.type));
+  if (!heldUnion)
+    return callWith(std::nullopt);
+  return emitUnionMemberDispatch(
+      expr, unionValue, heldUnion, split->result,
+      [&](Value member) -> Value { return callWith(member); });
+}
+
+static bool containsNodeKind(const parser::Node &node, llvm::StringRef kind) {
+  if (node.kind == kind)
+    return true;
+  for (const parser::Field &field : node.fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child && containsNodeKind(**child, kind))
+        return true;
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &item : *children)
+        if (item && containsNodeKind(*item, kind))
+          return true;
+    }
+  }
+  return false;
+}
+
+// ⭐ THE STATEMENT `xs.extend(u)` IS SPLIT AS A STATEMENT: an `isinstance`
+// chain over the union, one call per member, which the if statement joins --
+// the rebinding of `xs` each call makes included, as it joins any other
+// assignment in an arm. The arguments are evaluated once, in order, into
+// temporaries the arms read.
+// ⛔ The receiver is a name and is read again in each arm, after the
+// arguments; CPython reads it first. The two are one value while the arguments
+// cannot rebind the name: never a walrus among them, and no call either unless
+// the name is the function's own local.
+// ⛔ And each test must narrow the union to exactly its member, as the loop
+// split's do (`list[int] | list[str]` is one class to `isinstance`).
+bool ModuleEmitter::tryEmitUnionArgumentMutation(const parser::Node &call) {
+  const parser::Node *callee = ast::node(call, "func");
+  if (!callee || callee->kind != "Attribute")
+    return false;
+  const parser::Node *receiverNode = ast::node(*callee, "value");
+  std::optional<std::string_view> method = ast::string(*callee, "attr");
+  if (!receiverNode || receiverNode->kind != "Name" || !method)
+    return false;
+  std::optional<UnionArgumentSplit> split =
+      unionArgumentMethodSplit(call, *receiverNode, *method);
+  if (!split || !split->rebindsReceiver)
+    return false;
+  const auto *args = ast::nodeList(call, "args");
+  const auto *keywords = ast::nodeList(call, "keywords");
+  bool local = values.count(ast::nameSpelling(*receiverNode)) != 0;
+  auto mayRebind = [&](const parser::Node *argument) {
+    return argument && (containsNodeKind(*argument, "NamedExpr") ||
+                        (!local && containsNodeKind(*argument, "Call")));
+  };
+  for (const parser::NodePtr &argument : *args)
+    if (mayRebind(argument.get()))
+      return false;
+  if (keywords)
+    for (const parser::NodePtr &keyword : *keywords)
+      if (mayRebind(ast::node(*keyword, "value")))
+        return false;
+  const parser::SourceRange range = call.range;
+  std::string temp =
+      "__lyunionarg" + std::to_string(++syntheticFunctionCounter);
+  types.bindSymbol(temp, split->unionType);
+  std::vector<parser::NodePtr> tests;
+  for (mlir::Type member : split->unionType.getMemberTypes().drop_back()) {
+    auto contract = mlir::dyn_cast<py::ContractType>(member);
+    if (!contract)
+      return false;
+    llvm::StringRef cls = contract.getContractName();
+    cls = cls.substr(cls.rfind('.') + 1);
+    parser::NodePtr test = synth::call(
+        synth::name("isinstance", range),
+        {synth::name(temp, range), synth::name(cls, range)}, range);
+    llvm::SmallVector<BranchTypeNarrowing, 2> facts =
+        branchTypeNarrowings(*test, types, module);
+    if (facts.size() != 1 || facts.front().name != temp ||
+        facts.front().trueType != member)
+      return false;
+    tests.push_back(std::move(test));
+  }
+
+  llvm::SmallVector<std::string, 4> held;
+  auto release = llvm::scope_exit([&] {
+    for (const std::string &name : held)
+      values.erase(name);
+  });
+  auto hold = [&](Value value, std::string name = {}) {
+    if (name.empty())
+      name = "__lyunionarg" + std::to_string(++syntheticFunctionCounter);
+    values[name] = value;
+    types.bindSymbol(name, value.type);
+    held.push_back(name);
+    return name;
+  };
+  llvm::SmallVector<std::string, 4> positional;
+  for (auto [position, argument] : llvm::enumerate(*args)) {
+    Value value = emitExpr(argument.get());
+    positional.push_back(position == split->index ? hold(value, temp)
+                                                  : hold(value));
+  }
+  llvm::SmallVector<std::pair<std::string, std::string>, 2> named;
+  if (keywords)
+    for (const parser::NodePtr &keyword : *keywords)
+      named.emplace_back(std::string(*ast::string(*keyword, "arg")),
+                         hold(emitExpr(ast::node(*keyword, "value"))));
+  auto callStatement = [&] {
+    std::vector<parser::NodePtr> argumentNodes;
+    for (const std::string &name : positional)
+      argumentNodes.push_back(synth::name(name, range));
+    std::vector<parser::NodePtr> keywordNodes;
+    for (const auto &[keyword, name] : named)
+      keywordNodes.push_back(
+          synth::keyword(keyword, synth::name(name, range), range));
+    return synth::exprStmt(
+        synth::callWithKeywords(
+            synth::attribute(synth::cloneTree(*receiverNode), *method, range),
+            std::move(argumentNodes), std::move(keywordNodes), range),
+        range);
+  };
+  parser::NodePtr chain = callStatement();
+  // The value the emission holds may already be narrower than the union.
+  if (types.widenLiteral(values[temp].type) == split->unionType) {
+    for (auto it = tests.rbegin(); it != tests.rend(); ++it) {
+      std::vector<parser::NodePtr> body;
+      body.push_back(callStatement());
+      std::vector<parser::NodePtr> orelse;
+      orelse.push_back(std::move(chain));
+      chain = synth::ifStmt(std::move(*it), std::move(body),
+                            std::move(orelse), range);
+    }
+  }
+  synthesizedIteratorDefs.push_back(chain);
+  emitStatement(*chain);
+  return true;
 }
 
 llvm::SmallVector<std::string, 8>
@@ -1347,15 +1621,17 @@ Value ModuleEmitter::emitCallAsImplemented(const parser::Node &expr) {
   // differ is (`k = a` or `k = f`, with `a() -> int` and `f() -> float`): no
   // one shape returns both, so the join keeps them apart and each arm calls
   // its own function, its result entering the union as itself.
-  // ⛔ Only when every member declares `__call__` or is a function: a member
-  // that does not is a TypeError CPython raises at run time, and the refusal
-  // says which.
+  // ⭐ AND A UNION OF CLASSES, which a loop over a tuple of them binds
+  // (`for cls in (A, B): cls()`): each arm constructs the class it holds.
+  // ⛔ Only when every member declares `__call__` or is a function or a class:
+  // a member that is none of them is a TypeError CPython raises at run time,
+  // and the refusal says which.
   if (calleeNode && calleeNode->kind != "Lambda")
     if (auto unionCallee = mlir::dyn_cast_if_present<py::UnionType>(
             types.widenLiteral(types.inferExpr(calleeNode)));
         unionCallee &&
         llvm::all_of(unionCallee.getMemberTypes(), [&](mlir::Type member) {
-          return mlir::isa<py::CallableType>(member) ||
+          return mlir::isa<py::CallableType, py::TypeType>(member) ||
                  (mlir::isa<py::ContractType>(member) &&
                   lookupClassMethod(member, "__call__").has_value());
         })) {
@@ -1645,62 +1921,136 @@ Value ModuleEmitter::emitCallAsImplemented(const parser::Node &expr) {
   // implementation to declare: the answer is a disjunction of the one that
   // exists.
   //
-  // The receiver is emitted ONCE (captured in the first disjunct, named by
-  // the rest), and the disjunction is RIGHT-nested for the same reason the
-  // comparison chain is: a capture is defined in the arm that made it, so a
-  // left-nested tree puts later arms where it does not dominate them.
+  // Everything is evaluated first, once, in CPython's order -- the receiver,
+  // every member of the tuple, then `start` and `end` -- and the disjunction
+  // reads the temporaries. Spelling the members and the bounds into each
+  // disjunct was silently different: the tuple is built before the method
+  // runs, so `s.startswith((f(), g()))` runs `g()` even when `f()` matches,
+  // and `s.startswith(("x", "y"), at())` runs `at()` once, not once per
+  // member tried.
+  //
+  // A tuple held in a name or a parameter is the same call: a positional one
+  // is tested member by member (`p[0]`, `p[1]`), and one of unknown length is
+  // walked.
+  //
+  // ⛔ Only on a str or bytes receiver: a class of the program may declare an
+  // affix method that takes the tuple itself.
   if (calleeNode && calleeNode->kind == "Attribute") {
     llvm::StringRef affix = ast::string(*calleeNode, "attr").value_or("");
     const auto *affixArgs = ast::nodeList(expr, "args");
     const auto *affixKeywords = ast::nodeList(expr, "keywords");
     const parser::Node *tupleArg =
         affixArgs && !affixArgs->empty() ? affixArgs->front().get() : nullptr;
-    if ((affix == "startswith" || affix == "endswith") && tupleArg &&
-        tupleArg->kind == "Tuple" && affixArgs->size() <= 3 &&
-        (!affixKeywords || affixKeywords->empty())) {
-      const auto *elts = ast::nodeList(*tupleArg, "elts");
-      const parser::Field *receiverField =
-          parser::findField(*calleeNode, "value");
-      if (elts && receiverField &&
-          std::holds_alternative<parser::NodePtr>(receiverField->value)) {
-        if (elts->empty()) {
-          auto constant = py::BoolConstantOp::create(
-              builder, loc(expr), types.literal("False"),
-              builder.getBoolAttr(false));
-          return Value{constant.getResult(), types.literal("False")};
-        }
-        parser::NodePtr receiver =
-            std::get<parser::NodePtr>(receiverField->value);
-        std::string subject =
-            "__lyaffix" + std::to_string(++listCompCounter);
-        auto affixCall = [&](std::size_t index) {
-          parser::NodePtr self = synth::name(subject, expr.range);
-          parser::NodePtr attribute = synth::attribute(std::move(self), affix.str(), calleeNode->range);
-          std::vector<parser::NodePtr> callArgs{(*elts)[index]};
-          for (std::size_t rest = 1; rest < affixArgs->size(); ++rest)
-            callArgs.push_back((*affixArgs)[rest]);
-          parser::NodePtr call = synth::call(std::move(attribute), std::move(callArgs), expr.range);
-          return call;
-        };
-        parser::NodePtr folded = affixCall(elts->size() - 1);
-        for (std::size_t index = elts->size() - 1; index > 0; --index) {
-          parser::NodePtr disjunction = parser::makeNode("BoolOp", expr.range);
-          parser::addField(*disjunction, "op",
-                           parser::makeNode("Or", expr.range));
-          parser::addField(*disjunction, "values",
-                           std::vector<parser::NodePtr>{affixCall(index - 1),
-                                                        std::move(folded)});
-          folded = std::move(disjunction);
-        }
-        parser::NodePtr target = synth::name(subject, expr.range);
-        parser::NodePtr bind = synth::assign(std::move(target), receiver, expr.range);
-        Value result = emitNone(expr);
-        runWithScratchNames({subject}, [&] {
-          emitStatement(*bind);
-          result = emitExpr(folded.get());
-        });
-        return result;
+    const parser::Node *receiverNode = ast::node(*calleeNode, "value");
+    auto hasAffixReceiver = [&] {
+      auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+          types.widenLiteral(types.inferExpr(receiverNode)));
+      if (!contract)
+        return false;
+      llvm::StringRef name = contract.getContractName();
+      return name == "builtins.str" || name == "builtins.bytes" ||
+             name == "builtins.bytearray";
+    };
+    // The arity a held tuple is tested over, and 1 for one walked whole.
+    std::size_t heldArity = 0;
+    auto isPrefixTuple = [&]() -> bool {
+      if (!tupleArg)
+        return false;
+      if (tupleArg->kind == "Tuple") {
+        const auto *elts = ast::nodeList(*tupleArg, "elts");
+        return elts && llvm::none_of(*elts, [](const parser::NodePtr &elt) {
+                 return !elt || elt->kind == "Starred";
+               });
       }
+      auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+          types.widenLiteral(types.inferExpr(tupleArg)));
+      if (tupleArg->kind == "Starred" || !contract ||
+          contract.getContractName() != "builtins.tuple" ||
+          contract.getArguments().empty())
+        return false;
+      heldArity = contract.getArguments().size();
+      return heldArity > 1 ||
+             callsUnshadowedBuiltin(synth::name("any", expr.range).get(),
+                                    "any");
+    };
+    bool tupleArgs =
+        affixArgs && affixArgs->size() <= 3 &&
+        llvm::none_of(*affixArgs, [](const parser::NodePtr &arg) {
+          return !arg || arg->kind == "Starred";
+        });
+    if ((affix == "startswith" || affix == "endswith") && tupleArgs &&
+        (!affixKeywords || affixKeywords->empty()) && receiverNode &&
+        isPrefixTuple() && hasAffixReceiver()) {
+      parser::SourceRange range = expr.range;
+      llvm::SmallVector<std::string, 6> held;
+      auto release = llvm::scope_exit([&] {
+        for (const std::string &name : held)
+          values.erase(name);
+      });
+      auto hold = [&](Value value) {
+        std::string name =
+            "__lyaffix" + std::to_string(++syntheticFunctionCounter);
+        values[name] = value;
+        types.bindSymbol(name, value.type);
+        held.push_back(name);
+        return name;
+      };
+      std::string subject = hold(emitExpr(receiverNode));
+      llvm::SmallVector<std::string, 4> members;
+      std::optional<std::string> tupleName;
+      if (tupleArg->kind == "Tuple") {
+        for (const parser::NodePtr &elt : *ast::nodeList(*tupleArg, "elts"))
+          members.push_back(hold(emitExpr(elt.get())));
+      } else {
+        tupleName = hold(emitExpr(tupleArg));
+      }
+      llvm::SmallVector<std::string, 2> bounds;
+      for (const parser::NodePtr &bound : llvm::drop_begin(*affixArgs))
+        bounds.push_back(hold(emitExpr(bound.get())));
+      auto affixCall = [&](parser::NodePtr prefix) {
+        std::vector<parser::NodePtr> callArgs{std::move(prefix)};
+        for (const std::string &bound : bounds)
+          callArgs.push_back(synth::name(bound, range));
+        return synth::call(synth::attribute(synth::name(subject, range),
+                                            affix, calleeNode->range),
+                           std::move(callArgs), range);
+      };
+      parser::NodePtr folded;
+      std::size_t arity = tupleName ? heldArity : members.size();
+      if (!tupleName && members.empty()) {
+        auto constant = py::BoolConstantOp::create(
+            builder, loc(expr), types.literal("False"),
+            builder.getBoolAttr(false));
+        return Value{constant.getResult(), types.literal("False")};
+      }
+      if (!tupleName || arity > 1) {
+        std::vector<parser::NodePtr> tests;
+        for (std::size_t index = 0; index < arity; ++index)
+          tests.push_back(affixCall(
+              tupleName ? synth::subscript(
+                              synth::name(*tupleName, range),
+                              synth::intConstant(
+                                  static_cast<std::int64_t>(index), range),
+                              range)
+                        : synth::name(members[index], range)));
+        folded = synth::orChain(std::move(tests), range);
+      } else {
+        parser::NodePtr generator = parser::makeNode("comprehension", range);
+        parser::addField(*generator, "target",
+                         synth::name("__ly$affix", range));
+        parser::addField(*generator, "iter", synth::name(*tupleName, range));
+        parser::addField(*generator, "ifs", std::vector<parser::NodePtr>{});
+        parser::addField(*generator, "is_async", std::int64_t{0});
+        parser::NodePtr walk = parser::makeNode("GeneratorExp", range);
+        parser::addField(*walk, "elt",
+                         affixCall(synth::name("__ly$affix", range)));
+        parser::addField(*walk, "generators",
+                         std::vector<parser::NodePtr>{generator});
+        folded = synth::call(synth::name("any", range), {std::move(walk)},
+                             range);
+      }
+      synthesizedHelperTrees.push_back(folded);
+      return emitExpr(folded.get());
     }
   }
 
@@ -2619,6 +2969,9 @@ Value ModuleEmitter::emitCallAsImplemented(const parser::Node &expr) {
               CallOperands operands = emitCallOperands(expr);
               return emitCallableDispatch(expr, callee, operands);
             }
+        if (std::optional<Value> split = tryEmitUnionArgumentMethodCall(
+                expr, *receiverNode, *methodName))
+          return *split;
         Value receiver = emitExpr(receiverNode);
         if (std::optional<Value> dispatched =
                 tryEmitUnionMethodCall(expr, receiver, *methodName))
@@ -8505,31 +8858,58 @@ bool ModuleEmitter::targetHasDynamicClassValue(const parser::Node *node) {
 // sides", and so was the `type[E] | tuple[type[E], ...]` CPython's own
 // signature spells. The tuple is walked (`any(... for c in e)`) and the
 // union is split by `isinstance(e, tuple)`, the spellings that already run.
-// ⛔ Only over names and attribute reads: the subject is read once per
-// class, and the target once to test it and once to use it, which a call
-// with effects would not survive. Anything else keeps the refusal.
+//
+// A tuple whose members are DIFFERENT classes -- `NUMBER = (int, float)`,
+// then `isinstance(x, NUMBER)` -- is tested member by member, `t[0]` or
+// `t[1]`: walking it would bind each class to one name whose type is the union
+// of them, which no test reads. That union is itself a target -- `for c in
+// (int, str): isinstance(x, c)` -- answered by asking its tag which class it
+// holds.
+//
+// ⛔ The subject and the target are evaluated once, in that order, as the call
+// would: anything but a name or an attribute read is held in a temporary, since
+// the rewrite reads the subject once per class.
 std::optional<Value> ModuleEmitter::emitSubclassTestOverClassTuple(
     const parser::Node &expr, const parser::Node *subjectNode,
     const parser::Node *targetNode, bool subjectIsInstance) {
   if (!subjectNode || !targetNode || targetNode->kind == "Tuple")
     return std::nullopt;
+  auto isClassValue = [](mlir::Type type) {
+    if (mlir::isa_and_nonnull<py::TypeType>(type))
+      return true;
+    auto held = mlir::dyn_cast_if_present<py::UnionType>(type);
+    return held && llvm::all_of(held.getMemberTypes(), [](mlir::Type member) {
+             return mlir::isa<py::TypeType>(member);
+           });
+  };
   auto isClassTuple = [&](mlir::Type type) {
     auto tuple = mlir::dyn_cast_if_present<py::ContractType>(type);
     return tuple && tuple.getContractName() == "builtins.tuple" &&
            !tuple.getArguments().empty() &&
-           llvm::all_of(tuple.getArguments(), [](mlir::Type element) {
-             return mlir::isa<py::TypeType>(element);
-           });
+           llvm::all_of(tuple.getArguments(), isClassValue);
   };
   mlir::Type targetType = types.widenLiteral(types.inferExpr(targetNode));
   auto targetUnion = mlir::dyn_cast_if_present<py::UnionType>(targetType);
+  bool heldClass = targetUnion && isClassValue(targetType);
   bool splitsUnion =
-      targetUnion &&
+      targetUnion && !heldClass &&
       llvm::any_of(targetUnion.getMemberTypes(), isClassTuple) &&
       llvm::all_of(targetUnion.getMemberTypes(), [&](mlir::Type member) {
         return isClassTuple(member) || mlir::isa<py::TypeType>(member);
       });
-  if (!isClassTuple(targetType) && !splitsUnion)
+  std::size_t fixedArity = 0;
+  if (isClassTuple(targetType))
+    if (std::size_t arity =
+            mlir::cast<py::ContractType>(targetType).getArguments().size();
+        arity > 1)
+      fixedArity = arity;
+  if (!isClassTuple(targetType) && !splitsUnion && !heldClass)
+    return std::nullopt;
+  // Asked before anything is evaluated: declining after would evaluate again.
+  if (splitsUnion && !callsUnshadowedBuiltin(synth::name("tuple", expr.range).get(), "tuple"))
+    return std::nullopt;
+  if (!heldClass && !splitsUnion && !fixedArity &&
+      !callsUnshadowedBuiltin(synth::name("any", expr.range).get(), "any"))
     return std::nullopt;
   std::function<bool(const parser::Node *)> isRead =
       [&](const parser::Node *node) {
@@ -8539,33 +8919,75 @@ std::optional<Value> ModuleEmitter::emitSubclassTestOverClassTuple(
           return true;
         return node->kind == "Attribute" && isRead(ast::node(*node, "value"));
       };
-  if (!isRead(subjectNode) || !isRead(targetNode))
-    return std::nullopt;
   parser::SourceRange range = expr.range;
+  llvm::SmallVector<std::string, 3> held;
+  auto release = llvm::scope_exit([&] {
+    for (const std::string &name : held)
+      values.erase(name);
+  });
+  auto hold = [&](Value value) {
+    std::string name =
+        "__lyclasstest" + std::to_string(++syntheticFunctionCounter);
+    values[name] = value;
+    types.bindSymbol(name, value.type);
+    held.push_back(name);
+    return name;
+  };
+  // Both are evaluated before either is read, subject first.
+  std::optional<std::string> subjectName, targetName;
+  if (!isRead(subjectNode) || heldClass)
+    subjectName = hold(emitExpr(subjectNode));
+  std::optional<Value> targetValue;
+  if (!isRead(targetNode) || heldClass) {
+    targetValue = emitExpr(targetNode);
+    targetName = hold(*targetValue);
+  }
+  auto subjectRef = [&] {
+    return subjectName ? synth::name(*subjectName, range)
+                       : synth::cloneTree(*subjectNode);
+  };
+  auto targetRef = [&] {
+    return targetName ? synth::name(*targetName, range)
+                      : synth::cloneTree(*targetNode);
+  };
   llvm::StringRef test = subjectIsInstance ? "isinstance" : "issubclass";
   auto testAgainst = [&](parser::NodePtr target) {
     return synth::call(synth::name(test, range),
-                       {synth::cloneTree(*subjectNode), std::move(target)},
-                       range);
+                       {subjectRef(), std::move(target)}, range);
   };
+  if (heldClass) {
+    // The value the emission holds may already be narrower than the union.
+    auto heldUnion = mlir::dyn_cast<py::UnionType>(
+        types.widenLiteral(targetValue->type));
+    auto testMember = [&](Value member) -> Value {
+      parser::NodePtr call = testAgainst(synth::name(hold(member), range));
+      synthesizedHelperTrees.push_back(call);
+      return emitExpr(call.get());
+    };
+    if (!heldUnion)
+      return testMember(*targetValue);
+    return emitUnionMemberDispatch(expr, *targetValue, heldUnion,
+                                   types.boolType(), testMember);
+  }
   parser::NodePtr rewritten;
-  if (splitsUnion) {
+  if (fixedArity) {
+    std::vector<parser::NodePtr> tests;
+    for (std::size_t index = 0; index < fixedArity; ++index)
+      tests.push_back(testAgainst(synth::subscript(
+          targetRef(), synth::intConstant(static_cast<std::int64_t>(index), range),
+          range)));
+    rewritten = synth::orChain(std::move(tests), range);
+  } else if (splitsUnion) {
     parser::NodePtr tupleName = synth::name("tuple", range);
-    if (!callsUnshadowedBuiltin(tupleName.get(), "tuple"))
-      return std::nullopt;
     rewritten = synth::ifExp(
         synth::call(synth::name("isinstance", range),
-                    {synth::cloneTree(*targetNode), std::move(tupleName)},
-                    range),
-        testAgainst(synth::cloneTree(*targetNode)),
-        testAgainst(synth::cloneTree(*targetNode)), range);
+                    {targetRef(), std::move(tupleName)}, range),
+        testAgainst(targetRef()), testAgainst(targetRef()), range);
   } else {
     parser::NodePtr any = synth::name("any", range);
-    if (!callsUnshadowedBuiltin(any.get(), "any"))
-      return std::nullopt;
     parser::NodePtr generator = parser::makeNode("comprehension", range);
     parser::addField(*generator, "target", synth::name("__ly$class", range));
-    parser::addField(*generator, "iter", synth::cloneTree(*targetNode));
+    parser::addField(*generator, "iter", targetRef());
     parser::addField(*generator, "ifs", std::vector<parser::NodePtr>{});
     parser::addField(*generator, "is_async", std::int64_t{0});
     parser::NodePtr walk = parser::makeNode("GeneratorExp", range);

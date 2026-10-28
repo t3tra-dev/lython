@@ -319,6 +319,27 @@ private:
   std::optional<Value> tryEmitUnionMethodCall(const parser::Node &expr,
                                               Value receiver,
                                               llvm::StringRef methodName);
+  // A union argument of a builtin type's method that takes it through a
+  // protocol: which argument, the result, and whether the method rebinds its
+  // receiver.
+  struct UnionArgumentSplit {
+    std::size_t index;
+    py::UnionType unionType;
+    mlir::Type result;
+    bool rebindsReceiver;
+  };
+  std::optional<UnionArgumentSplit>
+  unionArgumentMethodSplit(const parser::Node &call,
+                           const parser::Node &receiverNode,
+                           llvm::StringRef methodName);
+  std::optional<Value>
+  tryEmitUnionArgumentMethodCall(const parser::Node &expr,
+                                 const parser::Node &receiverNode,
+                                 llvm::StringRef methodName);
+  bool tryEmitUnionArgumentMutation(const parser::Node &call);
+  std::optional<Value> tryEmitUnionAttributeRead(const parser::Node &expr,
+                                                 Value receiver,
+                                                 llvm::StringRef attribute);
   struct VirtualDispatchHelper {
     std::string symbol;
     py::CallableType callable;

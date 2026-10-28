@@ -1308,8 +1308,17 @@ tryManifestMethod(const TypeSystem &types, mlir::Type receiverType,
   // Positional tuple typing: a tuple contract carrying one argument PER
   // POSITION (heterogeneous annotations/literals, dict.items()'s
   // tuple[$K,$V]) types a literal-index __getitem__ as that position's
-  // member. The homogeneous view (joined members) instantiates the manifest
-  // contract; only the RESULT narrows to the indexed member.
+  // member. The homogeneous view (the members' union) instantiates the
+  // manifest contract; only the RESULT narrows to the indexed member.
+  //
+  // ⛔ The union, NOT `TypeSystem::join`: the evidence verifier binds the
+  // manifest's T for this receiver to the normalized union of its members, and
+  // the join answers something else for four kinds of member -- instances of
+  // one source base (`(Dog(), Cat())`, joined at `Animal`), class values
+  // (`(int, str)`, joined at `type[object]`), callables (joined at a shape)
+  // and tuples of one arity (`((1, 1), ("s", "t"))`, joined position by
+  // position) -- so `t[0]` over any of them compiled to evidence the lowering
+  // refused.
   if (methodName == "__getitem__" && positional.size() == 1 &&
       keywords.empty()) {
     auto tuple = mlir::dyn_cast_if_present<py::ContractType>(
@@ -1324,7 +1333,8 @@ tryManifestMethod(const TypeSystem &types, mlir::Type receiverType,
                        : *index;
         if (position >= 0 &&
             position < static_cast<std::int64_t>(members.size())) {
-          mlir::Type joinedView = types.tupleOf(types.join(members));
+          mlir::Type joinedView = types.tupleOf(
+              py::UnionType::getNormalized(&types.getContext(), members));
           if (std::optional<CallSolution> solution = tryManifestMethod(
                   types, joinedView, methodName, positional, keywords)) {
             solution->result = members[position];

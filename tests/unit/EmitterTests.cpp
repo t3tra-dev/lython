@@ -4219,6 +4219,35 @@ TEST(EmitterTest, AnInternalManifestMethodIsNotAnAttributeOfABuiltin) {
   EXPECT_TRUE(own.ok());
 }
 
+// What: a needle whose type says it is not a str is refused for a str
+// haystack, with the text of the TypeError CPython raises for it -- against a
+// str, and against a union with a str member -- while a union that may hold a
+// str is accepted, to be decided at run time.
+TEST(EmitterTest, AStrIsSearchedOnlyForAStr) {
+  mlir::MLIRContext context(testRegistry());
+  auto refusedWith = [&](llvm::StringRef source, llvm::StringRef message) {
+    lython::emitter::EmitResult emitted = emitSource(source, context);
+    EXPECT_FALSE(emitted.ok()) << source.str();
+    bool found = false;
+    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+      found = found || diagnostic.message.find(message.str()) != std::string::npos;
+    EXPECT_TRUE(found) << source.str();
+  };
+  refusedWith("s = 'ab'\nprint(1 in s)\n",
+              "'in <string>' requires string as left operand, not int");
+  refusedWith("def pick(c: bool):\n"
+              "    return 'ab' if c else [1, 2]\n"
+              "print(1 in pick(False))\n",
+              "for its member str: 'in <string>' requires string as left "
+              "operand, not int");
+  lython::emitter::EmitResult mayHoldOne = emitSource(
+      "def key(c: bool):\n"
+      "    return 'a' if c else 5\n"
+      "print(key(True) in 'abc')\n",
+      context);
+  EXPECT_TRUE(mayHoldOne.ok());
+}
+
 // What: `@overload` declarations without the def that implements them are
 // refused, for a module function and for a method, and a call that no
 // overload accepts is refused even where the implementation's own signature

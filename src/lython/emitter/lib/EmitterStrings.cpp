@@ -390,6 +390,17 @@ Value ModuleEmitter::emitFormatValue(const parser::Node &anchor, Value value,
                                      bool specKnownEmpty) {
   mlir::Type strType = types.contract("builtins.str");
   mlir::Type valueType = types.widenLiteral(value.type);
+  // ⭐ A UNION IS FORMATTED AS THE MEMBER IT HOLDS: `f"{v:>6}"` for an
+  // `int | float` is the int's or the float's `__format__`, as `str(v)` is
+  // already the member's `__str__`. The spec has been evaluated once, and each
+  // arm reads it.
+  // ⛔ A spec only: without one the union is stringified by tag already.
+  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(valueType);
+      unionType && spec && !specKnownEmpty)
+    return emitUnionMemberDispatch(
+        anchor, value, unionType, strType, [&](Value member) -> Value {
+          return emitFormatValue(anchor, member, spec, specKnownEmpty);
+        });
   // ⭐ ASK THE DISPATCHER BEFORE REFUSING, the way `__repr__` above does. This
   // site went straight to the refusal, so `format(x, "")` and `f"{x}"` on a
   // base-typed receiver were rejected for a hierarchy whose `repr(x)` one line

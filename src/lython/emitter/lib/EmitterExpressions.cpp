@@ -1739,8 +1739,17 @@ std::optional<Value> ModuleEmitter::tryEmitObjectInStr(const parser::Node &expr)
   parser::NodePtr needle = std::get<parser::NodePtr>(leftField->value);
   parser::NodePtr haystack = (*comparators)[0];
   if (!needle || !haystack ||
-      types.widenLiteral(types.inferExpr(haystack.get())) != types.strType() ||
-      !py::isPyObjectType(types.widenLiteral(types.inferExpr(needle.get()))))
+      types.widenLiteral(types.inferExpr(haystack.get())) != types.strType())
+    return std::nullopt;
+  // A union that may hold a str is asked the same way, as the object it is
+  // passed as: the search when it holds one, the TypeError when it does not.
+  mlir::Type needleType = types.widenLiteral(types.inferExpr(needle.get()));
+  auto needleUnion = mlir::dyn_cast_if_present<py::UnionType>(needleType);
+  if (!py::isPyObjectType(needleType) &&
+      !(needleUnion &&
+        llvm::any_of(needleUnion.getMemberTypes(), [&](mlir::Type member) {
+          return types.widenLiteral(member) == types.strType();
+        })))
     return std::nullopt;
   parser::SourceRange range = expr.range;
   if (objectInStrHelper.empty()) {
@@ -2434,6 +2443,41 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
     return emitNone(expr);
   }
   if (ast::isOperator(op, "In") || ast::isOperator(op, "NotIn")) {
+    // ⭐ A NEEDLE THE TYPE SAYS IS NOT A str IS CPython's TypeError for a str
+    // haystack, whatever its value ("'in <string>' requires string as left
+    // operand, not int"). The manifest's `__contains__` takes `object`, so the
+    // needle reached the lowering as lanes the string search has no place for
+    // ("runtime call is missing input 3 for builtins.str.__contains__") --
+    // `1 in "ab"`, and a union holding a str searched with an int.
+    // ⛔ Refused here and not raised: the type already says every run raises.
+    // An `object` needle, or a union that may hold a str, is decided at run
+    // time (tryEmitObjectInStr).
+    auto refusesNeedle = [&](mlir::Type haystack,
+                             llvm::StringRef where) -> bool {
+      mlir::Type needle = types.widenLiteral(lhs.type);
+      if (types.widenLiteral(haystack) != types.strType() ||
+          needle == types.strType())
+        return false;
+      std::string spelled = typeText(needle);
+      if (auto contract = mlir::dyn_cast<py::ContractType>(needle)) {
+        llvm::StringRef name = contract.getContractName();
+        spelled = name.substr(name.rfind('.') + 1).str();
+      }
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          where.str() + "'in <string>' requires string as left operand, not " +
+              spelled});
+      return true;
+    };
+    if (refusesNeedle(rhs.type, ""))
+      return emitNone(expr);
+    if (auto haystackUnion = mlir::dyn_cast_if_present<py::UnionType>(
+            types.widenLiteral(rhs.type)))
+      for (mlir::Type member : haystackUnion.getMemberTypes())
+        if (refusesNeedle(member,
+                          "'in' searches whichever member the union holds, "
+                          "and for its member str: "))
+          return emitNone(expr);
     if (std::optional<Value> contains =
             tryEmitClassDunder(expr, rhs, "__contains__", {lhs})) {
       Value membership = *contains;
@@ -3551,6 +3595,39 @@ bool ModuleEmitter::refuseInternalManifestMethod(const parser::Node &attribute) 
   return true;
 }
 
+// ⭐ A UNION READS THE ATTRIBUTE OF THE MEMBER IT HOLDS, by tag, as it calls
+// a method of it: `c.__name__` for a `c` walking `(int, str)`, `u.real` for an
+// `int | float`, and a field two classes both declare with different types.
+// Each reached the lowering, whose union read selects one FIELD of one type
+// from the box, and stopped there ("has no class schema for attribute").
+// ⛔ That read is kept where it applies -- every member a class of the program
+// declaring the field with one type -- since it needs no branch.
+std::optional<Value>
+ModuleEmitter::tryEmitUnionAttributeRead(const parser::Node &expr,
+                                         Value receiver,
+                                         llvm::StringRef attribute) {
+  auto unionType = mlir::dyn_cast_if_present<py::UnionType>(
+      types.widenLiteral(receiver.type));
+  if (!unionType || attribute == "__class__" ||
+      lookupClassField(receiver.type, attribute))
+    return std::nullopt;
+  mlir::Type joined = types.inferExpr(&expr);
+  if (!joined || types.widenLiteral(joined) == types.object())
+    return std::nullopt;
+  return emitUnionMemberDispatch(
+      expr, receiver, unionType, joined, [&](Value member) -> Value {
+        std::string name =
+            "__lyunionattr" + std::to_string(++syntheticFunctionCounter);
+        values[name] = member;
+        types.bindSymbol(name, member.type);
+        auto forget = llvm::scope_exit([&] { values.erase(name); });
+        parser::NodePtr read = synth::attribute(synth::name(name, expr.range),
+                                                attribute, expr.range);
+        synthesizedIteratorDefs.push_back(read);
+        return emitExpr(read.get());
+      });
+}
+
 Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   if (refuseInternalManifestMethod(expr))
     return emitNone(expr);
@@ -3583,6 +3660,8 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   auto attr = ast::string(expr, "attr");
   if (!attr)
     return emitNone(expr);
+  if (std::optional<Value> read = tryEmitUnionAttributeRead(expr, object, *attr))
+    return *read;
   // ⭐ A CLASS THAT DEFINES `__getattribute__` ANSWERS EVERY READ ITSELF, as
   // CPython asks it before anything else -- a field the class also declares
   // included. The field was read directly, and `__getattribute__` returning

@@ -811,6 +811,8 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     if (value && value->kind == "Constant" &&
         ast::isEllipsisField(*value, "value"))
       return;
+    if (value && value->kind == "Call" && tryEmitUnionArgumentMutation(*value))
+      return;
     // ⭐ A LIST IN A FIELD, MUTATED WITH AN ARGUMENT THAT CALLS, IS MUTATED
     // THROUGH A LOCAL. The field is read first, as Python reads it, and a call
     // in the argument the emitter inlines may bring blocks of its own -- a
