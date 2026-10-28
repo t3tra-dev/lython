@@ -1,4 +1,18 @@
-"""Test case implementation"""
+"""Test case implementation
+
+Deviations from CPython 3.14 (Lib/unittest/case.py):
+
+- assertCountEqual counts with `_count_diff_all_purpose` alone. CPython tries
+  `collections.Counter` first and falls back to it for unhashable elements on
+  TypeError; here an element's hashability is a static fact, and the two
+  counts report the same differences in the same order.
+- assertStartsWith and its three siblings do not catch AttributeError or
+  TypeError to explain a subject that is not str or bytes, and
+  assertIsSubclass and assertNotIsSubclass do not catch TypeError to explain
+  one that is not a class: such a call is refused when it is compiled.
+- assertHasAttr and assertNotHasAttr are not provided: they look an attribute
+  up by a name known only at run time.
+"""
 
 import sys
 import difflib
@@ -13,7 +27,7 @@ from collections.abc import Callable, Iterator
 from typing import overload
 
 from . import result
-from .util import strclass, safe_repr, _common_shorten_repr
+from .util import strclass, safe_repr, _common_shorten_repr, _count_diff_all_purpose
 
 __unittest = True
 
@@ -982,14 +996,14 @@ class TestCase(object):
             msg = self._formatMessage(msg, standardMsg)
             raise self.failureException(msg)
 
-    def _baseAssertEqual[T](self, first: T, second: T, msg: str | None = None) -> None:
+    def _baseAssertEqual[T, U](self, first: T, second: U, msg: str | None = None) -> None:
         """The default assertEqual implementation, not type specific."""
         if not first == second:
             standardMsg = '%s != %s' % _common_shorten_repr(first, second)
             msg = self._formatMessage(msg, standardMsg)
             raise self.failureException(msg)
 
-    def assertEqual[T](self, first: T, second: T, msg: str | None = None) -> None:
+    def assertEqual[T, U](self, first: T, second: U, msg: str | None = None) -> None:
         """Fail if the two objects are unequal as determined by the '=='
            operator.
         """
@@ -1013,7 +1027,7 @@ class TestCase(object):
             return
         self._baseAssertEqual(first, second, msg)
 
-    def assertNotEqual[T](self, first: T, second: T, msg: str | None = None) -> None:
+    def assertNotEqual[T, U](self, first: T, second: U, msg: str | None = None) -> None:
         """Fail if the two objects are equal as determined by the '!='
            operator.
         """
@@ -1067,7 +1081,42 @@ class TestCase(object):
         msg = self._formatMessage(msg, standardMsg)
         raise self.failureException(msg)
 
-    def assertSequenceEqual[S](self, seq1: S, seq2: S, msg: str | None = None,
+    def assertNotAlmostEqual(self, first: float, second: float, places: int | None = None,
+                             msg: str | None = None, delta: float | None = None) -> None:
+        """Fail if the two objects are equal as determined by their
+           difference rounded to the given number of decimal places
+           (default 7) and comparing to zero, or by comparing that the
+           difference between the two objects is less than the given delta.
+
+           Note that decimal places (from zero) are usually not the same
+           as significant digits (measured from the most significant digit).
+
+           Objects that are equal automatically fail.
+        """
+        if delta is not None and places is not None:
+            raise TypeError("specify delta or places not both")
+        diff = abs(first - second)
+        if delta is not None:
+            if not (first == second) and diff > delta:
+                return
+            standardMsg = '%s == %s within %s delta (%s difference)' % (
+                safe_repr(first),
+                safe_repr(second),
+                safe_repr(delta),
+                safe_repr(diff))
+        else:
+            if places is None:
+                places = 7
+            if not (first == second) and round(diff, places) != 0:
+                return
+            standardMsg = '%s == %s within %r places' % (safe_repr(first),
+                                                         safe_repr(second),
+                                                         places)
+
+        msg = self._formatMessage(msg, standardMsg)
+        raise self.failureException(msg)
+
+    def assertSequenceEqual[S, R](self, seq1: S, seq2: R, msg: str | None = None,
                                seq_type: type | None = None) -> None:
         """An equality assertion for ordered sequences (like lists and tuples).
 
@@ -1136,7 +1185,7 @@ class TestCase(object):
             return message + diff
         return message + (DIFF_OMITTED % len(diff))
 
-    def assertListEqual[T](self, list1: list[T], list2: list[T], msg: str | None = None) -> None:
+    def assertListEqual[T, U](self, list1: list[T], list2: list[U], msg: str | None = None) -> None:
         """A list-specific equality assertion.
 
         Args:
@@ -1148,7 +1197,7 @@ class TestCase(object):
         """
         self.assertSequenceEqual(list1, list2, msg, seq_type=list)
 
-    def assertTupleEqual[S](self, tuple1: S, tuple2: S, msg: str | None = None) -> None:
+    def assertTupleEqual[S, R](self, tuple1: S, tuple2: R, msg: str | None = None) -> None:
         """A tuple-specific equality assertion.
 
         Args:
@@ -1159,7 +1208,7 @@ class TestCase(object):
         """
         self.assertSequenceEqual(tuple1, tuple2, msg, seq_type=tuple)
 
-    def assertSetEqual[S](self, set1: S, set2: S, msg: str | None = None) -> None:
+    def assertSetEqual[S, R](self, set1: S, set2: R, msg: str | None = None) -> None:
         """A set-specific equality assertion.
 
         Args:
@@ -1191,14 +1240,14 @@ class TestCase(object):
         standardMsg = '\n'.join(lines)
         self.fail(self._formatMessage(msg, standardMsg))
 
-    def assertIn[T](self, member: T, container: list[T], msg: str | None = None) -> None:
+    def assertIn[T, C](self, member: T, container: C, msg: str | None = None) -> None:
         """Just like self.assertTrue(a in b), but with a nicer default message."""
         if member not in container:
             standardMsg = '%s not found in %s' % (safe_repr(member),
                                                   safe_repr(container))
             self.fail(self._formatMessage(msg, standardMsg))
 
-    def assertNotIn[T](self, member: T, container: list[T], msg: str | None = None) -> None:
+    def assertNotIn[T, C](self, member: T, container: C, msg: str | None = None) -> None:
         """Just like self.assertTrue(a not in b), but with a nicer default message."""
         if member in container:
             standardMsg = '%s unexpectedly found in %s' % (safe_repr(member),
@@ -1218,7 +1267,7 @@ class TestCase(object):
             standardMsg = 'unexpectedly identical: %s' % (safe_repr(expr1),)
             self.fail(self._formatMessage(msg, standardMsg))
 
-    def assertDictEqual[K, V](self, d1: dict[K, V], d2: dict[K, V], msg: str | None = None) -> None:
+    def assertDictEqual[K, V, L, W](self, d1: dict[K, V], d2: dict[L, W], msg: str | None = None) -> None:
         if d1 != d2:
             standardMsg = '%s != %s' % _common_shorten_repr(d1, d2)
             diff = ('\n' + '\n'.join(difflib.ndiff(
@@ -1226,6 +1275,29 @@ class TestCase(object):
                            pprint.pformat(d2).splitlines())))
             standardMsg = self._truncateMessage(standardMsg, diff)
             self.fail(self._formatMessage(msg, standardMsg))
+
+    def assertCountEqual[T, U](self, first: T, second: U, msg: str | None = None) -> None:
+        """Asserts that two iterables have the same elements, the same number of
+        times, without regard to order.
+
+            self.assertEqual(Counter(list(first)),
+                             Counter(list(second)))
+
+         Example:
+            - [0, 1, 1] and [1, 0, 1] compare equal.
+            - [0, 0, 1] and [0, 1] compare unequal.
+
+        """
+        first_seq, second_seq = list(first), list(second)
+        differences = _count_diff_all_purpose(first_seq, second_seq)
+
+        if differences:
+            standardMsg = 'Element counts were not equal:\n'
+            lines = ['First has %d, Second has %d:  %r' % diff for diff in differences]
+            diffMsg = '\n'.join(lines)
+            standardMsg = self._truncateMessage(standardMsg, diffMsg)
+            msg = self._formatMessage(msg, standardMsg)
+            self.fail(msg)
 
     def assertMultiLineEqual(self, first: str, second: str, msg: str | None = None) -> None:
         """Assert that two multi-line strings are equal."""
@@ -1259,16 +1331,28 @@ class TestCase(object):
             standardMsg = self._truncateMessage(standardMsg, diff)
             self.fail(self._formatMessage(msg, standardMsg))
 
-    def assertLess[T: float](self, a: T, b: T, msg: str | None = None) -> None:
+    def assertLess[T, U](self, a: T, b: U, msg: str | None = None) -> None:
         """Just like self.assertTrue(a < b), but with a nicer default message."""
         if not a < b:
             standardMsg = '%s not less than %s' % (safe_repr(a), safe_repr(b))
             self.fail(self._formatMessage(msg, standardMsg))
 
-    def assertGreater[T: float](self, a: T, b: T, msg: str | None = None) -> None:
+    def assertLessEqual[T, U](self, a: T, b: U, msg: str | None = None) -> None:
+        """Just like self.assertTrue(a <= b), but with a nicer default message."""
+        if not a <= b:
+            standardMsg = '%s not less than or equal to %s' % (safe_repr(a), safe_repr(b))
+            self.fail(self._formatMessage(msg, standardMsg))
+
+    def assertGreater[T, U](self, a: T, b: U, msg: str | None = None) -> None:
         """Just like self.assertTrue(a > b), but with a nicer default message."""
         if not a > b:
             standardMsg = '%s not greater than %s' % (safe_repr(a), safe_repr(b))
+            self.fail(self._formatMessage(msg, standardMsg))
+
+    def assertGreaterEqual[T, U](self, a: T, b: U, msg: str | None = None) -> None:
+        """Just like self.assertTrue(a >= b), but with a nicer default message."""
+        if not a >= b:
+            standardMsg = '%s not greater than or equal to %s' % (safe_repr(a), safe_repr(b))
             self.fail(self._formatMessage(msg, standardMsg))
 
     def assertIsNone(self, obj: object, msg: str | None = None) -> None:
@@ -1283,12 +1367,92 @@ class TestCase(object):
             standardMsg = 'unexpectedly None'
             self.fail(self._formatMessage(msg, standardMsg))
 
-    def assertIsInstance(self, obj: object, cls: type, msg: str | None = None) -> None:
+    def assertIsInstance[C](self, obj: object, cls: C, msg: str | None = None) -> None:
         """Same as self.assertTrue(isinstance(obj, cls)), with a nicer
         default message."""
         if not isinstance(obj, cls):
-            standardMsg = f'{safe_repr(obj)} is not an instance of {cls!r}'
+            if isinstance(cls, tuple):
+                standardMsg = f'{safe_repr(obj)} is not an instance of any of {cls!r}'
+            else:
+                standardMsg = f'{safe_repr(obj)} is not an instance of {cls!r}'
             self.fail(self._formatMessage(msg, standardMsg))
+
+    def assertNotIsInstance[C](self, obj: object, cls: C, msg: str | None = None) -> None:
+        """Included for symmetry with assertIsInstance."""
+        if isinstance(obj, cls):
+            standardMsg = f'{safe_repr(obj)} is an instance of {cls!r}'
+            if isinstance(cls, tuple):
+                for x in cls:
+                    if isinstance(obj, x):
+                        standardMsg = f'{safe_repr(obj)} is an instance of {x!r}'
+                        break
+            self.fail(self._formatMessage(msg, standardMsg))
+
+    def assertIsSubclass[C, S](self, cls: C, superclass: S, msg: str | None = None) -> None:
+        if issubclass(cls, superclass):
+            return
+        if isinstance(superclass, tuple):
+            standardMsg = f'{cls!r} is not a subclass of any of {superclass!r}'
+        else:
+            standardMsg = f'{cls!r} is not a subclass of {superclass!r}'
+        self.fail(self._formatMessage(msg, standardMsg))
+
+    def assertNotIsSubclass[C, S](self, cls: C, superclass: S, msg: str | None = None) -> None:
+        if not issubclass(cls, superclass):
+            return
+        standardMsg = f'{cls!r} is a subclass of {superclass!r}'
+        if isinstance(superclass, tuple):
+            for x in superclass:
+                if issubclass(cls, x):
+                    standardMsg = f'{cls!r} is a subclass of {x!r}'
+                    break
+        self.fail(self._formatMessage(msg, standardMsg))
+
+    def assertStartsWith[S, P](self, s: S, prefix: P, msg: str | None = None) -> None:
+        if s.startswith(prefix):
+            return
+        a = safe_repr(s, short=True)
+        b = safe_repr(prefix)
+        if isinstance(prefix, tuple):
+            standardMsg = f"{a} doesn't start with any of {b}"
+        else:
+            standardMsg = f"{a} doesn't start with {b}"
+        self.fail(self._formatMessage(msg, standardMsg))
+
+    def assertNotStartsWith[S, P](self, s: S, prefix: P, msg: str | None = None) -> None:
+        if not s.startswith(prefix):
+            return
+        a = safe_repr(s, short=True)
+        b = safe_repr(prefix)
+        if isinstance(prefix, tuple):
+            for x in prefix:
+                if s.startswith(x):
+                    b = safe_repr(x)
+                    break
+        self.fail(self._formatMessage(msg, f"{a} starts with {b}"))
+
+    def assertEndsWith[S, P](self, s: S, suffix: P, msg: str | None = None) -> None:
+        if s.endswith(suffix):
+            return
+        a = safe_repr(s, short=True)
+        b = safe_repr(suffix)
+        if isinstance(suffix, tuple):
+            standardMsg = f"{a} doesn't end with any of {b}"
+        else:
+            standardMsg = f"{a} doesn't end with {b}"
+        self.fail(self._formatMessage(msg, standardMsg))
+
+    def assertNotEndsWith[S, P](self, s: S, suffix: P, msg: str | None = None) -> None:
+        if not s.endswith(suffix):
+            return
+        a = safe_repr(s, short=True)
+        b = safe_repr(suffix)
+        if isinstance(suffix, tuple):
+            for x in suffix:
+                if s.endswith(x):
+                    b = safe_repr(x)
+                    break
+        self.fail(self._formatMessage(msg, f"{a} ends with {b}"))
 
 
 

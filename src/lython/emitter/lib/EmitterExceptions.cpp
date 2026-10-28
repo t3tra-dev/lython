@@ -1210,11 +1210,46 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
           handlerTypeLocs.push_back(loc(handler));
         } else {
           llvm::SmallVector<const parser::Node *, 4> candidateTypes;
+          // ⭐ A TUPLE OF CLASSES HELD IN A NAME is the tuple written out:
+          // `EXC = (KeyError, IndexError)` then `except EXC:` tests each
+          // member, `EXC[0]` then `EXC[1]`, as the literal tests each element.
+          // ⛔ A positional tuple read through a name or an attribute only:
+          // each member re-reads it, which a call would not survive, and one
+          // of unknown length has no member to name.
+          std::function<bool(const parser::Node *)> isRead =
+              [&](const parser::Node *node) {
+                if (!node)
+                  return false;
+                if (node->kind == "Name")
+                  return true;
+                return node->kind == "Attribute" &&
+                       isRead(ast::node(*node, "value"));
+              };
+          auto heldTuple = mlir::dyn_cast_if_present<py::ContractType>(
+              types.widenLiteral(types.inferExpr(typeNode)));
+          bool heldClasses =
+              typeNode->kind != "Tuple" && isRead(typeNode) && heldTuple &&
+              heldTuple.getContractName() == "builtins.tuple" &&
+              heldTuple.getArguments().size() > 1 &&
+              llvm::all_of(heldTuple.getArguments(), [](mlir::Type member) {
+                return mlir::isa<py::TypeType>(member);
+              });
           if (typeNode->kind == "Tuple") {
             if (const auto *elts = ast::nodeList(*typeNode, "elts"))
               for (const parser::NodePtr &elt : *elts)
                 if (elt)
                   candidateTypes.push_back(elt.get());
+          } else if (heldClasses) {
+            for (std::size_t position = 0;
+                 position < heldTuple.getArguments().size(); ++position) {
+              parser::NodePtr member = synth::subscript(
+                  synth::cloneTree(*typeNode),
+                  synth::intConstant(static_cast<std::int64_t>(position),
+                                     typeNode->range),
+                  typeNode->range);
+              candidateTypes.push_back(member.get());
+              synthesizedHelperTrees.push_back(std::move(member));
+            }
           } else {
             candidateTypes.push_back(typeNode);
           }

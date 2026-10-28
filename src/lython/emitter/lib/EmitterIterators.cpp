@@ -267,6 +267,15 @@ bool ModuleEmitter::isBuiltinIteratorName(llvm::StringRef name) const {
 bool ModuleEmitter::hasIndexWalkableEvidence(mlir::Type type) {
   if (!type)
     return false;
+  // ⭐ A UNION OF SEQUENCES IS WALKED BY INDEX TOO: `len(u)` and `u[i]` are
+  // asked of the member the value holds, by tag, and every member answers.
+  // `reversed(u)`, `zip(xs, u)` and `iter(u)` as a value were refused for a
+  // `str | list[str]` whose two members each walk.
+  if (auto unionType =
+          mlir::dyn_cast<py::UnionType>(types.widenLiteral(type)))
+    return llvm::all_of(unionType.getMemberTypes(), [&](mlir::Type member) {
+      return hasIndexWalkableEvidence(member);
+    });
   if (iteratesBySequenceProtocol(type))
     return false;
   if (!types.inferMethodCallWithEvidence(type, "__len__", {}))

@@ -727,6 +727,12 @@ public:
   // unless every member's call types.
   mlir::Type unionArgumentCallResult(const parser::Node &call,
                                      const ExprInferenceContext *ctx) const;
+  // The type of `u.attr` read from a union receiver: the join of what each
+  // member answers for the attribute, or null unless every member answers.
+  // `ModuleEmitter::tryEmitUnionAttributeRead` is its emission.
+  mlir::Type unionAttributeResult(const parser::Node &attribute,
+                                  mlir::Type receiver,
+                                  const ExprInferenceContext *ctx) const;
   // Same-shape callables collapse to one callable whose result is the join of
   // theirs, instead of a union nothing can call.
   mlir::Type commonCallableJoin(mlir::ArrayRef<mlir::Type> members) const;
@@ -864,6 +870,10 @@ private:
   // its address must not be answered by the first one's copy.
   mutable llvm::DenseMap<const parser::Node *, parser::NodePtr>
       unionArgumentCalls;
+  // The per-member read `unionAttributeResult` asks, per original read, under
+  // the same rule.
+  mutable llvm::DenseMap<const parser::Node *, parser::NodePtr>
+      unionAttributeReads;
   mutable bool rungUnionsAsInt = false;
   mutable bool callMetRungUnion = false;
   // The functions inference is re-reading at an argument's rung, so a body

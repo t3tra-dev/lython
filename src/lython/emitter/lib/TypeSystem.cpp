@@ -1805,14 +1805,22 @@ mlir::Type lazyIteratorCallType(const TypeSystem &types, llvm::StringRef name,
     }
     return generatorOf(tupleOfMembers(types, elements));
   }
-  if (name == "map" && count == 2) {
+  // ⭐ ONE PARAMETER PER SEQUENCE MAPPED: `map(lambda a, b: a + b, xs, ys)`
+  // zips its sequences into the call, as the emitter builds it. Only the
+  // one-sequence form was answered, so an unannotated function returning the
+  // two-sequence one was refused ("builtins.object is not callable").
+  if (name == "map" && count >= 2) {
     const parser::Node *callee = positional(0);
-    const parser::Node *source = positional(1);
-    if (!callee || !source)
+    if (!callee)
       return {};
-    mlir::Type element = elementOf(source);
-    if (!element)
-      return {};
+    llvm::SmallVector<mlir::Type, 4> elements;
+    for (unsigned index = 1; index < count; ++index) {
+      const parser::Node *source = positional(index);
+      mlir::Type element = source ? elementOf(source) : mlir::Type();
+      if (!element)
+        return {};
+      elements.push_back(element);
+    }
     // A lambda's own parameter is unannotated, so its type comes from the
     // sequence being mapped -- the same expectation the emitter distributes
     // when it inlines the body. Without it `map(lambda v: v * 2, xs)` inside
@@ -1820,7 +1828,7 @@ mlir::Type lazyIteratorCallType(const TypeSystem &types, llvm::StringRef name,
     // the real generator at the ABI as "bundle has 5 values, expects 1".
     if (callee->kind == "Lambda") {
       py::CallableType expected = py::CallableType::get(
-          &types.getContext(), {element}, {}, {}, {}, {});
+          &types.getContext(), elements, {}, {}, {}, {});
       FunctionSignature lambdaSig =
           types.functionSignature(*callee, std::nullopt, expected);
       return generatorOf(types.widenLiteral(lambdaSig.resultType));
@@ -4785,6 +4793,14 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     if (mlir::Type objectType = lenientRecurse(ast::node(*node, "value"))) {
       const py::protocols::Table &table = py::protocols::Table::get(context);
       if (auto attr = ast::string(*node, "attr")) {
+        // ⭐ A UNION ANSWERS WITH THE ATTRIBUTE OF THE MEMBER IT HOLDS, which
+        // is what the emitter reads by tag (tryEmitUnionAttributeRead).
+        // ⛔ `__class__` keeps its own road: it is `type(u)`, a class value.
+        if (*attr != "__class__" &&
+            mlir::isa<py::UnionType>(widenLiteral(objectType)))
+          if (mlir::Type joined =
+                  unionAttributeResult(*node, objectType, ctx))
+            return joined;
         // `x.__class__` is `type(x)`; `C.__qualname__` and `C.__module__` are
         // strs as `C.__name__` is.
         if (*attr == "__class__")
@@ -4841,6 +4857,17 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
                 simple = qualifiedName.drop_front(dot + 1);
               return literal("\"" + simple.str() + "\"");
             }
+        // The numeric tower's constant attributes, which the emitter folds
+        // (EmitterExpressions.cpp, emitAttribute): an int's four are ints and
+        // a float's `real` and `imag` are floats.
+        if (*attr == "real" || *attr == "imag" || *attr == "numerator" ||
+            *attr == "denominator") {
+          mlir::Type receiver = widenLiteral(objectType);
+          if (receiver == intType() || receiver == boolType())
+            return intType();
+          if (receiver == floatType() && (*attr == "real" || *attr == "imag"))
+            return floatType();
+        }
         // `e.code` of a SystemExit is computed from `args` as an object
         // (EmitterDocstrings.cpp, tryEmitSystemExitCode).
         if (*attr == "code" && objectType &&
@@ -6449,6 +6476,26 @@ mlir::Type TypeSystem::inferClassInstantiation(
       if (mlir::Type solved = solveGenericClassInstantiation(
               contract.getContractName(), positional, keywords))
         return solved;
+  // `frozenset(x)` of a str, bytes, tuple, range or dict is
+  // `frozenset(set(x))`, as the emitter builds it (EmitterIterators.cpp,
+  // tryEmitContainerConstructorCall), and a frozenset is itself: the manifest
+  // declares the constructor over set and list only, so this channel left the
+  // element unbound for the sources the emitter answers -- `return
+  // frozenset(t)` for `t: tuple[int, int]` was refused.
+  if (instanceType == contract("builtins.frozenset") &&
+      positional.size() == 1 && keywords.empty())
+    if (auto source = mlir::dyn_cast_if_present<py::ContractType>(
+            widenLiteral(positional.front()))) {
+      llvm::StringRef name = source.getContractName();
+      if (name == "builtins.frozenset")
+        return source;
+      if (name == "builtins.str" || name == "builtins.bytes" ||
+          name == "builtins.bytearray" || name == "builtins.tuple" ||
+          name == "builtins.range" || name == "builtins.dict")
+        if (mlir::Type element = iterableElementType(source))
+          if (!isObjectTop(*this, element))
+            return contract("builtins.frozenset", {widenLiteral(element)});
+    }
   mlir::Type templated = genericClassTemplate(*this, instanceType);
   if (std::optional<CallSolution> init =
           tryManifestMethod(*this, templated, "__init__", positional, keywords))
@@ -6940,10 +6987,10 @@ TypeSystem::unionMethodResult(mlir::Type receiver, llvm::StringRef method,
     return {};
   llvm::SmallVector<mlir::Type, 4> results;
   for (mlir::Type member : unionType.getMemberTypes()) {
-    // A function value's `__call__` is the function: it has no class to
-    // look the method up on.
+    // A function value's `__call__` is the function, and a class value's is
+    // its construction: neither has a class to look the method up on.
     CallInferenceResult inference =
-        method == "__call__" && mlir::isa<py::CallableType>(member)
+        method == "__call__" && mlir::isa<py::CallableType, py::TypeType>(member)
             ? inferCallWithEvidence(member, positional, keywords)
             : inferMethodCallWithEvidence(widenLiteral(member), method,
                                           positional, keywords);
@@ -6973,15 +7020,16 @@ TypeSystem::unionArgumentOfBuiltinCall(const parser::Node &call,
     return std::nullopt;
   llvm::StringRef name = ast::nameSpelling(*callee);
   static constexpr llvm::StringLiteral kBuiltins[] = {
-      "abs", "round", "int", "float", "complex", "divmod", "hash",
-      "bin", "hex",   "oct", "chr",   "ord"};
+      "abs", "round", "int", "float", "complex", "divmod",   "hash",
+      "bin", "hex",   "oct", "chr",   "ord",     "frozenset", "format"};
   if (!llvm::is_contained(kBuiltins, name))
     return std::nullopt;
   // The builtin and not a binding of the same spelling: a class the root
   // binds is asked by class, a manifest function by its contract, and the
   // rest are bound nowhere.
   std::optional<mlir::Type> bound = lookupSymbol(name);
-  if (name == "int" || name == "float" || name == "complex") {
+  if (name == "int" || name == "float" || name == "complex" ||
+      name == "frozenset") {
     mlir::Type builtin = contract(("builtins." + name).str());
     std::optional<mlir::Type> cls = lookupClass(name);
     if (!cls || *cls != builtin || (bound && *bound != typeObject(builtin)))
@@ -7056,6 +7104,31 @@ TypeSystem::unionArgumentCallResult(const parser::Node &call,
     auto scope = pushScope();
     bindLocalSymbol(temp, member);
     mlir::Type result = inferExprImpl(memberCall.get(), ctx);
+    if (!result || isObjectTop(*this, result))
+      return {};
+    results.push_back(widenLiteral(result));
+  }
+  return results.empty() ? mlir::Type() : join(results);
+}
+
+mlir::Type TypeSystem::unionAttributeResult(
+    const parser::Node &attribute, mlir::Type receiver,
+    const ExprInferenceContext *ctx) const {
+  auto unionType =
+      mlir::dyn_cast_if_present<py::UnionType>(widenLiteral(receiver));
+  std::optional<std::string_view> name = ast::string(attribute, "attr");
+  if (!unionType || !name)
+    return {};
+  static constexpr llvm::StringLiteral temp = "__lyunionattr";
+  parser::NodePtr &memberRead = unionAttributeReads[&attribute];
+  if (!memberRead || ast::string(*memberRead, "attr") != name)
+    memberRead = synth::attribute(synth::name(temp, attribute.range), *name,
+                                  attribute.range);
+  llvm::SmallVector<mlir::Type, 4> results;
+  for (mlir::Type member : unionType.getMemberTypes()) {
+    auto scope = pushScope();
+    bindLocalSymbol(temp, member);
+    mlir::Type result = inferExprImpl(memberRead.get(), ctx);
     if (!result || isObjectTop(*this, result))
       return {};
     results.push_back(widenLiteral(result));

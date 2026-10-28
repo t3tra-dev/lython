@@ -1,8 +1,9 @@
 # A value whose type is a union of members -- `str | list[str]`, `int | float`
-# -- is iterated, converted, searched and sliced as the member it holds: a
-# `for` loop and every comprehension or builtin that iterates it, the builtins
-# that convert or measure one value, `in` and a slice. The loop target outlives
-# the loop as whichever member's element it was last bound to.
+# -- is iterated, converted, searched, sliced and read as the member it holds:
+# a `for` loop and every comprehension or builtin that iterates it, the
+# builtins that convert or measure one value, `in`, a slice, and an attribute
+# its members answer differently. The loop target outlives the loop as
+# whichever member's element it was last bound to.
 #
 # A result holding union values is compared by its repr, which tells 'a', 1
 # and 1.0 apart as the values themselves would.
@@ -15,6 +16,20 @@ class Bag:
 
     def __iter__(self):
         return iter(self.xs)
+
+
+class Counted:
+    def __init__(self) -> None:
+        self.n = 1
+
+
+class Named:
+    def __init__(self) -> None:
+        self.n = "q"
+
+
+def counted_or_named(c: bool):
+    return Counted() if c else Named()
 
 
 def pick(n: int):
@@ -173,6 +188,15 @@ class UnionIterationTest(unittest.TestCase):
     def test_a_target_of_union_elements_outlives_the_loop(self):
         self.assertEqual(last_of([1, "a"]), "a")
         self.assertEqual(last_of(["a", 1]), 1)
+
+    def test_an_attribute_of_the_member_it_holds(self):
+        self.assertEqual(
+            repr([counted_or_named(True).n, counted_or_named(False).n]),
+            "[1, 'q']")
+        v = int_or_float(True)
+        w = int_or_float(False)
+        self.assertEqual(repr((v.real, v.imag, w.real, w.imag)),
+                         "(2.5, 0.0, -3, 0)")
 
     def test_a_generator_expression_over_a_local_types_the_return(self):
         self.assertEqual(longest(True), 4)
