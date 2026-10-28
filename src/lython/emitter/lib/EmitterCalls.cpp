@@ -1029,6 +1029,71 @@ ModuleEmitter::tryEmitUnionMethodCall(const parser::Node &expr, Value receiver,
       });
 }
 
+// The emission `TypeSystem::unionArgumentOfBuiltinCall` names: every argument
+// evaluated once, in order, into a temporary, then the builtin called on the
+// member the union argument holds. A member whose call is itself given a
+// union reaches this again from the arm.
+std::optional<Value>
+ModuleEmitter::tryEmitUnionArgumentCall(const parser::Node &expr) {
+  std::optional<std::size_t> index = types.unionArgumentOfBuiltinCall(expr);
+  if (!index)
+    return std::nullopt;
+  const parser::Node *calleeNode = ast::node(expr, "func");
+  if (programBindsName(ast::nameSpelling(*calleeNode)))
+    return std::nullopt;
+  mlir::Type joined = types.inferExpr(&expr);
+  if (!joined || types.widenLiteral(joined) == types.object())
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  llvm::SmallVector<std::string, 4> bound;
+  auto bind = [&](Value value) {
+    std::string name =
+        "__lyunionarg" + std::to_string(++syntheticFunctionCounter);
+    values[name] = value;
+    types.bindSymbol(name, value.type);
+    bound.push_back(name);
+    return name;
+  };
+  auto release = llvm::scope_exit([&] {
+    for (const std::string &name : bound)
+      values.erase(name);
+  });
+  llvm::SmallVector<std::string, 4> positional;
+  for (const parser::NodePtr &argument : *args)
+    positional.push_back(bind(emitExpr(argument.get())));
+  llvm::SmallVector<std::pair<std::string, std::string>, 2> named;
+  if (keywords)
+    for (const parser::NodePtr &keyword : *keywords)
+      named.emplace_back(std::string(*ast::string(*keyword, "arg")),
+                         bind(emitExpr(ast::node(*keyword, "value"))));
+  auto callWith = [&](std::optional<Value> member) -> Value {
+    std::vector<parser::NodePtr> argumentNodes;
+    for (auto [position, name] : llvm::enumerate(positional))
+      argumentNodes.push_back(synth::name(
+          member && position == *index ? bind(*member) : name, expr.range));
+    std::vector<parser::NodePtr> keywordNodes;
+    for (const auto &[keyword, name] : named)
+      keywordNodes.push_back(
+          synth::keyword(keyword, synth::name(name, expr.range), expr.range));
+    parser::NodePtr call = synth::callWithKeywords(
+        synth::name(ast::nameSpelling(*calleeNode), calleeNode->range),
+        std::move(argumentNodes), std::move(keywordNodes), expr.range);
+    synthesizedIteratorDefs.push_back(call);
+    return emitExpr(call.get());
+  };
+  // The arguments are evaluated by now, so a value the emission already
+  // holds narrower than the union is called as it is, over the temporaries.
+  Value unionValue = values[positional[*index]];
+  auto unionType =
+      mlir::dyn_cast<py::UnionType>(types.widenLiteral(unionValue.type));
+  if (!unionType)
+    return callWith(std::nullopt);
+  return emitUnionMemberDispatch(
+      expr, unionValue, unionType, joined,
+      [&](Value member) -> Value { return callWith(member); });
+}
+
 llvm::SmallVector<std::string, 8>
 ModuleEmitter::directSubclassesOf(llvm::StringRef cls) {
   llvm::SmallVector<std::pair<unsigned, std::string>, 8> found;
@@ -1269,6 +1334,8 @@ Value ModuleEmitter::emitCallAsImplemented(const parser::Node &expr) {
               types.lookupCanonicalBinding(spelled);
           canonical && *canonical == "sys.exc_info")
         return emitExcInfo(expr);
+  if (std::optional<Value> split = tryEmitUnionArgumentCall(expr))
+    return *split;
   if (std::optional<Value> dispatched = emitClassValueCall(expr, calleeNode))
     return *dispatched;
   // ⭐ A UNION OF CALLABLE INSTANCES IS CALLED THROUGH ITS LIVE MEMBER'S

@@ -1169,7 +1169,8 @@ generatorSendTypeFromAnnotation(const TypeSystem &types, mlir::Type annotation,
 // nullptr means "not one of these, or not a form this can type" -- the
 // caller falls through to the ordinary callee lookup.
 mlir::Type lazyIteratorCallType(const TypeSystem &types, llvm::StringRef name,
-                                const std::vector<parser::NodePtr> *args);
+                                const std::vector<parser::NodePtr> *args,
+                                const ExprInferenceContext *ctx);
 
 mlir::Type tupleOfMembers(const TypeSystem &types,
                           llvm::ArrayRef<mlir::Type> members) {
@@ -1729,7 +1730,22 @@ bool bindManifestModuleCallableExports(TypeSystem &types,
 }
 
 mlir::Type lazyIteratorCallType(const TypeSystem &types, llvm::StringRef name,
-                                const std::vector<parser::NodePtr> *args) {
+                                const std::vector<parser::NodePtr> *args,
+                                const ExprInferenceContext *ctx) {
+  // The sources are read with a body walk's locals (`ctx`), which no scope
+  // holds: `u = "ab"` then `return list(enumerate(u))` was "object is not
+  // callable" in an unannotated function while a parameter `u` typed.
+  std::optional<ExprInferenceContext> lenient;
+  if (ctx)
+    lenient.emplace(ExprInferenceContext{ctx->localCallables, nullptr,
+                                         ctx->localSymbols, /*strict=*/false,
+                                         ctx->seesEmitterProofs});
+  auto inferSource = [&](const parser::Node *source) {
+    return lenient ? types.inferExpr(source, *lenient) : types.inferExpr(source);
+  };
+  auto elementOf = [&](const parser::Node *source) {
+    return types.iterationElementType(source, ctx);
+  };
   // Iterator, not types.GeneratorType: the synthesized generator IS a
   // GeneratorType, but a generator value that crosses a function return
   // loses the frame target its manifest __next__ needs ("runtime manifest
@@ -1755,22 +1771,22 @@ mlir::Type lazyIteratorCallType(const TypeSystem &types, llvm::StringRef name,
       return {};
     // iter(gen) is gen: an object that already answers __next__ comes back
     // unchanged, which is what the emitter does too.
-    mlir::Type sourceType = types.widenLiteral(types.inferExpr(source));
+    mlir::Type sourceType = types.widenLiteral(inferSource(source));
     if (types.inferMethodCallWithEvidence(sourceType, "__next__", {}))
       return sourceType;
-    return generatorOf(types.iterationElementType(source));
+    return generatorOf(elementOf(source));
   }
   if ((name == "reversed" || name == "filter") &&
       count == (name == "filter" ? 2u : 1u)) {
     const parser::Node *source = positional(name == "filter" ? 1 : 0);
-    return source ? generatorOf(types.iterationElementType(source))
+    return source ? generatorOf(elementOf(source))
                   : mlir::Type();
   }
   if (name == "enumerate" && (count == 1 || count == 2)) {
     const parser::Node *source = positional(0);
     if (!source)
       return {};
-    mlir::Type element = types.iterationElementType(source);
+    mlir::Type element = elementOf(source);
     if (!element)
       return {};
     return generatorOf(
@@ -1782,7 +1798,7 @@ mlir::Type lazyIteratorCallType(const TypeSystem &types, llvm::StringRef name,
       const parser::Node *source = positional(index);
       if (!source)
         return {};
-      mlir::Type element = types.iterationElementType(source);
+      mlir::Type element = elementOf(source);
       if (!element)
         return {};
       elements.push_back(element);
@@ -1794,7 +1810,7 @@ mlir::Type lazyIteratorCallType(const TypeSystem &types, llvm::StringRef name,
     const parser::Node *source = positional(1);
     if (!callee || !source)
       return {};
-    mlir::Type element = types.iterationElementType(source);
+    mlir::Type element = elementOf(source);
     if (!element)
       return {};
     // A lambda's own parameter is unannotated, so its type comes from the
@@ -1810,7 +1826,7 @@ mlir::Type lazyIteratorCallType(const TypeSystem &types, llvm::StringRef name,
       return generatorOf(types.widenLiteral(lambdaSig.resultType));
     }
     auto callable = mlir::dyn_cast_if_present<py::CallableType>(
-        types.widenLiteral(types.inferExpr(callee)));
+        types.widenLiteral(inferSource(callee)));
     if (!callable || callable.getResultTypes().size() != 1)
       return {};
     return generatorOf(callable.getResultTypes().front());
@@ -3939,6 +3955,20 @@ void TypeSystem::restoreAnnotationDiagnostics(parser::Diagnostics diagnostics) {
 mlir::Type TypeSystem::iterableElementType(mlir::Type iterableType) const {
   if (!iterableType)
     return {};
+  // A union iterates as the member it holds (`tryEmitUnionIterationFor`
+  // splits the loop by tag), so its element is the join of every member's,
+  // and one member that cannot be iterated leaves the whole union without.
+  if (auto unionType =
+          mlir::dyn_cast<py::UnionType>(widenLiteral(iterableType))) {
+    llvm::SmallVector<mlir::Type, 4> elements;
+    for (mlir::Type member : unionType.getMemberTypes()) {
+      mlir::Type element = iterableElementType(member);
+      if (!element)
+        return {};
+      elements.push_back(element);
+    }
+    return elements.empty() ? mlir::Type() : join(elements);
+  }
   CallInferenceResult iterInference = inferMethodCallWithEvidence(
       widenLiteral(iterableType), "__iter__", {});
   if (!iterInference) {
@@ -3961,11 +3991,33 @@ mlir::Type TypeSystem::iterableElementType(mlir::Type iterableType) const {
   return widenLiteral(nextInference.resultType);
 }
 
-mlir::Type TypeSystem::iterationElementType(const parser::Node *arg) const {
+mlir::Type
+TypeSystem::iterationElementType(const parser::Node *arg,
+                                 const ExprInferenceContext *ctx) const {
   if (!arg)
     return {};
+  // ⛔ A body walk's locals live in its context and not in any scope, so a
+  // walk that asked with no context did not know them: `u = "ab"` then
+  // `return max(x for x in u)` in an unannotated function was refused as
+  // "object is not callable", while a parameter `u` typed. The generator's
+  // own targets are bound into a copy of those locals, which shadow scopes.
+  llvm::StringMap<mlir::Type> bound;
+  if (ctx && ctx->localSymbols)
+    bound = *ctx->localSymbols;
+  static const llvm::StringMap<mlir::Type> kNoCallables;
+  ExprInferenceContext inner{ctx ? ctx->localCallables : kNoCallables, nullptr,
+                             &bound, /*strict=*/false,
+                             !ctx || ctx->seesEmitterProofs};
+  auto infer = [&](const parser::Node *expression) -> mlir::Type {
+    return ctx ? inferenceState.zonk(inferExprImpl(expression, &inner))
+               : inferExpr(expression);
+  };
+  auto bindLocalSymbol = [&](llvm::StringRef name, mlir::Type type) {
+    this->bindLocalSymbol(name, type);
+    bound[name] = type;
+  };
   auto iterationElement = [&](const parser::Node *iterable) -> mlir::Type {
-    return iterableElementType(inferExpr(iterable));
+    return iterableElementType(infer(iterable));
   };
   if (arg->kind != "GeneratorExp")
     return iterationElement(arg);
@@ -4016,8 +4068,7 @@ mlir::Type TypeSystem::iterationElementType(const parser::Node *arg) const {
       bindLocalSymbol(ast::nameSpelling(*name), memberType);
     }
   }
-  return widenLiteral(inferExpr(
-      std::get<parser::NodePtr>(eltField->value).get()));
+  return widenLiteral(infer(std::get<parser::NodePtr>(eltField->value).get()));
 }
 
 const parser::Node *
@@ -5021,6 +5072,10 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           widened, "__getslice__", {intType, intType, intType, intType});
       if (sliced)
         return sliced.resultType;
+      // A union slices by tag (`emitSliceProtocolRead`).
+      if (mlir::Type unionResult = unionOperatorResult(
+              container, "__getslice__", {intType, intType, intType, intType}))
+        return unionResult;
       if (strict)
         return fail(sliced.failureReason);
     }
@@ -5471,6 +5526,8 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     return strict ? fail(inference.failureReason) : object();
   }
   if (node->kind == "Call") {
+    if (mlir::Type split = unionArgumentCallResult(*node, ctx))
+      return split;
     const parser::Node *callee = ast::node(*node, "func");
     if (std::optional<PrimitiveTypeSpec> primitive =
             primitiveTypeSpecFromSubscript(callee, *this))
@@ -5547,7 +5604,7 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       // which binds its targets.
       auto reducedElement = [&](const parser::Node *argument) -> mlir::Type {
         if (argument->kind == "GeneratorExp")
-          return iterationElementType(argument);
+          return iterationElementType(argument, ctx);
         return iterableElementType(widenLiteral(lenientRecurse(argument)));
       };
       if ((reducer == "sum" || reducer == "max" || reducer == "min") &&
@@ -5580,7 +5637,8 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       // channel comes from iterationElementType, the same walk the fold
       // itself uses; send and return are None because a synthesized
       // generator has neither.
-      if (mlir::Type lazy = lazyIteratorCallType(*this, reducer, reducerArgs))
+      if (mlir::Type lazy =
+              lazyIteratorCallType(*this, reducer, reducerArgs, ctx))
         return lazy;
       if ((reducer == "max" || reducer == "min") && reducerArgs &&
           reducerArgs->size() > 1) {
@@ -5876,6 +5934,10 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         // result shapes so a constructor call composes as an argument
         // (sorted(set(...)), dup(list(...))).
         auto elementOf = [&](mlir::Type iterableType) -> mlir::Type {
+          // A union is iterated by tag (the comprehension the constructor
+          // desugars to is a `for`, which the emitter splits by member).
+          if (mlir::isa_and_nonnull<py::UnionType>(widenLiteral(iterableType)))
+            return iterableElementType(iterableType);
           std::optional<CallSolution> iter = tryManifestMethod(
               *this, widenLiteral(iterableType), "__iter__", {});
           if (!iter)
@@ -6892,6 +6954,113 @@ TypeSystem::unionMethodResult(mlir::Type receiver, llvm::StringRef method,
   if (results.empty())
     return {};
   return join(results);
+}
+
+// ⭐ A BUILTIN GIVEN A UNION RUNS AS THE MEMBER THE VALUE HOLDS, as `len(u)`
+// always has. `abs(v)` for `v: int | float` is one call in CPython that each
+// member answers with its own method; here it was "no signature accepts
+// union<float, int>", and `hash(u)` passed the emit and was refused by the
+// lowering for a receiver with no concrete contract.
+// ⛔ Only these: each takes the one value it converts or measures, so running
+// it per member is the whole call. `print`, `isinstance`, `type`, `str` and
+// `repr` already take a union as it is, and a narrowing test must keep
+// seeing the union it narrows.
+std::optional<std::size_t>
+TypeSystem::unionArgumentOfBuiltinCall(const parser::Node &call,
+                                       const ExprInferenceContext *ctx) const {
+  const parser::Node *callee = ast::node(call, "func");
+  if (!callee || callee->kind != "Name")
+    return std::nullopt;
+  llvm::StringRef name = ast::nameSpelling(*callee);
+  static constexpr llvm::StringLiteral kBuiltins[] = {
+      "abs", "round", "int", "float", "complex", "divmod", "hash",
+      "bin", "hex",   "oct", "chr",   "ord"};
+  if (!llvm::is_contained(kBuiltins, name))
+    return std::nullopt;
+  // The builtin and not a binding of the same spelling: a class the root
+  // binds is asked by class, a manifest function by its contract, and the
+  // rest are bound nowhere.
+  std::optional<mlir::Type> bound = lookupSymbol(name);
+  if (name == "int" || name == "float" || name == "complex") {
+    mlir::Type builtin = contract(("builtins." + name).str());
+    std::optional<mlir::Type> cls = lookupClass(name);
+    if (!cls || *cls != builtin || (bound && *bound != typeObject(builtin)))
+      return std::nullopt;
+  } else if (std::optional<mlir::Type> manifest =
+                 py::protocols::Table::get(context).freeFunctionContract(
+                     ("builtins." + name).str())) {
+    if (!bound || *bound != *manifest)
+      return std::nullopt;
+  } else if (bound || lookupClass(name)) {
+    return std::nullopt;
+  }
+  const auto *args = ast::nodeList(call, "args");
+  if (!args)
+    return std::nullopt;
+  if (const auto *keywords = ast::nodeList(call, "keywords"))
+    for (const parser::NodePtr &keyword : *keywords)
+      if (!keyword || !ast::string(*keyword, "arg"))
+        return std::nullopt;
+  std::optional<std::size_t> found;
+  for (auto [index, argument] : llvm::enumerate(*args)) {
+    if (!argument || argument->kind == "Starred")
+      return std::nullopt;
+    if (!found && mlir::isa_and_nonnull<py::UnionType>(widenLiteral(
+                      inferenceState.zonk(inferExprImpl(argument.get(), ctx)))))
+      found = index;
+  }
+  return found;
+}
+
+mlir::Type
+TypeSystem::unionArgumentCallResult(const parser::Node &call,
+                                    const ExprInferenceContext *ctx) const {
+  std::optional<std::size_t> index = unionArgumentOfBuiltinCall(call, ctx);
+  if (!index)
+    return {};
+  const auto *args = ast::nodeList(call, "args");
+  auto unionType = mlir::cast<py::UnionType>(widenLiteral(
+      inferenceState.zonk(inferExprImpl((*args)[*index].get(), ctx))));
+  std::string temp = "__lyunionarg" + std::to_string(*index);
+  parser::NodePtr &memberCall = unionArgumentCalls[&call];
+  auto sameShape = [&] {
+    const auto *memberArgs = ast::nodeList(*memberCall, "args");
+    const auto *memberKeywords = ast::nodeList(*memberCall, "keywords");
+    const auto *keywords = ast::nodeList(call, "keywords");
+    if (ast::node(*memberCall, "func") != ast::node(call, "func") ||
+        !memberArgs || memberArgs->size() != args->size() ||
+        !memberKeywords != !keywords ||
+        (keywords && *memberKeywords != *keywords))
+      return false;
+    for (std::size_t position = 0; position < args->size(); ++position)
+      if (position == *index
+              ? ast::nameSpelling(*(*memberArgs)[position]) != temp
+              : (*memberArgs)[position] != (*args)[position])
+        return false;
+    return true;
+  };
+  if (!memberCall || !sameShape()) {
+    memberCall = parser::makeNode("Call", call.range);
+    for (const parser::Field &field : call.fields) {
+      if (field.name != "args") {
+        memberCall->fields.push_back(field);
+        continue;
+      }
+      std::vector<parser::NodePtr> replaced = *args;
+      replaced[*index] = synth::name(temp, (*args)[*index]->range);
+      parser::addField(*memberCall, "args", std::move(replaced));
+    }
+  }
+  llvm::SmallVector<mlir::Type, 4> results;
+  for (mlir::Type member : unionType.getMemberTypes()) {
+    auto scope = pushScope();
+    bindLocalSymbol(temp, member);
+    mlir::Type result = inferExprImpl(memberCall.get(), ctx);
+    if (!result || isObjectTop(*this, result))
+      return {};
+    results.push_back(widenLiteral(result));
+  }
+  return results.empty() ? mlir::Type() : join(results);
 }
 
 // ⭐ AND THE UNION ON THE RIGHT. `total += scaled(i)` is the accumulator every

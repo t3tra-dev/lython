@@ -315,6 +315,7 @@ private:
   // `u.method(...)` on a union receiver, by tag (EmitterCalls.cpp). Nothing --
   // and nothing emitted -- when a member cannot answer, and the caller then
   // refuses as before.
+  std::optional<Value> tryEmitUnionArgumentCall(const parser::Node &expr);
   std::optional<Value> tryEmitUnionMethodCall(const parser::Node &expr,
                                               Value receiver,
                                               llvm::StringRef methodName);
@@ -775,6 +776,7 @@ private:
   void emitIf(const parser::Node &statement);
   void emitMatch(const parser::Node &statement);
   void emitFor(const parser::Node &statement);
+  bool tryEmitUnionIterationFor(const parser::Node &statement);
   void emitGeneratorExpFor(const parser::Node &statement,
                            const parser::Node &genexpr);
   // EmitterIterators.cpp: lazy-iterator loop fusion (enumerate/zip/map/

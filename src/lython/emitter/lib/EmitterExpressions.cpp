@@ -2447,6 +2447,38 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
                                                types.boolType(), flipped);
       return Value{pyBool.getResult(), types.boolType()};
     }
+    // ⭐ A UNION IS SEARCHED BY TAG, as it is indexed and counted: each
+    // member answers with its own `__contains__`.
+    if (auto rhsUnion = mlir::dyn_cast_if_present<py::UnionType>(
+            types.widenLiteral(rhs.type));
+        rhsUnion &&
+        types.unionOperatorResult(rhs.type, "__contains__", {lhs.type})) {
+      Value membership = emitUnionMemberDispatch(
+          expr, rhs, rhsUnion, types.boolType(), [&](Value member) -> Value {
+            if (std::optional<Value> dunder =
+                    tryEmitClassDunder(expr, member, "__contains__", {lhs}))
+              return *dunder;
+            CallInferenceResult memberInference =
+                types.inferMethodCallWithEvidence(member.type, "__contains__",
+                                                  {lhs.type});
+            auto contains = py::ContainsOp::create(
+                builder, loc(expr), builder.getI1Type(),
+                mlir::FlatSymbolRefAttr::get(&context, "__contains__"),
+                callProtocolFor(memberInference), member.value, lhs.value);
+            auto pyBool = py::CastFromPrimOp::create(
+                builder, loc(expr), types.boolType(), contains.getResult());
+            return Value{pyBool.getResult(), types.boolType()};
+          });
+      if (ast::isOperator(op, "In"))
+        return membership;
+      mlir::Value bit = emitBoolValue(membership, expr);
+      auto one = mlir::arith::ConstantIntOp::create(builder, loc(expr), 1, 1);
+      mlir::Value flipped =
+          mlir::arith::XOrIOp::create(builder, loc(expr), bit, one);
+      auto pyBool = py::CastFromPrimOp::create(builder, loc(expr),
+                                               types.boolType(), flipped);
+      return Value{pyBool.getResult(), types.boolType()};
+    }
     CallInferenceResult inference =
         types.inferMethodCallWithEvidence(rhs.type, "__contains__", {lhs.type});
     if (!requireStaticEvidence(expr, inference))
@@ -3195,6 +3227,17 @@ Value ModuleEmitter::emitSliceProtocolRead(const parser::Node &expr,
     boundTypes.push_back(bound.type);
   CallInferenceResult inference = types.inferMethodCallWithEvidence(
       container.type, "__getslice__", boundTypes);
+  // ⭐ A UNION IS SLICED BY TAG, as it is indexed: each member answers with
+  // its own `__getslice__`, the bounds evaluated once before the test.
+  if (!inference)
+    if (auto containerUnion = mlir::dyn_cast_if_present<py::UnionType>(
+            types.widenLiteral(container.type)))
+      if (mlir::Type joined = types.unionOperatorResult(
+              container.type, "__getslice__", boundTypes))
+        return emitUnionMemberDispatch(
+            expr, container, containerUnion, joined, [&](Value member) {
+              return emitSliceProtocolRead(expr, member, bounds);
+            });
   if (!inference) {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, expr.range.start,
