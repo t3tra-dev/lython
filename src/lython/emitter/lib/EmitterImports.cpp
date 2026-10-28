@@ -3072,6 +3072,29 @@ void ModuleEmitter::emitTopLevelDeclarations() {
           emitClassNow(*name);
       }
       applyForeignFieldWrites();
+      // ⭐ A FUNCTION THAT NAMES A CLASS IS READ AGAIN NOW. registerModule
+      // typed every top-level function before any class registered its
+      // methods, so a body walk asking for one found none:
+      //
+      //     class Box:  def size(self) -> int: ...
+      //     def g(u: Box):
+      //         return u.size()    # Box does not provide manifest method 'size'
+      //
+      // and `r = u.size(); return r + 1` typed the result as object. The
+      // memo kept those answers; they are forgotten like those of a function
+      // reading a global bound late, and with them the functions calling
+      // one of these. A function whose walk failed is read again too: its
+      // parameter may hold an instance only its callers name
+      // (`def g(u): return u.m()`).
+      llvm::StringSet<> readAgain;
+      for (const parser::NodePtr &statement : *body) {
+        if (statement && statement->kind == "ClassDef")
+          readAgain.insert(ast::nameSpelling(*statement));
+        if (statement && statement->kind == "FunctionDef" &&
+            !types.functionSignature(*statement).bodyInferenceFailures.empty())
+          readAgain.insert(ast::nameSpelling(*statement));
+      }
+      forgetSignaturesReadingLateGlobals(moduleNode, readAgain);
       for (const parser::NodePtr &statement : *body) {
         if (!statement)
           continue;

@@ -1326,6 +1326,86 @@ bool ModuleEmitter::emitIndexedFor(const parser::Node &statement,
   return true;
 }
 
+// ⭐ A LOOP OVER A UNION RUNS AS THE MEMBER THE VALUE HOLDS. The iterable is
+// evaluated once into a temporary, and the loop is rewritten into an
+// `isinstance` chain with one copy of the whole `for` (body and `else`) per
+// member, each over the narrowed temporary:
+//
+//     for x in u:  body      ->   if isinstance(t, str): for x in t: body
+//                                 else:                  for x in t: body
+//
+// The `if` is what merges the names the arms bind, so `x` after the loop is
+// the join of the members' elements, as it is in CPython.
+//
+// ⛔ Not by materializing the members into one list: a list member iterated by
+// index sees elements appended during the loop, and a copy would not.
+// ⛔ Not when a member's class cannot be told apart by `isinstance`
+// (`list[int] | list[str]`): each test is checked to narrow the temporary to
+// exactly its member, and the loop keeps its refusal otherwise.
+bool ModuleEmitter::tryEmitUnionIterationFor(const parser::Node &statement) {
+  const parser::Node *iterNode = ast::node(statement, "iter");
+  const parser::Node *target = ast::node(statement, "target");
+  if (!iterNode || !target)
+    return false;
+  auto unionType = mlir::dyn_cast_if_present<py::UnionType>(
+      types.widenLiteral(types.inferExpr(iterNode)));
+  if (!unionType || !types.iterableElementType(unionType))
+    return false;
+  llvm::ArrayRef<mlir::Type> members = unionType.getMemberTypes();
+  const parser::SourceRange range = statement.range;
+  std::string temp = "__lyunioniter" + std::to_string(++listCompCounter);
+  types.bindSymbol(temp, unionType);
+  std::vector<parser::NodePtr> tests;
+  for (mlir::Type member : members.drop_back()) {
+    auto contract = mlir::dyn_cast<py::ContractType>(member);
+    if (!contract)
+      return false;
+    llvm::StringRef cls = contract.getContractName();
+    cls = cls.substr(cls.rfind('.') + 1);
+    parser::NodePtr test = synth::call(
+        synth::name("isinstance", range),
+        {synth::name(temp, range), synth::name(cls, range)}, range);
+    llvm::SmallVector<BranchTypeNarrowing, 2> facts =
+        branchTypeNarrowings(*test, types, module);
+    if (facts.size() != 1 || facts.front().name != temp ||
+        facts.front().trueType != member)
+      return false;
+    tests.push_back(std::move(test));
+  }
+  auto loopCopy = [&] {
+    std::vector<parser::NodePtr> body, orelse;
+    if (const auto *statements = ast::nodeList(statement, "body"))
+      for (const parser::NodePtr &child : *statements)
+        body.push_back(synth::cloneTree(*child));
+    if (const auto *statements = ast::nodeList(statement, "orelse"))
+      for (const parser::NodePtr &child : *statements)
+        orelse.push_back(synth::cloneTree(*child));
+    return synth::forStmt(synth::cloneTree(*target), synth::name(temp, range),
+                          std::move(body), std::move(orelse), range);
+  };
+  Value iterable = emitExpr(iterNode);
+  values[temp] = iterable;
+  parser::NodePtr chain = loopCopy();
+  // The value the emission holds may already be narrower than the inferred
+  // union (a proof it spent); then it is one loop over what it holds.
+  if (types.widenLiteral(iterable.type) == unionType) {
+    for (auto it = tests.rbegin(); it != tests.rend(); ++it) {
+      std::vector<parser::NodePtr> body;
+      body.push_back(loopCopy());
+      std::vector<parser::NodePtr> orelse;
+      orelse.push_back(std::move(chain));
+      chain = synth::ifStmt(std::move(*it), std::move(body),
+                            std::move(orelse), range);
+    }
+  } else {
+    types.bindSymbol(temp, iterable.type);
+  }
+  synthesizedIteratorDefs.push_back(chain);
+  emitStatement(*chain);
+  values.erase(temp);
+  return true;
+}
+
 void ModuleEmitter::emitFor(const parser::Node &statement) {
   const auto *orelse = ast::nodeList(statement, "orelse");
   bool hasElse = orelse && !orelse->empty();
@@ -1421,6 +1501,10 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
                                  /*tracksBinding=*/true);
     types.bindSymbol(name, content);
   }
+  // After the slots above, which belong to the loop as written: each copy the
+  // split emits finds its target already bound and writes there.
+  if (tryEmitUnionIterationFor(statement))
+    return;
   if (const parser::Node *iterNode = ast::node(statement, "iter");
       iterNode && iterNode->kind == "GeneratorExp") {
     if (hasElse) {

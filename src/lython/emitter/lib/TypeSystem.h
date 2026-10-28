@@ -641,7 +641,9 @@ public:
   void restoreAnnotationDiagnostics(parser::Diagnostics diagnostics);
   // The element an iteration over `node` yields (a generator expression or a
   // plain iterable); null when it cannot be seen.
-  mlir::Type iterationElementType(const parser::Node *node) const;
+  // With `ctx`, the iterables are read with the walk's locals in scope.
+  mlir::Type iterationElementType(const parser::Node *node,
+                                  const ExprInferenceContext *ctx = nullptr) const;
   // What iterating a value of `iterableType` yields: `__iter__` then
   // `__next__`, or the sequence protocol. Null when it is not iterable.
   mlir::Type iterableElementType(mlir::Type iterableType) const;
@@ -713,6 +715,18 @@ public:
   mlir::Type unionMethodResult(mlir::Type receiver, llvm::StringRef method,
                                mlir::ArrayRef<mlir::Type> positional,
                                mlir::ArrayRef<CallKeywordType> keywords) const;
+  // A call of one of the builtins that convert or measure ONE value (`abs`,
+  // `int`, `hash`, ...) with a union positional argument: which argument, so
+  // the call runs as the member the value holds. `unionArgumentCallResult` is
+  // its type and `ModuleEmitter::tryEmitUnionArgumentCall` its emission; the
+  // two read this one rule.
+  std::optional<std::size_t>
+  unionArgumentOfBuiltinCall(const parser::Node &call,
+                             const ExprInferenceContext *ctx = nullptr) const;
+  // The join of the call's result over the union argument's members, or null
+  // unless every member's call types.
+  mlir::Type unionArgumentCallResult(const parser::Node &call,
+                                     const ExprInferenceContext *ctx) const;
   // Same-shape callables collapse to one callable whose result is the join of
   // theirs, instead of a union nothing can call.
   mlir::Type commonCallableJoin(mlir::ArrayRef<mlir::Type> members) const;
@@ -844,6 +858,12 @@ private:
   // bool and int as the int its emission passes, whether this asking is that
   // one, and whether its first asking met such a union (`inferExprImpl`).
   mutable const parser::Node *callAskedAgain = nullptr;
+  // The per-member call `unionArgumentCallResult` asks, per original call.
+  // It shares the original's callee and argument nodes, and an entry is used
+  // only while they are the same nodes: a call freed and another allocated at
+  // its address must not be answered by the first one's copy.
+  mutable llvm::DenseMap<const parser::Node *, parser::NodePtr>
+      unionArgumentCalls;
   mutable bool rungUnionsAsInt = false;
   mutable bool callMetRungUnion = false;
   // The functions inference is re-reading at an argument's rung, so a body

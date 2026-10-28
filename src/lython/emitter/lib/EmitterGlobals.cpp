@@ -719,9 +719,10 @@ void ModuleEmitter::forgetSignaturesReadingLateGlobals(
     changed = false;
     for (const Reader &reader : readers) {
       if (forgotten.contains(reader.function) ||
-          llvm::none_of(reader.names, [&](const auto &entry) {
-            return late.contains(entry.getKey());
-          }))
+          (!late.contains(reader.name) &&
+           llvm::none_of(reader.names, [&](const auto &entry) {
+             return late.contains(entry.getKey());
+           })))
         continue;
       types.forgetSignature(reader.function);
       types.forgetInferredResult(reader.function);

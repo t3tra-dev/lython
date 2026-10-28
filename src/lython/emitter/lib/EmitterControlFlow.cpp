@@ -1985,8 +1985,13 @@ void ModuleEmitter::bindConditionallyAssignedLocals(
           // the emitter and died in the lowering as "a type-erased `object`
           // value cannot be stored in field 'class.v'". With no slot it keeps
           // the unresolved-name refusal, which is what it had before.
-          if (mlir::isa_and_nonnull<py::ContractType>(known->getValue()) &&
-              !py::isPyObjectType(known->getValue()))
+          // A union element takes the union slot a body binding takes
+          // (`inferConditionalLocalType`): `for x in xs` over a
+          // `list[int | str]` leaves `x` bound as one of the two.
+          if ((mlir::isa_and_nonnull<py::ContractType>(known->getValue()) &&
+               !py::isPyObjectType(known->getValue())) ||
+              (mlir::isa_and_nonnull<py::UnionType>(known->getValue()) &&
+               regionSlotsTakeUnions))
             contents.emplace_back(name, known->getValue());
           continue;
         }
