@@ -1,3 +1,8 @@
+# FIXED 2026-10-30: `is` against a union member is answered member by member
+# -- the tag test and the member's own identity, an int member against a bool
+# at run time (an int slot may hold a bool's object). Two members of one
+# value type are still refused.
+#
 # FIXED the silent half (2026-09-02); this is the refusal that remains.
 #
 # WAS: a wrong answer with no diagnostic. `classify(-1) is False` printed

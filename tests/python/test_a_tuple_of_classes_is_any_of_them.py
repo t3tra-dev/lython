@@ -5,9 +5,10 @@
 # which can be tested against, named and called. The value tested and the
 # tuple are each evaluated once. A member of a tuple is read by position
 # whatever its members are: classes, instances of one base, functions, or
-# tuples of one length. A class from a loop over a tuple of a class and its
-# subclass is a class value of the base, and two of them are the same object
-# exactly when they are the same class.
+# tuples of one length; tuples of different lengths in one list are tuples
+# of any length, each read as itself. A class from a loop over a tuple of a
+# class and its subclass is a class value of the base, and two of them are
+# the same object exactly when they are the same class.
 import unittest
 
 NUMBER = (int, float)
@@ -127,6 +128,13 @@ class HeldClassTupleTest(unittest.TestCase):
         self.assertEqual(functions[0](3) + functions[1](3), 10)
         self.assertEqual(pairs[0][1] + 1, 2)
         self.assertEqual(pairs[1][0], "s")
+
+    def test_tuples_of_different_lengths_in_one_list(self):
+        rows = [(1,), (1, 2), (3, 4, 5)]
+        self.assertEqual([(len(r), sum(r), r[0]) for r in rows],
+                         [(1, 1, 1), (2, 3, 1), (3, 12, 3)])
+        first, *rest = rows[2]
+        self.assertEqual((first, rest), (3, [4, 5]))
 
 
     def test_a_class_from_the_loop_meets_its_base(self):

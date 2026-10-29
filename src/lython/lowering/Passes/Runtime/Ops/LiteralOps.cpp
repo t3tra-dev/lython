@@ -492,8 +492,12 @@ mlir::Value RuntimeBundleLowerer::classValueView(mlir::Location loc,
   mlir::Value size = mlir::arith::ConstantIntOp::create(
                          builder, loc, type_objects::kWordCount, 64)
                          .getResult();
-  return RuntimeBundleLowerer::memrefFromBoxWords(builder, loc, word, size,
-                                                  viewType);
+  mlir::Value view = RuntimeBundleLowerer::memrefFromBoxWords(
+      builder, loc, word, size, viewType);
+  if (mlir::Operation *cast = view.getDefiningOp();
+      cast && mlir::isa<mlir::UnrealizedConversionCastOp>(cast))
+    cast->setAttr(ownership::kTypeObjectViewAttr, builder.getUnitAttr());
+  return view;
 }
 
 // A class value's class word: the address of the type object it views, or the

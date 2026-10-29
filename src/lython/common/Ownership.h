@@ -87,6 +87,10 @@ namespace py::ownership {
 //                                             absorbing retain, so a walk can
 //                                             find the holder
 //   ly.ownership.aggregate_id_next            the allocator for those ids
+//   ly.ownership.type_object_view             a view of the type object a
+//                                             class word names: immortal, so
+//                                             no view of the entity whose
+//                                             header the word was read from
 //   ly.ownership.deallocator_aliases          which contract's deallocator
 //                                             releases a class that has none
 //                                             of its own -- a ClassId-to-
@@ -182,6 +186,9 @@ inline constexpr llvm::StringLiteral kProtocolArgumentTypesAttr{
     "ly.ownership.protocol_argument_types"};
 inline constexpr llvm::StringLiteral kAggregateRetainAttr{
     "ly.ownership.aggregate_retain"};
+// On the cast that views a type object at a class word (`classValueView`).
+inline constexpr llvm::StringLiteral kTypeObjectViewAttr{
+    "ly.ownership.type_object_view"};
 // On a retain the refcount inserter writes IMMEDIATELY BEFORE a consume that
 // is not its group's death (a value read after it is given away): the consume
 // spends this increment, and the group keeps the token it had.

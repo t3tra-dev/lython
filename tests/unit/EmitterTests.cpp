@@ -2585,11 +2585,13 @@ TEST(EmitterTest, NextWithAnUnrelatedDefaultIsRefusedInItsOwnTerms) {
 }
 
 TEST(EmitterTest, AUnionIsNotDisjointFromItsOwnMember) {
-  // `is` against a member of the value's own union is refused, not answered.
-  // The disjointness fold decided both `is` and `is not` from the whole type,
-  // and a union is assignable to no member of itself in either direction, so
-  // `classify(-1) is False` printed False where CPython prints True -- a wrong
-  // answer with no diagnostic anywhere.
+  // `is` against a member of the value's own union is not folded: the
+  // disjointness fold decided both `is` and `is not` from the whole type, and a
+  // union is assignable to no member of itself in either direction, so
+  // `classify(-1) is False` printed False where CPython prints True. It is
+  // answered at run time, member by member (the value is checked in
+  // python/test_a_union_runs_as_the_member_it_holds); two members of one value
+  // type, whose identity is an implementation detail, are still refused.
   for (const char *source :
        {"def classify(n: int):\n    if n < 0:\n        return False\n    "
         "return n * 2\nprint(classify(-1) is False)\n",
@@ -2597,12 +2599,16 @@ TEST(EmitterTest, AUnionIsNotDisjointFromItsOwnMember) {
         "return n * 2\nprint(classify(-1) is not False)\n"}) {
     mlir::MLIRContext context(testRegistry());
     lython::emitter::EmitResult result = emitSource(source, context);
-    EXPECT_FALSE(result.ok()) << source;
-    bool refused = false;
-    for (const lython::parser::Diagnostic &diagnostic : result.diagnostics)
-      refused = refused || diagnostic.message.find("reference-typed operands") !=
-                               std::string::npos;
-    EXPECT_TRUE(refused) << source;
+    EXPECT_TRUE(result.ok()) << source;
+  }
+  {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult result = emitSource(
+        "def f(i: int) -> int | str:\n    return i if i > 0 else 's'\n"
+        "print(f(1) is f(2))\n",
+        context);
+    EXPECT_FALSE(result.ok());
+    EXPECT_TRUE(reportsDiagnostic(result, "reference-typed operands"));
   }
 
   // Two types that really are disjoint still fold, and a shared member is what
@@ -4323,8 +4329,8 @@ TEST(EmitterTest, ADefaultEverySolutionSharesIsReadOnlyAtItsType) {
 // keyword sub-patterns and is refused positional ones, which would read the
 // `__match_args__` of the class the value holds; over a class nothing derives
 // from, positional sub-patterns stay.
-// A field read on an `E | None` is refused where it is written, as a method
-// call on it is; narrowed first, it reads the field.
+// A field read on an `E | None` -- or a store into one -- is refused where it
+// is written, as a method call on it is; narrowed first, it reads the field.
 TEST(EmitterTest, AFieldOfAnOptionalIsReadAfterItIsNarrowed) {
   mlir::MLIRContext context(testRegistry());
   const std::string cls = "class E:\n"
@@ -4339,6 +4345,15 @@ TEST(EmitterTest, AFieldOfAnOptionalIsReadAfterItIsNarrowed) {
   EXPECT_TRUE(reportsDiagnostic(
       unnarrowed, "None has no attribute 'n' -- narrow the value to the "
                   "members that have it first"));
+  lython::emitter::EmitResult stored =
+      emitSource(cls + "def f(r: E | None) -> None:\n"
+                       "    r.n = 5\n"
+                       "f(E(1))\n",
+                 context);
+  EXPECT_FALSE(stored.ok());
+  EXPECT_TRUE(reportsDiagnostic(
+      stored, "'n' is written to whichever member the value holds: None has "
+              "no attribute 'n'"));
   lython::emitter::EmitResult narrowed =
       emitSource(cls + "def f(r: E | None) -> int:\n"
                        "    if r is not None:\n"

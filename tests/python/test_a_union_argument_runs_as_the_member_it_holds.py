@@ -7,7 +7,9 @@
 # function with no return annotation returns what `map` over two sequences
 # gives. A method parameter declared as a base takes a union of the base and
 # its subclasses, and a list display whose elements fit a union element
-# type, a subclass instance among them, is built as that list.
+# type, a subclass instance among them, is built as that list. A union
+# holding a subclass, handed to, returned as or stored in a union of its
+# base, is still the subclass: its class, its methods and its fields.
 import unittest
 
 order: list[str] = []
@@ -122,6 +124,49 @@ class UnionArgumentTest(unittest.TestCase):
 
         self.assertEqual(names([Left(), Right(), SubLeft()]),
                          ["Left", "Right", "SubLeft"])
+
+
+    def test_a_subclass_in_a_union_of_its_base(self):
+        class E:
+            def __init__(self, n: int) -> None:
+                self.n = n
+
+            def who(self) -> str:
+                return "E"
+
+        class SubE(E):
+            def who(self) -> str:
+                return "SubE"
+
+        class Other:
+            def __init__(self, n: int) -> None:
+                self.n = n * 100
+
+            def who(self) -> str:
+                return "Other"
+
+        def find(flag: bool) -> SubE | None:
+            return SubE(2) if flag else None
+
+        def describe(e: E | None) -> str:
+            if e is None:
+                return "-"
+            return e.who() + " " + type(e).__name__ + " " + str(e.n)
+
+        def widen(e: SubE, flag: bool) -> E | None:
+            return e if flag else None
+
+        def name(o: E | Other) -> str:
+            return type(o).__name__ + ":" + o.who() + ":" + str(o.n)
+
+        self.assertEqual([describe(find(True)), describe(find(False)),
+                          describe(widen(SubE(5), True))],
+                         ["SubE SubE 2", "-", "SubE SubE 5"])
+        self.assertEqual([name(o) for o in (E(1), SubE(2), Other(3))],
+                         ["E:E:1", "SubE:SubE:2", "Other:Other:300"])
+        table: dict[str, SubE] = {"a": SubE(7)}
+        self.assertEqual([describe(table.get("a")), describe(table.get("z"))],
+                         ["SubE SubE 7", "-"])
 
 
 if __name__ == "__main__":

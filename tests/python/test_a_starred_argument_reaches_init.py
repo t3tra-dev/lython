@@ -4,7 +4,8 @@
 # expression is its members, its body running where CPython iterates it;
 # positionals beside a `**` mapping stay the callee's *args; a key the
 # mapping shares with a keyword is reported against the class called; and a
-# call through a class value takes a starred tuple of known length.
+# call through a class value, of one class or of several, takes a starred
+# tuple of known length.
 import unittest
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -126,6 +127,21 @@ class StarredInitTest(unittest.TestCase):
         made = [make(Scaled, (1, 2)), make(Kid, (3, 4))]
         self.assertEqual([(type(m).__name__, m.a, m.b) for m in made],
                          [("Scaled", 10, 20), ("Kid", 30, 40)])
+
+
+    def test_a_class_value_of_several_classes_takes_a_tuple(self):
+        class Other:
+            def __init__(self, a: int, b: int) -> None:
+                self.a = a * 100
+                self.b = b * 100
+
+        def build(cls: type[Scaled] | type[Other],
+                  args: tuple[int, int]) -> Scaled | Other:
+            return cls(*args)
+
+        made = [build(Scaled, (1, 2)), build(Other, (1, 2))]
+        self.assertEqual([(type(m).__name__, m.a, m.b) for m in made],
+                         [("Scaled", 10, 20), ("Other", 100, 200)])
 
 
 if __name__ == "__main__":

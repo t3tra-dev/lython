@@ -2299,6 +2299,142 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
       return *identity;
     if (std::optional<Value> identity = unionReferenceIdentity(rhs, lhs))
       return *identity;
+    // ⭐ TWO UNIONS OF OBJECTS AND None, OR A UNION HOLDING A bool AGAINST A
+    // bool, ARE ONE OBJECT MEMBER BY MEMBER: None is None, a bool is one of
+    // two singletons (so its identity is its value), and two objects are
+    // compared by address. `a is b` over two `Node | None` results and `st is
+    // True` over a `bool | None` were refused as having "no stable identity".
+    // ⛔ Not two members of one value type -- two ints, two strs -- whose
+    // identity is the implementation detail the refusal below names. An int
+    // against a bool or None is never the same object, which is decidable.
+    auto valueKind = [&](mlir::Type widened) {
+      return widened == types.intType() || widened == types.floatType() ||
+             widened == types.strType() ||
+             widened == types.contract("builtins.bytes") ||
+             widened == types.contract("builtins.complex");
+    };
+    auto identityMember = [&](mlir::Type member) {
+      mlir::Type widened = types.widenLiteral(member);
+      return isNoneTypeLike(member) || widened == types.boolType() ||
+             valueKind(widened) ||
+             (mlir::isa<py::ContractType>(widened) &&
+              !py::isPyObjectType(widened));
+    };
+    auto membersOf = [&](mlir::Type type) {
+      llvm::SmallVector<mlir::Type, 4> members;
+      if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type))
+        members.append(unionType.getMemberTypes().begin(),
+                       unionType.getMemberTypes().end());
+      else if (type)
+        members.push_back(type);
+      return members;
+    };
+    auto answerable = [&](mlir::Type left, mlir::Type right) {
+      mlir::Type leftType = types.widenLiteral(left);
+      mlir::Type rightType = types.widenLiteral(right);
+      if (isNoneTypeLike(left) || isNoneTypeLike(right) ||
+          leftType == types.boolType() || rightType == types.boolType())
+        return true;
+      if (valueKind(leftType) || valueKind(rightType))
+        return !py::isAssignableTo(leftType, rightType, module) &&
+               !py::isAssignableTo(rightType, leftType, module);
+      return true;
+    };
+    llvm::SmallVector<mlir::Type, 4> lhsMembers =
+        membersOf(lhs.value.getType());
+    llvm::SmallVector<mlir::Type, 4> rhsMembers =
+        membersOf(rhs.value.getType());
+    if ((mlir::isa<py::UnionType>(lhs.value.getType()) ||
+         mlir::isa<py::UnionType>(rhs.value.getType())) &&
+        llvm::all_of(lhsMembers, identityMember) &&
+        llvm::all_of(rhsMembers, identityMember) &&
+        llvm::all_of(lhsMembers, [&](mlir::Type left) {
+          return llvm::all_of(rhsMembers, [&](mlir::Type right) {
+            return answerable(left, right);
+          });
+        })) {
+      // The bit for one member of each side, both unwrapped.
+      auto sameObject = [&](Value left, Value right) -> mlir::Value {
+        mlir::Type leftType = types.widenLiteral(left.type);
+        mlir::Type rightType = types.widenLiteral(right.type);
+        if (isNoneTypeLike(left.type) || isNoneTypeLike(right.type))
+          return common::constantBool(
+              builder, loc(expr),
+              isNoneTypeLike(left.type) && isNoneTypeLike(right.type));
+        if (leftType == types.boolType() || rightType == types.boolType()) {
+          // ⛔ An int member may hold a bool's object (a bool where an int is
+          // declared stays the bool), so int against bool is asked at run
+          // time, as `xs[0] is True` is below.
+          if ((leftType == types.intType() && rightType == types.boolType()) ||
+              (leftType == types.boolType() && rightType == types.intType())) {
+            Value intSide = leftType == types.intType() ? left : right;
+            Value boolSide = leftType == types.boolType() ? left : right;
+            return py::IsOp::create(
+                       builder, loc(expr), builder.getI1Type(),
+                       coerceValue(intSide, types.intType(), expr).value,
+                       coerceValue(boolSide, types.boolType(), expr).value)
+                .getResult();
+          }
+          if (leftType != rightType)
+            return common::constantBool(builder, loc(expr), false);
+          return mlir::arith::CmpIOp::create(
+                     builder, loc(expr), mlir::arith::CmpIPredicate::eq,
+                     emitBoolValue(coerceValue(left, types.boolType(), expr),
+                                   expr),
+                     emitBoolValue(coerceValue(right, types.boolType(), expr),
+                                   expr))
+              .getResult();
+        }
+        if (valueKind(leftType) || valueKind(rightType) ||
+            (!py::isAssignableTo(leftType, rightType, module) &&
+             !py::isAssignableTo(rightType, leftType, module)))
+          return common::constantBool(builder, loc(expr), false);
+        return py::IsOp::create(builder, loc(expr), builder.getI1Type(),
+                                left.value, right.value)
+            .getResult();
+      };
+      // Each side member by member: the bit of the member its tag names.
+      auto byMember = [&](Value side,
+                          llvm::function_ref<mlir::Value(Value)> of)
+          -> mlir::Value {
+        auto unionType =
+            mlir::dyn_cast<py::UnionType>(side.value.getType());
+        if (!unionType)
+          return of(side);
+        llvm::ArrayRef<mlir::Type> members = unionType.getMemberTypes();
+        std::function<mlir::Value(std::size_t)> chain =
+            [&](std::size_t index) -> mlir::Value {
+          mlir::Type member = members[index];
+          auto unwrapped = [&]() -> mlir::Value {
+            return of(Value{py::UnionUnwrapOp::create(builder, loc(expr),
+                                                      member, side.value)
+                                .getResult(),
+                            member});
+          };
+          if (index + 1 == members.size())
+            return unwrapped();
+          mlir::Value active =
+              py::UnionTestOp::create(builder, loc(expr), builder.getI1Type(),
+                                      side.value, mlir::TypeAttr::get(member))
+                  .getResult();
+          return emitValueDiamond(loc(expr), active, builder.getI1Type(),
+                                  unwrapped, [&] { return chain(index + 1); });
+        };
+        return chain(0);
+      };
+      mlir::Value bit = byMember(lhs, [&](Value left) {
+        return byMember(rhs, [&](Value right) { return sameObject(left, right); });
+      });
+      if (negatedIdentity)
+        bit = mlir::arith::XOrIOp::create(
+                  builder, loc(expr), bit,
+                  mlir::arith::ConstantIntOp::create(builder, loc(expr), 1, 1))
+                  .getResult();
+      return Value{py::CastFromPrimOp::create(builder, loc(expr),
+                                              types.boolType(), bit)
+                       .getResult(),
+                   types.boolType()};
+    }
     // ⭐ A CLASS IS ITS TYPE OBJECT, and `type.__eq__` is identity, so two
     // class values one of which may hold several classes are the same object
     // exactly when `==` says so: `ks[0] is ks[1]` over `list[type[A] |
@@ -6854,6 +6990,34 @@ Value ModuleEmitter::coerceValue(Value value, mlir::Type targetType,
     // `int | str | None`, and only the None arm was wrapped. `py.union.wrap`
     // already performs the injection -- it remaps the source tag member by
     // member -- so this is the emitter asking for what the lowering can do.
+    // ⭐ AND A MEMBER BELOW ONE OF THE TARGET'S IS INJECTED AS IT: `SubE |
+    // None` returned where `E | None` is declared, or `AA | B` where `A | B`
+    // is. The tag of such a member is remapped to the base's
+    // (`appendUnionRuntimeValues`), and it was refused in the lowering as a
+    // return operand that does not match the function's result.
+    auto injectsAsAMember = [&](mlir::Type member) {
+      if (unionType.hasMember(member))
+        return true;
+      mlir::Type sourceClass = types.widenLiteral(member);
+      bool classValue = mlir::isa<py::TypeType>(sourceClass);
+      if (classValue)
+        sourceClass = mlir::cast<py::TypeType>(sourceClass).getInstanceType();
+      auto sourceContract =
+          mlir::dyn_cast_if_present<py::ContractType>(sourceClass);
+      if (!sourceContract || isNumericPrimitiveContract(sourceContract))
+        return false;
+      return llvm::any_of(unionType.getMemberTypes(), [&](mlir::Type target) {
+        mlir::Type targetClass = types.widenLiteral(target);
+        if (mlir::isa<py::TypeType>(targetClass) != classValue)
+          return false;
+        if (classValue)
+          targetClass = mlir::cast<py::TypeType>(targetClass).getInstanceType();
+        auto targetContract =
+            mlir::dyn_cast_if_present<py::ContractType>(targetClass);
+        return targetContract &&
+               pythonSubclassOf(sourceContract, targetContract, types, module);
+      });
+    };
     if (auto sourceUnion =
             mlir::dyn_cast_if_present<py::UnionType>(value.type)) {
       if (llvm::all_of(sourceUnion.getMemberTypes(), [&](mlir::Type member) {
@@ -6863,6 +7027,12 @@ Value ModuleEmitter::coerceValue(Value value, mlir::Type targetType,
                                           value.value);
         return {op.getResult(), targetType};
       }
+      // ⛔ Not one wrap: `py.union.wrap` takes members as they are, and a
+      // subclass is upcast to its base first, as a lone value is below.
+      if (llvm::all_of(sourceUnion.getMemberTypes(), injectsAsAMember))
+        return emitUnionMemberDispatch(
+            anchor, value, sourceUnion, targetType,
+            [&](Value member) { return coerceValue(member, targetType, anchor); });
     }
     mlir::Type actual = types.widenLiteral(value.type);
     // ⭐ AND THE PROGRAM'S OWN HIERARCHY, for a class this module declares

@@ -804,6 +804,13 @@ void collectBoxWordDerivedViews(llvm::ArrayRef<mlir::Value> groupValues,
       }
       if (seedInteriorResults(user))
         continue;
+      // ⛔ A TYPE OBJECT IS NO VIEW OF THE ENTITY ITS CLASS WORD WAS READ
+      // FROM: it is immortal, and `type(o)` handing it to a merge made the
+      // entity look handed on -- the owned-local walk then dropped the
+      // element's release, one object per trip of a loop over a display.
+      if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(user);
+          cast && cast->hasAttr(kTypeObjectViewAttr))
+        continue;
       if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(user))
         for (mlir::Value result : cast.getResults())
           if (mlir::isa<mlir::MemRefType>(result.getType()) &&
