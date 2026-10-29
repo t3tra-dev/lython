@@ -745,11 +745,124 @@ ModuleEmitter::tryEmitStrFormatCall(const parser::Node &expr,
         parser::Severity::Error, expr.range.start, std::move(message)});
     return emitNone(expr);
   };
+  // ⭐ A STARRED SEQUENCE INTO A LITERAL TEMPLATE fills the fields it reaches.
+  // The template says which positionals it reads, so the sequence is
+  // collected where CPython collects it (`tuple(xs)`), tested for the length
+  // those fields need -- raising the IndexError CPython raises at the first
+  // field a short one cannot fill -- and read by index; members past the
+  // last field are ignored, as there. `"{:>4}|{:>4}".format(*row)` is how a
+  // table row is printed.
+  // ⛔ Only with the star last, no keywords, and numbered or automatic
+  // fields whose specs hold no field of their own: a keyword or a nested
+  // field is a second reader of the same positionals, which this does not
+  // count.
+  auto starredIntoLiteral = [&]() -> std::optional<Value> {
+    if (!args || args->empty() || !args->back() ||
+        args->back()->kind != "Starred" || (keywords && !keywords->empty()) ||
+        receiverNode->kind != "Constant")
+      return std::nullopt;
+    for (const parser::NodePtr &argument : llvm::drop_end(*args))
+      if (!argument || argument->kind == "Starred")
+        return std::nullopt;
+    std::optional<std::string_view> text = ast::string(*receiverNode, "value");
+    if (!text)
+      return std::nullopt;
+    for (llvm::StringRef builtin : {"tuple", "len", "IndexError"})
+      if (programBindsName(builtin))
+        return std::nullopt;
+    llvm::SmallVector<std::pair<std::string, std::optional<TemplateField>>, 8>
+        pieces;
+    std::string parseError;
+    if (!parseFormatTemplate(*text, pieces, parseError))
+      return std::nullopt;
+    llvm::SmallVector<unsigned, 8> read;
+    unsigned automatic = 0;
+    bool sawAutomatic = false, sawNumbered = false;
+    for (const auto &[literal, field] : pieces) {
+      if (!field)
+        continue;
+      if (field->hasSpec && field->spec.find('{') != std::string::npos)
+        return std::nullopt;
+      unsigned index = 0;
+      if (field->name.empty()) {
+        sawAutomatic = true;
+        index = automatic++;
+      } else if (llvm::all_of(field->name,
+                              [](char c) { return c >= '0' && c <= '9'; })) {
+        sawNumbered = true;
+        if (llvm::StringRef(field->name).getAsInteger(10, index))
+          return std::nullopt;
+      } else {
+        return std::nullopt;
+      }
+      if (!llvm::is_contained(read, index))
+        read.push_back(index);
+    }
+    if (sawAutomatic && sawNumbered)
+      return std::nullopt;
+    const parser::Field *callee = parser::findField(*calleeNode, "value");
+    const auto *receiverPtr =
+        callee ? std::get_if<parser::NodePtr>(&callee->value) : nullptr;
+    if (!receiverPtr || !*receiverPtr)
+      return std::nullopt;
+    parser::SourceRange range = expr.range;
+    llvm::SmallVector<std::string, 4> held;
+    auto releaseHeld = llvm::make_scope_exit([&] {
+      for (const std::string &name : held)
+        values.erase(name);
+    });
+    auto bind = [&](Value value) {
+      std::string name =
+          "__lyformat" + std::to_string(++syntheticFunctionCounter);
+      values[name] = value;
+      types.bindSymbol(name, value.type);
+      held.push_back(name);
+      return name;
+    };
+    std::vector<parser::NodePtr> passed;
+    for (const parser::NodePtr &argument : llvm::drop_end(*args))
+      passed.push_back(synth::name(bind(emitExpr(argument.get())), range));
+    std::optional<Value> collected = collectStarredMembers(
+        expr, emitExpr(ast::node(*args->back(), "value")));
+    if (!collected)
+      return std::nullopt;
+    std::string members = bind(*collected);
+    unsigned written = static_cast<unsigned>(args->size() - 1);
+    unsigned reached = 0;
+    for (unsigned index : read) {
+      if (index < written)
+        continue;
+      reached = std::max(reached, index - written + 1);
+      parser::NodePtr check = synth::ifStmt(
+          synth::compare(synth::lenCall(synth::name(members, range), range),
+                         "LtE",
+                         synth::intConstant(index - written, range), range),
+          {synth::raiseCall("IndexError",
+                            "Replacement index " + std::to_string(index) +
+                                " out of range for positional args tuple",
+                            range)},
+          {}, range);
+      emitStatement(*check);
+      synthesizedIteratorDefs.push_back(std::move(check));
+    }
+    for (unsigned member = 0; member < reached; ++member)
+      passed.push_back(synth::subscript(
+          synth::name(members, range),
+          synth::intConstant(static_cast<std::int64_t>(member), range),
+          range));
+    parser::NodePtr call =
+        synth::methodCall(*receiverPtr, "format", std::move(passed), range);
+    synthesizedIteratorDefs.push_back(call);
+    return emitExpr(call.get());
+  };
   if (args)
     for (const parser::NodePtr &argument : *args)
-      if (argument && argument->kind == "Starred")
+      if (argument && argument->kind == "Starred") {
+        if (std::optional<Value> filled = starredIntoLiteral())
+          return filled;
         return diag("str.format does not support * unpacking (pass the "
                     "arguments explicitly)");
+      }
 
   std::optional<std::string> tpl;
   if (receiverNode->kind == "Constant")
