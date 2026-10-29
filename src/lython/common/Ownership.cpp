@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <iterator>
 #include <mutex>
 #include <optional>
@@ -847,6 +848,30 @@ bool valueGroupEqualsEntryArgumentGroup(mlir::func::FuncOp function,
       return true;
   }
   return false;
+}
+
+bool valueGroupSelectsEntryArgumentGroups(mlir::func::FuncOp function,
+                                          llvm::ArrayRef<mlir::Value> group) {
+  std::function<bool(llvm::ArrayRef<mlir::Value>, unsigned)> selects =
+      [&](llvm::ArrayRef<mlir::Value> values, unsigned depth) {
+        if (valueGroupEqualsEntryArgumentGroup(function, values))
+          return true;
+        if (values.empty() || depth > 8)
+          return false;
+        auto first = values.front().getDefiningOp<mlir::arith::SelectOp>();
+        if (!first)
+          return false;
+        llvm::SmallVector<mlir::Value, 4> whenTrue, whenFalse;
+        for (mlir::Value value : values) {
+          auto select = value.getDefiningOp<mlir::arith::SelectOp>();
+          if (!select || select.getCondition() != first.getCondition())
+            return false;
+          whenTrue.push_back(select.getTrueValue());
+          whenFalse.push_back(select.getFalseValue());
+        }
+        return selects(whenTrue, depth + 1) && selects(whenFalse, depth + 1);
+      };
+  return selects(group, 0);
 }
 
 bool callResultGroupIsOwned(mlir::func::FuncOp callee, unsigned resultIndex) {

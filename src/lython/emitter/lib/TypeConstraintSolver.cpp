@@ -690,6 +690,22 @@ bool bindExpectedType(const TypeSystem &types, mlir::Type expected,
     if (auto actualType = mlir::dyn_cast_if_present<py::TypeType>(actual))
       return bindExpectedType(types, expectedType.getInstanceType(),
                               actualType.getInstanceType(), bindings);
+    // ⭐ A CLASS VALUE THAT MAY HOLD SEVERAL CLASSES meets a `type[A]`
+    // parameter when each of them does: `for c in (A, SubA): name(c)` gives
+    // `type[A] | type[SubA]`, and only the list spelling, whose element is
+    // the join, was taken.
+    if (auto actualUnion = mlir::dyn_cast_if_present<py::UnionType>(actual))
+      if (llvm::all_of(actualUnion.getMemberTypes(), [](mlir::Type member) {
+            return mlir::isa<py::TypeType>(member);
+          }))
+        return llvm::all_of(actualUnion.getMemberTypes(),
+                            [&](mlir::Type member) {
+                              return bindExpectedType(
+                                  types, expectedType.getInstanceType(),
+                                  mlir::cast<py::TypeType>(member)
+                                      .getInstanceType(),
+                                  bindings);
+                            });
   }
   if (auto expectedProtocol =
           mlir::dyn_cast_if_present<py::ProtocolType>(expected))

@@ -6546,6 +6546,17 @@ bool ModuleEmitter::inlineArgumentFits(mlir::Type actual,
       for (mlir::Type member : expectedUnion.getMemberTypes())
         if (member != expected && inlineArgumentFits(actual, member))
           return true;
+  // ⭐ AND A UNION FITS WHEN EVERY MEMBER DOES, by the same rules: `bus.emit(e)`
+  // for an `e` walking `(Ev("a"), Stop("b"))` gives `Ev | Stop` to a parameter
+  // declared Ev, which both members are, and was refused where a free
+  // function of the same signature took it. The inlined body binds the union,
+  // as that function's specialization at it does.
+  if (auto actualUnion = mlir::dyn_cast<py::UnionType>(actual))
+    if (llvm::all_of(actualUnion.getMemberTypes(), [&](mlir::Type member) {
+          return member != actual &&
+                 inlineArgumentFits(types.widenLiteral(member), expected);
+        }))
+      return true;
   // ⭐ THE EMITTER'S OWN MRO, because the module's may not exist yet. An
   // unbound base-method call inside a subclass method passes `self`:
   //
@@ -7824,6 +7835,15 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
       staticStar = staticStar || operands.positionalUnpacked[index] != 0;
     if (declaredInit && declaredInit->method && !staticStar) {
       DynamicUnpackTarget target = dynamicUnpackTargetForMethod(*declaredInit);
+      if (auto contract = mlir::dyn_cast<py::ContractType>(instanceType)) {
+        llvm::StringRef path = py::contracts::runtimeClassPathForContract(
+            contract.getContractName());
+        auto dot = path.rfind('.');
+        target.calledAs =
+            (dot == llvm::StringRef::npos ? std::string("__main__")
+                                          : path.take_front(dot).str()) +
+            "." + py::contracts::pythonQualnameForContract(path);
+      }
       DynamicUnpackCall call;
       call.explicitPositional = plain;
       call.explicitValues.assign(operands.positional.begin(),

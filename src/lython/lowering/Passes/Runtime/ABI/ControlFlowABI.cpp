@@ -1152,9 +1152,6 @@ RuntimeBundleLowerer::lowerRuntimeValueSelect(mlir::arith::SelectOp select) {
   mlir::Value result = select.getResult();
   if (valueBundles.find(result) != valueBundles.end())
     return mlir::success();
-  if (mlir::isa<py::UnionType>(result.getType()))
-    return select.emitError()
-           << "select over a union-typed Python value is not supported yet";
 
   if (mlir::failed(RuntimeBundleLowerer::ensureValueBundle(
           select, select.getTrueValue())) ||

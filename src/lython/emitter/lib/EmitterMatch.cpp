@@ -12,6 +12,7 @@
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringSet.h"
 
 #include <cstddef>
@@ -804,33 +805,62 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
 
       bool capturesSupported = true;
       std::optional<mlir::Value> valueCondition;
+      std::string heldSubject;
+      auto forgetHeldSubject = llvm::make_scope_exit([&] {
+        if (!heldSubject.empty())
+          values.erase(heldSubject);
+      });
       for (auto &[attrName, sub] : attrPatterns) {
         std::optional<mlir::Type> field =
             lookupClassField(narrowed.type, attrName);
+        // ⭐ A KEYWORD NAMES ANY ATTRIBUTE, as `getattr` reads it: a class
+        // attribute, a property, an exception's `args` -- `case A(tag=t)`
+        // for a `tag = "t"` in the class body. Read the way `subject.tag`
+        // is; only an attribute nothing resolves stays refused (CPython's
+        // pattern would fail on the AttributeError, which no static answer
+        // here models).
+        std::optional<Value> read;
         if (!field) {
-          capturesSupported = false;
-          break;
+          if (heldSubject.empty()) {
+            heldSubject =
+                "__lymatchsubject" + std::to_string(++syntheticFunctionCounter);
+            values[heldSubject] = narrowed;
+            types.bindSymbol(heldSubject, narrowed.type);
+          }
+          parser::NodePtr attribute = synth::attribute(
+              synth::name(heldSubject, sub->range), attrName, sub->range);
+          synthesizedIteratorDefs.push_back(attribute);
+          mlir::Type attributeType = types.inferExpr(attribute.get());
+          if (!attributeType ||
+              types.widenLiteral(attributeType) == types.object()) {
+            capturesSupported = false;
+            break;
+          }
+          read = emitExpr(attribute.get());
         }
         bool isCapture = sub->kind == "MatchAs";
         std::optional<std::string_view> captureName =
             isCapture ? ast::string(*sub, "name") : std::nullopt;
         if (isCapture && !captureName)
           continue; // wildcard positional: field existence is the only check
-        auto attrGet = py::AttrGetOp::create(
-            builder, loc(statement), *field, narrowed.value, attrName);
-        attrGet->setAttr("ly.attr.kind", builder.getStringAttr("field"));
-        markFieldReadMaybeUnset(attrGet, narrowed.type, attrName);
-        if (auto contract =
-                mlir::dyn_cast_if_present<py::ContractType>(narrowed.type))
-          attrGet->setAttr("ly.attr.owner",
-                           builder.getStringAttr(contract.getContractName()));
+        if (!read) {
+          auto attrGet = py::AttrGetOp::create(
+              builder, loc(statement), *field, narrowed.value, attrName);
+          attrGet->setAttr("ly.attr.kind", builder.getStringAttr("field"));
+          markFieldReadMaybeUnset(attrGet, narrowed.type, attrName);
+          if (auto contract =
+                  mlir::dyn_cast_if_present<py::ContractType>(narrowed.type))
+            attrGet->setAttr("ly.attr.owner",
+                             builder.getStringAttr(contract.getContractName()));
+          read = Value{attrGet.getResult(), *field};
+        }
         if (isCapture) {
-          values[std::string(*captureName)] = Value{attrGet.getResult(), *field};
-          types.bindSymbol(*captureName, *field);
+          values[std::string(*captureName)] = *read;
+          types.bindSymbol(*captureName, read->type);
           continue;
         }
         // MatchValue: gate the case body on attribute equality.
-        Value element{attrGet.getResult(), *field};
+        Value element = *read;
         Value patternValue = emitExpr(ast::node(*sub, "value"));
         Value compared = emitBinarySpecial<py::EqOp>(
             *sub, "__eq__", element, patternValue, types.boolType());
@@ -897,8 +927,12 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
       // On the fall-through edge the tested member is excluded — but only
       // when falling through can only mean the class test failed (a value
       // inequality also falls through without excluding the member).
+      // ⛔ And never for a class value: an instance of its bound that is not
+      // one of the class it holds falls through too, so `case cls():` failing
+      // proved nothing -- and excluding the member made a later `case B():`
+      // irrefutable, taken for an A (and a read of B's field crashed).
       if (analysis.kind == IsInstanceAnalysis::Kind::UnionTest &&
-          analysis.falseType && !refutableByValue)
+          analysis.falseType && !refutableByValue && !classValueTarget)
         matchSubjectType = analysis.falseType;
       check = nextCheck;
       continue;

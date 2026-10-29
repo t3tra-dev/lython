@@ -1038,7 +1038,14 @@ set(LYTHON_LEAK_GATE_CASES
     # A display read at a run-time index in a loop: the selection lends its
     # candidates to the read, and each candidate's own reference is released
     # after the loop rather than through the read (one object per call).
-    an_element_read_at_a_run_time_index_in_a_loop)
+    an_element_read_at_a_run_time_index_in_a_loop
+    # A `Node | None` parameter returned: the result is owned, so the return
+    # takes the reference the caller releases.
+    an_optional_parameter_returned_to_its_caller
+    # One object chosen among several -- by a ternary arm reading a display at
+    # a run-time index, past an IndexError caught in the same function, and
+    # kept across a generator's `yield` -- holds exactly one reference.
+    a_chosen_element_is_released_on_every_path)
 
 # Cases that end with a non-zero status BY DESIGN, as `<dir>/<case>=<code>`.
 #

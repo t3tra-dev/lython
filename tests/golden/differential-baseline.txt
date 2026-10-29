@@ -40,6 +40,7 @@ a_callable_value_call_that_may_reach_an_iterable_parameter.py AGREE
 a_capture_that_outlives_a_yield.py AGREE
 a_chain_built_through_a_guarded_tail.py AGREE
 a_chain_is_built_in_a_loop.py AGREE
+a_chosen_element_is_released_on_every_path.py AGREE
 a_class_attribute_a_subclass_in_a_third_module_redeclares.py AGREE
 a_class_attribute_a_subclass_redeclares.py AGREE
 a_class_attribute_a_subclass_redeclares_across_modules.py AGREE
@@ -517,6 +518,7 @@ an_optional_held_across_a_yield_in_a_try.py AGREE
 an_optional_instance_boxed_into_object.py AGREE
 an_optional_local_rebound_in_a_try.py AGREE
 an_optional_module_global_has_a_cell.py AGREE
+an_optional_parameter_returned_to_its_caller.py AGREE
 an_optional_result_drives_a_loop.py AGREE
 an_optional_returned_through_a_finally.py AGREE
 an_or_default_keeps_the_value.py AGREE

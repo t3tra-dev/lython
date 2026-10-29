@@ -778,25 +778,47 @@ ModuleEmitter::tryEmitStrFormatCall(const parser::Node &expr,
     llvm::SmallVector<unsigned, 8> read;
     unsigned automatic = 0;
     bool sawAutomatic = false, sawNumbered = false;
-    for (const auto &[literal, field] : pieces) {
-      if (!field)
-        continue;
-      if (field->hasSpec && field->spec.find('{') != std::string::npos)
-        return std::nullopt;
+    auto readField = [&](llvm::StringRef name) -> bool {
       unsigned index = 0;
-      if (field->name.empty()) {
+      if (name.empty()) {
         sawAutomatic = true;
         index = automatic++;
-      } else if (llvm::all_of(field->name,
+      } else if (llvm::all_of(name,
                               [](char c) { return c >= '0' && c <= '9'; })) {
         sawNumbered = true;
-        if (llvm::StringRef(field->name).getAsInteger(10, index))
-          return std::nullopt;
+        if (name.getAsInteger(10, index))
+          return false;
       } else {
-        return std::nullopt;
+        return false;
       }
       if (!llvm::is_contained(read, index))
         read.push_back(index);
+      return true;
+    };
+    for (const auto &[literal, field] : pieces) {
+      if (!field)
+        continue;
+      if (!readField(field->name))
+        return std::nullopt;
+      // ⭐ A FIELD IN THE SPEC IS READ AFTER ITS OWN, as CPython's
+      // MarkupIterator does: `"{:>{}}".format(*w)` reads w[0] for the value
+      // and w[1] for the width.
+      // ⛔ One level, and a bare index only -- what CPython itself allows in
+      // a spec is that one level.
+      llvm::StringRef spec = field->hasSpec ? llvm::StringRef(field->spec)
+                                            : llvm::StringRef();
+      while (!spec.empty()) {
+        std::size_t open = spec.find('{');
+        if (open == llvm::StringRef::npos)
+          break;
+        std::size_t close = spec.find('}', open);
+        if (close == llvm::StringRef::npos)
+          return std::nullopt;
+        llvm::StringRef inner = spec.slice(open + 1, close);
+        if (inner.contains('{') || !readField(inner))
+          return std::nullopt;
+        spec = spec.drop_front(close + 1);
+      }
     }
     if (sawAutomatic && sawNumbered)
       return std::nullopt;

@@ -1635,7 +1635,13 @@ private:
     if (isAsync)
       consumePegLiteral("with_stmt", "async", "expected 'async'");
     consumePegLiteral("with_stmt", "with", "expected 'with'");
-    const bool parenthesized = matchText("(");
+    // ⭐ `with (a) as b:` IS ONE ITEM WHOSE EXPRESSION IS PARENTHESIZED. The
+    // grammar's first alternative, the parenthesized item list, fails when
+    // its `)` is not followed by `:`, and the PEG parser then takes the plain
+    // list, whose first expression starts at the `(` -- so this builder asks
+    // the same question before it consumes the parenthesis.
+    const bool parenthesized =
+        atText("(") && closingParenFollowedByColon() && matchText("(");
     bool parseAsParenthesizedItemList = parenthesized;
     std::vector<NodePtr> items;
     if (parenthesized && hasTopLevelNamedExpressionBeforeClosingParen()) {
@@ -1688,6 +1694,28 @@ private:
     addField(*node, "type_comment",
              typeComment.empty() ? FieldValue{} : FieldValue{typeComment});
     return node;
+  }
+
+  // At a `(`: is the token after its matching `)` a `:`?
+  bool closingParenFollowedByColon() const {
+    int depth = 0;
+    for (std::size_t cursor = index; cursor < tokens.size(); ++cursor) {
+      const Token &token = tokens[cursor];
+      if (token.kind == TokenKind::End)
+        return false;
+      if (token.rawText == "(" || token.rawText == "[" ||
+          token.rawText == "{") {
+        ++depth;
+        continue;
+      }
+      if (token.rawText == ")" || token.rawText == "]" ||
+          token.rawText == "}") {
+        if (--depth == 0)
+          return cursor + 1 < tokens.size() &&
+                 tokens[cursor + 1].rawText == ":";
+      }
+    }
+    return false;
   }
 
   bool hasTopLevelNamedExpressionBeforeClosingParen() const {

@@ -5,7 +5,9 @@
 # constructor (`frozenset(u)`) and a format specification. The receiver and the
 # arguments are evaluated once, in order, before the member is asked. A
 # function with no return annotation returns what `map` over two sequences
-# gives.
+# gives. A method parameter declared as a base takes a union of the base and
+# its subclasses, and a list display whose elements fit a union element
+# type, a subclass instance among them, is built as that list.
 import unittest
 
 order: list[str] = []
@@ -86,6 +88,40 @@ class UnionArgumentTest(unittest.TestCase):
         self.assertEqual(format(num(True), ">6"), "   1.5")
         self.assertEqual(f"{num(False):>6}|{num(False):06.2f}",
                          "     3|003.00")
+
+
+    def test_a_method_parameter_takes_a_union_of_its_subclasses(self):
+        class Event:
+            def __init__(self, src: str) -> None:
+                self.src = src
+
+        class Stop(Event):
+            pass
+
+        class Bus:
+            def emit(self, e: Event) -> str:
+                return e.src + ":" + type(e).__name__
+
+        bus = Bus()
+        self.assertEqual([bus.emit(e) for e in (Event("a"), Stop("b"))],
+                         ["a:Event", "b:Stop"])
+
+
+    def test_a_display_with_a_subclass_meets_a_union_element(self):
+        class Left:
+            pass
+
+        class SubLeft(Left):
+            pass
+
+        class Right:
+            pass
+
+        def names(xs: list[Left | Right]) -> list[str]:
+            return [type(x).__name__ for x in xs]
+
+        self.assertEqual(names([Left(), Right(), SubLeft()]),
+                         ["Left", "Right", "SubLeft"])
 
 
 if __name__ == "__main__":

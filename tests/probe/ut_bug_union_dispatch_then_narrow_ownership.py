@@ -5,6 +5,10 @@
 # FOUND: 2026-10-20, porting unittest -- docs/unittest-port.md lists every ut_ probe.
 # CLASSIFICATION @ lang-gaps fa5c535a: 3 loud 拒否 (診断)
 #   released owned resource from @_ZN8__main__19program_or_manifestE is used after release
+# FIXED 2026-10-30: a union result whose member is a program class declares
+#   that member's lane owned (the ABI asked the deallocator list before the
+#   program's class deallocators were written), so the return takes the
+#   reference its caller releases.
 # CPython 3.14 expects: < / 0
 import io
 

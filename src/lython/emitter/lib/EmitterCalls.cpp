@@ -308,6 +308,30 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
                                         module);
               }))
             value = coerceValue(value, expectedClass, *valueNode);
+      // ⭐ And a union of CLASS VALUES below the parameter's is a class value
+      // of it: the type object the tag names, picked member by member.
+      if (positionalAligned && !unpacked)
+        if (auto expectedClass = mlir::dyn_cast_if_present<py::TypeType>(
+                expectedFor(operands.positionalTypes.size())))
+          if (auto unionType = mlir::dyn_cast<py::UnionType>(
+                  types.widenLiteral(value.type));
+              unionType &&
+              llvm::all_of(unionType.getMemberTypes(), [&](mlir::Type member) {
+                auto memberClass = mlir::dyn_cast<py::TypeType>(member);
+                auto memberInstance =
+                    memberClass ? mlir::dyn_cast<py::ContractType>(
+                                      memberClass.getInstanceType())
+                                : py::ContractType();
+                auto bound = mlir::dyn_cast<py::ContractType>(
+                    expectedClass.getInstanceType());
+                return memberInstance && bound &&
+                       pythonSubclassOf(memberInstance, bound, types, module);
+              }))
+            value = emitUnionMemberDispatch(
+                *valueNode, value, unionType, expectedClass,
+                [&](Value member) {
+                  return coerceValue(member, expectedClass, *valueNode);
+                });
       // ⭐ AN INLINED METHOD'S OWN `*args` IS THE VALUES ITS CALL GAVE. A pack
       // of one has no arity in its type (`tuple[str]` is also the
       // homogeneous spelling), so it is forwarded as those values, not
@@ -732,7 +756,8 @@ ModuleEmitter::emitDynamicUnpack(const parser::Node &anchor,
     return refuse("a `**` mapping whose keys are known only at run time is "
                   "copied with dict(), which this program rebinds");
 
-  std::string qualified = target.module.empty()
+  std::string qualified = !target.calledAs.empty() ? target.calledAs
+                          : target.module.empty()
                               ? target.qualname
                               : target.module + "." + target.qualname;
   std::string source = bind(mapping->second);
@@ -1963,6 +1988,115 @@ ModuleEmitter::tryEmitStaticKeywordPackGet(const parser::Node &call) {
   return emitNone(call);
 }
 
+// ⭐ `range(*args)`, `max(*xs)` AND `min(*xs)` TAKE THEIR SEQUENCE BY LENGTH,
+// which is what CPython's argument parsing does with it: the sequence is
+// collected (`tuple(xs)`), a length the builtin does not take raises its own
+// TypeError -- "range expected at most 3 arguments, got 4", "max expected at
+// least 1 argument, got 0" -- and the call is made with the members its
+// length gives. One member to max/min is an ITERABLE of its own there:
+// `max(*["abc"])` is "c", and `max(*[5])` raises "'int' object is not
+// iterable".
+// ⛔ Only the sequence alone, with no keyword: `max(*xs, key=f)` and
+// `range(1, *xs)` place the members differently, and a member type max/min
+// cannot iterate beside one it can (a list member) types its two arms apart.
+std::optional<Value>
+ModuleEmitter::emitStarredBuiltinByLength(const parser::Node &expr) {
+  const parser::Node *calleeNode = ast::node(expr, "func");
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (!calleeNode || calleeNode->kind != "Name" || !args ||
+      args->size() != 1 || !args->front() ||
+      args->front()->kind != "Starred" || (keywords && !keywords->empty()))
+    return std::nullopt;
+  llvm::StringRef name = ast::nameSpelling(*calleeNode);
+  if ((name != "range" && name != "max" && name != "min") ||
+      !callsUnshadowedBuiltin(calleeNode, name))
+    return std::nullopt;
+  for (llvm::StringRef builtin : {"tuple", "len", "str", "type", "TypeError"})
+    if (programBindsName(builtin))
+      return std::nullopt;
+  const parser::Node *sequenceNode = ast::node(*args->front(), "value");
+  mlir::Type member =
+      sequenceNode ? types.iterableElementType(types.widenLiteral(
+                         types.inferExpr(sequenceNode)))
+                   : mlir::Type();
+  if (!member)
+    return std::nullopt;
+  member = types.widenLiteral(member);
+  bool reducer = name != "range";
+  bool memberIsText = member == types.contract("builtins.str");
+  if (reducer && !memberIsText && types.iterableElementType(member))
+    return std::nullopt;
+
+  parser::SourceRange range = expr.range;
+  std::optional<Value> collected =
+      collectStarredMembers(expr, emitExpr(sequenceNode));
+  if (!collected)
+    return std::nullopt;
+  std::string held = "__lybylen" + std::to_string(++syntheticFunctionCounter);
+  values[held] = *collected;
+  types.bindSymbol(held, collected->type);
+  auto releaseHeld = llvm::make_scope_exit([&] { values.erase(held); });
+  auto id = [&](llvm::StringRef text) { return synth::name(text, range); };
+  auto number = [&](std::int64_t value) {
+    return synth::intConstant(value, range);
+  };
+  auto length = [&] { return synth::lenCall(id(held), range); };
+  auto member_at = [&](std::int64_t index) {
+    return synth::subscript(id(held), number(index), range);
+  };
+  auto raiseWhen = [&](parser::NodePtr test, parser::NodePtr message) {
+    parser::NodePtr raise = parser::makeNode("Raise", range);
+    parser::addField(*raise, "exc",
+                     synth::call(id("TypeError"), {std::move(message)}, range));
+    parser::NodePtr check = synth::ifStmt(std::move(test), {raise}, {}, range);
+    emitStatement(*check);
+    synthesizedIteratorDefs.push_back(std::move(check));
+  };
+  std::string spelled = name.str();
+  raiseWhen(synth::compare(length(), "Eq", number(0), range),
+            synth::strConstant(spelled + " expected at least 1 argument, got 0",
+                               range));
+  parser::NodePtr call;
+  if (!reducer) {
+    raiseWhen(synth::compare(length(), "Gt", number(3), range),
+              synth::binOp(synth::strConstant(
+                               "range expected at most 3 arguments, got ",
+                               range),
+                           "Add",
+                           synth::call(id("str"), {length()}, range), range));
+    auto rangeOf = [&](std::int64_t count) {
+      std::vector<parser::NodePtr> members;
+      for (std::int64_t index = 0; index < count; ++index)
+        members.push_back(member_at(index));
+      return synth::call(id("range"), std::move(members), range);
+    };
+    call = synth::ifExp(
+        synth::compare(length(), "Eq", number(1), range), rangeOf(1),
+        synth::ifExp(synth::compare(length(), "Eq", number(2), range),
+                     rangeOf(2), rangeOf(3), range),
+        range);
+  } else if (memberIsText) {
+    call = synth::ifExp(synth::compare(length(), "Eq", number(1), range),
+                        synth::call(id(spelled), {member_at(0)}, range),
+                        synth::call(id(spelled), {id(held)}, range), range);
+  } else {
+    raiseWhen(synth::compare(length(), "Eq", number(1), range),
+              synth::binOp(
+                  synth::binOp(
+                      synth::strConstant("'", range), "Add",
+                      synth::attribute(
+                          synth::call(id("type"), {member_at(0)}, range),
+                          "__name__", range),
+                      range),
+                  "Add", synth::strConstant("' object is not iterable", range),
+                  range));
+    call = synth::call(id(spelled), {id(held)}, range);
+  }
+  synthesizedIteratorDefs.push_back(call);
+  return emitExpr(call.get());
+}
+
 Value ModuleEmitter::emitCall(const parser::Node &expr) {
   // ⭐ A STARRED TUPLE DISPLAY IS ITS ELEMENTS, in the order they are written:
   // `f(*(a, b))` builds the tuple from `a` then `b` and unpacks it, which
@@ -1999,6 +2133,58 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         return emitCall(*respelled);
       }
     }
+  // ⭐ A STARRED GENERATOR EXPRESSION INTO A METHOD IS THE TUPLE OF ITS
+  // MEMBERS, made where the star stands: `a.add(*(v for v in range(4)))` and
+  // `"{} {}".format(*(w for w in ws))`. The function path collects such a
+  // star itself (`emitCallOperands`); the method and format paths took it as
+  // a value and said "unsupported expression kind 'GeneratorExp'".
+  // ⛔ Only where CPython iterates it at the star too: with no keyword after
+  // it, or behind another positional. A lone first star with keywords is
+  // iterated after them (CALL_FUNCTION_EX), which this spelling would not do.
+  if (const parser::Node *calleeNode = ast::node(expr, "func");
+      calleeNode && calleeNode->kind == "Attribute" &&
+      !programBindsName("tuple"))
+    if (const auto *written = ast::nodeList(expr, "args")) {
+      const auto *writtenKeywords = ast::nodeList(expr, "keywords");
+      bool keywordsFollow = writtenKeywords && !writtenKeywords->empty();
+      const parser::Node *receiver = ast::node(*calleeNode, "value");
+      mlir::Type receiverType =
+          receiver ? types.widenLiteral(types.inferExpr(receiver))
+                   : mlir::Type();
+      bool onAValue = receiverType && (mlir::isa<py::ContractType>(receiverType) ||
+                                       mlir::isa<py::UnionType>(receiverType));
+      std::vector<parser::NodePtr> collected;
+      bool respelled = false;
+      for (auto [index, arg] : llvm::enumerate(*written)) {
+        const parser::Node *generator =
+            arg && arg->kind == "Starred" ? ast::node(*arg, "value") : nullptr;
+        if (onAValue && generator && generator->kind == "GeneratorExp" &&
+            (!keywordsFollow || index != 0)) {
+          parser::NodePtr tupled = synth::call(
+              synth::name("tuple", arg->range),
+              {*std::get_if<parser::NodePtr>(
+                  &parser::findField(*arg, "value")->value)},
+              arg->range);
+          collected.push_back(synth::starred(std::move(tupled), arg->range));
+          respelled = true;
+          continue;
+        }
+        collected.push_back(arg);
+      }
+      if (respelled) {
+        std::vector<parser::NodePtr> keywords;
+        if (writtenKeywords)
+          keywords.assign(writtenKeywords->begin(), writtenKeywords->end());
+        const parser::Field *callee = parser::findField(expr, "func");
+        parser::NodePtr call = synth::callWithKeywords(
+            *std::get_if<parser::NodePtr>(&callee->value), std::move(collected),
+            std::move(keywords), expr.range);
+        synthesizedIteratorDefs.push_back(call);
+        return emitCall(*call);
+      }
+    }
+  if (std::optional<Value> byLength = emitStarredBuiltinByLength(expr))
+    return *byLength;
   Value result = emitCallAsImplemented(expr);
   // A call of an `@overload`ed function is typed by the overload it matched.
   const parser::Node *calleeNode = ast::node(expr, "func");
@@ -7158,8 +7344,23 @@ ModuleEmitter::emitClassValueCall(const parser::Node &expr,
                   "not supported: each class it could name would be an arm");
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");
-  if ((args && llvm::any_of(*args, [](const parser::NodePtr &arg) {
-         return !arg || arg->kind == "Starred";
+  // ⭐ A STARRED TUPLE WHOSE TYPE GIVES ITS LENGTH IS ITS MEMBERS, read out
+  // of it once where the star stands: `cls(*args)` for an `args:
+  // tuple[int, int]`, as the class's own construction takes it.
+  // ⛔ Not a sequence of run-time length, whose members each arm would have
+  // to count for itself.
+  auto knownArity = [&](const parser::Node *starred) -> std::optional<unsigned> {
+    const parser::Node *value = ast::node(*starred, "value");
+    if (!value)
+      return std::nullopt;
+    llvm::SmallVector<mlir::Type, 4> members;
+    if (!appendStarredArgumentTypes(
+            types, types.widenLiteral(types.inferExpr(value)), members))
+      return std::nullopt;
+    return static_cast<unsigned>(members.size());
+  };
+  if ((args && llvm::any_of(*args, [&](const parser::NodePtr &arg) {
+         return !arg || (arg->kind == "Starred" && !knownArity(arg.get()));
        })) ||
       (keywords && llvm::any_of(*keywords, [](const parser::NodePtr &kw) {
          return !kw || !ast::string(*kw, "arg");
@@ -7184,8 +7385,21 @@ ModuleEmitter::emitClassValueCall(const parser::Node &expr,
   };
   std::vector<std::string> positional;
   if (args)
-    for (const parser::NodePtr &arg : *args)
-      positional.push_back(bindTemp(arg.get()));
+    for (const parser::NodePtr &arg : *args) {
+      if (arg->kind != "Starred") {
+        positional.push_back(bindTemp(arg.get()));
+        continue;
+      }
+      std::string packed = bindTemp(ast::node(*arg, "value"));
+      for (unsigned index = 0, count = *knownArity(arg.get()); index < count;
+           ++index) {
+        parser::NodePtr member = synth::subscript(
+            synth::name(packed, arg->range),
+            synth::intConstant(index, arg->range), arg->range);
+        synthesizedIteratorDefs.push_back(member);
+        positional.push_back(bindTemp(member.get()));
+      }
+    }
   std::vector<std::pair<std::string, std::string>> named;
   if (keywords)
     for (const parser::NodePtr &kw : *keywords)
@@ -10147,15 +10361,42 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
     mlir::Type strType = types.contract("builtins.str");
     llvm::SmallVector<Value, 4> evaluated;
     std::optional<Value> collected;
+    std::string *heldStarredName = nullptr;
     auto collectArguments = [&] {
       std::vector<parser::NodePtr> members(printArgs->begin(),
                                            printArgs->end());
+      if (heldStarredName && !heldStarredName->empty())
+        members = {synth::starred(synth::name(*heldStarredName, expr.range),
+                                  expr.range)};
       parser::NodePtr display = synth::tuple(std::move(members), expr.range);
       synthesizedIteratorDefs.push_back(display);
       collected = emitExpr(display.get());
     };
     bool collectAfterKeywords = starredArguments && printArgs->size() == 1 &&
                                 printKeywords && !printKeywords->empty();
+    // ⭐ THE STARRED EXPRESSION IS EVALUATED WHERE IT IS WRITTEN even when
+    // its members are collected after the keywords: CPython builds
+    // `[note(3), note(4)]` first and only iterates it at the call. Emitting
+    // the whole display after the keywords ran `sep=`'s call before the
+    // notes. The value is held and the display iterates the held name.
+    // ⛔ Not a generator expression, whose body CPython runs when the call
+    // iterates it -- after the keywords, which the display already does.
+    std::string heldStarred;
+    auto releaseHeldStarred = llvm::make_scope_exit([&] {
+      if (!heldStarred.empty())
+        values.erase(heldStarred);
+    });
+    if (collectAfterKeywords)
+      if (const parser::Node *starredValue =
+              ast::node(*printArgs->front(), "value");
+          starredValue && starredValue->kind != "GeneratorExp") {
+        Value held = emitExpr(starredValue);
+        heldStarred =
+            "__lyprintstar" + std::to_string(++syntheticFunctionCounter);
+        values[heldStarred] = held;
+        types.bindSymbol(heldStarred, held.type);
+        heldStarredName = &heldStarred;
+      }
     if (starredArguments && !collectAfterKeywords)
       collectArguments();
     else if (!starredArguments && printArgs)

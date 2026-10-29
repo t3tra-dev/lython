@@ -325,7 +325,26 @@ mlir::Type inferredFunctionResult(
                          typedInPlace);
   if (results.empty())
     return types.none();
-  return joinIgnoringEmptyLiterals(types, results, resultNodes);
+  mlir::Type joined = joinIgnoringEmptyLiterals(types, results, resultNodes);
+  // ⭐ A LITERAL BESIDE ITS OWN CONTRACT IS THAT CONTRACT: `return int(s)`
+  // and `return -1` are both ints, and the union `int | Literal[-1]` they
+  // joined to is no type a `return` inside a `try` can carry -- every
+  // unannotated function returning from its `try` and its handler was
+  // refused, while `-> int` compiled.
+  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(joined)) {
+    llvm::ArrayRef<mlir::Type> members = unionType.getMemberTypes();
+    llvm::SmallVector<mlir::Type, 4> kept;
+    for (mlir::Type member : members) {
+      mlir::Type widened = types.widenLiteral(member);
+      if (mlir::isa<py::LiteralType>(member) && widened != member &&
+          llvm::is_contained(members, widened))
+        continue;
+      kept.push_back(member);
+    }
+    if (kept.size() != members.size())
+      joined = types.join(kept);
+  }
+  return joined;
 }
 
 struct GeneratorFunctionAnalysis {

@@ -452,10 +452,15 @@ mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorLaneReturnOperands(
   //
   // Why NOT when `forceRetain`: that flags the SAME value carried by two lanes,
   // and two lanes are two references however the first one was obtained.
+  //
+  // ⭐ AND A SELECT BETWEEN PARAMETERS IS ONE OF THEM: the borrowed-entry rule
+  // follows `arith.select` and retains `x = a if f else b` at the suspend,
+  // so asking only for the parameter itself took a second reference there --
+  // one object leaked per generator that kept the choice across a `yield`.
   bool borrowedEntryReturn = false;
   if (!forceRetain && !bundle.physicalValues().empty())
     if (auto function = op->getParentOfType<mlir::func::FuncOp>())
-      borrowedEntryReturn = ownership::valueGroupEqualsEntryArgumentGroup(
+      borrowedEntryReturn = ownership::valueGroupSelectsEntryArgumentGroups(
           function, bundle.physicalValues());
 
   if (lane.contract == "builtins.object" &&

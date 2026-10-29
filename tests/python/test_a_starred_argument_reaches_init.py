@@ -1,8 +1,10 @@
 # A starred argument whose members the type or the spelling says reaches the
 # parameters one by one -- of a function, a method, or a class's `__init__`,
 # which runs; a starred tuple display is its elements; a starred generator
-# expression is its members, its body running where CPython iterates it; and
-# positionals beside a `**` mapping stay the callee's *args.
+# expression is its members, its body running where CPython iterates it;
+# positionals beside a `**` mapping stay the callee's *args; a key the
+# mapping shares with a keyword is reported against the class called; and a
+# call through a class value takes a starred tuple of known length.
 import unittest
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -37,6 +39,22 @@ class Forwarded:
         self.options = options
 
 
+class Named:
+    def __init__(self, x: str, **options: str) -> None:
+        self.options = options
+
+    def put(self, x: str, **options: str) -> str:
+        return x
+
+
+class Kid(Scaled):
+    pass
+
+
+def make(cls: type[Scaled], args: tuple[int, int]) -> Scaled:
+    return cls(*args)
+
+
 def both(a: float, b: float = 0.5) -> str:
     return f"{a!r} {b!r}"
 
@@ -69,6 +87,25 @@ class StarredInitTest(unittest.TestCase):
         made = Forwarded("a", "b", **options)
         self.assertEqual((made.parts, made.options), (("a", "b"), {"k": 1}))
 
+    def test_a_key_given_twice_names_what_was_called(self):
+        options = {"x": "1"}
+        with self.assertRaises(TypeError) as raised:
+            Named(**options, x="3")
+        self.assertEqual(str(raised.exception),
+                         "__main__.Named() got multiple values for keyword "
+                         "argument 'x'")
+        with self.assertRaises(TypeError) as raised:
+            Named("a", **options)
+        self.assertEqual(str(raised.exception),
+                         "Named.__init__() got multiple values for argument "
+                         "'x'")
+        held = Named("a")
+        with self.assertRaises(TypeError) as raised:
+            held.put(**options, x="3")
+        self.assertEqual(str(raised.exception),
+                         "__main__.Named.put() got multiple values for "
+                         "keyword argument 'x'")
+
     def test_a_tuple_display_meets_each_parameter(self):
         self.assertEqual([both(*(4, 5)), both(*(4.0, 5)), both(4, *(5,))],
                          ["4 5", "4.0 5", "4 5"])
@@ -83,6 +120,12 @@ class StarredInitTest(unittest.TestCase):
             "20,30,10")
         words = [1, 2]
         self.assertEqual(keyed(*(w for w in words), k=words.pop()), "1,0,2")
+
+
+    def test_a_class_value_takes_a_tuple_of_known_length(self):
+        made = [make(Scaled, (1, 2)), make(Kid, (3, 4))]
+        self.assertEqual([(type(m).__name__, m.a, m.b) for m in made],
+                         [("Scaled", 10, 20), ("Kid", 30, 40)])
 
 
 if __name__ == "__main__":

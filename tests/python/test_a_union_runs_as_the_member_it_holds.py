@@ -3,7 +3,8 @@
 # a `for` loop and every comprehension or builtin that iterates it, the
 # builtins that convert or measure one value, `in`, a slice, and an attribute
 # its members answer differently. The loop target outlives the loop as
-# whichever member's element it was last bound to.
+# whichever member's element it was last bound to. A conditional expression
+# between two union values is whichever of them its test picks.
 #
 # A result holding union values is compared by its repr, which tells 'a', 1
 # and 1.0 apart as the values themselves would.
@@ -201,6 +202,19 @@ class UnionIterationTest(unittest.TestCase):
     def test_a_generator_expression_over_a_local_types_the_return(self):
         self.assertEqual(longest(True), 4)
         self.assertEqual(longest(False), 6)
+
+
+    def test_a_conditional_expression_between_union_values(self):
+        def pick(a: str | None, b: str | None, c: bool) -> str | None:
+            return a if c else b
+
+        def either(a: int | str, b: int | str, c: bool) -> int | str:
+            return a if c else b
+
+        self.assertEqual([pick("x", None, True), pick("x", None, False)],
+                         ["x", None])
+        self.assertEqual(repr([either(1, "s", True), either(1, "s", False)]),
+                         "[1, 's']")
 
 
 if __name__ == "__main__":

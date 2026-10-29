@@ -1,8 +1,8 @@
 # What a call hands a parameter that CPython takes as it is: `sep=None` and
 # `end=None` are print's defaults, a `str | None` forwarded to them is either;
 # an `object` parameter's default is the value written; a bool is an int for
-# `*args: int`; and a lambda that prints with a keyword is the None it
-# returns.
+# `*args: int`; a lambda that prints with a keyword is the None it returns;
+# and a starred argument to print is evaluated before the keywords after it.
 import io
 import unittest
 from collections.abc import Callable
@@ -39,6 +39,19 @@ class Holder:
         return str(a) + ":" + str(sum(rest))
 
 
+order: list[str] = []
+
+
+def noted(x: int) -> int:
+    order.append("note " + str(x))
+    return x
+
+
+def separator() -> str:
+    order.append("sep")
+    return "|"
+
+
 class KeywordAndDefaultTest(unittest.TestCase):
     def test_none_is_print_default(self):
         self.assertEqual(
@@ -64,6 +77,18 @@ class KeywordAndDefaultTest(unittest.TestCase):
         show: Callable[[int], None] = lambda r: print(r, end="!\n", file=out)
         show(1)
         self.assertEqual(out.getvalue(), "1!\n")
+
+    def test_a_starred_argument_runs_before_the_keywords(self):
+        out = io.StringIO()
+        order.clear()
+        print(*[noted(3), noted(4)], sep=separator(), file=out)
+        print(*[noted(i) for i in range(2)], sep=separator(), file=out)
+        self.assertEqual(order, ["note 3", "note 4", "sep",
+                                 "note 0", "note 1", "sep"])
+        self.assertEqual(out.getvalue(), "3|4\n0|1\n")
+        order.clear()
+        print(*(noted(i) for i in range(2)), sep=separator(), file=out)
+        self.assertEqual(order, ["sep", "note 0", "note 1"])
 
 
 if __name__ == "__main__":

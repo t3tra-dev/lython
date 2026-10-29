@@ -1837,7 +1837,7 @@ TEST(EmitterTest, AStarredSequenceOfUnknownLengthFillsWhatItReaches) {
                 "    return len(rest)\n"
                 "print(h(*xs, 2))\n",
                 "must be the last positional argument"},
-           Case{"print(list(range(*xs)))\n",
+           Case{"print(abs(*xs))\n",
                 "only to the *args of a function or method this program "
                 "defines"},
        }) {
@@ -1851,7 +1851,8 @@ TEST(EmitterTest, AStarredSequenceOfUnknownLengthFillsWhatItReaches) {
       std::string(pair) + "def f(a: int = 0, *rest: int) -> int:\n"
                           "    return a\n"
                           "mk = Maker()\n"
-                          "print(f(*xs), g(*xs), mk.m(*xs), print(*xs))\n",
+                          "print(f(*xs), g(*xs), mk.m(*xs), print(*xs),\n"
+                          "      list(range(*xs)), max(*xs))\n",
       context);
   EXPECT_TRUE(filled.ok());
   lython::emitter::EmitResult forwarded = emitSource(
@@ -4322,6 +4323,32 @@ TEST(EmitterTest, ADefaultEverySolutionSharesIsReadOnlyAtItsType) {
 // keyword sub-patterns and is refused positional ones, which would read the
 // `__match_args__` of the class the value holds; over a class nothing derives
 // from, positional sub-patterns stay.
+// A field read on an `E | None` is refused where it is written, as a method
+// call on it is; narrowed first, it reads the field.
+TEST(EmitterTest, AFieldOfAnOptionalIsReadAfterItIsNarrowed) {
+  mlir::MLIRContext context(testRegistry());
+  const std::string cls = "class E:\n"
+                          "    def __init__(self, n: int) -> None:\n"
+                          "        self.n = n\n";
+  lython::emitter::EmitResult unnarrowed =
+      emitSource(cls + "def f(r: E | None) -> int:\n"
+                       "    return r.n\n"
+                       "print(f(E(1)))\n",
+                 context);
+  EXPECT_FALSE(unnarrowed.ok());
+  EXPECT_TRUE(reportsDiagnostic(
+      unnarrowed, "None has no attribute 'n' -- narrow the value to the "
+                  "members that have it first"));
+  lython::emitter::EmitResult narrowed =
+      emitSource(cls + "def f(r: E | None) -> int:\n"
+                       "    if r is not None:\n"
+                       "        return r.n\n"
+                       "    return 0\n"
+                       "print(f(E(1)))\n",
+                 context);
+  EXPECT_TRUE(narrowed.ok());
+}
+
 TEST(EmitterTest, AClassPatternOverAClassValueNamesItsAttributes) {
   mlir::MLIRContext context(testRegistry());
   const std::string classes = "class A:\n"
