@@ -1093,10 +1093,21 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
     std::string contract = runtimeContractName(member);
     if (contract.empty())
       return false;
+    // ⭐ A PROGRAM CLASS OWNS ITS LANE BEFORE ITS DEALLOCATOR IS WRITTEN.
+    // `synthesizeSourceClassDeallocators` (and the alias naming a program
+    // exception class after BaseException's) run after this walk, so the
+    // list above has no program class in it -- while a dispatcher's ABI,
+    // prepared from the settled list, has every one. `ident(e: Node | None)
+    // -> Node | None: return e` therefore declared no owned result and got
+    // no retain at its return, and its caller released the result it
+    // believed it owned: the refcount went below zero.
+    // ⛔ Not by preparing the ABIs after the deallocators: the generator
+    // resume bodies built between them read the prepared signatures.
     return llvm::any_of(deallocators,
                         [&](const ownership::RuntimeDeallocator &candidate) {
                           return candidate.contractName == contract;
-                        });
+                        }) ||
+           lookupModuleSymbol<py::ClassOp>(module, contract);
   };
   module.walk([&](mlir::func::FuncOp function) {
     auto callableType =

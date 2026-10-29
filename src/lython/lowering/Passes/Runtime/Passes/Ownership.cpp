@@ -312,7 +312,9 @@ mlir::FailureOr<mlir::Value> buildRetainHeaderView(mlir::OpBuilder &builder,
 // on its way out through a return, and a transfer whose source is read after
 // the call -- the same operation, so the same body.
 mlir::LogicalResult insertRetain(mlir::func::FuncOp retain,
-                                 mlir::Operation *anchor, mlir::Value header) {
+                                 mlir::Operation *anchor, mlir::Value header,
+                                 bool unfolds = false,
+                                 int callSite = __builtin_LINE()) {
   if (!retain)
     return anchor->emitError()
            << "taking a reference here requires a runtime retain primitive";
@@ -326,7 +328,13 @@ mlir::LogicalResult insertRetain(mlir::func::FuncOp retain,
   if (mlir::failed(headerView))
     return anchor->emitError() << "cannot build object retain view";
 
-  mlir::func::CallOp::create(builder, anchor->getLoc(), retain, *headerView);
+  auto call =
+      mlir::func::CallOp::create(builder, anchor->getLoc(), retain, *headerView);
+  if (unfolds)
+    call->setAttr(own::kUnfoldRetainAttr, builder.getUnitAttr());
+  // The retain-side twin of `ly.debug.release_site` (emitGroupRelease).
+  if (std::getenv("LYTHON_TRACE_RELEASE_SITE_LINES"))
+    call->setAttr("ly.debug.retain_site", builder.getI64IntegerAttr(callSite));
   return mlir::success();
 }
 
@@ -2487,7 +2495,18 @@ bool releaseOwnedGroupByLiveness(
     aliases.namesOf(lent, names);
     own::collectBoxWordDerivedViews(llvm::SmallVector<mlir::Value, 8>(names),
                                     names, &contracts);
-    for (mlir::Value name : names)
+    for (mlir::Value name : names) {
+      // ⭐ A NAME A RETAIN MINTED A TOKEN FOR IS THAT TOKEN'S, not the lent
+      // one's: the retain just before the marker reads the result (and pins
+      // the candidate up to there), and every later use is the marker's own
+      // group to walk. Followed as a read of the candidate, `w = row[k] if
+      // k < 1 else row[0]` handed the marker to the merge -- a branch, the
+      // bail below -- and the candidate's release was dropped altogether:
+      // one element of the display per call.
+      if (mlir::Operation *marker = name.getDefiningOp();
+          marker && marker->hasAttr(own::kOwnedLocalObjectAttr) &&
+          own::ownedLocalMarkerIsRetainRooted(marker, aliases))
+        continue;
       for (mlir::OpOperand &read : name.getUses()) {
         mlir::Operation *reader = read.getOwner();
         if (mlir::isa<mlir::scf::YieldOp>(reader) &&
@@ -2507,6 +2526,7 @@ bool releaseOwnedGroupByLiveness(
         lastUse[blockReader->getBlock()] =
             latestUserInBlock(lastUse[blockReader->getBlock()], blockReader);
       }
+    }
     mlir::Operation *blockIf = ancestorInRegion(ifOp, region);
     if (!blockIf || blockIf->hasTrait<mlir::OpTrait::IsTerminator>())
       return false;
@@ -3185,7 +3205,8 @@ bool releaseOwnedGroupByLiveness(
       return false;
   for (mlir::Operation *consume : unfoldRetainBefore) {
     if (mlir::failed(insertRetain(aliases.function(consume, "Ly_IncRef"),
-                                  consume, group.values.front())))
+                                  consume, group.values.front(),
+                                  /*unfolds=*/true)))
       return false;
   }
   return true;
@@ -5485,6 +5506,28 @@ private:
 
 
 
+// Is `consume` the one the inserter unfolded a retain for (`kUnfoldRetainAttr`
+// on a retain of this group just before it)? Then it spends that increment
+// and the group's own token is still held after it. The retain is written at
+// the consume, so only other retains and their header views can stand
+// between the two.
+bool consumeSpendsAnUnfoldRetain(FuncContractCache &contracts,
+                                 mlir::func::CallOp consume,
+                                 llvm::ArrayRef<mlir::Value> group,
+                                 own::AliasAnalysis &aliases) {
+  for (mlir::Operation *op = consume->getPrevNode(); op;
+       op = op->getPrevNode()) {
+    if (mlir::isa<mlir::memref::SubViewOp, mlir::memref::CastOp>(op))
+      continue;
+    auto retain = mlir::dyn_cast<mlir::func::CallOp>(op);
+    if (!retain || !retain->hasAttr(own::kUnfoldRetainAttr))
+      return false;
+    if (callRetainsGroup(contracts, retain, group, aliases))
+      return true;
+  }
+  return false;
+}
+
 void collectUnwindGroupSites(FuncContractCache &contracts,
                              own::AliasAnalysis &aliases,
                              const own::ReferenceMap &references,
@@ -5555,10 +5598,22 @@ void collectUnwindGroupSites(FuncContractCache &contracts,
           }
           if (callConsumesGroup(contracts, call, group.values, aliases)) {
             if (!deadAfterRaise.deadAfter(contracts, call) &&
+                !consumeSpendsAnUnfoldRetain(contracts, call, group.values,
+                                             aliases) &&
                 seenConsumes.insert(top).second)
               group.consumeSites.push_back(top);
             continue;
           }
+          // ⭐ THE INSERTER'S OWN UNFOLD IS NOT AN UNKNOWN BALANCE: the consume
+          // right after it spends it (`consumeSpendsAnUnfoldRetain` above), so
+          // the group holds what it held before the pair. Bailing on it, as on
+          // any retain below, dropped the group from this analysis entirely:
+          // `t = ([1], [2]); try: return len(t[i])` keeps both lists past the
+          // tuple's taking of them for the run-time index, and an IndexError
+          // caught by the `except` left both unreleased, two lists per call.
+          if (call->hasAttr(own::kUnfoldRetainAttr) &&
+              callRetainsGroup(contracts, call, group.values, aliases))
+            continue;
           if (callRetainsGroup(contracts, call, group.values, aliases) &&
               !call->hasAttr(own::kAggregateRetainAttr)) {
             // A live extra token under no name this walk can charge it to: the

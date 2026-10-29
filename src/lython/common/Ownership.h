@@ -71,6 +71,10 @@ namespace py::ownership {
 //   ly.ownership.aggregate_release            releaseAggregate, which is
 //                                             releaseFields over the parent's
 //                                             fields
+//   ly.ownership.unfold_retain                dup, paired with the consume
+//                                             written right after it: the
+//                                             consume moves the new reference
+//                                             and the walked name keeps its own
 //
 // --- Physical, not ownership ------------------------------------------------
 //
@@ -178,6 +182,11 @@ inline constexpr llvm::StringLiteral kProtocolArgumentTypesAttr{
     "ly.ownership.protocol_argument_types"};
 inline constexpr llvm::StringLiteral kAggregateRetainAttr{
     "ly.ownership.aggregate_retain"};
+// On a retain the refcount inserter writes IMMEDIATELY BEFORE a consume that
+// is not its group's death (a value read after it is given away): the consume
+// spends this increment, and the group keeps the token it had.
+inline constexpr llvm::StringLiteral kUnfoldRetainAttr{
+    "ly.ownership.unfold_retain"};
 inline constexpr llvm::StringLiteral kAggregateReleaseAttr{
     "ly.ownership.aggregate_release"};
 
@@ -527,6 +536,12 @@ llvm::SmallVector<mlir::Value, 4> valueSlice(mlir::ValueRange values,
                                              unsigned offset, unsigned size);
 bool valueGroupEqualsEntryArgumentGroup(mlir::func::FuncOp function,
                                         llvm::ArrayRef<mlir::Value> group);
+// The group is an entry argument group on every path through `arith.select`s
+// (`a if f else b` over two parameters), which the refcount inserter's
+// borrowed-return rule follows too: it retains such a group at an owned
+// return, so a lowering that hands it on must not take a reference of its own.
+bool valueGroupSelectsEntryArgumentGroups(mlir::func::FuncOp function,
+                                          llvm::ArrayRef<mlir::Value> group);
 bool callResultGroupIsOwned(mlir::func::FuncOp callee, unsigned resultIndex);
 
 enum class OwnershipKind { NonObject, Borrow, Own, Immortal };
