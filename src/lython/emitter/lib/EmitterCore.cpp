@@ -48,6 +48,10 @@ EmitResult ModuleEmitter::emit() {
       [this](llvm::StringRef baseName, mlir::ArrayRef<mlir::Type> arguments) {
         return ensureGenericClassSpecialization(baseName, arguments);
       });
+  types.setClassValueExactness(
+      [this](const parser::Node *expr, mlir::Type type) {
+        return classValueIsExact(expr, type);
+      });
 
   module = mlir::ModuleOp::create(builder.getUnknownLoc());
   module.setName(moduleName);

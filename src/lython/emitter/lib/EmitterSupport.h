@@ -185,6 +185,11 @@ std::optional<mlir::Type> isinstanceTargetType(const parser::Node *node,
 // The same question for `isinstance(x, (A, B))`: one class, or a tuple of them.
 std::optional<llvm::SmallVector<mlir::Type, 4>>
 isinstanceTargetTypes(const parser::Node *node, TypeSystem &types);
+// Whether an `isinstance`/`issubclass` target holds a class value that may
+// name a subclass of its static class (`cls: type[Base]`), alone or in a
+// tuple: the static answer is then the bound's, not the held class's.
+bool isinstanceTargetHoldsClassValue(const parser::Node *node,
+                                     TypeSystem &types);
 // A contract this program declares (`class Err`), as opposed to one a manifest
 // declares (`builtins.BaseException`). The two are told apart by the dot: only
 // a manifest contract is module-qualified.

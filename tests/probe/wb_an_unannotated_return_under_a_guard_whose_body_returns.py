@@ -16,6 +16,11 @@
 # CLASSIFICATION: loud 拒否 (診断)
 #   static type str | None is a union, and '__len__' runs on whichever member
 #   the value holds
+# FIXED 2026-10-30. It had agreed since an earlier round only because the
+#   first walk LEAKED the guard's narrowing (`held: str`) into the code after
+#   the `if`; closing that leak brought the refusal back. Each `return` is now
+#   typed where the walk stood (`returnTypeAt`), and the end-of-body table
+#   answers only a return the walk could not type in place.
 # CPython 3.14 expects: 2
 
 

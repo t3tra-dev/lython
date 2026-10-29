@@ -628,6 +628,22 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
             "capture or literal sub-patterns"});
         return;
       }
+      // ⭐ A CLASS VALUE IS TESTED FOR THE CLASS IT HOLDS, as `isinstance`
+      // tests it: `case cls():` with `cls: type[A]` holding a subclass B
+      // matched every A, because the test was the one for the bound.
+      // ⛔ Positional sub-patterns are refused for it: they read the
+      // `__match_args__` of the class the value holds, which may not be the
+      // bound's.
+      const bool classValueTarget =
+          isinstanceTargetHoldsClassValue(clsNode, types);
+      if (classValueTarget && positionalSubs && !positionalSubs->empty()) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, statement.range.start,
+            "a class pattern over a class value reads the __match_args__ of "
+            "the class the value holds at run time; spell the attributes as "
+            "keyword patterns (`attr=pattern`)"});
+        return;
+      }
       // (attribute name, sub-pattern) pairs: positional names resolve through
       // the class's __match_args__ tuple, keyword names are explicit.
       llvm::SmallVector<std::pair<std::string, const parser::Node *>, 4>
@@ -666,9 +682,19 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
 
       mlir::Block *matchBlock = nullptr;
       mlir::Block *nextCheck = nullptr;
-      if (analysis.kind != IsInstanceAnalysis::Kind::AlwaysTrue) {
+      if (analysis.kind != IsInstanceAnalysis::Kind::AlwaysTrue ||
+          classValueTarget) {
         mlir::Value bit;
-        if (analysis.kind == IsInstanceAnalysis::Kind::UnionTest) {
+        // The class of a union subject is read behind a branch on its tag,
+        // so the test can end in a block of its own.
+        mlir::Block *testEnd = check;
+        if (classValueTarget) {
+          bit = emitClassValueSubclassBit(statement, subject, clsNode,
+                                          /*subjectIsInstance=*/true);
+          if (!bit)
+            return;
+          testEnd = builder.getInsertionBlock();
+        } else if (analysis.kind == IsInstanceAnalysis::Kind::UnionTest) {
           bit = py::UnionTestOp::create(
                     builder, loc(statement), builder.getI1Type(), subject.value,
                     mlir::TypeAttr::get(analysis.trueType))
@@ -681,7 +707,7 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
         }
         matchBlock = builder.createBlock(region, continuation->getIterator());
         nextCheck = builder.createBlock(region, continuation->getIterator());
-        builder.setInsertionPointToEnd(check);
+        builder.setInsertionPointToEnd(testEnd);
         mlir::cf::CondBranchOp::create(builder, loc(statement), bit, matchBlock,
                                        mlir::ValueRange{}, nextCheck,
                                        mlir::ValueRange{});

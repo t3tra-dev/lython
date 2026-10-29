@@ -446,6 +446,7 @@ an_annotation_marker_that_wraps_a_type.py AGREE
 an_async_context_manager_written_in_python.py AGREE
 an_async_for_suspends_inside_anext.py AGREE
 an_async_loop_awaits_its_target.py AGREE
+an_element_read_at_a_run_time_index_in_a_loop.py AGREE
 an_empty_arm_takes_the_other_ones_element.py AGREE
 an_empty_bucket_beside_a_full_one.py AGREE
 an_empty_container_beside_a_typed_one_in_a_generic_call.py AGREE

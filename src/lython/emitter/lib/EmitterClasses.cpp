@@ -7828,12 +7828,19 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
       call.explicitPositional = plain;
       call.explicitValues.assign(operands.positional.begin(),
                                  operands.positional.begin() + plain);
-      for (unsigned index = static_cast<unsigned>(
-               target.positionalNames.size());
-           index < plain; ++index)
-        call.extras.push_back(operands.positional[index]);
-      if (operands.dynamicTail)
+      // ⛔ THE POSITIONALS PAST THE PARAMETERS ARE THE COLLECTED *args ONLY
+      // WHEN A STARRED TAIL IS COLLECTED WITH THEM, as for a method. With a
+      // `**` mapping alone nothing is collected, and dropping them lost them:
+      // `Fwd("a", "b", **opts)` built `()` for `*parts` where CPython builds
+      // `('a', 'b')`, silently. They stay positionals, which the inlined
+      // `__init__` binds into its *args.
+      if (operands.dynamicTail) {
+        for (unsigned index = static_cast<unsigned>(
+                 target.positionalNames.size());
+             index < plain; ++index)
+          call.extras.push_back(operands.positional[index]);
         call.tail = operands.positional[*operands.dynamicTail];
+      }
       for (auto [index, value] : llvm::enumerate(operands.keywordValues))
         call.keywords.push_back({operands.keywordTypes[index].name, value});
       std::optional<DynamicUnpackResult> collected =
@@ -7842,8 +7849,11 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
         return emitNone(expr);
       if (collected->completed)
         return *collected->completed;
-      unsigned kept = std::min<unsigned>(
-          plain, static_cast<unsigned>(target.positionalNames.size()));
+      unsigned kept =
+          operands.dynamicTail
+              ? std::min<unsigned>(
+                    plain, static_cast<unsigned>(target.positionalNames.size()))
+              : plain;
       CallOperands rebuilt;
       for (unsigned index = 0; index < kept; ++index) {
         rebuilt.positional.push_back(operands.positional[index]);
@@ -7906,11 +7916,57 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
       }
     }
   }
-  // ⛔ A STARRED ARGUMENT KEEPS THE CONSTRUCTOR OFF THE INLINE PATH. Inlining
-  // `__init__` needs one Value per parameter and a starred operand is one
-  // Value for several, so the runtime call below takes it -- where the pack's
-  // own expansion (`starredSequenceElements`) does the splitting. It used to
-  // be refused outright here instead.
+  // ⭐ A STARRED TUPLE WHOSE TYPE SAYS HOW MANY MEMBERS IT HAS IS THOSE
+  // MEMBERS, read out one by one so that `__init__` gets one Value per
+  // parameter and is inlined with its defaults. The runtime call below
+  // initializes the class's FIELDS from the pack and never runs `__init__`:
+  // `P(*t)` for `def __init__(self, a, b): self.a = a * 10` printed 1 2 where
+  // CPython prints 10 20, silently, and any `__init__` whose parameters were
+  // not its fields was refused in the lowering.
+  if (llvm::any_of(operands.positionalUnpacked,
+                   [](char value) { return value != 0; })) {
+    CallOperands expanded = operands;
+    expanded.positional.clear();
+    expanded.positionalUnpacked.clear();
+    expanded.positionalTypes.clear();
+    bool everyArityKnown = true;
+    for (auto [index, value] : llvm::enumerate(operands.positional)) {
+      llvm::SmallVector<mlir::Type, 4> members;
+      if (!operands.positionalUnpacked[index]) {
+        expanded.positional.push_back(value);
+      } else if (appendStarredArgumentTypes(types, value.type, members)) {
+        std::string held =
+            "__lystarpack" + std::to_string(++syntheticFunctionCounter);
+        values[held] = value;
+        types.bindSymbol(held, value.type);
+        for (unsigned member = 0; member < members.size(); ++member) {
+          parser::NodePtr read = synth::subscript(
+              synth::name(held, expr.range),
+              synth::intConstant(static_cast<std::int64_t>(member), expr.range),
+              expr.range);
+          synthesizedIteratorDefs.push_back(read);
+          expanded.positional.push_back(emitExpr(read.get()));
+        }
+        values.erase(held);
+      } else {
+        everyArityKnown = false;
+        break;
+      }
+    }
+    if (everyArityKnown) {
+      for (const Value &value : expanded.positional) {
+        expanded.positionalUnpacked.push_back(0);
+        expanded.positionalTypes.push_back(value.type);
+      }
+      operands = std::move(expanded);
+    }
+  }
+  // ⛔ A STARRED ARGUMENT STILL HERE KEEPS THE CONSTRUCTOR OFF THE INLINE
+  // PATH. Inlining `__init__` needs one Value per parameter and a starred
+  // operand is one Value for several, so the runtime call below takes it --
+  // where the pack's own expansion (`starredSequenceElements`) does the
+  // splitting, which is right only for a class whose fields ARE its
+  // initializer's parameters.
   bool hasUnpackedPositional = llvm::any_of(
       operands.positionalUnpacked, [](char value) { return value != 0; });
 
@@ -7955,6 +8011,17 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
   }
   std::optional<MethodBinding> init =
       lookupClassMethod(inferredInstanceType, "__init__");
+  // ⛔ NOT PAST AN `__init__` THE PROGRAM WROTE: the runtime call would fill
+  // the fields and skip its body, silently (see the expansion above).
+  if (init && init->method && hasUnpackedPositional) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "a starred argument whose members are not known here cannot reach '" +
+            name.str() +
+            ".__init__': pass a tuple whose type says how many members it has, "
+            "or spell the arguments out"});
+    return emitNone(expr);
+  }
   if (init && !hasUnpackedPositional) {
     Value receiver{newOp.getInstance(), inferredInstanceType};
     Value descriptorReceiver = emitDescriptorReceiver(expr, receiver, *init);

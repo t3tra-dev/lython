@@ -2506,29 +2506,35 @@ RuntimeBundleLowerer::lowerListRuntimeNext(py::NextOp op,
   // the two sides have to be different code.
   llvm::SmallVector<mlir::Type, 4> laneTypes(elementShapes->begin(),
                                              elementShapes->end());
-  auto pick = mlir::scf::IfOp::create(builder, loc, laneTypes, valid,
-                                      /*withElseRegion=*/true);
-  {
-    mlir::OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointToStart(&pick.getThenRegion().front());
-    mlir::Value entityWord = loadBoxWord(box_abi::kEntityWord);
-    mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
-        RuntimeBundleLowerer::lanesFromBoxEntity(
-            builder, loc, entityWord, laneTypes,
-            runtimeContractName(elementContract), op);
-    if (mlir::failed(lanes))
-      return mlir::failure();
-    mlir::scf::YieldOp::create(builder, loc, *lanes);
-    builder.setInsertionPointToStart(&pick.getElseRegion().front());
-    llvm::SmallVector<mlir::Value, 4> deadLanes;
-    for (auto [index, deadValue] : llvm::enumerate(dead->values))
-      deadLanes.push_back(memrefFromBoxWords(
-          builder, loc, pointerWord(deadValue), sizeWord(deadValue),
-          mlir::cast<mlir::MemRefType>((*elementShapes)[index])));
-    mlir::scf::YieldOp::create(builder, loc, deadLanes);
+  // ⭐ A LANE-LESS ELEMENT IS READ FROM NOTHING: None is the one value its
+  // slot can hold, so there is no word to load and no reference to take.
+  // Asked for a retain, `for x in [None, None]` and `print(*[None])` failed
+  // with "needs an own primitive in the runtime manifest".
+  llvm::SmallVector<mlir::Value, 4> elementValues;
+  if (!laneTypes.empty()) {
+    auto pick = mlir::scf::IfOp::create(builder, loc, laneTypes, valid,
+                                        /*withElseRegion=*/true);
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(&pick.getThenRegion().front());
+      mlir::Value entityWord = loadBoxWord(box_abi::kEntityWord);
+      mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
+          RuntimeBundleLowerer::lanesFromBoxEntity(
+              builder, loc, entityWord, laneTypes,
+              runtimeContractName(elementContract), op);
+      if (mlir::failed(lanes))
+        return mlir::failure();
+      mlir::scf::YieldOp::create(builder, loc, *lanes);
+      builder.setInsertionPointToStart(&pick.getElseRegion().front());
+      llvm::SmallVector<mlir::Value, 4> deadLanes;
+      for (auto [index, deadValue] : llvm::enumerate(dead->values))
+        deadLanes.push_back(memrefFromBoxWords(
+            builder, loc, pointerWord(deadValue), sizeWord(deadValue),
+            mlir::cast<mlir::MemRefType>((*elementShapes)[index])));
+      mlir::scf::YieldOp::create(builder, loc, deadLanes);
+    }
+    elementValues.assign(pick.getResults().begin(), pick.getResults().end());
   }
-  llvm::SmallVector<mlir::Value, 4> elementValues(pick.getResults().begin(),
-                                                  pick.getResults().end());
 
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> canonical =
       RuntimeBundleLowerer::unboxSlotElementValues(op, elementContract,
@@ -2555,7 +2561,9 @@ RuntimeBundleLowerer::lowerListRuntimeNext(py::NextOp op,
     return mlir::failure();
   } else if (!*deferred) {
     std::optional<RuntimeValue> retained =
-        RuntimeBundleLowerer::retainEvidenceElement(op, element);
+        element.values.empty()
+            ? std::optional<RuntimeValue>(element)
+            : RuntimeBundleLowerer::retainEvidenceElement(op, element);
     if (!retained)
       return op.emitError()
              << "iteration over a runtime-mode list of " << elementContract

@@ -242,13 +242,31 @@ void collectReturnTypes(const TypeSystem &types, const parser::Node *node,
                         llvm::SmallVectorImpl<std::string> *failureReasons,
                         const llvm::StringMap<mlir::Type> *localSymbols,
                         llvm::SmallVectorImpl<const parser::Node *>
-                            *resultNodes = nullptr) {
+                            *resultNodes = nullptr,
+                        const llvm::DenseMap<const parser::Node *, mlir::Type>
+                            *typedInPlace = nullptr) {
   if (!node)
     return;
   if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
       node->kind == "Lambda" || node->kind == "ClassDef")
     return;
   if (node->kind == "Return") {
+    // ⭐ A RETURN IS TYPED WHERE IT STANDS when the body walk could: inside
+    // the arm of `if held is not None:` the walk has `held` narrowed, and
+    // the symbol table it ends with does not. `return len(held)` re-typed
+    // against that table asked `str | None` for `__len__` and refused the
+    // function. ⛔ The end-of-body table still answers a return the walk
+    // could not type in place -- a name a loop binds after the return reads
+    // it.
+    if (typedInPlace)
+      if (auto found = typedInPlace->find(node);
+          found != typedInPlace->end() && found->second &&
+          !py::isPyObjectType(found->second)) {
+        results.push_back(found->second);
+        if (resultNodes)
+          resultNodes->push_back(ast::node(*node, "value"));
+        return;
+      }
     mlir::Type type =
         inferReturnExpr(types, ast::node(*node, "value"), localCallables,
                         failureReasons, localSymbols);
@@ -263,22 +281,24 @@ void collectReturnTypes(const TypeSystem &types, const parser::Node *node,
     if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
       if (*child)
         collectReturnTypes(types, child->get(), localCallables, results,
-                           failureReasons, localSymbols, resultNodes);
+                           failureReasons, localSymbols, resultNodes,
+                           typedInPlace);
     } else if (const auto *children =
                    std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
       for (const parser::NodePtr &child : *children)
         collectReturnTypes(types, child.get(), localCallables, results,
-                           failureReasons, localSymbols, resultNodes);
+                           failureReasons, localSymbols, resultNodes,
+                           typedInPlace);
     }
   }
 }
 
-mlir::Type inferredFunctionResult(const TypeSystem &types,
-                                  const parser::Node &function,
-                                  llvm::SmallVectorImpl<std::string>
-                                      *failureReasons = nullptr,
-                                  const llvm::StringMap<mlir::Type>
-                                      *localSymbols = nullptr) {
+mlir::Type inferredFunctionResult(
+    const TypeSystem &types, const parser::Node &function,
+    llvm::SmallVectorImpl<std::string> *failureReasons = nullptr,
+    const llvm::StringMap<mlir::Type> *localSymbols = nullptr,
+    const llvm::DenseMap<const parser::Node *, mlir::Type> *typedInPlace =
+        nullptr) {
   llvm::StringMap<mlir::Type> localCallables =
       localCallableTypesInFunction(types, function);
 
@@ -301,7 +321,8 @@ mlir::Type inferredFunctionResult(const TypeSystem &types,
   if (const auto *body = ast::nodeList(function, "body"))
     for (const parser::NodePtr &statement : *body)
       collectReturnTypes(types, statement.get(), localCallables, results,
-                         failureReasons, localSymbols, &resultNodes);
+                         failureReasons, localSymbols, &resultNodes,
+                         typedInPlace);
   if (results.empty())
     return types.none();
   return joinIgnoringEmptyLiterals(types, results, resultNodes);
@@ -328,6 +349,9 @@ struct GeneratorFunctionAnalysis {
   // frame lane for that is what refused the generator.
   llvm::SmallVector<const parser::Node *, 4> yieldNodes;
   llvm::SmallVector<mlir::Type, 4> returnTypes;
+  // Each `return`'s type as the walk typed it where it stands, for the
+  // result of a function that is not a generator (`collectReturnTypes`).
+  llvm::DenseMap<const parser::Node *, mlir::Type> returnTypeAt;
   // Send types of `yield from` delegates: PEP 380 forwards send() into the
   // active delegate, so an unannotated outer generator's send channel is
   // the join of its delegates'.
@@ -512,9 +536,9 @@ void bindGeneratorAnalysisTarget(const TypeSystem &types,
 // is what the two recorded shapes need, and a guard it does not recognise
 // leaves the walk exactly as it was.
 //
-// ⛔ And not the `else` arm: the negative of `is not None` is None, which is
-// the type the walk already infers, and the negative of `isinstance` is not a
-// type at all.
+// ⛔ The `else` arm only as far as a union goes: the negative of `is not
+// None` is None, which the walk already infers, and the negative of
+// `isinstance` is the members the class does not cover.
 // ⛔ A SYMBOL LOOKUP, not the generator analysis it was written against: the
 // COMPREHENSION FILTER asks the same question about its own `bound` map, and
 // giving the two callers two narrowing walks is how the same fact starts being
@@ -536,10 +560,6 @@ void applyGuardNarrowing(
         applyGuardNarrowing(types, value.get(), currentType, narrow);
     return;
   }
-  // ⛔ And neither does an isinstance: eliminating one class from a plain
-  // contract leaves the contract, which is what the reader already has.
-  if (onFalseSide && test->kind == "Call")
-    return;
   if (test->kind == "Call") {
     const parser::Node *callee = ast::node(*test, "func");
     const auto *args = ast::nodeList(*test, "args");
@@ -553,8 +573,51 @@ void applyGuardNarrowing(
     std::string spelling = ast::qualifiedName((*args)[1].get());
     if (spelling.empty())
       return;
-    if (std::optional<mlir::Type> narrowed = types.lookupClass(spelling))
-      narrow(ast::nameSpelling(*subject), *narrowed);
+    std::optional<mlir::Type> narrowed = types.lookupClass(spelling);
+    if (!narrowed)
+      return;
+    llvm::StringRef name = ast::nameSpelling(*subject);
+    if (!onFalseSide) {
+      narrow(name, *narrowed);
+      return;
+    }
+    // ⭐ THE FALSE SIDE OF A UNION IS THE MEMBERS THE CLASS DOES NOT COVER.
+    // `if isinstance(v, int): ... else: yield v.upper()` over an `int | str`
+    // asked the whole union for `upper`, so the generator was refused where
+    // the emitter -- which narrows both arms -- compiles it. Eliminating a
+    // class from a plain contract still leaves the contract, which is what
+    // the reader already has.
+    // ⛔ A member counts as covered only when it is the class or is declared
+    // under it (and bool under int, as CPython's hierarchy has it); one this
+    // cannot place stays, which only keeps a reader as wide as it was.
+    mlir::Type current = currentType(name);
+    if (!current)
+      if (std::optional<mlir::Type> bound = types.lookupSymbol(name))
+        current = *bound;
+    auto unionType =
+        mlir::dyn_cast_if_present<py::UnionType>(types.widenLiteral(current));
+    auto target = mlir::dyn_cast<py::ContractType>(*narrowed);
+    if (!unionType || !target)
+      return;
+    llvm::SmallVector<mlir::Type, 4> rest;
+    for (mlir::Type member : unionType.getMemberTypes()) {
+      auto contract =
+          mlir::dyn_cast<py::ContractType>(types.widenLiteral(member));
+      bool covered =
+          contract &&
+          (contract.getContractName() == target.getContractName() ||
+           types.declaredSubclassOf(contract.getContractName(),
+                                    target.getContractName()) ||
+           (contract.getContractName() == "builtins.bool" &&
+            target.getContractName() == "builtins.int"));
+      if (!covered)
+        rest.push_back(member);
+    }
+    if (rest.empty() || rest.size() == unionType.getMemberTypes().size())
+      return;
+    narrow(name, rest.size() == 1
+                     ? rest.front()
+                     : py::UnionType::getNormalized(&types.getContext(), rest));
     return;
   }
   // ⭐ A BARE NAME'S TRUTH proves it is not None, as `NAME is not None`
@@ -792,6 +855,7 @@ void collectGeneratorFunctionAnalysis(
                                 &analysis.failureReasons,
                                 &analysis.localSymbols)
               : types.none());
+    analysis.returnTypeAt[node] = analysis.returnTypes.back();
     return;
   }
   if (node->kind == "Assign") {
@@ -954,6 +1018,11 @@ void collectGeneratorFunctionAnalysis(
     collectGeneratorFunctionAnalysis(types, ast::node(*node, "test"),
                                      localCallables, generatorSendHint,
                                      analysis);
+    // ⛔ TAKEN BEFORE THE GUARD NARROWS, or the narrowing is what the `else`
+    // arm and the code after the statement start from: `isinstance(v, int)`
+    // left `v` an int in the else arm, whose `v.upper()` refused the
+    // generator for an `int | str` parameter.
+    llvm::StringMap<mlir::Type> before = analysis.localSymbols;
     llvm::SmallVector<std::pair<std::string, std::optional<mlir::Type>>, 2>
         saved;
     applyGeneratorGuardNarrowing(
@@ -972,7 +1041,6 @@ void collectGeneratorFunctionAnalysis(
     // after the statement and for the `else` arm, so `k = a; if c: k = f;
     // return k` was typed as returning `f`, and the emitter's `a`-or-`f` value
     // was retyped to it: a call through the result found no function.
-    llvm::StringMap<mlir::Type> before = analysis.localSymbols;
     if (const auto *body = ast::nodeList(*node, "body"))
       for (const parser::NodePtr &statement : *body)
         collectGeneratorFunctionAnalysis(types, statement.get(), localCallables,
@@ -3332,6 +3400,15 @@ void TypeSystem::setGenericClassResolver(GenericClassResolver resolver) {
   genericClassResolver = std::move(resolver);
 }
 
+void TypeSystem::setClassValueExactness(ClassValueExactness exactness) {
+  classValueExactness = std::move(exactness);
+}
+
+bool TypeSystem::classValueIsExact(const parser::Node *expr,
+                                   mlir::Type type) const {
+  return !classValueExactness || classValueExactness(expr, type);
+}
+
 mlir::Type
 TypeSystem::resolveGenericClass(llvm::StringRef baseName,
                                 mlir::ArrayRef<mlir::Type> arguments) const {
@@ -5120,6 +5197,29 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     if (node->kind == "List")
       return listOf(joinIgnoringEmptyLiterals(*this, elementTypes,
                                               elementNodes));
+    // ⭐ AN EMPTY CONTAINER IN A TUPLE TAKES ITS KIND'S SIBLINGS' TYPE, as it
+    // does in a list or a dict (`joinIgnoringEmptyLiterals`): `for xs in ([1,
+    // 2], []): sum(xs)` iterated `list[int] | list[object]`, a union of two
+    // list types that `sum` cannot take. An empty literal beside a typed one
+    // is an absence of evidence, not a second element type.
+    for (auto [index, elementNode] : llvm::enumerate(elementNodes)) {
+      auto empty = mlir::dyn_cast_if_present<py::ContractType>(
+          elementTypes[index]);
+      if (!empty || !isEmptyContainerLiteral(elementNode))
+        continue;
+      llvm::SmallVector<mlir::Type, 4> siblings;
+      for (auto [other, otherNode] : llvm::enumerate(elementNodes)) {
+        auto sibling = mlir::dyn_cast_if_present<py::ContractType>(
+            elementTypes[other]);
+        if (other != index && sibling && !isEmptyContainerLiteral(otherNode) &&
+            sibling.getContractName() == empty.getContractName())
+          siblings.push_back(sibling);
+      }
+      if (!siblings.empty())
+        if (mlir::Type joined = join(siblings);
+            mlir::isa_and_nonnull<py::ContractType>(joined))
+          elementTypes[index] = joined;
+    }
     // Both paths type heterogeneous tuples positionally: the joined
     // (homogeneous-union) view made `yield (i, "x")` infer as
     // tuple[int | str], whose literal-index __getitem__ result is a union
@@ -5918,6 +6018,22 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           return inference.resultType;
         return fail(inference.failureReason);
       }
+      // ⭐ `print` IS None WHATEVER ITS KEYWORDS. The emitter writes `sep=`,
+      // `end=`, `file=` and `flush=` itself (tryEmitPrintCall) and the
+      // manifest contract names none of them, so `lambda r: print(r,
+      // end="!")` under `Callable[[int], None]` inferred nothing and was
+      // refused as a lambda with unresolved types.
+      // ⛔ Only the builtin's own binding, and only keywords print takes.
+      if (name == "print" && !keywords.empty())
+        if (std::optional<mlir::Type> bound = lookupSymbol(name);
+            bound && *bound == py::protocols::Table::get(context)
+                                   .freeFunctionContract("builtins.print")
+                                   .value_or(mlir::Type()) &&
+            llvm::all_of(keywords, [](const CallKeywordType &keyword) {
+              return keyword.name == "sep" || keyword.name == "end" ||
+                     keyword.name == "file" || keyword.name == "flush";
+            }))
+          return none();
       // `hasattr` and `callable` too: the emitter answers each with a bool or
       // a literal one, and inferring nothing for them made `not names and
       // hasattr(cls, 'runTest')` an `and` with no representable result.
@@ -8033,9 +8149,9 @@ TypeSystem::functionSignature(const parser::Node &function,
     if (int declaredRung = numericTowerRung(*this, annotated);
         declaredRung > 0 && declaredRung <= 2 &&
         returnRungWalks.insert(&function).second) {
-      mlir::Type walked = inferredFunctionResult(*this, function,
-                                                 /*failureReasons=*/nullptr,
-                                                 &generator.localSymbols);
+      mlir::Type walked = inferredFunctionResult(
+          *this, function, /*failureReasons=*/nullptr, &generator.localSymbols,
+          &generator.returnTypeAt);
       returnRungWalks.erase(&function);
       mlir::Type widened = walked ? widenLiteral(walked) : mlir::Type();
       if (mlir::Type below = belowDeclaredRung(*this, widened, annotated))
@@ -8044,9 +8160,9 @@ TypeSystem::functionSignature(const parser::Node &function,
   } else if (ast::nameSpelling(function) == "__init__") {
     sig.resultType = none();
   } else {
-    mlir::Type walked = inferredFunctionResult(*this, function,
-                                               &sig.bodyInferenceFailures,
-                                               &generator.localSymbols);
+    mlir::Type walked = inferredFunctionResult(
+        *this, function, &sig.bodyInferenceFailures, &generator.localSymbols,
+        &generator.returnTypeAt);
     auto overridden = resultTypeOverrides.find(&function);
     if (overridden == resultTypeOverrides.end()) {
       sig.resultType = walked;

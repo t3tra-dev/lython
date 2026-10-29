@@ -617,6 +617,22 @@ isinstanceTargetTypes(const parser::Node *node, TypeSystem &types) {
   return std::nullopt;
 }
 
+bool isinstanceTargetHoldsClassValue(const parser::Node *node,
+                                     TypeSystem &types) {
+  if (!node)
+    return false;
+  if (node->kind == "Tuple") {
+    if (const auto *elements = ast::nodeList(*node, "elts"))
+      for (const parser::NodePtr &element : *elements)
+        if (isinstanceTargetHoldsClassValue(element.get(), types))
+          return true;
+    return false;
+  }
+  mlir::Type type = types.widenLiteral(types.inferExpr(node));
+  return mlir::isa_and_nonnull<py::TypeType>(type) &&
+         !types.classValueIsExact(node, type);
+}
+
 // The subclass relation from the module PRE-PASS, for the two source classes
 // whose class ops the subtype walk may not have seen yet.
 //
@@ -1193,6 +1209,9 @@ IsInstanceAnalysis analyzeIsInstanceAny(mlir::Type sourceType,
 struct IsInstanceBranchAnalysis {
   std::string name;
   IsInstanceAnalysis analysis;
+  // The target holds a class value that may name a subclass of the class
+  // the analysis was asked about (`isinstanceTargetHoldsClassValue`).
+  bool classValueTarget = false;
 };
 
 static std::optional<IsInstanceBranchAnalysis>
@@ -1220,8 +1239,8 @@ optionalIsInstanceBranchAnalysis(const parser::Node &test, TypeSystem &types,
     return std::nullopt;
 
   return IsInstanceBranchAnalysis{
-      name.str(),
-      analyzeIsInstanceAny(*sourceType, *targetTypes, types, from)};
+      name.str(), analyzeIsInstanceAny(*sourceType, *targetTypes, types, from),
+      isinstanceTargetHoldsClassValue((*args)[1].get(), types)};
 }
 
 const parser::Node *nameComparedWithNone(const parser::Node *left,
@@ -1512,7 +1531,11 @@ optionalBranchTypeNarrowing(const parser::Node &test, TypeSystem &types,
                   narrowing.name = std::string(ast::nameSpelling(*owner)) +
                                    "." + std::string(*attr);
                   narrowing.trueType = memberAnalysis.trueType;
-                  narrowing.falseType = memberAnalysis.falseType;
+                  // A class value proves nothing on the false side, as for a
+                  // name below.
+                  if (!isinstanceTargetHoldsClassValue(
+                          (*isinstanceArgs)[1].get(), types))
+                    narrowing.falseType = memberAnalysis.falseType;
                   // ⭐ The FALSE side matters for a union field and only for
                   // one: `int | str` minus `str` is `int`, and without it the
                   // else branch of `isinstance(self.payload, str)` still read
@@ -1611,11 +1634,20 @@ optionalBranchTypeNarrowing(const parser::Node &test, TypeSystem &types,
   const IsInstanceAnalysis &analysis = analyzed->analysis;
   if (analysis.kind == IsInstanceAnalysis::Kind::Unsupported)
     return std::nullopt;
+  // ⛔ A CLASS VALUE PROVES ITS BOUND ON THE TRUE SIDE AND NOTHING ON THE
+  // FALSE ONE. `isinstance(x, cls)` with `cls: type[Base]` is asked of the
+  // class the value holds, at run time, and an x that is a Base but not an
+  // instance of that class takes the false side -- where the analysis of the
+  // bound had narrowed `x: Base | None` to None.
+  if (analyzed->classValueTarget &&
+      analysis.kind == IsInstanceAnalysis::Kind::AlwaysFalse)
+    return std::nullopt;
 
   BranchTypeNarrowing narrowing;
   narrowing.name = analyzed->name;
   narrowing.trueType = analysis.trueType;
-  narrowing.falseType = analysis.falseType;
+  if (!analyzed->classValueTarget)
+    narrowing.falseType = analysis.falseType;
   if (analysis.kind == IsInstanceAnalysis::Kind::UnionClassTest &&
       analysis.unionMembers.size() == 1)
     narrowing.trueSourceType = analysis.unionMembers.front();
@@ -1963,6 +1995,16 @@ std::optional<bool> optionalStaticBranchTruth(const parser::Node &test,
   std::optional<IsInstanceBranchAnalysis> analyzed =
       optionalIsInstanceBranchAnalysis(test, types, from);
   if (!analyzed)
+    return std::nullopt;
+  // ⛔ Never TRUE for a class value that may name a subclass: the analysis is
+  // of its bound, and `isinstance(e, cls)` on an `Exception` folded to True
+  // for `cls: type[Exception]` holding KeyError -- `if` bodies, comprehension
+  // filters and `assert`s ran for every exception. FALSE stands: a value no
+  // instance of the bound can be is no instance of a class under it either,
+  // and the arm it drops may not even type (a KeyError stored where the
+  // bound's instances go).
+  if (analyzed->classValueTarget &&
+      analyzed->analysis.kind != IsInstanceAnalysis::Kind::AlwaysFalse)
     return std::nullopt;
   if (analyzed->analysis.kind == IsInstanceAnalysis::Kind::AlwaysTrue)
     return true;

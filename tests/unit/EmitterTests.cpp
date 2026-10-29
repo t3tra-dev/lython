@@ -4318,6 +4318,44 @@ TEST(EmitterTest, ADefaultEverySolutionSharesIsReadOnlyAtItsType) {
   EXPECT_TRUE(ground.ok());
 }
 
+// What: a class pattern over a class value that may name a subclass takes
+// keyword sub-patterns and is refused positional ones, which would read the
+// `__match_args__` of the class the value holds; over a class nothing derives
+// from, positional sub-patterns stay.
+TEST(EmitterTest, AClassPatternOverAClassValueNamesItsAttributes) {
+  mlir::MLIRContext context(testRegistry());
+  const std::string classes = "class A:\n"
+                              "    __match_args__ = ('v',)\n"
+                              "    def __init__(self, v: int) -> None:\n"
+                              "        self.v = v\n";
+  const std::string match = "def f(x: A, cls: type[A]) -> str:\n"
+                            "    match x:\n"
+                            "        case cls(1):\n"
+                            "            return 'one'\n"
+                            "        case cls(v=n):\n"
+                            "            return str(n)\n"
+                            "    return 'none'\n"
+                            "print(f(A(1), A))\n";
+  lython::emitter::EmitResult open =
+      emitSource(classes + "class B(A):\n    pass\n" + match, context);
+  EXPECT_FALSE(open.ok());
+  EXPECT_TRUE(reportsDiagnostic(
+      open, "a class pattern over a class value reads the __match_args__ of "
+            "the class the value holds at run time"));
+  lython::emitter::EmitResult closed = emitSource(classes + match, context);
+  EXPECT_TRUE(closed.ok());
+  lython::emitter::EmitResult named = emitSource(
+      classes + "class B(A):\n    pass\n" +
+          "def f(x: A, cls: type[A]) -> str:\n"
+          "    match x:\n"
+          "        case cls(v=1):\n"
+          "            return 'one'\n"
+          "    return 'none'\n"
+          "print(f(A(1), B))\n",
+      context);
+  EXPECT_TRUE(named.ok());
+}
+
 // What: `@overload` declarations without the def that implements them are
 // refused, for a module function and for a method, and a call that no
 // overload accepts is refused even where the implementation's own signature

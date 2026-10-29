@@ -551,15 +551,17 @@ llvm::SmallVector<mlir::Value, 4> ModuleEmitter::carriedLoopEdgeOperands(
         mlir::isa_and_nonnull<py::ContractType>(local.type) &&
         !isSourceClassContract(assignedType) &&
         !isSourceClassContract(local.type);
-    bool unionIntoScalarLane =
-        mlir::isa_and_nonnull<py::UnionType>(assignedType) &&
-        !mlir::isa_and_nonnull<py::UnionType>(local.type);
+    // ⭐ AND A UNION INTO A UNION LANE WITHOUT ALL ITS MEMBERS, which the
+    // upcast below retyped all the same: an `int | str` into an `int | None`
+    // lane reached the lowering as "type mismatch for bb argument".
+    bool unionIntoLane =
+        mlir::isa_and_nonnull<py::UnionType>(assignedType);
     // ⭐ AND A FUNCTION INTO A FUNCTION LANE IT DOES NOT FIT, which the
     // upcast below retyped all the same, so the call through the lane found
     // no target.
     bool functionLane = isFunctionLane(local.type) &&
                         mlir::isa_and_nonnull<py::CallableType>(assignedType);
-    if ((bothManifest || unionIntoScalarLane || functionLane) &&
+    if ((bothManifest || unionIntoLane || functionLane) &&
         assignedType != local.type &&
         !py::isAssignableTo(assignedType, local.type, module) &&
         !py::isAssignableTo(found->second.type, local.type, module)) {

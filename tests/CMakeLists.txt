@@ -1034,7 +1034,11 @@ set(LYTHON_LEAK_GATE_CASES
     # A choice between two wide ints held as deferred ints keeps one object
     # and releases the other, whether each came from an operator, a list
     # element, a loop-carried int or a field.
-    wide_ints_chosen_stored_and_passed)
+    wide_ints_chosen_stored_and_passed
+    # A display read at a run-time index in a loop: the selection lends its
+    # candidates to the read, and each candidate's own reference is released
+    # after the loop rather than through the read (one object per call).
+    an_element_read_at_a_run_time_index_in_a_loop)
 
 # Cases that end with a non-zero status BY DESIGN, as `<dir>/<case>=<code>`.
 #
