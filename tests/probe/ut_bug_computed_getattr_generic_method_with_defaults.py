@@ -8,6 +8,12 @@
 # FIXED: 2026-10-20 -- a type parameter is solved from an omitted default, the
 #   value the call passes.
 # CLASSIFICATION @ lang-gaps c8463f9d + the fix: 1 正しい
+# REGRESSED: de43895c (2026-10-22), when a generic method got one body per
+#   solution: the body emitted for `self.pick(ValueError)` registered the
+#   default's cell at `type[ValueError]`, and the class statement refused to
+#   store BaseException there. FIXED again 2026-10-29: the cell is typed once,
+#   by the def (sharedMethodDefaultCell). Test:
+#   python/test_a_default_is_one_object_for_every_solution.
 # CPython 3.14 expects: test_a ran ValueError
 class Case:
     def __init__(self, name: str) -> None:

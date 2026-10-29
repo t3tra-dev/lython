@@ -986,6 +986,104 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
 // loop position.
 // ---------------------------------------------------------------------------
 
+// ⭐ `zip(*rows)` ZIPS AS MANY SEQUENCES AS THE CALL HANDS IT, which only
+// the run time knows -- the transpose idiom, `list(zip(*m))`, and its
+// inverse `a, b = zip(*pairs)`. The sequences are collected as CPython
+// collects the call's arguments, one tuple of them, and a generator yields
+// a tuple of each one's next member until the shortest is done; none at
+// all is an empty zip.
+// ⛔ Each sequence is read by index, so it has to be one (a list, a tuple,
+// a str): an iterator's members are read once, and a row the generator
+// could only step through would need one `next` per row per member.
+std::optional<Value> ModuleEmitter::emitStarredZip(const parser::Node &expr) {
+  auto reject = [&](llvm::StringRef reason) -> std::optional<Value> {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start, std::string(reason)});
+    return emitNone(expr);
+  };
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (keywords && !keywords->empty())
+    return reject("zip() with a starred argument takes no keyword arguments "
+                  "here");
+  for (llvm::StringRef builtin : {"tuple", "len"})
+    if (programBindsName(builtin))
+      return reject("zip() with a starred argument reads its sequences with " +
+                    builtin.str() + "(), which this program rebinds");
+  parser::SourceRange range = expr.range;
+  std::vector<NodePtr> members(args->begin(), args->end());
+  NodePtr display = synth::tuple(std::move(members), range);
+  synthesizedIteratorDefs.push_back(display);
+  Value rows = emitExpr(display.get());
+  mlir::Type rowsType = types.widenLiteral(rows.type);
+  mlir::Type row = types.iterableElementType(rowsType);
+  row = row ? types.widenLiteral(row) : row;
+  if (!row || !hasIndexWalkableEvidence(row))
+    return reject("zip() with a starred argument requires sequences it can "
+                  "index (list/str/tuple/bytes); convert each with list(...) "
+                  "first");
+
+  std::string memoKey = "zip*|" + typeText(rowsType);
+  auto memoized = lazyIteratorMemo.find(memoKey);
+  if (memoized == lazyIteratorMemo.end()) {
+    std::string symbol =
+        "__lyiter$zipstar$" + std::to_string(++syntheticFunctionCounter);
+    auto name = [&](llvm::StringRef id) { return synth::name(id, range); };
+    auto number = [&](std::int64_t value) {
+      return synth::intConstant(value, range);
+    };
+    auto finish = [&] { return synth::returnStmt(nullptr, range); };
+    // if __lyi >= len(__lyr): return
+    // __lyout.append(__lyr[__lyi])
+    std::vector<NodePtr> perRow;
+    perRow.push_back(synth::ifStmt(
+        synth::compare(name("__lyi"), "GtE",
+                       synth::lenCall(name("__lyr"), range), range),
+        {finish()}, {}, range));
+    perRow.push_back(synth::exprStmt(
+        synth::methodCall(name("__lyout"), "append",
+                          {synth::subscript(name("__lyr"), name("__lyi"),
+                                            range)},
+                          range),
+        range));
+    std::vector<NodePtr> step;
+    NodePtr fresh = parser::makeNode("List", range);
+    parser::addField(*fresh, "elts", std::vector<NodePtr>{});
+    step.push_back(synth::assign(name("__lyout"), std::move(fresh), range));
+    step.push_back(synth::forStmt(name("__lyr"), name("__lyrows"),
+                                  std::move(perRow), {}, range));
+    step.push_back(synth::yieldStmt(
+        synth::call(name("tuple"), {name("__lyout")}, range), range));
+    step.push_back(synth::assign(
+        name("__lyi"), synth::binOp(name("__lyi"), "Add", number(1), range),
+        range));
+    std::vector<NodePtr> body;
+    body.push_back(synth::ifStmt(
+        synth::compare(synth::lenCall(name("__lyrows"), range), "Eq",
+                       number(0), range),
+        {finish()}, {}, range));
+    body.push_back(synth::assign(name("__lyi"), number(0), range));
+    body.push_back(synth::whileStmt(synth::constantBool(true, range),
+                                    std::move(step), {}, range));
+    llvm::SmallVector<const parser::Node *, 1> paramNodes;
+    NodePtr def = synth::functionDef(symbol, {synth::Param{"__lyrows", nullptr}},
+                                     {}, std::move(body), nullptr, {}, range,
+                                     &paramNodes);
+    synthesizedIteratorDefs.push_back(def);
+    types.overrideParameterType(paramNodes[0], rowsType);
+    FunctionSignature sig = types.functionSignature(*def);
+    emitCallableFunction(*def, symbol, sig, {}, /*isLambda=*/false);
+    memoized = lazyIteratorMemo
+                   .insert({memoKey, LazyIteratorSynthesis{
+                                         symbol, sig.publicCallable}})
+                   .first;
+  }
+  Value callee = emitBindingRef(expr, memoized->second.symbol,
+                                memoized->second.callableType);
+  return emitCallableDispatch(
+      expr, callee, emitCallOperands(expr, {rows}, /*includeAstArguments=*/false));
+}
+
 std::optional<Value>
 ModuleEmitter::tryEmitLazyIteratorValueCall(const parser::Node &expr,
                                             const parser::Node *calleeNode) {
@@ -1009,7 +1107,7 @@ ModuleEmitter::tryEmitLazyIteratorValueCall(const parser::Node &expr,
   if (args)
     for (const NodePtr &arg : *args)
       if (arg && arg->kind == "Starred")
-        return std::nullopt;
+        return name == "zip" ? emitStarredZip(expr) : std::nullopt;
   parser::SourceRange range = expr.range;
 
   // Split off the callable argument for map/filter (spelled into the body,

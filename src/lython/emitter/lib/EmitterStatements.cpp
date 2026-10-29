@@ -693,6 +693,36 @@ void ModuleEmitter::emitPendingDefaultCells(const parser::Node &statement) {
                               builder.getStringAttr(cell->name),
                               coerced.value);
     }
+  // A method with a body per solution: the class statement is its def, and
+  // writes the one cell every solution reads (sharedMethodDefaultCell),
+  // whether or not a solution has been emitted yet.
+  if (mainModuleDef && statement.kind == "ClassDef")
+    if (const auto *classBody = ast::nodeList(statement, "body"))
+      for (const parser::NodePtr &member : *classBody) {
+        if (!member ||
+            (member->kind != "FunctionDef" &&
+             member->kind != "AsyncFunctionDef") ||
+            !methodSpecializedPerSolution(statement, *member))
+          continue;
+        const parser::Node *arguments = ast::node(*member, "args");
+        std::size_t slots = 0;
+        if (arguments)
+          for (llvm::StringRef field : {"posonlyargs", "args", "kwonlyargs"})
+            if (const auto *list = ast::nodeList(*arguments, field))
+              slots += list->size();
+        for (unsigned slot = 0; slot < slots; ++slot) {
+          std::optional<GenericDefaultCell> cell =
+              sharedMethodDefaultCell(runningModule, statement, *member, slot);
+          if (!cell)
+            continue;
+          const parser::Node *expr = defaultExpressionForSlot(*member, slot);
+          Value value = emitExprExpected(expr, cell->type);
+          Value coerced = coerceValue(value, cell->type, statement);
+          py::GlobalSetOp::create(builder, loc(statement),
+                                  builder.getStringAttr(cell->name),
+                                  coerced.value);
+        }
+      }
   flushedDefaultCellOwners.insert(&statement);
   auto pending = pendingDefaultCells.find(&statement);
   if (pending == pendingDefaultCells.end())

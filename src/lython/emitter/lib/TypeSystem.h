@@ -182,6 +182,11 @@ struct StatementNames {
 };
 // Fills `names` from `node`; a def or class is its name and its header.
 void collectStatementNames(const parser::Node &node, StatementNames &names);
+// The names `node` binds by assignment, augmented assignment, a `for`
+// target, `with ... as` or `:=`, outside any def, class or lambda in it. Read
+// from the statement shapes rather than from `ctx`, which a synthesized
+// target does not carry.
+void collectRebindingTargets(const parser::Node &node, llvm::StringSet<> &names);
 
 class TypeSystem {
 public:

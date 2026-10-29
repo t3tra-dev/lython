@@ -2951,6 +2951,10 @@ mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::unionTagFromBoxWords(
   // strings, and unpacking one read a str's lanes as an int's. Refused rather
   // than guessed. A subclass member is not this: the class word IS the more
   // specific answer, and either reading is the same object.
+  unsigned classValues = static_cast<unsigned>(
+      llvm::count_if(unionType.getMemberTypes(), [](mlir::Type member) {
+        return mlir::isa<py::TypeType>(member);
+      }));
   {
     llvm::SmallVector<std::pair<mlir::Type, llvm::SmallVector<std::string, 8>>,
                       4>
@@ -2985,10 +2989,44 @@ mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::unionTagFromBoxWords(
   for (auto [index, member] : llvm::enumerate(unionType.getMemberTypes())) {
     mlir::Value matched =
         mlir::arith::ConstantIntOp::create(builder, loc, 0, 1).getResult();
-    if (mlir::isa<py::TypeType>(member)) {
+    if (auto classValue = mlir::dyn_cast<py::TypeType>(member)) {
       // A class value's box names `type`, whichever class it holds.
       matched = RuntimeBundleLowerer::classTestMatches(loc, exact,
                                                        "builtins.type");
+      // ⭐ WHICH CLASS, THE TYPE OBJECT IT ADDRESSES SAYS. With two class
+      // values in the union every one of them matched `type`, and the last
+      // tested won: `list[type[int] | type[str]]` read `int` back as the str
+      // class -- `c("5")` built a str, `c.__name__` said "str".
+      // ⛔ Not the entity word when the box holds something else: that is
+      // no type object, so `object`'s stands in, which no class value below
+      // `object` is a subtype of.
+      if (classValues > 1) {
+        std::optional<std::string> runtimeClass =
+            RuntimeBundleLowerer::runtimeClassForContract(
+                classValue.getInstanceType());
+        if (!runtimeClass)
+          return op->emitError()
+                 << "a value of " << unionType
+                 << " cannot be read back from a container slot or a boxed "
+                    "field: " << member << " names no class with a type "
+                    "object to compare the held one with";
+        mlir::Value objectClass =
+            type_objects::classWord(builder, loc, module, "builtins.object");
+        mlir::Value held = mlir::arith::SelectOp::create(
+            builder, loc, matched, entityWord, objectClass);
+        mlir::Value expected =
+            type_objects::classWord(builder, loc, module, *runtimeClass);
+        mlir::func::FuncOp isSubtype = getOrCreatePrivateFunction(
+            module, builder, "LyType_IsSubtype",
+            builder.getFunctionType(
+                {builder.getI64Type(), builder.getI64Type()},
+                {builder.getI1Type()}));
+        mlir::Value names =
+            mlir::func::CallOp::create(builder, loc, isSubtype,
+                                       mlir::ValueRange{held, expected})
+                .getResult(0);
+        matched = mlir::arith::AndIOp::create(builder, loc, matched, names);
+      }
     } else if (static_cast<std::int64_t>(index) !=
                laneLessTag.value_or(-1)) {
       mlir::FailureOr<llvm::SmallVector<std::string, 8>> classes =

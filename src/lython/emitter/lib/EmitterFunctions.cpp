@@ -783,6 +783,22 @@ std::string ModuleEmitter::methodDefaultCellName(const parser::Node &root,
       .str();
 }
 
+// A constant, or a tuple of them: the same value whether it is evaluated once
+// or at every call.
+static bool immutableDefaultExpression(const parser::Node *node) {
+  if (!node)
+    return false;
+  if (node->kind == "Constant")
+    return true;
+  if (node->kind != "Tuple")
+    return false;
+  if (const auto *elements = ast::nodeList(*node, "elts"))
+    for (const parser::NodePtr &element : *elements)
+      if (!immutableDefaultExpression(element.get()))
+        return false;
+  return true;
+}
+
 // ⭐ A COPY OF A METHOD'S BODY CAN BE EMITTED BEFORE THE METHOD'S OWN. A call
 // in a function body is emitted before the module walk reaches the class
 // statement, and the cell was registered only by the method's own emission,
@@ -807,21 +823,7 @@ static bool defaultEvaluatedPerCall(mlir::Type declared,
                                     const parser::Node *expression) {
   if (!declared || !mlir::isa<py::ProtocolType>(declared))
     return false;
-  std::function<bool(const parser::Node *)> immutable =
-      [&](const parser::Node *node) -> bool {
-    if (!node)
-      return false;
-    if (node->kind == "Constant")
-      return true;
-    if (node->kind != "Tuple")
-      return false;
-    if (const auto *elements = ast::nodeList(*node, "elts"))
-      for (const parser::NodePtr &element : *elements)
-        if (!immutable(element.get()))
-          return false;
-    return true;
-  };
-  return immutable(expression);
+  return immutableDefaultExpression(expression);
 }
 
 std::optional<std::string>
@@ -829,6 +831,15 @@ ModuleEmitter::methodDefaultCell(const MethodBinding &method, unsigned slot,
                                  mlir::Type declared) {
   if (!method.method)
     return std::nullopt;
+  const parser::Node *sharedRoot = nullptr;
+  if (const parser::Node *owner = methodDefaultCellOwner(method, &sharedRoot);
+      owner && methodSpecializedPerSolution(*owner, *method.method)) {
+    std::optional<GenericDefaultCell> cell =
+        sharedMethodDefaultCell(*sharedRoot, *owner, *method.method, slot);
+    if (cell && declared && cell->type == types.widenLiteral(declared))
+      return cell->name;
+    return std::nullopt;
+  }
   auto &cells = methodDefaultCells[method.method];
   for (const auto &entry : cells)
     if (entry.first == slot)
@@ -867,6 +878,169 @@ ModuleEmitter::methodDefaultCell(const MethodBinding &method, unsigned slot,
   return cellName;
 }
 
+const parser::Node *
+ModuleEmitter::methodDefaultCellOwner(const MethodBinding &method,
+                                      const parser::Node **rootOut) {
+  if (!method.method)
+    return nullptr;
+  const parser::Node *root = &moduleNode;
+  if (const EmitOptions::SourceModule *source =
+          sourceModuleForClass(method.definingClass)) {
+    if (source->isStub || !source->moduleNode)
+      return nullptr;
+    root = source->moduleNode;
+  }
+  const parser::Node *owner = defaultCellOwnerIn(*root, *method.method);
+  if (!owner || owner == method.method)
+    return nullptr;
+  if (rootOut)
+    *rootOut = root;
+  return owner;
+}
+
+bool ModuleEmitter::methodSpecializedPerSolution(const parser::Node &owner,
+                                                 const parser::Node &def) {
+  return hasTypeParameters(def) ||
+         (owner.kind == "ClassDef" && hasTypeParameters(owner));
+}
+
+// The names `type_params` declares on a def or a class.
+static void collectTypeParameterNames(const parser::Node &node,
+                                      llvm::StringSet<> &names) {
+  if (const auto *params = ast::nodeList(node, "type_params"))
+    for (const parser::NodePtr &param : *params)
+      if (param)
+        if (std::optional<std::string_view> name = ast::string(*param, "name"))
+          names.insert(llvm::StringRef(name->data(), name->size()));
+}
+
+// Does an annotation spell any of `names` -- as a name, or as a word of a
+// quoted annotation?
+static bool annotationSpellsAnyOf(const parser::Node &annotation,
+                                  const llvm::StringSet<> &names) {
+  bool found = false;
+  ast::walk(&annotation, [&](const parser::Node &node) {
+    if (node.kind == "Name" && names.contains(ast::nameSpelling(node)))
+      found = true;
+    if (node.kind == "Constant")
+      if (std::optional<std::string_view> text = ast::string(node, "value")) {
+        llvm::StringRef rest(text->data(), text->size());
+        while (!rest.empty() && !found) {
+          rest = rest.drop_until(
+              [](char c) { return llvm::isAlpha(c) || c == '_'; });
+          llvm::StringRef word = rest.take_while(
+              [](char c) { return llvm::isAlnum(c) || c == '_'; });
+          found = names.contains(word);
+          rest = rest.drop_front(word.size());
+        }
+      }
+    return found ? ast::Walk::Stop : ast::Walk::Continue;
+  });
+  return found;
+}
+
+// The annotation of parameter `slot` (positionals first, then the
+// keyword-only ones), or null.
+static const parser::Node *annotationForSlot(const parser::Node &def,
+                                             unsigned slot) {
+  const parser::Node *arguments = ast::node(def, "args");
+  if (!arguments)
+    return nullptr;
+  llvm::SmallVector<const parser::Node *, 8> parameters =
+      positionalArgumentNodes(*arguments);
+  if (const auto *kwOnly = ast::nodeList(*arguments, "kwonlyargs"))
+    for (const parser::NodePtr &parameter : *kwOnly)
+      if (parameter)
+        parameters.push_back(parameter.get());
+  if (slot >= parameters.size())
+    return nullptr;
+  return ast::node(*parameters[slot], "annotation");
+}
+
+std::optional<ModuleEmitter::GenericDefaultCell>
+ModuleEmitter::sharedMethodDefaultCell(const parser::Node &root,
+                                       const parser::Node &owner,
+                                       const parser::Node &def, unsigned slot) {
+  auto key = std::make_pair(&def, slot);
+  if (auto found = sharedMethodDefaultCells.find(key);
+      found != sharedMethodDefaultCells.end())
+    return found->second;
+  const parser::Node *expr = defaultExpressionForSlot(def, slot);
+  // A constant, or a tuple of them, is the same value evaluated per call.
+  if (!expr || immutableDefaultExpression(expr)) {
+    sharedMethodDefaultCells[key] = std::nullopt;
+    return std::nullopt;
+  }
+  llvm::StringSet<> typeParameters;
+  collectTypeParameterNames(def, typeParameters);
+  collectTypeParameterNames(owner, typeParameters);
+  const parser::Node *annotation = annotationForSlot(def, slot);
+  mlir::Type type;
+  // ⛔ Not in the scope of whichever call asks first: an imported class's
+  // annotation and default name that module's classes and constants.
+  auto typeIt = [&] {
+    if (annotation && !annotationSpellsAnyOf(*annotation, typeParameters))
+      type = types.annotationType(annotation);
+    else
+      type = types.inferExpr(expr);
+  };
+  const parser::Node &running =
+      activeSourceModuleNode ? *activeSourceModuleNode : moduleNode;
+  const EmitOptions::SourceModule *source = nullptr;
+  if (&root != &running)
+    for (const EmitOptions::SourceModule &candidate : options.sourceModules)
+      if (candidate.moduleNode == &root)
+        source = &candidate;
+  if (source)
+    emitInDefiningModuleScope(*source, typeIt);
+  else
+    typeIt();
+  type = type ? types.widenLiteral(type) : type;
+  std::optional<GenericDefaultCell> cell;
+  if (type && unboundStaticParameterCount(type) == 0)
+    cell = GenericDefaultCell{methodDefaultCellName(root, owner, def, slot),
+                              type};
+  sharedMethodDefaultCells[key] = cell;
+  return cell;
+}
+
+std::string
+ModuleEmitter::sharedMethodOmittedDefaultMismatch(const MethodBinding &method,
+                                                  unsigned slot,
+                                                  mlir::Type declared) {
+  const parser::Node *root = nullptr;
+  const parser::Node *owner = methodDefaultCellOwner(method, &root);
+  if (!owner || !methodSpecializedPerSolution(*owner, *method.method))
+    return "";
+  const parser::Node *expr = defaultExpressionForSlot(*method.method, slot);
+  if (!expr || immutableDefaultExpression(expr))
+    return "";
+  mlir::Type parameter = declared ? types.widenLiteral(declared) : declared;
+  std::optional<GenericDefaultCell> cell =
+      sharedMethodDefaultCell(*root, *owner, *method.method, slot);
+  if (cell && cell->type == parameter)
+    return "";
+  std::string name;
+  if (const parser::Node *arguments = ast::node(*method.method, "args")) {
+    llvm::SmallVector<const parser::Node *, 8> parameters =
+        positionalArgumentNodes(*arguments);
+    if (const auto *kwOnly = ast::nodeList(*arguments, "kwonlyargs"))
+      for (const parser::NodePtr &candidate : *kwOnly)
+        if (candidate)
+          parameters.push_back(candidate.get());
+    if (slot < parameters.size())
+      name = std::string(ast::nameSpelling(*parameters[slot]));
+  }
+  return "the default of '" + name +
+         "' is one value every call shares, as CPython evaluates it once "
+         "at the def" +
+         (cell ? ", and it is " + pythonTypeSpelling(cell->type)
+               : std::string(", and its type depends on the type parameters")) +
+         "; this call leaves it out where the parameter is " +
+         (parameter ? pythonTypeSpelling(parameter) : std::string("unknown")) +
+         ": pass it";
+}
+
 bool ModuleEmitter::statementHasImportedDefaultCells(
     const parser::Node &statement) {
   // A def whose cell is written at its statement: one with a default that is
@@ -889,6 +1063,15 @@ bool ModuleEmitter::statementHasImportedDefaultCells(
   };
   if (pendingDefaultCells.count(&statement))
     return true;
+  if (statement.kind == "ClassDef")
+    if (const auto *body = ast::nodeList(statement, "body"))
+      for (const parser::NodePtr &member : *body)
+        if (member &&
+            (member->kind == "FunctionDef" ||
+             member->kind == "AsyncFunctionDef") &&
+            methodSpecializedPerSolution(statement, *member) &&
+            hasCellDefault(*member))
+          return true;
   return (statement.kind == "FunctionDef" ||
           statement.kind == "AsyncFunctionDef") &&
          hasTypeParameters(statement) && hasCellDefault(statement);
@@ -1964,8 +2147,11 @@ mlir::ArrayAttr ModuleEmitter::emitCallableDefaultValues(
   // ⛔ Nor one whose statement already ran: nothing would write the cell.
   // A generic function's is the exception -- its statement writes it whether
   // or not a specialization exists yet, and specializations come later.
+  bool sharedMethod = defaultCellOwner && defaultCellOwner != &function &&
+                      methodSpecializedPerSolution(*defaultCellOwner, function);
   if (defaultCellOwner && flushedDefaultCellOwners.contains(defaultCellOwner) &&
-      !(defaultCellOwner == &function && hasTypeParameters(function)))
+      !(defaultCellOwner == &function && hasTypeParameters(function)) &&
+      !sharedMethod)
     defaultCellOwner = nullptr;
   bool isModuleLevelDef = defaultCellOwner != nullptr;
   auto declaredSlotType = [&](unsigned slot) -> mlir::Type {
@@ -2011,7 +2197,9 @@ mlir::ArrayAttr ModuleEmitter::emitCallableDefaultValues(
 
     mlir::Type slotDeclared = isModuleLevelDef ? declaredSlotType(slot)
                                                : mlir::Type();
-    bool perCall = defaultEvaluatedPerCall(slotDeclared, expr.get());
+    // A constant tuple is the same value evaluated per call.
+    bool perCall = defaultEvaluatedPerCall(slotDeclared, expr.get()) ||
+                   (sharedMethod && immutableDefaultExpression(expr.get()));
     if (isModuleLevelDef && !perCall) {
       if (mlir::Type declared = declaredSlotType(slot)) {
         // ⭐ A SPECIALIZATION READS ITS GENERIC'S CELL. Its own cell was
@@ -2028,6 +2216,23 @@ mlir::ArrayAttr ModuleEmitter::emitCallableDefaultValues(
           llvm::SmallVector<mlir::NamedAttribute, 2> attrs;
           std::optional<GenericDefaultCell> cell =
               genericDefaultCell(function, slot);
+          if (!cell || cell->type != declared) {
+            attrs.push_back(builder.getNamedAttr(
+                "kind", builder.getStringAttr("unshared")));
+            return builder.getDictionaryAttr(attrs);
+          }
+          attrs.push_back(
+              builder.getNamedAttr("kind", builder.getStringAttr("global")));
+          attrs.push_back(builder.getNamedAttr(
+              "value", builder.getStringAttr(cell->name)));
+          return builder.getDictionaryAttr(attrs);
+        }
+        // The same for a method with a body per solution: its class
+        // statement writes the one cell (emitPendingDefaultCells).
+        if (sharedMethod) {
+          llvm::SmallVector<mlir::NamedAttribute, 2> attrs;
+          std::optional<GenericDefaultCell> cell = sharedMethodDefaultCell(
+              definingModule, *defaultCellOwner, function, slot);
           if (!cell || cell->type != declared) {
             attrs.push_back(builder.getNamedAttr(
                 "kind", builder.getStringAttr("unshared")));

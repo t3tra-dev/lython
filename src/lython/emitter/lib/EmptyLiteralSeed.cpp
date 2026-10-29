@@ -3,10 +3,12 @@
 #include "AstAccess.h"
 #include "PrimitiveTypes.h"
 
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
 
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -253,12 +255,16 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
   // pushes: `bindLocalSymbol` would make them visible to everything the scan
   // calls, and the signature walk's bindings are provisional -- it is reading a
   // body whose parameters may still be variables.
+  // The walk's names, and over them the ones a loop being scanned rebinds,
+  // at their widened types (see the loop arm of `visit`).
+  const llvm::StringMap<mlir::Type> *symbols = localSymbols;
+  std::vector<std::unique_ptr<llvm::StringMap<mlir::Type>>> loopSymbols;
   auto inferHere = [&](const parser::Node *expr) {
-    return localSymbols ? types.inferExpr(
-                              expr, ExprInferenceContext{noLocalCallables(),
-                                                         nullptr, localSymbols,
-                                                         /*strict=*/false})
-                        : types.inferExpr(expr);
+    return symbols ? types.inferExpr(
+                         expr, ExprInferenceContext{noLocalCallables(), nullptr,
+                                                    symbols,
+                                                    /*strict=*/false})
+                   : types.inferExpr(expr);
   };
   bool isMapping = literalKind == "Dict";
   // `dict()`/`set()`/`list()` spell the same literals as calls; the callers map
@@ -439,7 +445,7 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
                                 auto &&noteType) {
     if (expr && depth < 3 && isEmptyContainerExpression(expr)) {
       if (mlir::Type inner = emptyLiteralSeedTypeIn(
-              types, name, literalKindOf(*expr), allSuites, localSymbols,
+              types, name, literalKindOf(*expr), allSuites, symbols,
               depth + 1, subscriptDepth + 1)) {
         noteType(slot, inner);
         return;
@@ -593,7 +599,7 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
             nested.append(allSuites.begin(), allSuites.end());
             bound = emptyLiteralSeedTypeIn(types, assignedName,
                                            literalKindOf(*assigned), nested,
-                                           localSymbols, depth + 1);
+                                           symbols, depth + 1);
           }
           if (!bound)
             bound = types.widenLiteral(inferHere(assigned));
@@ -901,6 +907,54 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
             }
           noteMaybeContainer(element, stored, note);
         }
+    }
+    // ⭐ A NAME THE LOOP REBINDS IS ITS WIDENED TYPE INSIDE IT, as the
+    // emitter carries it from the loop's header on. Read at the literal it
+    // was first bound to, `i = 0` made `out.append(r[i])` in the loop an
+    // append of `r[0]` -- the int of a `tuple[int, str]` -- and the list was
+    // typed `list[int]` for a loop that appends the str too.
+    std::optional<TypeSystem::Scope> reboundScope;
+    const llvm::StringMap<mlir::Type> *outerSymbols = symbols;
+    auto restoreSymbols =
+        llvm::make_scope_exit([&] { symbols = outerSymbols; });
+    if (node.kind == "While" || node.kind == "For" ||
+        node.kind == "AsyncFor") {
+      llvm::StringSet<> rebound;
+      for (llvm::StringRef field : {"body", "orelse"})
+        if (const auto *suite = ast::nodeList(node, field))
+          for (const parser::NodePtr &statement : *suite)
+            if (statement)
+              collectRebindingTargets(*statement, rebound);
+      llvm::StringMap<mlir::Type> widened;
+      for (const auto &entry : rebound) {
+        llvm::StringRef rebinding = entry.getKey();
+        mlir::Type current;
+        bool walked = false;
+        if (symbols)
+          if (auto found = symbols->find(rebinding); found != symbols->end()) {
+            current = found->second;
+            walked = true;
+          }
+        if (!current)
+          if (std::optional<mlir::Type> bound = types.lookupSymbol(rebinding))
+            current = *bound;
+        if (!current || !mlir::isa<py::LiteralType>(current))
+          continue;
+        if (walked) {
+          widened[rebinding] = types.widenLiteral(current);
+          continue;
+        }
+        if (!reboundScope)
+          reboundScope.emplace(types.pushScope());
+        types.bindLocalSymbol(rebinding, types.widenLiteral(current));
+      }
+      if (!widened.empty()) {
+        auto overlay = std::make_unique<llvm::StringMap<mlir::Type>>(*symbols);
+        for (const auto &entry : widened)
+          (*overlay)[entry.getKey()] = entry.second;
+        symbols = overlay.get();
+        loopSymbols.push_back(std::move(overlay));
+      }
     }
     // ⭐ A `for` target is BOUND while its body is scanned. The seed is
     // usually the loop variable -- `for i in range(3): xs.append(i)` and
