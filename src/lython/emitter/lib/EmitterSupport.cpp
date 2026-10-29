@@ -614,6 +614,24 @@ isinstanceTargetTypes(const parser::Node *node, TypeSystem &types) {
     targets.push_back(*single);
     return targets;
   }
+  // ⭐ A CLASS VALUE THAT MAY HOLD ONE OF SEVERAL CLASSES tests for one of
+  // them, as the tuple does: `isinstance(o, k)` for a `k: type[A] | type[B]`
+  // proves `o` is an A or a B. Nothing narrowed it, so `o.v` on the true side
+  // was read from an `A | B | C` and refused or failed in the lowering.
+  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(
+          types.widenLiteral(types.inferExpr(node)))) {
+    for (mlir::Type member : unionType.getMemberTypes()) {
+      auto typeObject = mlir::dyn_cast<py::TypeType>(member);
+      mlir::Type instance =
+          typeObject ? types.widenLiteral(typeObject.getInstanceType())
+                     : mlir::Type();
+      if (!instance || !mlir::isa<py::ContractType>(instance) ||
+          !mlir::cast<py::ContractType>(instance).getArguments().empty())
+        return std::nullopt;
+      targets.push_back(instance);
+    }
+    return targets;
+  }
   return std::nullopt;
 }
 
@@ -629,6 +647,11 @@ bool isinstanceTargetHoldsClassValue(const parser::Node *node,
     return false;
   }
   mlir::Type type = types.widenLiteral(types.inferExpr(node));
+  // A value that may hold one of several classes is never exactly one.
+  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type))
+    return llvm::all_of(unionType.getMemberTypes(), [](mlir::Type member) {
+      return mlir::isa<py::TypeType>(member);
+    });
   return mlir::isa_and_nonnull<py::TypeType>(type) &&
          !types.classValueIsExact(node, type);
 }

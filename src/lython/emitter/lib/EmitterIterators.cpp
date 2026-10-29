@@ -1084,6 +1084,158 @@ std::optional<Value> ModuleEmitter::emitStarredZip(const parser::Node &expr) {
       expr, callee, emitCallOperands(expr, {rows}, /*includeAstArguments=*/false));
 }
 
+// ⭐ A STARRED ARGUMENT TO `chain` OR `product` IS ITS ROWS, however many:
+// `chain(*lists)` flattens and `product(*pools)` is every pick of one member
+// from each, which is how both are written. The arguments are collected as a
+// call collects them -- a display of the written ones and the starred ones,
+// evaluated where they stand -- and a synthesized generator walks the rows:
+// `chain` row by row, `product` over the pools it reads up front, as
+// CPython's does (Modules/itertoolsmodule.c reads every pool into a tuple
+// before yielding).
+// ⛔ No keywords: `product`'s `repeat=` repeats the pools, which a starred
+// count of them does not say how to spell here.
+std::optional<Value>
+ModuleEmitter::emitStarredItertools(const parser::Node &expr,
+                                    llvm::StringRef name) {
+  auto reject = [&](llvm::StringRef reason) -> std::optional<Value> {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start, std::string(reason)});
+    return emitNone(expr);
+  };
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (keywords && !keywords->empty())
+    return reject("itertools." + name.str() +
+                  "() with a starred argument takes no keyword arguments here");
+  for (llvm::StringRef builtin : {"tuple", "list", "len"})
+    if (programBindsName(builtin))
+      return reject("itertools." + name.str() +
+                    "() with a starred argument reads its rows with " +
+                    builtin.str() + "(), which this program rebinds");
+  parser::SourceRange range = expr.range;
+  std::vector<NodePtr> members(args->begin(), args->end());
+  NodePtr display = synth::tuple(std::move(members), range);
+  synthesizedIteratorDefs.push_back(display);
+  Value rows = emitExpr(display.get());
+  mlir::Type rowsType = types.widenLiteral(rows.type);
+  mlir::Type row = types.iterableElementType(rowsType);
+  mlir::Type member =
+      row ? types.iterableElementType(types.widenLiteral(row)) : mlir::Type();
+  if (!member)
+    return reject("itertools." + name.str() +
+                  "() with a starred argument needs rows whose members have a "
+                  "type");
+
+  std::string memoKey = (name + "*|" + typeText(rowsType)).str();
+  auto memoized = lazyIteratorMemo.find(memoKey);
+  if (memoized == lazyIteratorMemo.end()) {
+    std::string symbol = ("__lyiter$" + name + "star$" +
+                          std::to_string(++syntheticFunctionCounter))
+                             .str();
+    auto id = [&](llvm::StringRef text) { return synth::name(text, range); };
+    std::vector<NodePtr> body;
+    if (name == "chain") {
+      // for __lyr in __lyrows:
+      //     for __lyx in __lyr:
+      //         yield __lyx
+      std::vector<NodePtr> inner{synth::yieldStmt(id("__lyx"), range)};
+      std::vector<NodePtr> outer{
+          synth::forStmt(id("__lyx"), id("__lyr"), std::move(inner), {}, range)};
+      body.push_back(
+          synth::forStmt(id("__lyr"), id("__lyrows"), std::move(outer), {},
+                         range));
+    } else {
+      // __lypools = [tuple(__lyp) for __lyp in __lyrows]
+      // __lynone = list(__lypools[0][:0]) if len(__lypools) > 0 else []
+      // __lypicks = [__lynone]
+      // for __lypool in __lypools:
+      //     __lynext = __lypicks[:0]
+      //     for __lyx in __lypicks:
+      //         for __lyy in __lypool:
+      //             __lynext.append(__lyx + [__lyy])
+      //     __lypicks = __lynext
+      // for __lypick in __lypicks:
+      //     yield tuple(__lypick)
+      NodePtr pools = parser::makeNode("ListComp", range);
+      NodePtr generator = parser::makeNode("comprehension", range);
+      parser::addField(*generator, "target", id("__lyp"));
+      parser::addField(*generator, "iter", id("__lyrows"));
+      parser::addField(*generator, "ifs", std::vector<NodePtr>{});
+      parser::addField(*generator, "is_async", std::int64_t{0});
+      parser::addField(*pools, "elt",
+                       synth::call(id("tuple"), {id("__lyp")}, range));
+      parser::addField(*pools, "generators", std::vector<NodePtr>{generator});
+      body.push_back(synth::assign(id("__lypools"), std::move(pools), range));
+      // ⛔ Not `[[]]`: an empty literal has no member type of its own, and
+      // the picks' is the pools' -- an empty slice of the first pool has it
+      // (and with no pool at all there is nothing to type; `[]` then).
+      NodePtr firstPool = synth::subscript(id("__lypools"),
+                                           synth::intConstant(0, range), range);
+      NodePtr noneOfIt = parser::makeNode("Slice", range);
+      parser::addField(*noneOfIt, "upper", synth::intConstant(0, range));
+      NodePtr emptyPick = parser::makeNode("List", range);
+      parser::addField(*emptyPick, "elts", std::vector<NodePtr>{});
+      body.push_back(synth::assign(
+          id("__lynone"),
+          synth::ifExp(
+              synth::compare(synth::lenCall(id("__lypools"), range), "Gt",
+                             synth::intConstant(0, range), range),
+              synth::call(id("list"),
+                          {synth::subscript(std::move(firstPool),
+                                            std::move(noneOfIt), range)},
+                          range),
+              std::move(emptyPick), range),
+          range));
+      NodePtr seeded = parser::makeNode("List", range);
+      parser::addField(*seeded, "elts", std::vector<NodePtr>{id("__lynone")});
+      body.push_back(synth::assign(id("__lypicks"), std::move(seeded), range));
+      // A fresh empty list of the picks' own type: `__lypicks[:0]`.
+      auto emptyList = [&] {
+        NodePtr none = parser::makeNode("Slice", range);
+        parser::addField(*none, "upper", synth::intConstant(0, range));
+        return synth::subscript(id("__lypicks"), std::move(none), range);
+      };
+      NodePtr extended = parser::makeNode("List", range);
+      parser::addField(*extended, "elts", std::vector<NodePtr>{id("__lyy")});
+      std::vector<NodePtr> perMember{synth::exprStmt(
+          synth::methodCall(id("__lynext"), "append",
+                            {synth::binOp(id("__lyx"), "Add",
+                                          std::move(extended), range)},
+                            range),
+          range)};
+      std::vector<NodePtr> perPick{synth::forStmt(
+          id("__lyy"), id("__lypool"), std::move(perMember), {}, range)};
+      std::vector<NodePtr> perPool;
+      perPool.push_back(synth::assign(id("__lynext"), emptyList(), range));
+      perPool.push_back(synth::forStmt(id("__lyx"), id("__lypicks"),
+                                       std::move(perPick), {}, range));
+      perPool.push_back(synth::assign(id("__lypicks"), id("__lynext"), range));
+      body.push_back(synth::forStmt(id("__lypool"), id("__lypools"),
+                                    std::move(perPool), {}, range));
+      std::vector<NodePtr> yieldPick{synth::yieldStmt(
+          synth::call(id("tuple"), {id("__lypick")}, range), range)};
+      body.push_back(synth::forStmt(id("__lypick"), id("__lypicks"),
+                                    std::move(yieldPick), {}, range));
+    }
+    llvm::SmallVector<const parser::Node *, 1> paramNodes;
+    NodePtr def = synth::functionDef(symbol, {synth::Param{"__lyrows", nullptr}},
+                                     {}, std::move(body), nullptr, {}, range,
+                                     &paramNodes);
+    synthesizedIteratorDefs.push_back(def);
+    types.overrideParameterType(paramNodes[0], rowsType);
+    FunctionSignature sig = types.functionSignature(*def);
+    emitCallableFunction(*def, symbol, sig, {}, /*isLambda=*/false);
+    memoized = lazyIteratorMemo
+                   .insert({memoKey, LazyIteratorSynthesis{
+                                         symbol, sig.publicCallable}})
+                   .first;
+  }
+  Value callee = emitBindingRef(expr, memoized->second.symbol,
+                                memoized->second.callableType);
+  return emitCallableDispatch(
+      expr, callee, emitCallOperands(expr, {rows}, /*includeAstArguments=*/false));
+}
+
 std::optional<Value>
 ModuleEmitter::tryEmitLazyIteratorValueCall(const parser::Node &expr,
                                             const parser::Node *calleeNode) {
@@ -2660,6 +2812,33 @@ std::optional<Value> ModuleEmitter::tryEmitContainerConstructorCall(
     if (args && !args->empty())
       return reject("dict() with both a positional argument and keyword "
                     "arguments is not supported yet");
+    // ⭐ `dict(**d)` IS A COPY OF d, which `{**d}` builds. ⛔ Only a mapping
+    // whose keys are str, and only alone: CPython raises TypeError for a key
+    // that is not a str ("keywords must be strings") and for a key two
+    // arguments both give, which the display would answer silently.
+    if (keywords->size() == 1 && keywords->front() &&
+        !ast::string(*keywords->front(), "arg")) {
+      const parser::Field *mappingField =
+          parser::findField(*keywords->front(), "value");
+      const auto *mapping =
+          mappingField ? std::get_if<NodePtr>(&mappingField->value) : nullptr;
+      auto mappingType = mapping && *mapping
+                             ? mlir::dyn_cast_if_present<py::ContractType>(
+                                   types.widenLiteral(
+                                       types.inferExpr(mapping->get())))
+                             : py::ContractType();
+      if (!mappingType || mappingType.getContractName() != "builtins.dict" ||
+          mappingType.getArguments().size() != 2 ||
+          types.widenLiteral(mappingType.getArguments()[0]) !=
+              types.contract("builtins.str"))
+        return reject("dict(**mapping) is taken for a dict whose keys are str: "
+                      "CPython raises TypeError for any other key");
+      NodePtr literal = parser::makeNode("Dict", range);
+      parser::addField(*literal, "keys", std::vector<NodePtr>{nullptr});
+      parser::addField(*literal, "values", std::vector<NodePtr>{*mapping});
+      synthesizedIteratorDefs.push_back(literal);
+      return emitExpr(literal.get());
+    }
     std::vector<NodePtr> keys;
     std::vector<NodePtr> vals;
     for (const NodePtr &keyword : *keywords) {
@@ -3500,9 +3679,12 @@ ModuleEmitter::tryEmitItertoolsValueCall(const parser::Node &expr,
   const auto *keywords = ast::nodeList(expr, "keywords");
   if (args)
     for (const NodePtr &arg : *args)
-      if (arg && arg->kind == "Starred")
+      if (arg && arg->kind == "Starred") {
+        if (name == "chain" || name == "product")
+          return emitStarredItertools(expr, name);
         return rejectValue("itertools." + name.str() +
                            "() does not support * argument unpacking");
+      }
   std::size_t argCount = args ? args->size() : 0;
   auto argAt = [&](std::size_t index) -> const parser::Node * {
     if (!args || index >= args->size())

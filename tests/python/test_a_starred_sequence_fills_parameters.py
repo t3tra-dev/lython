@@ -4,6 +4,8 @@
 # length raises CPython's TypeError. The sequence is collected where CPython
 # collects it: after a written positional, there; alone, after the keywords.
 # Any iterable is collected so. `zip(*rows)` zips as many rows as it is given.
+# A starred generator expression into a method or a format template is the
+# tuple of its members.
 import os.path
 import unittest
 
@@ -47,6 +49,17 @@ class Shape:
 
 def summed(xs: list[int]):
     return add(*xs)
+
+
+class Accumulator:
+    def __init__(self, base: int) -> None:
+        self.base = base
+
+    def add(self, *values: int) -> int:
+        return self.base + sum(values)
+
+    def pair(self, a: int, b: int) -> int:
+        return a * 10 + b
 
 
 class StarredParametersTest(unittest.TestCase):
@@ -140,6 +153,15 @@ class StarredParametersTest(unittest.TestCase):
             for v in column:
                 texts.append(v.upper() if isinstance(v, str) else str(v + 1))
         self.assertEqual(texts, ["2", "3", "A", "B"])
+
+
+    def test_a_generator_expression_into_a_method_or_a_template(self):
+        acc = Accumulator(10)
+        words = ["x", "y"]
+        self.assertEqual([acc.add(*(v for v in range(4))),
+                          acc.add(1, *(v * 2 for v in range(3))),
+                          acc.pair(*(v for v in (3, 4)))], [16, 17, 34])
+        self.assertEqual("{} {}".format(*(w.upper() for w in words)), "X Y")
 
 
 if __name__ == "__main__":

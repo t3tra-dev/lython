@@ -48,6 +48,31 @@ TEST(ParserTest, RepeatedParseIsStable) {
   }
 }
 
+// `with (a) as b:` is one item whose expression is parenthesized, and
+// `with (a as b):` is a parenthesized item list: what follows the `)` tells
+// them apart.
+TEST(ParserTest, AParenthesizedWithItemTakesItsTarget) {
+  auto items = [](const char *source) {
+    ParseResult result = lython::parser::parse(source, "<test>.py");
+    EXPECT_TRUE(result.ok()) << source;
+    return result.ok() ? lython::parser::dumpAst(*result.tree,
+                                                 /*includeAttributes=*/false)
+                       : std::string();
+  };
+  const std::string one = items("with (a) as cur:\n    pass\n");
+  EXPECT_NE(one.find("context_expr=Name(id=\"a\""), std::string::npos) << one;
+  EXPECT_NE(one.find("optional_vars=Name(id=\"cur\""), std::string::npos)
+      << one;
+  const std::string tuple = items("with (a, b) as c:\n    pass\n");
+  EXPECT_NE(tuple.find("context_expr=Tuple("), std::string::npos) << tuple;
+  const std::string subscript = items("with (a)[0] as c:\n    pass\n");
+  EXPECT_NE(subscript.find("context_expr=Subscript("), std::string::npos)
+      << subscript;
+  const std::string listed = items("with (a as b, c as d):\n    pass\n");
+  EXPECT_NE(listed.find("optional_vars=Name(id=\"d\""), std::string::npos)
+      << listed;
+}
+
 TEST(ParserTest, FStringTokens) {
   ParseResult result =
       lython::parser::parse("name = \"w\"\nprint(f\"hello {name}!\")\n",

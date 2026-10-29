@@ -1,7 +1,11 @@
 # `isinstance(x, cls)` and `case cls():` with `cls` a class value -- a
 # parameter, a loop over classes, a field -- test the class the value holds,
 # which may be any class under its static one; only that the value is an
-# instance of the static class follows, and only where the test held.
+# instance of the static class follows, and only where the test held: a
+# class pattern that fails leaves the subject's later patterns refutable. A
+# class value that may hold one of several classes proves one of them. A
+# class pattern's keyword names any attribute: a class attribute, a property,
+# an exception's args.
 import unittest
 
 
@@ -88,6 +92,65 @@ def matched_optional(x: Base | None, cls: type[Base]) -> str:
             return "other"
 
 
+class Other:
+    def __init__(self) -> None:
+        self.other = "other-field"
+
+
+def after_a_failed_pattern(x: Base | Other, cls: type[Base]) -> str:
+    match x:
+        case cls():
+            return "cls " + x.name()
+        case Other():
+            return "Other " + x.other
+        case _:
+            return "rest " + type(x).__name__
+
+
+class Tagged:
+    def __init__(self, v: str) -> None:
+        self.v = v
+
+
+class Marked:
+    def __init__(self, v: str) -> None:
+        self.v = v
+
+
+def read_when_one_of(o: Tagged | Marked | Other,
+                     k: type[Tagged] | type[Marked]) -> str:
+    if isinstance(o, k):
+        return o.v
+    return "miss"
+
+
+class Labelled:
+    tag = "t"
+
+    def __init__(self, x: int) -> None:
+        self.x = x
+
+    @property
+    def doubled(self) -> int:
+        return self.x * 2
+
+
+def by_attributes(v: Labelled, cls: type[Labelled]) -> str:
+    match v:
+        case cls(tag=t, x=n):
+            return f"{t} {n}"
+    return "no"
+
+
+def by_property(v: Labelled) -> str:
+    match v:
+        case Labelled(doubled=4):
+            return "four"
+        case Labelled(doubled=d, tag="t"):
+            return f"d={d}"
+    return "no"
+
+
 class ClassValueTestTest(unittest.TestCase):
     def test_an_if_tests_the_held_class(self):
         self.assertFalse(is_one(ValueError(), KeyError))
@@ -128,6 +191,31 @@ class ClassValueTestTest(unittest.TestCase):
                          ["no", "match", "match"])
         self.assertEqual([matched_optional(A(), B), matched_optional(B(), B),
                           matched_optional(None, A)], ["other", "hit", "none"])
+
+    def test_a_failed_class_pattern_keeps_the_later_ones_refutable(self):
+        self.assertEqual([after_a_failed_pattern(A(), B),
+                          after_a_failed_pattern(B(), B),
+                          after_a_failed_pattern(Other(), A)],
+                         ["rest A", "cls base", "Other other-field"])
+
+    def test_a_class_value_of_several_classes_proves_one_of_them(self):
+        self.assertEqual([read_when_one_of(Tagged("t"), Tagged),
+                          read_when_one_of(Marked("m"), Tagged),
+                          read_when_one_of(Marked("m"), Marked),
+                          read_when_one_of(Other(), Marked)],
+                         ["t", "miss", "m", "miss"])
+
+
+    def test_a_class_pattern_keyword_names_any_attribute(self):
+        self.assertEqual([by_attributes(Labelled(1), Labelled),
+                          by_property(Labelled(2)), by_property(Labelled(3))],
+                         ["t 1", "four", "d=6"])
+        try:
+            raise ValueError("boom", 2)
+        except ValueError as e:
+            match e:
+                case ValueError(args=a):
+                    self.assertEqual(a, ("boom", 2))
 
 
 if __name__ == "__main__":

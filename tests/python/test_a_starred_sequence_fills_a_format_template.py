@@ -1,7 +1,7 @@
 # A starred sequence into a literal `str.format` template fills the fields it
 # reaches, in order or by number; members past the last field are ignored,
 # and a sequence too short for a field raises the IndexError CPython raises
-# at that field.
+# at that field. A field in a field's spec reads the member after its own.
 import unittest
 
 
@@ -31,6 +31,19 @@ class StarredFormatTest(unittest.TestCase):
             "{2}{0}".format(*[1, 2])
         self.assertEqual(str(raised.exception),
                          "Replacement index 2 out of range for positional "
+                         "args tuple")
+
+
+    def test_a_field_in_the_spec_reads_the_next_member(self):
+        widths = [5, 3]
+        self.assertEqual("[{:>{}}]".format(*widths), "[  5]")
+        both = [7, 4, "x"]
+        self.assertEqual("{:>{}}{}".format(*both), "   7x")
+        short = [5]
+        with self.assertRaises(IndexError) as raised:
+            "{:>{}}".format(*short)
+        self.assertEqual(str(raised.exception),
+                         "Replacement index 1 out of range for positional "
                          "args tuple")
 
 

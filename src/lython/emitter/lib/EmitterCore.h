@@ -866,6 +866,14 @@ private:
   // sequences (memoized by builtin + argument types + callable spelling).
   std::optional<Value>
   emitStarredZip(const parser::Node &expr);
+  // `range(*args)`, `max(*xs)`, `min(*xs)` with the sequence alone: taken
+  // by its length, with the builtin's own TypeError for one it refuses.
+  std::optional<Value> emitStarredBuiltinByLength(const parser::Node &expr);
+  // `itertools.chain(*rows)` and `itertools.product(*pools)`: the rows are
+  // collected, as a call collects its arguments, and walked by a synthesized
+  // generator.
+  std::optional<Value> emitStarredItertools(const parser::Node &expr,
+                                            llvm::StringRef name);
   std::optional<Value>
   tryEmitLazyIteratorValueCall(const parser::Node &expr,
                                const parser::Node *calleeNode);
@@ -1151,6 +1159,10 @@ private:
     mlir::Type kwargType;
     std::string module;
     std::string qualname;
+    // What the call names when CPython merges its keywords, before anything
+    // is bound: the class for a constructor (`__main__.Fwd()`), where the
+    // binding itself names `Fwd.__init__()`. Empty: the function.
+    std::string calledAs;
   };
   struct DynamicUnpackCall {
     // How many positional values the call gives before the starred one, and

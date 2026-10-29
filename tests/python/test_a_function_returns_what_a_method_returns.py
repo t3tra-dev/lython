@@ -1,9 +1,24 @@
 # A module function with no return annotation returns what a method of a class
 # in the same module returns: called on a parameter, on a local, on a fresh
 # instance, on a parameter typed only by its callers, and through iteration
-# of the instance.
+# of the instance. One that returns from a `try` and from its handler
+# returns the type both give, a literal among them included.
 import unittest
 from typing import Iterator
+
+
+def parsed(s: str):
+    try:
+        return int(s)
+    except ValueError:
+        return -1
+
+
+def named(s: str):
+    try:
+        return s.upper()
+    except ValueError:
+        return "none"
 
 
 class Box:
@@ -64,6 +79,12 @@ class MethodResultTest(unittest.TestCase):
     def test_iterating_the_instance(self):
         self.assertEqual(counted(Box([7, 8, 9])) + 0, 3)
         self.assertEqual(largest(Box([7, 9, 8])) + 0, 9)
+
+
+    def test_returns_from_a_try_and_its_handler(self):
+        self.assertEqual([parsed("12"), parsed("x"), parsed("3") + 1],
+                         [12, -1, 4])
+        self.assertEqual(named("a"), "A")
 
 
 if __name__ == "__main__":

@@ -1019,6 +1019,16 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     return emitJoinedStr(*expr);
   if (expr->kind == "FormattedValue")
     return emitFormattedValue(*expr);
+  // A star reaches here from a call whose builtin takes each argument as a
+  // value (`len(*xs)`), which "unsupported expression kind 'Starred'" said
+  // in the parser's words.
+  if (expr->kind == "Starred") {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr->range.start,
+        "a starred argument is not taken by this call: give the members it "
+        "would pass as arguments of their own"});
+    return emitNone(*expr);
+  }
   diagnostics.push_back(
       parser::Diagnostic{parser::Severity::Error, expr->range.start,
                          "unsupported expression kind '" + expr->kind + "'"});
@@ -2289,6 +2299,36 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
       return *identity;
     if (std::optional<Value> identity = unionReferenceIdentity(rhs, lhs))
       return *identity;
+    // ⭐ A CLASS IS ITS TYPE OBJECT, and `type.__eq__` is identity, so two
+    // class values one of which may hold several classes are the same object
+    // exactly when `==` says so: `ks[0] is ks[1]` over `list[type[A] |
+    // type[B]]` was refused while `ks[0] == ks[1]` answered.
+    auto holdsClasses = [&](mlir::Type type) {
+      mlir::Type widened = types.widenLiteral(type);
+      if (mlir::isa_and_nonnull<py::TypeType>(widened))
+        return true;
+      auto unionType = mlir::dyn_cast_if_present<py::UnionType>(widened);
+      return unionType &&
+             llvm::all_of(unionType.getMemberTypes(), [](mlir::Type member) {
+               return mlir::isa<py::TypeType>(member);
+             });
+    };
+    if (holdsClasses(lhs.type) && holdsClasses(rhs.type) &&
+        (mlir::isa<py::UnionType>(types.widenLiteral(lhs.type)) ||
+         mlir::isa<py::UnionType>(types.widenLiteral(rhs.type)))) {
+      Value equal = emitBinarySpecial<py::EqOp>(expr, "__eq__", lhs, rhs,
+                                                types.boolType());
+      mlir::Value bit = emitBoolValue(equal, expr);
+      if (negatedIdentity)
+        bit = mlir::arith::XOrIOp::create(
+                  builder, loc(expr), bit,
+                  mlir::arith::ConstantIntOp::create(builder, loc(expr), 1, 1))
+                  .getResult();
+      return Value{py::CastFromPrimOp::create(builder, loc(expr),
+                                              types.boolType(), bit)
+                       .getResult(),
+                   types.boolType()};
+    }
     if (auto lhsType = mlir::dyn_cast_if_present<py::TypeType>(lhs.type))
       if (auto rhsType = mlir::dyn_cast_if_present<py::TypeType>(rhs.type)) {
         if (std::optional<Value> dynamic =
@@ -3608,8 +3648,28 @@ ModuleEmitter::tryEmitUnionAttributeRead(const parser::Node &expr,
                                          llvm::StringRef attribute) {
   auto unionType = mlir::dyn_cast_if_present<py::UnionType>(
       types.widenLiteral(receiver.type));
-  if (!unionType || attribute == "__class__" ||
-      lookupClassField(receiver.type, attribute))
+  if (!unionType || attribute == "__class__")
+    return std::nullopt;
+  // ⛔ A None MEMBER HAS NO ATTRIBUTE TO READ, and is refused as a union
+  // method call is: CPython raises AttributeError when the value holds None,
+  // and the field read below -- which takes every member for a class --
+  // reached the lowering as "union member None has no class schema". The
+  // program narrows first (`if r is not None:`), which is what a checker
+  // asks of `r.n` for an `E | None` too.
+  if (!(attribute.starts_with("__") && attribute.ends_with("__")))
+    for (mlir::Type member : unionType.getMemberTypes())
+      if (py::isPyNoneType(member)) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "static type " + typeText(unionType) +
+                " is a union, and '" + attribute.str() +
+                "' is read from whichever member the value holds: None has "
+                "no attribute '" +
+                attribute.str() +
+                "' -- narrow the value to the members that have it first"});
+        return emitNone(expr);
+      }
+  if (lookupClassField(receiver.type, attribute))
     return std::nullopt;
   mlir::Type joined = types.inferExpr(&expr);
   if (!joined || types.widenLiteral(joined) == types.object())
@@ -5608,8 +5668,19 @@ Value ModuleEmitter::emitContainerLiteral(const parser::Node &expr,
            pythonSubclassOf(actualClass.getInstanceType(),
                             formalClass.getInstanceType(), types, module)))
         continue;
-      if (!isAssignableWithStaticEvidence(actual, formal, module) &&
-          !declaredSubclassOfType(actual, formal, types)) {
+      // ⭐ A union formal is fit by fitting one of its members, a subclass
+      // of one included: `[A(), B(), SubA()]` for a `list[A | B]` formal kept
+      // `list[A | B | SubA]` and was refused in the lowering.
+      auto fits = [&](mlir::Type member) {
+        member = types.widenLiteral(member);
+        return actual == member ||
+               isAssignableWithStaticEvidence(actual, member, module) ||
+               declaredSubclassOfType(actual, member, types);
+      };
+      auto formalUnion = mlir::dyn_cast<py::UnionType>(formal);
+      if (!fits(formal) &&
+          !(formalUnion &&
+            llvm::any_of(formalUnion.getMemberTypes(), fits))) {
         allFit = false;
         break;
       }
