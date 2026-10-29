@@ -1055,6 +1055,35 @@ mapRegionTerminatorGroupToParentResults(mlir::Operation *terminator,
       owner->getNumResults() == 0)
     return std::nullopt;
 
+  // ⛔ AN ARM THAT YIELDS A VALUE BORN OUTSIDE ITS `scf.if` LENDS IT, unless
+  // every arm yields that value. The result is whichever arm ran, so on the
+  // other paths it names another object and this group is still alive beside
+  // it. Read as a transfer, `r[i]` over `(A(k), A(k + 1))` -- a selection, one
+  // arm per candidate -- had the first candidate's own release written after
+  // the read, inside the loop, where it released whichever candidate was read;
+  // the first one's token reached the exit unpaid, one A per call. A value
+  // born in the arm is a transfer (the int fast/slow `scf.if`): the other
+  // arms never made it.
+  if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(owner)) {
+    for (auto [position, operand] :
+         llvm::enumerate(terminator->getOperands())) {
+      if (region->isAncestor(operand.getParentRegion()) ||
+          llvm::none_of(group, [&](mlir::Value value) {
+            return aliases.same(operand, value);
+          }))
+        continue;
+      for (mlir::Region &arm : ifOp->getRegions()) {
+        if (&arm == region)
+          continue;
+        mlir::Operation *other =
+            arm.empty() ? nullptr : arm.front().getTerminator();
+        if (!other || position >= other->getNumOperands() ||
+            !aliases.same(other->getOperand(position), operand))
+          return std::nullopt;
+      }
+    }
+  }
+
   llvm::SmallVector<bool, 4> mappedMask;
   llvm::SmallVector<mlir::Value, 4> mapped = remapGroupThroughValueMapping(
       terminator->getOperands(), owner->getResults(), group, aliases,

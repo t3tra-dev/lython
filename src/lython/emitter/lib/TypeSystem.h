@@ -503,6 +503,13 @@ public:
   // The specialized contract for `baseName[arguments]`, or null.
   mlir::Type resolveGenericClass(llvm::StringRef baseName,
                                  mlir::ArrayRef<mlir::Type> arguments) const;
+  // Whether a class value names exactly the class its static type is of --
+  // a class spelled by name, or one no class derives from -- rather than any
+  // subclass of it. The emitter owns the class table that answers it.
+  using ClassValueExactness =
+      std::function<bool(const parser::Node *expr, mlir::Type type)>;
+  void setClassValueExactness(ClassValueExactness exactness);
+  bool classValueIsExact(const parser::Node *expr, mlir::Type type) const;
   // The specialized contract a `C[int]` subscript spells, or null when the
   // node is an ordinary value subscript. Shared by annotation resolution and
   // expression inference (`C[int]` in value position is a class object).
@@ -953,6 +960,7 @@ private:
   // costs nothing.
   mutable llvm::StringMap<parser::NodePtr> parsedAnnotations;
   GenericClassResolver genericClassResolver;
+  ClassValueExactness classValueExactness;
   struct GenericClassTemplate {
     llvm::SmallVector<std::string, 4> params;
     const parser::Node *initNode = nullptr;

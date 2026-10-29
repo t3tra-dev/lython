@@ -1877,9 +1877,15 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       // ⭐ AND A FUNCTION REFERENCE, which names a symbol and carries
       // nothing: `print(await double(j))` evaluates `print` first, and the
       // reference was live across the await with no lane to ride.
+      // ⭐ AND A CLASS OR UNION TEST of a value, which the emitter writes once
+      // per read and CSE then merges: `yield str(v)` and a `print(v)` after it
+      // shared one `union.test` of the parameter, whose i1 was live across the
+      // suspend. A copy in front of each user tests the same SSA value, which
+      // those users read anyway.
       clone.walk([&](mlir::Operation *op) {
         bool reference = mlir::isa<py::BindingRefOp>(op);
-        if (op->getNumOperands() == 0 && op->getNumResults() == 1 &&
+        bool test = mlir::isa<py::UnionTestOp, py::ClassTestOp>(op);
+        if ((op->getNumOperands() == 0 || test) && op->getNumResults() == 1 &&
             op->getRegions().empty() &&
             (reference || mlir::isMemoryEffectFree(op)) &&
             !op->hasTrait<mlir::OpTrait::IsTerminator>())

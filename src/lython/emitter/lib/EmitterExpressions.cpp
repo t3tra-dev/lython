@@ -5260,6 +5260,15 @@ mlir::Type ModuleEmitter::siblingExpectationFor(const parser::Node &literal,
   llvm::ArrayRef<mlir::Type> arguments = contract.getArguments();
   if (literal.kind == "Dict")
     return arguments.size() == 2 ? arguments[forKey ? 0 : 1] : mlir::Type();
+  // A tuple's element is its own position's (the inference gave an empty one
+  // its kind's siblings' type).
+  if (literal.kind == "Tuple")
+    if (const auto *elements = ast::nodeList(literal, "elts");
+        elements && elements->size() == arguments.size() &&
+        arguments.size() > 1)
+      for (auto [index, candidate] : llvm::enumerate(*elements))
+        if (candidate.get() == element)
+          return arguments[index];
   return arguments.size() == 1 ? arguments.front() : mlir::Type();
 }
 

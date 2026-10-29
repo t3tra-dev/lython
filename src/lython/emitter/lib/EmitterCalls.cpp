@@ -102,6 +102,33 @@ std::optional<llvm::StringRef> contractName(mlir::Type type) {
   return contract.getContractName();
 }
 
+// The call's arguments with every starred display spread into its elements,
+// or nothing when no argument is one (see `emitCall`).
+std::optional<std::vector<parser::NodePtr>>
+spreadStarredDisplays(const std::vector<parser::NodePtr> &written) {
+  std::vector<parser::NodePtr> spread;
+  bool spreadAny = false;
+  for (const parser::NodePtr &arg : written) {
+    const parser::Node *display =
+        arg && arg->kind == "Starred" ? ast::node(*arg, "value") : nullptr;
+    const auto *elements = display && display->kind == "Tuple"
+                               ? ast::nodeList(*display, "elts")
+                               : nullptr;
+    if (elements &&
+        llvm::none_of(*elements, [](const parser::NodePtr &element) {
+          return !element || element->kind == "Starred";
+        })) {
+      spread.insert(spread.end(), elements->begin(), elements->end());
+      spreadAny = true;
+      continue;
+    }
+    spread.push_back(arg);
+  }
+  if (!spreadAny)
+    return std::nullopt;
+  return spread;
+}
+
 } // namespace
 
 CallOperands
@@ -181,6 +208,13 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
 
   // The starred iterable CPython collects at the call, after the keywords.
   std::optional<unsigned> collectAfterKeywords;
+  // ...and the members of a starred generator expression collected there.
+  parser::NodePtr generatorMembersAfterKeywords;
+  llvm::SmallVector<std::string, 1> heldGeneratorIterables;
+  auto releaseHeldGeneratorIterables = llvm::scope_exit([&] {
+    for (const std::string &held : heldGeneratorIterables)
+      values.erase(held);
+  });
   const auto *callKeywords = ast::nodeList(expr, "keywords");
   bool hasKeywords = callKeywords && !callKeywords->empty();
   if (const auto *args = ast::nodeList(expr, "args")) {
@@ -192,9 +226,56 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
         positionalAligned = false;
       const parser::Node *valueNode =
           unpacked ? ast::node(*arg, "value") : arg.get();
+      // ⭐ A STARRED GENERATOR EXPRESSION IS ITS MEMBERS, collected as a
+      // display collects them (`(*g,)`), since a generator expression is not
+      // a value here: `f(*(x * 2 for x in xs))` was "unsupported expression
+      // kind 'GeneratorExp'" while `print(*(...))` ran. Its outermost
+      // iterable is evaluated where it is written, as CPython evaluates it
+      // when the generator is made; its body runs where CPython iterates it
+      // -- after the keywords when it is the first positional.
+      parser::NodePtr generatorMembers;
+      std::optional<Value> generatorIterable;
+      if (unpacked && valueNode && valueNode->kind == "GeneratorExp" &&
+          !programBindsName("tuple"))
+        if (const auto *generators = ast::nodeList(*valueNode, "generators");
+            generators && !generators->empty() && generators->front())
+          if (const parser::Node *outer =
+                  ast::node(*generators->front(), "iter")) {
+            Value iterable = emitExpr(outer);
+            std::string held =
+                "__lystargen" + std::to_string(++syntheticFunctionCounter);
+            values[held] = iterable;
+            types.bindSymbol(held, iterable.type);
+            heldGeneratorIterables.push_back(held);
+            parser::NodePtr generator = synth::cloneTree(*valueNode);
+            if (auto *clonedGenerators = parser::findField(*generator,
+                                                           "generators"))
+              if (auto *list = std::get_if<std::vector<parser::NodePtr>>(
+                      &clonedGenerators->value);
+                  list && !list->empty() && list->front())
+                if (parser::Field *iter =
+                        parser::findField(*list->front(), "iter"))
+                  iter->value = synth::name(held, outer->range);
+            generatorMembers = synth::tuple(
+                {synth::starred(std::move(generator), valueNode->range)},
+                valueNode->range);
+            synthesizedIteratorDefs.push_back(generatorMembers);
+            generatorIterable = iterable;
+          }
+      // Deferred only with its members' type known: the held iterable stands
+      // in for them until then, and must not be what the call receives.
+      mlir::Type generatorElement;
+      if (generatorMembers)
+        if (mlir::Type element = types.iterableElementType(types.widenLiteral(
+                types.inferExpr(generatorMembers.get()))))
+          generatorElement = types.widenLiteral(element);
+      bool generatorAfterKeywords = generatorMembers && generatorElement &&
+                                    writtenBefore == 0 && hasKeywords;
       auto shaped = lambdaArgumentExpectations.find(valueNode);
       Value value =
-          shaped != lambdaArgumentExpectations.end()
+          generatorAfterKeywords ? *generatorIterable
+          : generatorMembers     ? emitExpr(generatorMembers.get())
+          : shaped != lambdaArgumentExpectations.end()
               ? emitExprExpected(valueNode, shaped->second)
           : positionalAligned
               ? emitExprExpected(valueNode,
@@ -231,7 +312,7 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
       // of one has no arity in its type (`tuple[str]` is also the
       // homogeneous spelling), so it is forwarded as those values, not
       // unpacked as a tuple.
-      if (unpacked)
+      if (unpacked && !generatorAfterKeywords)
         if (auto pack = staticPositionalPacks.find(value.value);
             pack != staticPositionalPacks.end()) {
           for (const Value &element : pack->second) {
@@ -253,7 +334,12 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
       // iterable is collected so -- a range, a dict, a generator -- and is a
       // sequence of unknown length from then on.
       std::optional<mlir::Type> iterated;
-      if (unpacked) {
+      if (generatorAfterKeywords) {
+        iterated = generatorElement;
+        collectAfterKeywords =
+            static_cast<unsigned>(operands.positional.size());
+        generatorMembersAfterKeywords = generatorMembers;
+      } else if (unpacked) {
         llvm::SmallVector<mlir::Type, 4> spread;
         bool sequence = py::dynamicStarElementType(
                             types.widenLiteral(value.type))
@@ -291,7 +377,10 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
       operands.positional.push_back(value);
       operands.positionalUnpacked.push_back(unpacked ? 1 : 0);
       if (unpacked) {
-        if (!appendStarredArgumentTypes(types, value.type,
+        // The held iterable stands in for the members until the keywords
+        // are in; its own arity is not theirs.
+        if (generatorAfterKeywords ||
+            !appendStarredArgumentTypes(types, value.type,
                                         operands.positionalTypes)) {
           // ⭐ A SEQUENCE OF UNKNOWN LENGTH IS KEPT WHOLE, as the `*tuple[T]`
           // the matcher reads (py::variadicTailElement): a callee whose
@@ -393,10 +482,14 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
                 "names; spell the keywords out";
     }
   }
-  if (collectAfterKeywords)
-    if (std::optional<Value> collected = collectStarredMembers(
-            expr, operands.positional[*collectAfterKeywords]))
+  if (collectAfterKeywords) {
+    if (generatorMembersAfterKeywords)
+      operands.positional[*collectAfterKeywords] =
+          emitExpr(generatorMembersAfterKeywords.get());
+    else if (std::optional<Value> collected = collectStarredMembers(
+                 expr, operands.positional[*collectAfterKeywords]))
       operands.positional[*collectAfterKeywords] = *collected;
+  }
 
   return operands;
 }
@@ -1195,13 +1288,25 @@ Value ModuleEmitter::emitCallableDispatch(const parser::Node &anchor,
       unionsOnly = true;
     }
   }
+  // ⭐ And past the fixed parameters, where `*xs: int` declares each member:
+  // `g(True)` packed the bool's lanes into a `tuple[int]` and the lowering
+  // refused the call ("arguments do not match Callable contract").
+  mlir::Type varargElement;
+  if (callable && callable.hasVararg())
+    if (auto tuple = mlir::dyn_cast_if_present<py::ContractType>(
+            callable.getVarargType());
+        tuple && tuple.getContractName() == "builtins.tuple" &&
+        tuple.getArguments().size() == 1)
+      varargElement = tuple.getArguments().front();
   if (callable && chosen->valid)
     for (auto [index, value] : llvm::enumerate(chosen->positional)) {
-      if (index >= callable.getPositionalTypes().size() ||
-          index >= chosen->positionalUnpacked.size() ||
+      mlir::Type declared = index < callable.getPositionalTypes().size()
+                                ? callable.getPositionalTypes()[index]
+                                : varargElement;
+      if (!declared || index >= chosen->positionalUnpacked.size() ||
           chosen->positionalUnpacked[index] ||
           (unionsOnly && !mlir::isa<py::UnionType>(value.type)) ||
-          !boolKeptAsInt(callable.getPositionalTypes()[index], value.type))
+          !boolKeptAsInt(declared, value.type))
         continue;
       if (chosen != &asInts) {
         asInts = *chosen;
@@ -1859,6 +1964,41 @@ ModuleEmitter::tryEmitStaticKeywordPackGet(const parser::Node &call) {
 }
 
 Value ModuleEmitter::emitCall(const parser::Node &expr) {
+  // ⭐ A STARRED TUPLE DISPLAY IS ITS ELEMENTS, in the order they are written:
+  // `f(*(a, b))` builds the tuple from `a` then `b` and unpacks it, which
+  // nothing can tell from `f(a, b)`. Taken whole, the pack went where a starred
+  // sequence goes -- a constructor's runtime path, which handed `P(*(1, 2))` to
+  // `__init__`-less field initialization ("received 2 positional arguments for 1
+  // fields"), and `*(2,)`, whose `tuple[int]` says no length, to the run-time
+  // length path. As arguments, each element meets its parameter the way a
+  // written one does: coerced, solved (`first(*(1.5, 2.5))`), and specialized
+  // at its rung (`f(*(4, 5))` into float parameters).
+  //
+  // ⛔ THE WHOLE CALL IS RESPELLED, not the operands one path collects: the
+  // dynamic-unpack and generic paths count arguments by their AST position,
+  // and spread operands under a starred node made `show(*("a", "b"), **kw)`
+  // pass no positionals at all -- silently.
+  //
+  // ⛔ NOT A LIST DISPLAY. `add(*[1])` is the spelling a program uses to
+  // reach the TypeError CPython raises for a short sequence, which the
+  // run-time length path raises; spread, it would be refused as a call with
+  // too few arguments, before anything ran.
+  if (const auto *written = ast::nodeList(expr, "args"))
+    if (std::optional<std::vector<parser::NodePtr>> spread =
+            spreadStarredDisplays(*written)) {
+      std::vector<parser::NodePtr> keywords;
+      if (const auto *writtenKeywords = ast::nodeList(expr, "keywords"))
+        keywords.assign(writtenKeywords->begin(), writtenKeywords->end());
+      const parser::Field *callee = parser::findField(expr, "func");
+      const auto *calleeNode =
+          callee ? std::get_if<parser::NodePtr>(&callee->value) : nullptr;
+      if (calleeNode && *calleeNode) {
+        parser::NodePtr respelled = synth::callWithKeywords(
+            *calleeNode, std::move(*spread), std::move(keywords), expr.range);
+        synthesizedIteratorDefs.push_back(respelled);
+        return emitCall(*respelled);
+      }
+    }
   Value result = emitCallAsImplemented(expr);
   // A call of an `@overload`ed function is typed by the overload it matched.
   const parser::Node *calleeNode = ast::node(expr, "func");
@@ -9171,17 +9311,7 @@ ModuleEmitter::tryEmitAsciiCall(const parser::Node &expr,
 // `isinstance(x, t)` / `issubclass(s, t)` over class values: the class of x
 // (or s itself) has t in its MRO.
 bool ModuleEmitter::targetHasDynamicClassValue(const parser::Node *node) {
-  if (!node)
-    return false;
-  if (node->kind == "Tuple") {
-    if (const auto *elts = ast::nodeList(*node, "elts"))
-      for (const parser::NodePtr &elt : *elts)
-        if (targetHasDynamicClassValue(elt.get()))
-          return true;
-    return false;
-  }
-  mlir::Type type = types.widenLiteral(types.inferExpr(node));
-  return mlir::isa<py::TypeType>(type) && !classValueIsExact(node, type);
+  return isinstanceTargetHoldsClassValue(node, types);
 }
 
 // ⭐ A TUPLE OF CLASSES IS ANY OF THEM, also when only the run says how many:
@@ -9337,6 +9467,18 @@ std::optional<Value> ModuleEmitter::emitClassValueSubclassTest(
     const parser::Node &expr, const parser::Node *subjectNode,
     const parser::Node *targetNode, bool subjectIsInstance) {
   Value subject = emitExpr(subjectNode);
+  mlir::Value test =
+      emitClassValueSubclassBit(expr, subject, targetNode, subjectIsInstance);
+  if (!test)
+    return emitNone(expr);
+  auto pyBool =
+      py::CastFromPrimOp::create(builder, loc(expr), types.boolType(), test);
+  return Value{pyBool.getResult(), types.boolType()};
+}
+
+mlir::Value ModuleEmitter::emitClassValueSubclassBit(
+    const parser::Node &expr, const Value &subject,
+    const parser::Node *targetNode, bool subjectIsInstance) {
   // A tuple of classes is any of them, each evaluated in order.
   llvm::SmallVector<Value, 4> targets;
   if (targetNode->kind == "Tuple") {
@@ -9346,13 +9488,13 @@ std::optional<Value> ModuleEmitter::emitClassValueSubclassTest(
   } else {
     targets.push_back(emitExpr(targetNode));
   }
-  auto refuse = [&](mlir::Type offending) -> std::optional<Value> {
+  auto refuse = [&](mlir::Type offending) -> mlir::Value {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, expr.range.start,
         std::string(subjectIsInstance ? "isinstance()" : "issubclass()") +
             " needs class values on both sides here, and " +
             typeText(offending) + " is not one"});
-    return emitNone(expr);
+    return {};
   };
   for (const Value &target : targets)
     if (!mlir::isa<py::TypeType>(target.type))
@@ -9379,9 +9521,7 @@ std::optional<Value> ModuleEmitter::emitClassValueSubclassTest(
                       .getResult()
                 : one;
   }
-  auto pyBool =
-      py::CastFromPrimOp::create(builder, loc(expr), types.boolType(), test);
-  return Value{pyBool.getResult(), types.boolType()};
+  return test;
 }
 
 std::optional<Value>
@@ -9877,6 +10017,36 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
         "print() does not take the keyword argument '" + refusedKeyword + "'"});
     return emitNone(expr);
   }
+  // ⭐ `sep=None` AND `end=None` ARE THE DEFAULTS, as in builtin_print_impl,
+  // and a `str | None` is whichever it holds -- what a wrapper that forwards
+  // its own `sep` parameter hands over. Coerced to str, either one failed in
+  // the lowering ("a union seen as 'builtins.str' needs that class to be one
+  // header lane"). The value is evaluated either way, where it is written.
+  auto printTextKeyword = [&](const parser::Node *valueNode,
+                              llvm::StringRef fallback) -> Value {
+    mlir::Type strType = types.contract("builtins.str");
+    Value value = emitExpr(valueNode);
+    mlir::Type held = types.widenLiteral(value.type);
+    bool optionalText =
+        mlir::isa<py::UnionType>(held) &&
+        types.widenLiteral(removeNoneFromType(held, types)) == strType;
+    if (!isNoneTypeLike(held) && !optionalText)
+      return coerceValue(value, strType, expr);
+    std::string valueName =
+        "__lyprintkw" + std::to_string(++syntheticFunctionCounter);
+    values[valueName] = value;
+    types.bindSymbol(valueName, value.type);
+    parser::NodePtr chosen = synth::strConstant(fallback, expr.range);
+    if (optionalText)
+      chosen = synth::ifExp(
+          synth::compare(synth::name(valueName, expr.range), "IsNot",
+                         synth::noneConstant(expr.range), expr.range),
+          synth::name(valueName, expr.range), std::move(chosen), expr.range);
+    synthesizedIteratorDefs.push_back(chosen);
+    Value text = coerceValue(emitExpr(chosen.get()), strType, expr);
+    values.erase(valueName);
+    return text;
+  };
   // ⭐ `end=` IS THE FILE'S OWN `write`, which is what CPython's print does:
   // `builtin_print_impl` writes the joined arguments and then writes `end`,
   // and the only reason this could not be spelled here was the sink. The
@@ -9897,7 +10067,7 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
     if (evaluatedEnd) {
       end = *evaluatedEnd;
     } else if (endNode) {
-      end = coerceValue(emitExpr(endNode), strContract, expr);
+      end = printTextKeyword(endNode, "\n");
     } else {
       mlir::Type newlineType = types.literal("\"\\n\"");
       end = coerceValue(Value{py::StrConstantOp::create(
@@ -9997,9 +10167,9 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
       llvm::StringRef name = ast::string(*keyword, "arg").value_or("");
       const parser::Node *value = ast::node(*keyword, "value");
       if (name == "sep")
-        separator = coerceValue(emitExpr(value), strType, expr);
+        separator = printTextKeyword(value, " ");
       else if (name == "end")
-        end = coerceValue(emitExpr(value), strType, expr);
+        end = printTextKeyword(value, "\n");
       else if (name == "file") {
         // `file=None` is sys.stdout, as in CPython.
         Value file = emitExpr(value);
@@ -10142,11 +10312,9 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
     for (const parser::NodePtr &keyword : *printKeywords) {
       llvm::StringRef name = ast::string(*keyword, "arg").value_or("");
       if (name == "sep")
-        separatorValue = coerceValue(emitExpr(ast::node(*keyword, "value")),
-                                     types.contract("builtins.str"), expr);
+        separatorValue = printTextKeyword(ast::node(*keyword, "value"), " ");
       else if (name == "end")
-        endValue = coerceValue(emitExpr(ast::node(*keyword, "value")),
-                               types.contract("builtins.str"), expr);
+        endValue = printTextKeyword(ast::node(*keyword, "value"), "\n");
     }
   };
   if (!noPrintKeywords && (!printArgs || printArgs->empty())) {

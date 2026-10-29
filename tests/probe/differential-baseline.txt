@@ -409,7 +409,7 @@ ut_unsupported_object_with_class_value_union_field_held.py AGREE
 ut_unsupported_paramspec_decorator.py GAP
 ut_unsupported_paramspec_forwarder_as_value.py GAP
 ut_unsupported_range_count.py GAP
-ut_unsupported_reversed_heterogeneous_tuple.py GAP
+ut_unsupported_reversed_heterogeneous_tuple.py AGREE
 ut_unsupported_subclasses.py AGREE
 ut_unsupported_sys_modules.py GAP
 ut_unsupported_traceback_attribute.py GAP

@@ -588,8 +588,13 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
     // concrete producer every other argument of that parameter is
     // specialized from. difflib's `SequenceMatcher(isjunk)` reached
     // "default argument has no concrete runtime contract".
+    // ⭐ AND AN `object` PARAMETER: its default is the str or int it is,
+    // which the argument adaptation boxes as it boxes a passed one. Bundled
+    // as `object`, `def show(b: object = "d")` handed the str's three lanes
+    // where the box's one is expected.
     mlir::Type memberType =
-        unionType || runtimeContractName(parameterType).empty()
+        unionType || runtimeContractName(parameterType).empty() ||
+                isBuiltinsObjectContract(parameterType)
             ? runtimeContractType(context, contractName)
             : parameterType;
     RuntimeBundle member;

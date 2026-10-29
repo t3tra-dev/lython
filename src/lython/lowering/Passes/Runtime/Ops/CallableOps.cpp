@@ -238,12 +238,18 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRuntimeListPop(
     return op.emitError()
            << "list.pop needs a concrete element contract; annotate the list's "
               "element type";
-  for (mlir::Type shape : *shapes) {
-    auto memref = mlir::dyn_cast<mlir::MemRefType>(shape);
-    if (!memref || memref.getRank() != 1)
-      return op.emitError() << "list.pop cannot rebuild an element of "
-                            << elementContract << " from its payload box";
-  }
+  // ⭐ A UNION ELEMENT IS BUILT FROM THE BOX, as a subscript read builds it
+  // (`payloadElementAt`): its physical form starts with a TAG, which no box
+  // word holds, so the lane check below refused `xs.pop()` for every
+  // `list[int | None]` -- an undo stack -- while `xs[-1]` read it.
+  auto elementUnion = mlir::dyn_cast<py::UnionType>(elementContract);
+  if (!elementUnion)
+    for (mlir::Type shape : *shapes) {
+      auto memref = mlir::dyn_cast<mlir::MemRefType>(shape);
+      if (!memref || memref.getRank() != 1)
+        return op.emitError() << "list.pop cannot rebuild an element of "
+                              << elementContract << " from its payload box";
+    }
 
   builder.setInsertionPoint(op);
   mlir::Location loc = op.getLoc();
@@ -291,6 +297,35 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRuntimeListPop(
     return mlir::memref::LoadOp::create(builder, loc, itemsArray, index)
         .getResult();
   };
+  if (elementUnion) {
+    mlir::Value entityWord = loadParkedWord(box_abi::kEntityWord);
+    mlir::Value classWord =
+        box_abi::slotClassFromEntity(builder, loc, entityWord);
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> unionValues =
+        RuntimeBundleLowerer::unionValuesFromBoxWords(op, elementUnion,
+                                                      classWord, entityWord);
+    if (mlir::failed(unionValues))
+      return mlir::failure();
+    // The member's own reference, taken before the parked one is released.
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> owned =
+        RuntimeBundleLowerer::retainUnionMemberValues(op, elementUnion,
+                                                       *unionValues);
+    if (mlir::failed(owned))
+      return mlir::failure();
+    RuntimeBundle result;
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundleWithOwnership(
+            op, elementContract, *owned, result,
+            ownership::logicalOwnershipKind(elementContract,
+                                            /*ownsObject=*/true))))
+      return mlir::failure();
+    valueBundles[op.getResult(0)] = std::move(result);
+    erase.push_back(op);
+    RuntimeBundleLowerer::createRuntimeCall(
+        loc, *releaseParked, mlir::ValueRange{itemsArray, parkSlot});
+    RuntimeBundleLowerer::demoteSequenceEvidence(op, receiver);
+    return RuntimeBundleLowerer::pinContainerLiveness(op, receiver,
+                                                      /*insertAfterOp=*/true);
+  }
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> parkedLanes =
       RuntimeBundleLowerer::lanesFromBoxEntity(
           builder, loc, loadParkedWord(box_abi::kEntityWord), *shapes,

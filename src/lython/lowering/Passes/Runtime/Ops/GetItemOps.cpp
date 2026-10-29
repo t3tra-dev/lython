@@ -193,9 +193,15 @@ mlir::LogicalResult RuntimeBundleLowerer::bindSelectedEvidenceObjectResult(
   // only had to stop consulting the cache, and this one has to BUILD them --
   // `materializeObjectBundleForStorage` is the widening that already exists,
   // and it records the active member so the slot's reference stays nameable.
+  //
+  // ⛔ Not `kind == Object`: a class value rebuilt from its lane is a
+  // TypeObject bundle (`makeObjectBundleWithOwnership`), and it reached a
+  // union-typed result as itself, the type object's header where the tag is
+  // read -- `xs[0] is int` over `list[type[int] | type[str]]` failed with the
+  // same "memref<16xi1>" message.
   if (auto resultUnion =
           mlir::dyn_cast<py::UnionType>(resultValue.getType());
-      resultUnion && bundle.kind == RuntimeBundle::Kind::Object &&
+      resultUnion && bundle.isObjectLike() &&
       !mlir::isa<py::UnionType>(bundle.objectValue.contract)) {
     if (mlir::failed(
             RuntimeBundleLowerer::canonicalizeSlotElementBundle(op, bundle)))
@@ -1170,6 +1176,13 @@ RuntimeBundleLowerer::selectEvidenceObjectByMatch(
       for (const RuntimeValue &candidate : candidates) {
         RuntimeBundle source = RuntimeBundle::objectWithOwnership(
             candidate.contract, candidate.values, candidate.ownership);
+        // ⭐ A MEMBER IN ITS SLOT FORM IS UNBOXED FIRST, as the widening of a
+        // read is (`bindSelectedEvidenceObjectResult`): a tuple display keeps
+        // a bool as its box, and `for v in (1, True)` put that box where the
+        // union's bool lane is the truth bit.
+        if (mlir::failed(
+                RuntimeBundleLowerer::canonicalizeSlotElementBundle(op, source)))
+          return mlir::failure();
         llvm::SmallVector<mlir::Value, 8> values;
         if (mlir::failed(RuntimeBundleLowerer::appendUnionRuntimeValues(
                 op, resultUnion, source, candidate.contract, values)))
@@ -1632,6 +1645,34 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerSequenceEvidenceGetItem(
   // explicit `__len__` use — otherwise the container's release is placed after
   // its previous last use (the bounds check above) and would free the elements
   // before the selection reads them.
+  //
+  // ⭐ A UNION SELECTION TAKES A REFERENCE PER MEMBER, as a union read from a
+  // payload does. The selection widened every candidate into the union's
+  // form, and a union names no contract whose retain `retainEvidenceElement`
+  // could look up, so `r[i]` over `(1, "a")` failed here.
+  if (auto resultUnion =
+          mlir::dyn_cast<py::UnionType>(op.getResult().getType());
+      resultUnion && (*selected).objectValue.contract == resultUnion) {
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> owned =
+        RuntimeBundleLowerer::retainUnionMemberValues(
+            op, resultUnion,
+            llvm::SmallVector<mlir::Value, 8>(
+                (*selected).physicalValues().begin(),
+                (*selected).physicalValues().end()));
+    if (mlir::failed(owned))
+      return mlir::failure();
+    if (mlir::failed(pinContainerLiveness(op, container)))
+      return mlir::failure();
+    RuntimeBundle result;
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundleWithOwnership(
+            op, resultUnion, *owned, result,
+            ownership::logicalOwnershipKind(resultUnion,
+                                            /*ownsObject=*/true))))
+      return mlir::failure();
+    valueBundles[op.getResult()] = std::move(result);
+    erase.push_back(op);
+    return true;
+  }
   RuntimeValue chainElement{(*selected).objectValue.contract,
                             llvm::SmallVector<mlir::Value, 4>(
                                 (*selected).physicalValues().begin(),

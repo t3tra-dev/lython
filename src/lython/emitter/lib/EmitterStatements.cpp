@@ -296,6 +296,21 @@ mlir::Type ModuleEmitter::noneSeedUnionType(llvm::StringRef name) {
         if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
             node->kind == "ClassDef" || node->kind == "Lambda")
           return;
+        // ⭐ A NAME A LOOP REBINDS IS ANY OF ITS VALUES inside it, as the
+        // generator walk and the empty-literal seed read it: `j = 0` then
+        // `while ...: last = r[j]; j += 1` read `r[0]`, an int, so `last`
+        // was seeded `int | None` and the str the loop stored reached the
+        // lowering through that lane ("type mismatch for bb argument").
+        if (node->kind == "While" || node->kind == "For" ||
+            node->kind == "AsyncFor") {
+          llvm::StringSet<> rebound;
+          collectRebindingTargets(*node, rebound);
+          for (const auto &entry : rebound)
+            if (std::optional<mlir::Type> bound =
+                    types.lookupSymbol(entry.getKey());
+                bound && mlir::isa<py::LiteralType>(*bound))
+              types.bindSymbol(entry.getKey(), types.widenLiteral(*bound));
+        }
         if (node->kind == "For" || node->kind == "AsyncFor")
           if (const parser::Node *target = ast::node(*node, "target"))
             if (target->kind == "Name")
@@ -398,6 +413,21 @@ mlir::Type ModuleEmitter::noneSeedUnionType(llvm::StringRef name) {
                 // in.
                 if (bound && isNoneTypeLike(bound))
                   continue;
+                // ⭐ A UNION IS A SETTLED TYPE TOO -- `last = r[j]` over a
+                // `tuple[int, str]` -- and the seed is its members and None.
+                if (auto boundUnion =
+                        mlir::dyn_cast_if_present<py::UnionType>(bound);
+                    boundUnion &&
+                    llvm::all_of(boundUnion.getMemberTypes(),
+                                 [](mlir::Type member) {
+                                   return mlir::isa<py::ContractType>(member) ||
+                                          isNoneTypeLike(member);
+                                 })) {
+                  for (mlir::Type member : boundUnion.getMemberTypes())
+                    if (!isNoneTypeLike(member))
+                      members.push_back(member);
+                  continue;
+                }
                 if (!bound || py::isPyObjectType(bound) ||
                     !mlir::isa<py::ContractType>(bound)) {
                   opaque = true;
@@ -430,11 +460,20 @@ mlir::Type ModuleEmitter::noneSeedUnionType(llvm::StringRef name) {
   if (opaque || members.empty())
     return {};
   mlir::Type joined = types.join(members);
-  if (!joined || py::isPyObjectType(joined) ||
-      !mlir::isa<py::ContractType>(joined))
-    return {};
-  llvm::SmallVector<mlir::Type, 2> memberTypes{joined,
-                                               types.literal("None")};
+  llvm::SmallVector<mlir::Type, 4> memberTypes;
+  if (auto joinedUnion = mlir::dyn_cast_if_present<py::UnionType>(joined)) {
+    for (mlir::Type member : joinedUnion.getMemberTypes()) {
+      if (!mlir::isa<py::ContractType>(member) && !isNoneTypeLike(member))
+        return {};
+      memberTypes.push_back(member);
+    }
+  } else {
+    if (!joined || py::isPyObjectType(joined) ||
+        !mlir::isa<py::ContractType>(joined))
+      return {};
+    memberTypes.push_back(joined);
+  }
+  memberTypes.push_back(types.literal("None"));
   return py::UnionType::getNormalized(&context, memberTypes);
 }
 

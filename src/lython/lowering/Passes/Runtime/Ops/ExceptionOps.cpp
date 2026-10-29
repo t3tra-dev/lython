@@ -514,11 +514,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRaise(py::RaiseOp op) {
   // (`Ly_IncRef observed non-positive refcount`), and "retain iff there is a
   // local try" leaks again as soon as one exception is raised TWICE (355 B).
   //
-  // ⭐ The repair belongs in the EMITTER, not here: narrow the union with the
-  // `isinstance` chain it already builds and emit one `py.raise` per member
-  // INSIDE the try, where each arm is a plain named raise and the EH wiring
-  // comes out right by construction. Recorded in
-  // tests/probe/wb_raise_a_runtime_chosen_exception.py.
+  // ⛔ Nor in the emitter, which this note proposed until it was tried: an
+  // `isinstance` chain raising each member, written out by hand, crashes
+  // exactly as the select does -- a narrowing is a view, and the arm's raise
+  // still transfers lanes the union owns. The answer is in the ownership walk
+  // (a raise consuming a value another group also holds), with the
+  // measurements in tests/probe/wb_raise_a_runtime_chosen_exception.py.
   if (mlir::isa_and_nonnull<py::UnionType>(exception->contract) &&
       !exception->unionActiveMember)
     return op.emitError()

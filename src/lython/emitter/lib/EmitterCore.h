@@ -1380,6 +1380,12 @@ private:
                              const parser::Node *subjectNode,
                              const parser::Node *targetNode,
                              bool subjectIsInstance);
+  // The same test over a subject already evaluated -- a match subject -- as
+  // an i1; null after a diagnostic.
+  mlir::Value emitClassValueSubclassBit(const parser::Node &expr,
+                                        const Value &subject,
+                                        const parser::Node *targetNode,
+                                        bool subjectIsInstance);
   std::optional<Value> tryEmitTypeCall(const parser::Node &expr,
                                        const parser::Node *calleeNode);
   std::optional<Value> tryEmitIsInstanceCall(const parser::Node &expr,
