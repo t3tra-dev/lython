@@ -2361,7 +2361,8 @@ TEST(DriverTest, AnOptionalFieldIsBoxedLikeThePayloadAlone) {
 // compiler dies with SIGILL and no diagnostic, which is what it did.
 // A slot records only the class of what it holds, so a union whose members
 // are the same class at run time cannot be read back out of one; a member that
-// is a subclass of another can, and so can a union of distinct classes.
+// is a subclass of another can, and so can a union of distinct classes, and
+// one of class values, whose type object says which class it is.
 TEST(DriverTest, AUnionOfTwoTuplesCannotBeReadBackFromASlot) {
   CompileResult same = compileSource(
       "def f(xs: list[tuple[int, int] | tuple[str, str]]) -> None:\n"
@@ -2372,12 +2373,22 @@ TEST(DriverTest, AUnionOfTwoTuplesCannotBeReadBackFromASlot) {
   EXPECT_NE(same.diagnostics.find("are the same class at run time"),
             std::string::npos)
       << same.diagnostics;
+  CompileResult classes = compileSource(
+      "xs: list[type[int] | type[str]] = [int, str]\n"
+      "for c in xs:\n"
+      "    print(c.__name__)\n");
+  EXPECT_TRUE(classes.succeeded) << classes.diagnostics;
   CompileResult distinct = compileSource(
       "def f(xs: list[tuple[int, int] | str]) -> None:\n"
       "    for x in xs:\n"
       "        print(x)\n"
       "f([(1, 1), \"s\"])\n");
   EXPECT_TRUE(distinct.succeeded) << distinct.diagnostics;
+  CompileResult oneClass = compileSource(
+      "xs: list[type[int] | str] = [int, \"s\"]\n"
+      "for c in xs:\n"
+      "    print(c)\n");
+  EXPECT_TRUE(oneClass.succeeded) << oneClass.diagnostics;
   CompileResult subclass = compileSource(
       "class A:\n    pass\nclass B(A):\n    pass\n"
       "def f(xs: list[A | B]) -> None:\n"

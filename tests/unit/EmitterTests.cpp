@@ -1337,8 +1337,8 @@ TEST(EmitterTest, AMethodOnAUnionIsAnsweredByEveryMemberOrRefused) {
 }
 
 // A program that replaces sys.stdout refuses what would read the stream it
-// replaced: an object of another kind assigned to it, a `from sys import
-// stdout` snapshot, and a print() whose arguments are unpacked.
+// replaced: an object of another kind assigned to it and a `from sys import
+// stdout` snapshot; a print() whose arguments are unpacked writes through it.
 TEST(EmitterTest, AReplacedStreamRefusesWhatItCannotWriteThrough) {
   struct Case {
     const char *source;
@@ -1352,11 +1352,6 @@ TEST(EmitterTest, AReplacedStreamRefusesWhatItCannotWriteThrough) {
                 "from sys import stdout\n"
                 "sys.stdout = sys.__stdout__\n",
                 "would bind the stream as it is at the import"},
-           Case{"import sys\n"
-                "xs = [1, 2]\n"
-                "sys.stdout = sys.__stdout__\n"
-                "print(*xs)\n",
-                "in a program that replaces sys.stdout"},
        }) {
     mlir::MLIRContext context(testRegistry());
     lython::emitter::EmitResult emitted = emitSource(item.source, context);
@@ -1367,6 +1362,13 @@ TEST(EmitterTest, AReplacedStreamRefusesWhatItCannotWriteThrough) {
               diagnostic.message.find(item.message) != std::string::npos;
     EXPECT_TRUE(found) << item.source;
   }
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult unpacked = emitSource("import sys\n"
+                                                    "xs = [1, 2]\n"
+                                                    "sys.stdout = sys.__stdout__\n"
+                                                    "print(*xs)\n",
+                                                    context);
+  EXPECT_TRUE(unpacked.ok());
 }
 
 // The chain attributes read the words a raise left in the exception; an
@@ -1805,36 +1807,53 @@ TEST(EmitterTest, AMappingOfUnknownKeysReachesOnlyKwargs) {
 }
 
 // A starred sequence whose length only the run time knows reaches *args -- a
-// generic function's or method's too -- and is refused where its first
-// members would fill a positional parameter, after which nothing positional
-// may follow it, and before a builtin.
-TEST(EmitterTest, AStarredSequenceOfUnknownLengthReachesOnlyArgs) {
+// generic function's or method's too -- and the parameters before it; it is
+// refused where a keyword names a parameter it may reach, where its members
+// are an empty display's, where the callee's spelling calls something, after
+// which nothing positional may follow it, and before a builtin that takes no
+// such sequence.
+TEST(EmitterTest, AStarredSequenceOfUnknownLengthFillsWhatItReaches) {
   mlir::MLIRContext context(testRegistry());
   struct Case {
     const char *source;
     const char *message;
   };
+  const char *pair = "def g(a: int, b: int = 0) -> int:\n"
+                     "    return a + b\n"
+                     "class Maker:\n"
+                     "    def m(self, a: int) -> int:\n"
+                     "        return a\n"
+                     "def make() -> Maker:\n"
+                     "    return Maker()\n"
+                     "xs = [1]\n";
   for (const Case &item : {
-           Case{"def f(a: int = 0, *rest: int) -> int:\n"
-                "    return a\n"
-                "xs = [1]\n"
-                "print(f(*xs))\n",
-                "its first members would fill 'a' of 'f'"},
+           Case{"print(g(*xs, b=1))\n",
+                "its first members would fill 'a' and 'b' of 'g'"},
+           Case{"print(g(*[]))\n",
+                "its first members would fill 'a' and 'b' of 'g'"},
+           Case{"print(make().m(*xs))\n",
+                "its first members would fill 'a' of 'Maker.m'"},
            Case{"def h(*rest: int) -> int:\n"
                 "    return len(rest)\n"
-                "xs = [1]\n"
                 "print(h(*xs, 2))\n",
                 "must be the last positional argument"},
-           Case{"xs = [1, 2]\n"
-                "print(*xs)\n",
+           Case{"print(list(range(*xs)))\n",
                 "only to the *args of a function or method this program "
                 "defines"},
        }) {
     mlir::MLIRContext caseContext(testRegistry());
-    lython::emitter::EmitResult result = emitSource(item.source, caseContext);
-    EXPECT_FALSE(result.ok()) << item.source;
-    EXPECT_TRUE(reportsDiagnostic(result, item.message)) << item.source;
+    std::string source = std::string(pair) + item.source;
+    lython::emitter::EmitResult result = emitSource(source, caseContext);
+    EXPECT_FALSE(result.ok()) << source;
+    EXPECT_TRUE(reportsDiagnostic(result, item.message)) << source;
   }
+  lython::emitter::EmitResult filled = emitSource(
+      std::string(pair) + "def f(a: int = 0, *rest: int) -> int:\n"
+                          "    return a\n"
+                          "mk = Maker()\n"
+                          "print(f(*xs), g(*xs), mk.m(*xs), print(*xs))\n",
+      context);
+  EXPECT_TRUE(filled.ok());
   lython::emitter::EmitResult forwarded = emitSource(
       "def total(*args: int) -> int:\n"
       "    return len(args)\n"
@@ -4246,6 +4265,57 @@ TEST(EmitterTest, AStrIsSearchedOnlyForAStr) {
       "print(key(True) in 'abc')\n",
       context);
   EXPECT_TRUE(mayHoldOne.ok());
+}
+
+// What: a call that leaves out the default of a generic method, or of a
+// method of a generic class, is refused when the default's one object cannot
+// be the type the call solves the parameter to -- in a function, at module
+// level, and for a second solution -- and accepted when the call passes the
+// argument or the parameter names no type parameter.
+TEST(EmitterTest, ADefaultEverySolutionSharesIsReadOnlyAtItsType) {
+  mlir::MLIRContext context(testRegistry());
+  const std::string shared =
+      "the default of 'into' is one value every call shares, as CPython "
+      "evaluates it once at the def";
+  auto refusedWith = [&](llvm::StringRef source, llvm::StringRef message) {
+    lython::emitter::EmitResult emitted = emitSource(source, context);
+    EXPECT_FALSE(emitted.ok()) << source.str();
+    bool found = false;
+    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+      found = found || diagnostic.message.find(message.str()) != std::string::npos;
+    EXPECT_TRUE(found) << source.str();
+  };
+  const std::string method =
+      "class C:\n"
+      "    def keep[T](self, v: T, into: list[T] = []) -> list[T]:\n"
+      "        into.append(v)\n"
+      "        return into\n";
+  refusedWith(method + "c = C()\nprint(c.keep(1), c.keep(2))\n", shared);
+  refusedWith(method + "def use(c: C) -> None:\n"
+                       "    print(c.keep(1), c.keep('s'))\n"
+                       "use(C())\n",
+              shared + ", and it is list[object]; this call leaves it out "
+                       "where the parameter is list[str]: pass it");
+  refusedWith("class Box[T]:\n"
+              "    def __init__(self, v: T) -> None:\n"
+              "        self.v = v\n"
+              "    def keep(self, into: list[T] = []) -> list[T]:\n"
+              "        into.append(self.v)\n"
+              "        return into\n"
+              "print(Box(1).keep(), Box('s').keep())\n",
+              shared);
+  lython::emitter::EmitResult passed =
+      emitSource(method + "c = C()\nprint(c.keep(1, [0]), c.keep('s', []))\n",
+                 context);
+  EXPECT_TRUE(passed.ok());
+  lython::emitter::EmitResult ground = emitSource(
+      "class C:\n"
+      "    def note[T](self, v: T, into: list[str] = []) -> int:\n"
+      "        into.append(repr(v))\n"
+      "        return len(into)\n"
+      "c = C()\nprint(c.note(1), c.note('s'))\n",
+      context);
+  EXPECT_TRUE(ground.ok());
 }
 
 // What: `@overload` declarations without the def that implements them are

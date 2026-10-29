@@ -865,6 +865,8 @@ private:
   // values synthesize per-call-site generator functions over indexable
   // sequences (memoized by builtin + argument types + callable spelling).
   std::optional<Value>
+  emitStarredZip(const parser::Node &expr);
+  std::optional<Value>
   tryEmitLazyIteratorValueCall(const parser::Node &expr,
                                const parser::Node *calleeNode);
   struct LazyIteratorSynthesis {
@@ -1136,6 +1138,12 @@ private:
   struct DynamicUnpackTarget {
     // The parameters a positional argument can fill, the receiver excluded.
     llvm::SmallVector<std::string, 8> positionalNames;
+    // Which of them have a default, and what each declares.
+    llvm::SmallVector<bool, 8> positionalDefaults;
+    llvm::SmallVector<mlir::Type, 8> positionalTypes;
+    // CPython's counts include a bound receiver: `C.m() takes 2 positional
+    // arguments` for `def m(self, a)`.
+    bool receiverCounted = false;
     unsigned positionalOnlyCount = 0;
     llvm::SmallVector<std::string, 4> kwOnlyNames;
     // `tuple[U]` and `dict[str, U]`, or null when there is none.
@@ -1148,6 +1156,8 @@ private:
     // How many positional values the call gives before the starred one, and
     // those of them beyond the parameters (what *args receives first).
     unsigned explicitPositional = 0;
+    // The values themselves, when each is one argument.
+    llvm::SmallVector<Value, 8> explicitValues;
     llvm::SmallVector<Value, 4> extras;
     std::optional<Value> tail;
     // In call order; the mapping is the one with the empty name.
@@ -1158,16 +1168,34 @@ private:
     std::optional<Value> kwargs;
     // The keywords that bind named parameters, in call order.
     llvm::SmallVector<std::pair<std::string, Value>, 4> named;
+    // The whole call, already made: a starred sequence that fills
+    // parameters is called once per length it may have
+    // (emitStarredCallByLength).
+    std::optional<Value> completed;
   };
   std::optional<DynamicUnpackResult>
   emitDynamicUnpack(const parser::Node &anchor,
                     const DynamicUnpackTarget &target,
                     const DynamicUnpackCall &call);
+  // Whether str() of a value of this type may run code the program wrote: a
+  // class of its own, or any value whose class is not known here. Null is
+  // not known.
+  bool renderingRunsProgramCode(mlir::Type type);
+  // The members of a starred iterable as one tuple, the way CPython collects
+  // a call's arguments; null when `tuple` is rebound.
+  std::optional<Value> collectStarredMembers(const parser::Node &anchor,
+                                             Value iterable);
+  std::optional<Value>
+  emitStarredCallByLength(const parser::Node &anchor,
+                          const DynamicUnpackTarget &target,
+                          const DynamicUnpackCall &call);
   // `operands` rewritten for a callee the emitter knows the parameters of: its
-  // *args is one tuple and its **kwargs one fresh dict.
+  // *args is one tuple and its **kwargs one fresh dict. `completed` is set
+  // when the call was made here instead.
   bool normalizeDynamicUnpacks(const parser::Node &anchor,
                                const DynamicUnpackTarget &target,
-                               CallOperands &operands);
+                               CallOperands &operands,
+                               std::optional<Value> *completed = nullptr);
   std::optional<DynamicUnpackTarget> dynamicUnpackTargetFor(
       const parser::Node &anchor, Value callee);
   DynamicUnpackTarget dynamicUnpackTargetForMethod(const MethodBinding &method);
@@ -2540,6 +2568,30 @@ private:
   std::optional<std::string> methodDefaultCell(const MethodBinding &method,
                                                unsigned slot,
                                                mlir::Type declared);
+  // ⭐ A GENERIC METHOD, OR ANY METHOD OF A GENERIC CLASS, HAS ONE BODY PER
+  // SOLUTION AND ONE DEFAULT FOR ALL OF THEM -- the generic function's rule
+  // (genericDefaultCell), with the class statement as the def. The cell is
+  // typed by the declared parameter where it names no type parameter and by
+  // the default's own type where it does; a solution whose parameter is not
+  // that type reads no default. Null when the slot has no shared cell.
+  bool methodSpecializedPerSolution(const parser::Node &owner,
+                                    const parser::Node &def);
+  std::optional<GenericDefaultCell>
+  sharedMethodDefaultCell(const parser::Node &root, const parser::Node &owner,
+                          const parser::Node &def, unsigned slot);
+  // Why a call that leaves `slot` out cannot read the shared cell at this
+  // solution's `declared` type; empty when it can or the default is
+  // evaluated per call.
+  std::string sharedMethodOmittedDefaultMismatch(const MethodBinding &method,
+                                                 unsigned slot,
+                                                 mlir::Type declared);
+  std::map<std::pair<const parser::Node *, unsigned>,
+           std::optional<GenericDefaultCell>>
+      sharedMethodDefaultCells;
+  // The class statement a method's default cell belongs to, in the module
+  // that defines the method; null when there is none.
+  const parser::Node *methodDefaultCellOwner(const MethodBinding &method,
+                                             const parser::Node **root);
   // The cell a METHOD's non-constant default was parked in, per (def node,
   // slot). An inlined method call reads this instead of re-emitting the
   // expression -- which is what made `def add(self, into: list[int] = [])`

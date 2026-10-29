@@ -5396,8 +5396,14 @@ ModuleEmitter::dynamicUnpackTargetForMethod(const MethodBinding &method) {
   DynamicUnpackTarget target;
   std::size_t firstSlot = methodBindingBindsReceiver(method) ? 1 : 0;
   for (std::size_t slot = firstSlot; slot < signature.positionalNames.size();
-       ++slot)
+       ++slot) {
     target.positionalNames.push_back(signature.positionalNames[slot]);
+    if (signature.positionalDefaults.size() == signature.positionalNames.size())
+      target.positionalDefaults.push_back(signature.positionalDefaults[slot]);
+    if (slot < signature.positionalTypes.size())
+      target.positionalTypes.push_back(signature.positionalTypes[slot]);
+  }
+  target.receiverCounted = firstSlot == 1;
   target.positionalOnlyCount =
       signature.positionalOnlyCount > firstSlot
           ? signature.positionalOnlyCount - static_cast<unsigned>(firstSlot)
@@ -5472,6 +5478,9 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
   // knows: collected into the method's *args and **kwargs below
   // (emitDynamicUnpack), as a call of a function collects them.
   std::optional<Value> dynamicTail;
+  bool collectTailAfterKeywords = false;
+  const auto *writtenKeywords = ast::nodeList(expr, "keywords");
+  bool hasKeywords = writtenKeywords && !writtenKeywords->empty();
   bool dynamicMapping = false;
   if (const auto *args = ast::nodeList(expr, "args")) {
     for (const parser::NodePtr &arg : *args) {
@@ -5518,11 +5527,24 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
           }
           continue;
         }
-        if (auto sequence = mlir::dyn_cast_if_present<py::ContractType>(
-                types.widenLiteral(starred.type));
-            sequence && sequence.getArguments().size() == 1 &&
-            (sequence.getContractName() == "builtins.tuple" ||
-             sequence.getContractName() == "builtins.list")) {
+        // Collected where CPython collects it (emitCallOperands): here,
+        // after a written positional, or after the keywords.
+        bool sequence = py::dynamicStarElementType(
+                            types.widenLiteral(starred.type))
+                            .has_value();
+        if (!positional.empty() || (!sequence && !hasKeywords)) {
+          if (std::optional<Value> collected =
+                  collectStarredMembers(*arg, starred)) {
+            starred = *collected;
+            sequence = true;
+          }
+        } else if (!sequence &&
+                   types.iterableElementType(types.widenLiteral(starred.type)) &&
+                   !programBindsName("tuple")) {
+          collectTailAfterKeywords = true;
+          sequence = true;
+        }
+        if (sequence) {
           dynamicTail = starred;
           continue;
         }
@@ -5585,6 +5607,11 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
     }
   }
 
+  if (collectTailAfterKeywords && dynamicTail)
+    if (std::optional<Value> collected =
+            collectStarredMembers(expr, *dynamicTail))
+      dynamicTail = *collected;
+
   Value descriptorReceiver = emitDescriptorReceiver(expr, receiver, method);
   bool bindReceiver = methodBindingBindsReceiver(method);
   if (method.kind == "instance" && mlir::isa<py::TypeType>(receiver.type))
@@ -5595,6 +5622,7 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
     DynamicUnpackTarget target = dynamicUnpackTargetForMethod(method);
     DynamicUnpackCall call;
     call.explicitPositional = static_cast<unsigned>(positional.size());
+    call.explicitValues.assign(positional.begin(), positional.end());
     if (dynamicTail) {
       for (std::size_t index = target.positionalNames.size();
            index < positional.size(); ++index)
@@ -5607,6 +5635,8 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
         emitDynamicUnpack(expr, target, call);
     if (!collected)
       return emitNone(expr);
+    if (collected->completed)
+      return *collected->completed;
     if (dynamicTail && positional.size() > target.positionalNames.size())
       positional.resize(target.positionalNames.size());
     KeywordArguments named;
@@ -7515,6 +7545,13 @@ Value ModuleEmitter::emitInlineMethodBody(
                                          builder.getStringAttr(*cellName));
       return Value{get.getResult(), get.getResult().getType()};
     }
+    // ⛔ Not the expression evaluated here instead: that is a fresh default
+    // per call, and the one CPython shares cannot be this solution's type.
+    if (std::string why =
+            sharedMethodOmittedDefaultMismatch(method, slot, slotType(slot));
+        !why.empty())
+      diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
+                                               anchor.range.start, why});
     return emitExpr(defaultNode);
   };
   // ⭐ A DEFAULT BINDS AS AN ARGUMENT WOULD. Into a protocol parameter, an
@@ -7789,6 +7826,8 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
       DynamicUnpackTarget target = dynamicUnpackTargetForMethod(*declaredInit);
       DynamicUnpackCall call;
       call.explicitPositional = plain;
+      call.explicitValues.assign(operands.positional.begin(),
+                                 operands.positional.begin() + plain);
       for (unsigned index = static_cast<unsigned>(
                target.positionalNames.size());
            index < plain; ++index)
@@ -7801,6 +7840,8 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
           emitDynamicUnpack(expr, target, call);
       if (!collected)
         return emitNone(expr);
+      if (collected->completed)
+        return *collected->completed;
       unsigned kept = std::min<unsigned>(
           plain, static_cast<unsigned>(target.positionalNames.size()));
       CallOperands rebuilt;

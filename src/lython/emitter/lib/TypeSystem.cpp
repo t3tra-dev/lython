@@ -638,6 +638,65 @@ void applyGeneratorGuardNarrowing(
       narrow, onFalseSide);
 }
 
+} // namespace
+
+void collectRebindingTargets(const parser::Node &node,
+                             llvm::StringSet<> &names) {
+  auto bindTarget = [&](const parser::Node *target, auto &&recurse) -> void {
+    if (!target)
+      return;
+    if (target->kind == "Name") {
+      names.insert(ast::nameSpelling(*target));
+      return;
+    }
+    if (target->kind == "Starred") {
+      recurse(ast::node(*target, "value"), recurse);
+      return;
+    }
+    if (target->kind == "Tuple" || target->kind == "List")
+      if (const auto *elements = ast::nodeList(*target, "elts"))
+        for (const parser::NodePtr &element : *elements)
+          recurse(element.get(), recurse);
+  };
+  if (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
+      node.kind == "ClassDef") {
+    if (std::optional<std::string_view> bound = ast::string(node, "name"))
+      names.insert(*bound);
+    return;
+  }
+  if (node.kind == "Lambda")
+    return;
+  if (node.kind == "Assign") {
+    if (const auto *targets = ast::nodeList(node, "targets"))
+      for (const parser::NodePtr &target : *targets)
+        bindTarget(target.get(), bindTarget);
+  } else if (node.kind == "AugAssign" || node.kind == "AnnAssign" ||
+             node.kind == "For" || node.kind == "AsyncFor" ||
+             node.kind == "NamedExpr") {
+    bindTarget(ast::node(node, "target"), bindTarget);
+  } else if (node.kind == "withitem") {
+    bindTarget(ast::node(node, "optional_vars"), bindTarget);
+  } else if (node.kind == "Name") {
+    if (const parser::Node *context = ast::node(node, "ctx");
+        context && context->kind == "Store")
+      names.insert(ast::nameSpelling(node));
+  }
+  for (const parser::Field &field : node.fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child)
+        collectRebindingTargets(**child, names);
+      continue;
+    }
+    if (const auto *children =
+            std::get_if<std::vector<parser::NodePtr>>(&field.value))
+      for (const parser::NodePtr &child : *children)
+        if (child)
+          collectRebindingTargets(*child, names);
+  }
+}
+
+namespace {
+
 void collectGeneratorFunctionAnalysis(
     const TypeSystem &types, const parser::Node *node,
     const llvm::StringMap<mlir::Type> &localCallables,
@@ -1015,6 +1074,35 @@ void collectGeneratorFunctionAnalysis(
       }
     }
     return;
+  }
+  // ⭐ A NAME THE LOOP REBINDS IS NOT ITS FIRST VALUE INSIDE THE LOOP. The
+  // emitter carries it at its widened type from the loop's header on; this
+  // walk read `i = 0` as the literal 0 everywhere after it, so `r[i]` over a
+  // `tuple[int, str]` was `r[0]`, an int:
+  //
+  //     def g(r: tuple[int, str]):
+  //         i = 0
+  //         while i < 2:
+  //             out = []
+  //             out.append(r[i])
+  //             yield tuple(out)    # typed tuple[int]; the second holds "a"
+  //             i = i + 1
+  //
+  // and the generator handed out a str where every reader expected an int.
+  if (node->kind == "While" || node->kind == "For" ||
+      node->kind == "AsyncFor") {
+    llvm::StringSet<> rebound;
+    for (llvm::StringRef field : {"body", "orelse"})
+      if (const auto *suite = ast::nodeList(*node, field))
+        for (const parser::NodePtr &statement : *suite)
+          if (statement)
+            collectRebindingTargets(*statement, rebound);
+    for (const auto &entry : rebound) {
+      auto found = analysis.localSymbols.find(entry.getKey());
+      if (found != analysis.localSymbols.end() && found->second &&
+          mlir::isa<py::LiteralType>(found->second))
+        found->second = types.widenLiteral(found->second);
+    }
   }
   if (node->kind == "For" || node->kind == "AsyncFor") {
     // Bind the loop target to the iteration element type before the generic
@@ -1791,6 +1879,31 @@ mlir::Type lazyIteratorCallType(const TypeSystem &types, llvm::StringRef name,
       return {};
     return generatorOf(
         tupleOfMembers(types, {types.contract("builtins.int"), element}));
+  }
+  // `zip(*rows)`: as many sequences as the call hands it, so a tuple whose
+  // length only the run time knows, of what they hold (emitStarredZip).
+  if (name == "zip" && args &&
+      llvm::any_of(*args, [](const parser::NodePtr &arg) {
+        return arg && arg->kind == "Starred";
+      })) {
+    llvm::SmallVector<mlir::Type, 4> held;
+    for (const parser::NodePtr &arg : *args) {
+      if (!arg)
+        return {};
+      mlir::Type sequence;
+      if (arg->kind == "Starred") {
+        sequence = elementOf(ast::node(*arg, "value"));
+      } else {
+        sequence = inferSource(arg.get());
+      }
+      mlir::Type member =
+          sequence ? types.iterableElementType(types.widenLiteral(sequence))
+                   : mlir::Type();
+      if (!member)
+        return {};
+      held.push_back(types.widenLiteral(member));
+    }
+    return generatorOf(types.tupleOf(types.join(held)));
   }
   if (name == "zip" && count >= 2) {
     llvm::SmallVector<mlir::Type, 4> elements;
@@ -5702,8 +5815,14 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           if (strict && !starredType)
             return {};
           if (!appendStarredArgumentTypes(*this, starredType, positional)) {
-            if (std::optional<mlir::Type> element =
-                    py::dynamicStarElementType(widenLiteral(starredType))) {
+            std::optional<mlir::Type> element =
+                py::dynamicStarElementType(widenLiteral(starredType));
+            // Any other iterable is collected into one (emitCallOperands).
+            if (!element && starredType)
+              if (mlir::Type iterated =
+                      iterableElementType(widenLiteral(starredType)))
+                element = widenLiteral(iterated);
+            if (element) {
               positional.push_back(py::variadicTailType(*element));
               sawVariadicTail = true;
               continue;
@@ -6804,6 +6923,27 @@ CallInferenceResult TypeSystem::inferCallWithEvidence(
                                                        std::nullopt},
                                  true,
                                  {}};
+    // A sequence of unknown length that fills parameters: the emitter calls
+    // once per length (emitStarredCallByLength), and the call that fills
+    // every parameter is the type of all of them.
+    if (!positional.empty() && callable.hasParameterMetadata())
+      if (std::optional<mlir::Type> element =
+              py::variadicTailElement(positional.back());
+          element &&
+          positional.size() - 1 < callable.getPositionalTypes().size()) {
+        llvm::SmallVector<mlir::Type, 8> filled(positional.drop_back());
+        filled.resize(callable.getPositionalTypes().size(), *element);
+        if (callable.hasVararg())
+          filled.push_back(positional.back());
+        if (std::optional<CallSolution> result =
+                tryCallableApplication(*this, callable, filled, keywords))
+          return CallInferenceResult{
+              result->result,
+              CallInferenceEvidence{result->callableContract, "__call__",
+                                    std::nullopt},
+              true,
+              {}};
+      }
     // ⛔ This refusal is CORRECT and must stay: the declared signature does not
     // admit these arguments, and nothing here may widen it. What used to be a
     // defect behind it -- an int argument where a float parameter is declared
@@ -7248,13 +7388,14 @@ mlir::Type TypeSystem::join(mlir::ArrayRef<mlir::Type> types) const {
   }
   // ⭐ CLASS VALUES JOIN AT THE CLASS VALUE OF THEIR INSTANCES' JOIN.
   // `[A, B]` with `class B(A)` is a `list[type[A]]`, the list a loop that
-  // constructs through each element needs; a union of two class values has
-  // no construction and no class attribute to read, and no representation of
-  // its own either -- every class value is the same reference to a type
-  // object, whichever class it names.
+  // constructs through each element needs, through the subclasses of A.
   // Classes with no common source base (`{int, str}`) join at `type[object]`:
   // a class value that may name any class, whose name, identity, hash and
   // subclass tests are all answered at run time.
+  // ⛔ Not a union of the class values, though a union of them is now
+  // called, read and stored by tag: `k is int` against a union member is
+  // refused, and `type[object]` answers it (measured 2026-10-29,
+  // tests/probe/wb_a_class_value_of_two_builtin_classes_is_called.py).
   if (llvm::all_of(present, [](mlir::Type member) {
         return mlir::isa<py::TypeType>(member);
       })) {

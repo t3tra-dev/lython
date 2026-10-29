@@ -179,8 +179,13 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
     return formal;
   };
 
+  // The starred iterable CPython collects at the call, after the keywords.
+  std::optional<unsigned> collectAfterKeywords;
+  const auto *callKeywords = ast::nodeList(expr, "keywords");
+  bool hasKeywords = callKeywords && !callKeywords->empty();
   if (const auto *args = ast::nodeList(expr, "args")) {
     bool positionalAligned = true;
+    unsigned writtenBefore = 0;
     for (const parser::NodePtr &arg : *args) {
       bool unpacked = arg && arg->kind == "Starred";
       if (unpacked)
@@ -234,8 +239,45 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
             operands.positionalUnpacked.push_back(0);
             operands.positionalTypes.push_back(element.type);
           }
+          writtenBefore += static_cast<unsigned>(pack->second.size());
           continue;
         }
+      // ⭐ A STARRED ITERABLE IS COLLECTED WHERE CPYTHON COLLECTS IT. After
+      // a written positional the call's arguments are a list extended by
+      // it, there and then; first, it is handed to the call whole and made
+      // a tuple when the call is made, after the keywords:
+      //
+      //     k(0, *ws, key=ws.pop())    # CPython passes (0, 1, 2, 3)
+      //
+      // gave (0, 1, 2), the members read after the keyword ran. Any
+      // iterable is collected so -- a range, a dict, a generator -- and is a
+      // sequence of unknown length from then on.
+      std::optional<mlir::Type> iterated;
+      if (unpacked) {
+        llvm::SmallVector<mlir::Type, 4> spread;
+        bool sequence = py::dynamicStarElementType(
+                            types.widenLiteral(value.type))
+                            .has_value();
+        if (!appendStarredArgumentTypes(types, value.type, spread)) {
+          if (writtenBefore != 0 || (!sequence && !hasKeywords)) {
+            if (std::optional<Value> collected =
+                    collectStarredMembers(*arg, value))
+              value = *collected;
+          } else if (!sequence) {
+            if (mlir::Type element = types.iterableElementType(
+                    types.widenLiteral(value.type));
+                element && !programBindsName("tuple")) {
+              iterated = types.widenLiteral(element);
+              collectAfterKeywords =
+                  static_cast<unsigned>(operands.positional.size());
+            }
+          }
+        } else {
+          writtenBefore += static_cast<unsigned>(spread.size());
+        }
+      } else {
+        ++writtenBefore;
+      }
       // ⛔ Nothing positional after a starred sequence of unknown length:
       // where its members end is a run-time fact, so a later argument has no
       // static position.
@@ -256,7 +298,7 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
           // parameters the emitter knows can take it into its *args
           // (normalizeDynamicUnpacks).
           std::optional<mlir::Type> element =
-              py::dynamicStarElementType(value.type);
+              iterated ? iterated : py::dynamicStarElementType(value.type);
           if (element && !operands.dynamicTail) {
             operands.dynamicTail =
                 static_cast<unsigned>(operands.positional.size() - 1);
@@ -351,8 +393,30 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
                 "names; spell the keywords out";
     }
   }
+  if (collectAfterKeywords)
+    if (std::optional<Value> collected = collectStarredMembers(
+            expr, operands.positional[*collectAfterKeywords]))
+      operands.positional[*collectAfterKeywords] = *collected;
 
   return operands;
+}
+
+std::optional<Value>
+ModuleEmitter::collectStarredMembers(const parser::Node &anchor,
+                                     Value iterable) {
+  if (programBindsName("tuple"))
+    return std::nullopt;
+  std::string name =
+      "__lystarred" + std::to_string(++syntheticFunctionCounter);
+  values[name] = iterable;
+  types.bindSymbol(name, iterable.type);
+  parser::NodePtr call =
+      synth::call(synth::name("tuple", anchor.range),
+                  {synth::name(name, anchor.range)}, anchor.range);
+  synthesizedIteratorDefs.push_back(call);
+  Value collected = emitExpr(call.get());
+  values.erase(name);
+  return collected;
 }
 
 // A rewritten call whose positional arguments are widened along the numeric
@@ -478,6 +542,12 @@ ModuleEmitter::emitDynamicUnpack(const parser::Node &anchor,
   if (call.tail) {
     unsigned positionalCount =
         static_cast<unsigned>(target.positionalNames.size());
+    if (call.explicitPositional < positionalCount)
+      if (std::optional<Value> made =
+              emitStarredCallByLength(anchor, target, call)) {
+        result.completed = *made;
+        return result;
+      }
     if (call.explicitPositional < positionalCount) {
       llvm::ArrayRef<std::string> open =
           llvm::ArrayRef<std::string>(target.positionalNames)
@@ -656,9 +726,253 @@ ModuleEmitter::emitDynamicUnpack(const parser::Node &anchor,
   return result;
 }
 
+// ⭐ A STARRED SEQUENCE OF UNKNOWN LENGTH FILLS THE PARAMETERS IT REACHES,
+// as CPython binds it: `add(*xs)` for `def add(a, b)` is `add(xs[0], xs[1])`
+// when xs holds two, and CPython's TypeError for any other length. The call
+// is made once per length the parameters take -- the defaults filling what
+// a shorter sequence leaves, *args taking what a longer one has past them --
+// behind a test of the length, with the arguments and keywords the call
+// already evaluated.
+// ⛔ Not for a callee whose spelling evaluates anything (`make().m(*xs)`):
+// each length's call spells the callee again, and only a name or an
+// attribute of one reads the same object twice without running code.
+// ⛔ Nor where a keyword names a parameter the sequence may reach, or a `**`
+// mapping may: which one CPython reports as given twice depends on both.
+std::optional<Value>
+ModuleEmitter::emitStarredCallByLength(const parser::Node &anchor,
+                                       const DynamicUnpackTarget &target,
+                                       const DynamicUnpackCall &call) {
+  const parser::Node *callee = ast::node(anchor, "func");
+  for (const parser::Node *part = callee; part;
+       part = part->kind == "Attribute" ? ast::node(*part, "value") : nullptr)
+    if (part->kind != "Attribute" && part->kind != "Name")
+      return std::nullopt;
+  unsigned given = call.explicitPositional;
+  unsigned count = static_cast<unsigned>(target.positionalNames.size());
+  if (!callee || !call.tail || given >= count ||
+      call.explicitValues.size() != given ||
+      target.positionalDefaults.size() != count || target.qualname.empty())
+    return std::nullopt;
+  for (llvm::StringRef builtin : {"tuple", "len", "str", "TypeError"})
+    if (programBindsName(builtin))
+      return std::nullopt;
+  unsigned kwOnlyGiven = 0;
+  for (const auto &[name, value] : call.keywords) {
+    if (name.empty())
+      return std::nullopt;
+    for (unsigned index = given; index < count; ++index)
+      if (target.positionalNames[index] == name)
+        return std::nullopt;
+    if (llvm::is_contained(target.kwOnlyNames, name))
+      ++kwOnlyGiven;
+  }
+  // ⛔ Each length's call must be one the parameters take: a member none of
+  // them could hold (an empty display's) keeps the refusal at this call
+  // rather than in each length's.
+  std::optional<mlir::Type> member =
+      py::dynamicStarElementType(types.widenLiteral(call.tail->type));
+  if (!member || target.positionalTypes.size() != count)
+    return std::nullopt;
+  for (unsigned index = given; index < count; ++index) {
+    mlir::Type declared = target.positionalTypes[index];
+    if (!declared || unboundStaticParameterCount(declared) != 0 ||
+        isAssignableWithStaticEvidence(*member, declared, module) ||
+        belowDeclaredRung(types, *member, declared))
+      continue;
+    return std::nullopt;
+  }
+  unsigned required = 0;
+  while (required < count && !target.positionalDefaults[required])
+    ++required;
+  unsigned shortest = required > given ? required - given : 0;
+  unsigned filling = count - given;
+  bool vararg = static_cast<bool>(target.varargType);
+  unsigned receiver = target.receiverCounted ? 1 : 0;
+
+  parser::SourceRange range = anchor.range;
+  llvm::SmallVector<std::string, 8> bound;
+  auto releaseNames = llvm::make_scope_exit([&] {
+    for (const std::string &name : bound)
+      values.erase(name);
+  });
+  auto bind = [&](Value value) {
+    std::string name =
+        "__lystarcall" + std::to_string(++syntheticFunctionCounter);
+    values[name] = value;
+    types.bindSymbol(name, value.type);
+    bound.push_back(name);
+    return name;
+  };
+  auto keep = [&](parser::NodePtr node) -> const parser::Node * {
+    synthesizedIteratorDefs.push_back(node);
+    return node.get();
+  };
+  auto name = [&](llvm::StringRef id) { return synth::name(id, range); };
+  auto text = [&](llvm::StringRef value) {
+    return synth::strConstant(value, range);
+  };
+  auto number = [&](std::int64_t value) {
+    return synth::intConstant(value, range);
+  };
+
+  // The sequence as CPython collects it, then its length.
+  std::string sequence = bind(emitExpr(keep(synth::call(
+      name("tuple"), {name(bind(*call.tail))}, range))));
+  std::string length =
+      bind(emitExpr(keep(synth::lenCall(name(sequence), range))));
+  std::string qualname = target.qualname;
+  auto quotedNames = [&](unsigned from, unsigned to) {
+    llvm::SmallVector<std::string, 4> names;
+    for (unsigned index = from; index < to; ++index)
+      names.push_back("'" + target.positionalNames[index] + "'");
+    if (names.size() == 1)
+      return names.front();
+    if (names.size() == 2)
+      return names[0] + " and " + names[1];
+    std::string joined;
+    for (unsigned index = 0; index + 1 < names.size(); ++index)
+      joined += names[index] + ", ";
+    return joined + "and " + names.back();
+  };
+  auto raiseTypeError = [&](parser::NodePtr message) {
+    return synth::raiseStmt(
+        synth::call(name("TypeError"), {std::move(message)}, range), range);
+  };
+  // Too short: the parameters left without a value, by name.
+  for (unsigned length0 = 0; length0 < shortest; ++length0) {
+    unsigned missing = required - given - length0;
+    std::string message = qualname + "() missing " + std::to_string(missing) +
+                          " required positional argument" +
+                          (missing == 1 ? "" : "s") + ": " +
+                          quotedNames(given + length0, required);
+    std::vector<parser::NodePtr> body;
+    body.push_back(raiseTypeError(text(message)));
+    parser::NodePtr check = synth::ifStmt(
+        synth::compare(name(length), "Eq", number(length0), range),
+        std::move(body), {}, range);
+    emitStatement(*keep(std::move(check)));
+  }
+  // Too long, with no *args: CPython's count of what was given.
+  if (!vararg) {
+    unsigned argcount = count + receiver;
+    unsigned defaults = count - required;
+    std::string takes =
+        defaults ? "from " + std::to_string(argcount - defaults) + " to " +
+                       std::to_string(argcount) + " positional arguments"
+                 : std::to_string(argcount) + " positional argument" +
+                       (argcount == 1 ? "" : "s");
+    // At least one more than the parameters, so never "1 was given".
+    parser::NodePtr givenCount = synth::call(
+        name("str"),
+        {synth::binOp(name(length), "Add", number(given + receiver), range)},
+        range);
+    std::string tail = " were given";
+    if (kwOnlyGiven)
+      tail = " positional arguments (and " + std::to_string(kwOnlyGiven) +
+             " keyword-only argument" + (kwOnlyGiven == 1 ? "" : "s") +
+             ") were given";
+    parser::NodePtr message = synth::binOp(
+        synth::binOp(text(qualname + "() takes " + takes + " but "), "Add",
+                     std::move(givenCount), range),
+        "Add", text(tail), range);
+    std::vector<parser::NodePtr> body;
+    body.push_back(raiseTypeError(std::move(message)));
+    parser::NodePtr check = synth::ifStmt(
+        synth::compare(name(length), "Gt", number(filling), range),
+        std::move(body), {}, range);
+    emitStatement(*keep(std::move(check)));
+  }
+
+  // One call per length: the given values, the sequence's first members,
+  // and *args the rest of it.
+  llvm::SmallVector<std::string, 8> explicitNames;
+  for (Value value : call.explicitValues)
+    explicitNames.push_back(bind(value));
+  llvm::SmallVector<std::pair<std::string, std::string>, 4> keywordNames;
+  for (const auto &[keyword, value] : call.keywords)
+    keywordNames.push_back({keyword, bind(value)});
+  auto armCall = [&](unsigned members, bool rest) -> const parser::Node * {
+    std::vector<parser::NodePtr> arguments;
+    for (const std::string &explicitName : explicitNames)
+      arguments.push_back(name(explicitName));
+    for (unsigned index = 0; index < members; ++index)
+      arguments.push_back(synth::subscript(name(sequence), number(index), range));
+    if (rest) {
+      parser::NodePtr slice = parser::makeNode("Slice", range);
+      parser::addField(*slice, "lower", number(members));
+      arguments.push_back(synth::starred(
+          synth::subscript(name(sequence), std::move(slice), range), range));
+    }
+    std::vector<parser::NodePtr> keywords;
+    for (const auto &[keyword, valueName] : keywordNames)
+      keywords.push_back(synth::keyword(keyword, name(valueName), range));
+    return keep(synth::callWithKeywords(synth::cloneTree(*callee),
+                                        std::move(arguments),
+                                        std::move(keywords), range));
+  };
+  struct Arm {
+    unsigned members;
+    bool rest;
+  };
+  llvm::SmallVector<Arm, 4> arms;
+  for (unsigned members = shortest; members < filling; ++members)
+    arms.push_back(Arm{members, false});
+  arms.push_back(Arm{filling, vararg});
+
+  // The arms, each behind its length's test but the last, joined after.
+  struct Made {
+    mlir::Block *block;
+    Value value;
+  };
+  llvm::SmallVector<Made, 4> made;
+  mlir::Region *region = builder.getInsertionBlock()->getParent();
+  for (auto [index, arm] : llvm::enumerate(arms)) {
+    if (index + 1 < arms.size()) {
+      mlir::Value test = emitBoolValue(
+          emitExpr(keep(synth::compare(name(length), "Eq",
+                                       number(arm.members), range))),
+          anchor);
+      mlir::Block *origin = builder.getInsertionBlock();
+      mlir::Block *taken =
+          builder.createBlock(region, std::next(origin->getIterator()));
+      mlir::Block *next =
+          builder.createBlock(region, std::next(taken->getIterator()));
+      builder.setInsertionPointToEnd(origin);
+      mlir::cf::CondBranchOp::create(builder, loc(anchor), test, taken,
+                                     mlir::ValueRange{}, next,
+                                     mlir::ValueRange{});
+      builder.setInsertionPointToStart(taken);
+      Value value = emitExpr(armCall(arm.members, arm.rest));
+      made.push_back(Made{builder.getInsertionBlock(), value});
+      builder.setInsertionPointToStart(next);
+      continue;
+    }
+    Value value = emitExpr(armCall(arm.members, arm.rest));
+    made.push_back(Made{builder.getInsertionBlock(), value});
+  }
+  if (made.size() == 1)
+    return made.front().value;
+  llvm::SmallVector<mlir::Type, 4> resultTypes;
+  for (const Made &arm : made)
+    resultTypes.push_back(arm.value.type);
+  mlir::Type joined = types.join(resultTypes);
+  mlir::Block *merge = builder.createBlock(
+      region, std::next(made.back().block->getIterator()));
+  mlir::BlockArgument result = merge->addArgument(joined, loc(anchor));
+  for (const Made &arm : made) {
+    builder.setInsertionPointToEnd(arm.block);
+    Value coerced = coerceValue(arm.value, joined, anchor);
+    mlir::cf::BranchOp::create(builder, loc(anchor), merge,
+                               mlir::ValueRange{coerced.value});
+  }
+  builder.setInsertionPointToStart(merge);
+  return Value{result, joined};
+}
+
 bool ModuleEmitter::normalizeDynamicUnpacks(const parser::Node &anchor,
                                             const DynamicUnpackTarget &target,
-                                            CallOperands &operands) {
+                                            CallOperands &operands,
+                                            std::optional<Value> *completed) {
   if (operands.invalidBeyondDynamic ||
       (!operands.dynamicTail && !operands.dynamicMapping))
     return false;
@@ -702,6 +1016,11 @@ bool ModuleEmitter::normalizeDynamicUnpacks(const parser::Node &anchor,
       covered += width;
     }
     call.explicitPositional = covered;
+    if (llvm::none_of(llvm::ArrayRef<char>(operands.positionalUnpacked)
+                          .take_front(tail),
+                      [](char unpacked) { return unpacked != 0; }))
+      call.explicitValues.assign(operands.positional.begin(),
+                                 operands.positional.begin() + tail);
     call.tail = operands.positional[tail];
   } else {
     call.explicitPositional =
@@ -714,6 +1033,12 @@ bool ModuleEmitter::normalizeDynamicUnpacks(const parser::Node &anchor,
       emitDynamicUnpack(anchor, target, call);
   if (!result)
     return false;
+  if (result->completed) {
+    if (!completed)
+      return false;
+    *completed = result->completed;
+    return true;
+  }
 
   CallOperands rebuilt;
   if (result->vararg) {
@@ -788,6 +1113,10 @@ ModuleEmitter::dynamicUnpackTargetFor(const parser::Node &anchor,
     target.positionalNames.push_back(
         index < names.size() && names[index] ? names[index].getValue().str()
                                              : std::string());
+  for (mlir::BoolAttr hasDefault : callable.getPositionalDefaults())
+    target.positionalDefaults.push_back(hasDefault && hasDefault.getValue());
+  target.positionalTypes.assign(callable.getPositionalTypes().begin(),
+                                callable.getPositionalTypes().end());
   target.positionalOnlyCount = callable.getPositionalOnlyCount();
   for (mlir::StringAttr name : callable.getKwOnlyNames())
     target.kwOnlyNames.push_back(name ? name.getValue().str() : std::string());
@@ -826,8 +1155,11 @@ Value ModuleEmitter::emitCallableDispatch(const parser::Node &anchor,
     if (std::optional<DynamicUnpackTarget> target =
             dynamicUnpackTargetFor(anchor, callee)) {
       normalized = givenOperands;
-      if (!normalizeDynamicUnpacks(anchor, *target, normalized))
+      std::optional<Value> completed;
+      if (!normalizeDynamicUnpacks(anchor, *target, normalized, &completed))
         return emitNone(anchor);
+      if (completed)
+        return *completed;
       chosen = &normalized;
     }
   // ⭐ A bool, OR A UNION OF bool AND int, GIVEN AN int PARAMETER is passed
@@ -9452,6 +9784,33 @@ ModuleEmitter::tryEmitListCall(const parser::Node &expr,
   return std::nullopt;
 }
 
+bool ModuleEmitter::renderingRunsProgramCode(mlir::Type type) {
+  type = type ? types.widenLiteral(type) : type;
+  if (!type)
+    return true;
+  if (auto unionType = mlir::dyn_cast<py::UnionType>(type))
+    return llvm::any_of(unionType.getMemberTypes(), [&](mlir::Type member) {
+      return renderingRunsProgramCode(member);
+    });
+  // A class's and a function's text is the runtime's.
+  if (mlir::isa<py::TypeType, py::CallableType>(type))
+    return false;
+  auto contract = mlir::dyn_cast<py::ContractType>(type);
+  if (!contract)
+    return true;
+  static const llvm::StringSet<> kRuntimeRendered = {
+      "builtins.int",      "builtins.float",     "builtins.str",
+      "builtins.bool",     "builtins.bytes",     "builtins.bytearray",
+      "builtins.complex",  "types.NoneType",     "builtins.list",
+      "builtins.tuple",    "builtins.dict",      "builtins.set",
+      "builtins.frozenset", "builtins.range"};
+  if (!kRuntimeRendered.contains(contract.getContractName()))
+    return true;
+  return llvm::any_of(contract.getArguments(), [&](mlir::Type argument) {
+    return renderingRunsProgramCode(argument);
+  });
+}
+
 std::optional<Value>
 ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
                                 const parser::Node *calleeNode) {
@@ -9531,10 +9890,13 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
   // half a line. CPython makes a call per piece, which only a sink of the
   // program's own can observe -- and a `file=` takes the piece-by-piece path
   // below; `sys.stdout` here is always the runtime's stream.
-  auto writeWithEnd = [&](Value text) -> std::optional<Value> {
+  auto writeWithEnd = [&](Value text, std::optional<Value> evaluatedEnd =
+                                          std::nullopt) -> std::optional<Value> {
     mlir::Type strContract = types.contract("builtins.str");
     Value end;
-    if (endNode) {
+    if (evaluatedEnd) {
+      end = *evaluatedEnd;
+    } else if (endNode) {
       end = coerceValue(emitExpr(endNode), strContract, expr);
     } else {
       mlir::Type newlineType = types.literal("\"\\n\"");
@@ -9579,27 +9941,58 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
   // is CPython's print -- the joined line above is a shortcut only the
   // runtime's own stream can take (EmitterGlobals.cpp, replaced streams).
   bool replacedStdout = llvm::is_contained(replacedStreams, "sys.stdout");
-  bool chosenSink = fileNode || flushNode || replacedStdout;
+  // ⭐ AND SO IS A LINE WHOSE RENDERING RUNS THE PROGRAM'S OWN CODE. A
+  // `__str__` that prints, or raises, sees the pieces before it already
+  // written, as `builtin_print_impl` writes them:
+  //
+  //     class X:
+  //         def __str__(self): print("inner"); return "x"
+  //     print("a", X())     # CPython: "a inner" then "x"; was "inner", "a x"
+  //
+  // and a raising one left nothing where CPython leaves "a ".
+  // ⭐ And a starred argument is its members, each a piece: the arguments
+  // are collected as CPython collects a call's (a tuple display of them, or
+  // the one starred iterable after the keywords), then written one by one.
+  bool starredArguments =
+      printArgs && llvm::any_of(*printArgs, [](const parser::NodePtr &argument) {
+        return argument && argument->kind == "Starred";
+      });
+  bool rendersProgramCode = false;
+  if (printArgs && printArgs->size() >= 2)
+    for (const parser::NodePtr &argument : *printArgs)
+      if (argument && renderingRunsProgramCode(types.inferExpr(argument.get())))
+        rendersProgramCode = true;
+  if (starredArguments)
+    for (llvm::StringRef builtin : {"str", "enumerate"})
+      if (programBindsName(builtin)) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "print() with a starred argument writes each member with " +
+                builtin.str() + "(), which this program rebinds"});
+        return emitNone(expr);
+      }
+  bool chosenSink = fileNode || flushNode || replacedStdout ||
+                    starredArguments || rendersProgramCode;
   if (chosenSink) {
-    if (printArgs)
-      for (const parser::NodePtr &argument : *printArgs)
-        if (!argument || argument->kind == "Starred") {
-          diagnostics.push_back(parser::Diagnostic{
-              parser::Severity::Error, expr.range.start,
-              fileNode || flushNode
-                  ? "print() to a file takes its arguments spelled out, not "
-                    "unpacked"
-                  : "print() takes its arguments spelled out, not unpacked, "
-                    "in a program that replaces sys.stdout: each one is "
-                    "written to the stream sys.stdout holds"});
-          return emitNone(expr);
-        }
     mlir::Type strType = types.contract("builtins.str");
     llvm::SmallVector<Value, 4> evaluated;
-    if (printArgs)
+    std::optional<Value> collected;
+    auto collectArguments = [&] {
+      std::vector<parser::NodePtr> members(printArgs->begin(),
+                                           printArgs->end());
+      parser::NodePtr display = synth::tuple(std::move(members), expr.range);
+      synthesizedIteratorDefs.push_back(display);
+      collected = emitExpr(display.get());
+    };
+    bool collectAfterKeywords = starredArguments && printArgs->size() == 1 &&
+                                printKeywords && !printKeywords->empty();
+    if (starredArguments && !collectAfterKeywords)
+      collectArguments();
+    else if (!starredArguments && printArgs)
       for (const parser::NodePtr &argument : *printArgs)
         evaluated.push_back(emitExpr(argument.get()));
     std::optional<Value> separator, end, stream, flush;
+    if (printKeywords)
     for (const parser::NodePtr &keyword : *printKeywords) {
       llvm::StringRef name = ast::string(*keyword, "arg").value_or("");
       const parser::Node *value = ast::node(*keyword, "value");
@@ -9616,6 +10009,8 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
       else if (name == "flush")
         flush = emitExpr(value);
     }
+    if (collectAfterKeywords)
+      collectArguments();
     auto constant = [&](llvm::StringRef text) {
       mlir::Type literal = types.literal(
           (llvm::Twine("\"") + (text == "\n" ? "\\n" : text) + "\"").str());
@@ -9655,6 +10050,48 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
       if (!argumentName.empty())
         values.erase(argumentName);
     };
+    if (collected) {
+      std::string membersName =
+          "__lyprintargs" + std::to_string(++syntheticFunctionCounter);
+      std::string separatorName =
+          "__lyprintsep" + std::to_string(++syntheticFunctionCounter);
+      std::string indexName =
+          "__lyprinti" + std::to_string(++syntheticFunctionCounter);
+      std::string memberName =
+          "__lyprintv" + std::to_string(++syntheticFunctionCounter);
+      values[membersName] = *collected;
+      types.bindSymbol(membersName, collected->type);
+      values[separatorName] = *separator;
+      types.bindSymbol(separatorName, separator->type);
+      parser::SourceRange range = expr.range;
+      auto write = [&](parser::NodePtr piece) {
+        return synth::exprStmt(
+            synth::methodCall(synth::name(streamName, range), "write",
+                              {std::move(piece)}, range),
+            range);
+      };
+      std::vector<parser::NodePtr> separated;
+      separated.push_back(write(synth::name(separatorName, range)));
+      std::vector<parser::NodePtr> body;
+      body.push_back(synth::ifStmt(
+          synth::compare(synth::name(indexName, range), "NotEq",
+                         synth::intConstant(0, range), range),
+          std::move(separated), {}, range));
+      body.push_back(write(synth::call(synth::name("str", range),
+                                       {synth::name(memberName, range)},
+                                       range)));
+      parser::NodePtr loop = synth::forStmt(
+          synth::tuple({synth::name(indexName, range),
+                        synth::name(memberName, range)},
+                       range),
+          synth::call(synth::name("enumerate", range),
+                      {synth::name(membersName, range)}, range),
+          std::move(body), {}, range);
+      emitStatement(*loop);
+      synthesizedIteratorDefs.push_back(std::move(loop));
+      values.erase(membersName);
+      values.erase(separatorName);
+    }
     for (auto [index, value] : llvm::enumerate(evaluated)) {
       if (index != 0)
         call("write", separator);
@@ -9696,12 +10133,30 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
     return emitNone(expr);
   }
   bool noPrintKeywords = !separatorNode && !endNode;
-  if (endNode && (!printArgs || printArgs->empty())) {
+  // `sep=` and `end=` once each, in the order written, after the arguments:
+  // when CPython evaluates a call's keywords.
+  std::optional<Value> separatorValue, endValue;
+  auto evaluateKeywords = [&] {
+    if (!printKeywords)
+      return;
+    for (const parser::NodePtr &keyword : *printKeywords) {
+      llvm::StringRef name = ast::string(*keyword, "arg").value_or("");
+      if (name == "sep")
+        separatorValue = coerceValue(emitExpr(ast::node(*keyword, "value")),
+                                     types.contract("builtins.str"), expr);
+      else if (name == "end")
+        endValue = coerceValue(emitExpr(ast::node(*keyword, "value")),
+                               types.contract("builtins.str"), expr);
+    }
+  };
+  if (!noPrintKeywords && (!printArgs || printArgs->empty())) {
+    evaluateKeywords();
     mlir::Type emptyType = types.literal("\"\"");
     auto empty = py::StrConstantOp::create(builder, loc(expr), emptyType,
                                            builder.getStringAttr(""));
     return writeWithEnd(coerceValue(Value{empty.getResult(), emptyType},
-                                    types.contract("builtins.str"), expr));
+                                    types.contract("builtins.str"), expr),
+                        endValue);
   }
   if (noPrintKeywords && (!printArgs || printArgs->empty())) {
     mlir::Type emptyType = types.literal("\"\"");
@@ -9776,6 +10231,7 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
     evaluated.reserve(printArgs->size());
     for (const parser::NodePtr &argument : *printArgs)
       evaluated.push_back(emitExpr(argument.get()));
+    evaluateKeywords();
     bool allConverted = true;
     std::size_t unconverted = 0;
     Value joined;
@@ -9791,8 +10247,8 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
         continue;
       }
       Value separator;
-      if (separatorNode) {
-        separator = coerceValue(emitExpr(separatorNode), strType, expr);
+      if (separatorValue) {
+        separator = *separatorValue;
       } else {
         mlir::Type separatorType = types.literal("\" \"");
         separator = Value{py::StrConstantOp::create(
@@ -9808,7 +10264,7 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
     }
     if (allConverted) {
       if (endNode)
-        return writeWithEnd(joined);
+        return writeWithEnd(joined, endValue);
       Value printCallee = emitExpr(calleeNode);
       CallOperands operands =
           emitCallOperands(expr, {joined}, /*includeAstArguments=*/false);
