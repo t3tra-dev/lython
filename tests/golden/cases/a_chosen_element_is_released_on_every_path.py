@@ -12,6 +12,10 @@
 # - a generator keeping `a if f else b` across a `yield`: the suspend took a
 #   reference for the frame and so did the borrowed-return rule (one object
 #   per generator).
+# - `type(o)` of an element of a display walked in a loop inside a loop: the
+#   type object read from the element's header was counted as a view of the
+#   element, and handing it to a merge dropped the element's release (one
+#   object per trip of the outer loop).
 from typing import Iterator
 
 
@@ -40,6 +44,18 @@ def gen(a: Cell, b: Cell, f: bool) -> Iterator[str]:
     yield x.text + "!"
 
 
+class Leaf(Cell):
+    pass
+
+
+def kinds(trips: int) -> list[str]:
+    seen: list[str] = []
+    for _ in range(trips):
+        for o in (Cell("c"), Leaf("l")):
+            seen.append(type(o).__name__)
+    return seen
+
+
 out: list[str] = []
 total = 0
 for i in range(100):
@@ -47,3 +63,5 @@ for i in range(100):
     total += nth(i % 3)
     out.extend(gen(Cell("p"), Cell("q"), i % 2 == 0))
 print(total, len(out), out[:6])
+names = kinds(100)
+print(len(names), names[:4])

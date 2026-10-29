@@ -2505,6 +2505,26 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
     const parser::Node *objectNode = ast::node(target, "value");
     Value object = emitExpr(objectNode);
     if (auto attr = ast::string(target, "attr")) {
+      // ⛔ A None MEMBER HAS NO ATTRIBUTE TO WRITE, as it has none to read
+      // (`tryEmitUnionAttributeRead`): CPython raises AttributeError when the
+      // value holds None, and the store reached the lowering as "attr.set
+      // object type has no class schema".
+      if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(
+              types.widenLiteral(object.type));
+          unionType && llvm::any_of(unionType.getMemberTypes(),
+                                    [](mlir::Type member) {
+                                      return py::isPyNoneType(member);
+                                    })) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, target.range.start,
+            "static type " + typeText(unionType) + " is a union, and '" +
+                std::string(*attr) +
+                "' is written to whichever member the value holds: None has "
+                "no attribute '" +
+                std::string(*attr) +
+                "' -- narrow the value to the members that have it first"});
+        return;
+      }
       // ⛔ AN EXCEPTION'S CHAIN IS WRITTEN BY A RAISE, NOT BY AN ASSIGNMENT.
       // The words a raise writes are read back as attributes, and a store
       // reached the lowering as "attr.set object type has no class schema".

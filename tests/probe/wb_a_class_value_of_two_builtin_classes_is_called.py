@@ -19,6 +19,12 @@
 #   - `k is int` over a union, which is refused (wb_identity_against_a_union_
 #     member) where `type[object]` answers it at run time: a list of classes
 #     joined as a union would lose that spelling. That is what is left.
+# FIXED 2026-10-30 for the call: classes with no common base join as a union
+#   of their class values (`k is int` over one is answered now), so `conv =
+#   int if c else str; conv("5")` and `[k("3") for k in [int, float]]` run.
+#   What still refuses this file is `return kind(text)` inside a `try`:
+#   `first_that_parses` returns `int | float | str`, and a union is not yet
+#   carried out of a `try` ("return inside try is not implemented yet").
 # CPython 3.14 expects: "5 str", "3 3.0 3.5", "1.5"
 import sys
 

@@ -622,6 +622,18 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
           }
       std::optional<mlir::Type> target =
           shapeSupported ? isinstanceTargetType(clsNode, types) : std::nullopt;
+      // ⭐ A CLASS VALUE THAT MAY HOLD ONE OF SEVERAL CLASSES tests for one
+      // of them, as `isinstance(o, k)` does: `case k():` for a `k: type[A] |
+      // type[B]` was refused where the `if` spelling answered.
+      llvm::SmallVector<mlir::Type, 4> heldTargets;
+      if (shapeSupported && !target)
+        if (std::optional<llvm::SmallVector<mlir::Type, 4>> several =
+                isinstanceTargetTypes(clsNode, types);
+            several && several->size() > 1 &&
+            isinstanceTargetHoldsClassValue(clsNode, types)) {
+          heldTargets = std::move(*several);
+          target = heldTargets.front();
+        }
       if (!shapeSupported || !target) {
         diagnostics.push_back(parser::Diagnostic{
             parser::Severity::Error, statement.range.start,
@@ -666,7 +678,10 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
         attrPatterns.push_back(
             {std::string((*kwdAttrs)[index]), (*kwdPatterns)[index].get()});
       IsInstanceAnalysis analysis =
-          analyzeIsInstance(matchSubjectType, *target, types, module);
+          heldTargets.empty()
+              ? analyzeIsInstance(matchSubjectType, *target, types, module)
+              : analyzeIsInstanceAny(matchSubjectType, heldTargets, types,
+                                     module);
       if (analysis.kind == IsInstanceAnalysis::Kind::Unsupported ||
           analysis.kind == IsInstanceAnalysis::Kind::UnionClassTest ||
           (analysis.kind == IsInstanceAnalysis::Kind::UnionTest &&

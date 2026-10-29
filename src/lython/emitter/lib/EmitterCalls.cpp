@@ -2183,6 +2183,53 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         return emitCall(*call);
       }
     }
+  // ⭐ A NAME HOLDING A TUPLE OF KNOWN LENGTH, STARRED THROUGH A CLASS VALUE
+  // THAT MAY HOLD SEVERAL CLASSES, IS ITS MEMBERS read by index:
+  // `cls(*args)` for `cls: type[A] | type[B]` and `args: tuple[int, int]`
+  // dispatched `__call__` member by member with the star still in it, and was
+  // refused, while `cls(args[0], args[1])` constructs. Reading a name has no
+  // effect, so the members are read where the star stands.
+  if (const parser::Node *calleeNode = ast::node(expr, "func"))
+    if (auto calleeUnion = mlir::dyn_cast_if_present<py::UnionType>(
+            types.widenLiteral(types.inferExpr(calleeNode)));
+        calleeUnion &&
+        llvm::all_of(calleeUnion.getMemberTypes(),
+                     [](mlir::Type member) {
+                       return mlir::isa<py::TypeType>(member);
+                     }))
+      if (const auto *written = ast::nodeList(expr, "args")) {
+        std::vector<parser::NodePtr> spread;
+        bool respelled = false;
+        for (const parser::NodePtr &arg : *written) {
+          const parser::Node *starred =
+              arg && arg->kind == "Starred" ? ast::node(*arg, "value") : nullptr;
+          llvm::SmallVector<mlir::Type, 4> members;
+          if (starred && starred->kind == "Name" &&
+              appendStarredArgumentTypes(
+                  types, types.widenLiteral(types.inferExpr(starred)),
+                  members) &&
+              !members.empty()) {
+            for (unsigned index = 0; index < members.size(); ++index)
+              spread.push_back(synth::subscript(
+                  synth::name(ast::nameSpelling(*starred), arg->range),
+                  synth::intConstant(index, arg->range), arg->range));
+            respelled = true;
+            continue;
+          }
+          spread.push_back(arg);
+        }
+        if (respelled) {
+          std::vector<parser::NodePtr> keywords;
+          if (const auto *writtenKeywords = ast::nodeList(expr, "keywords"))
+            keywords.assign(writtenKeywords->begin(), writtenKeywords->end());
+          parser::NodePtr call = synth::callWithKeywords(
+              *std::get_if<parser::NodePtr>(
+                  &parser::findField(expr, "func")->value),
+              std::move(spread), std::move(keywords), expr.range);
+          synthesizedIteratorDefs.push_back(call);
+          return emitCall(*call);
+        }
+      }
   if (std::optional<Value> byLength = emitStarredBuiltinByLength(expr))
     return *byLength;
   Value result = emitCallAsImplemented(expr);
@@ -9710,8 +9757,19 @@ mlir::Value ModuleEmitter::emitClassValueSubclassBit(
             typeText(offending) + " is not one"});
     return {};
   };
+  // A target that may hold one of several classes tests the one its tag
+  // names (`case k():` for `k: type[A] | type[B]`).
+  auto classValueUnion = [](mlir::Type type) -> py::UnionType {
+    auto unionType = mlir::dyn_cast<py::UnionType>(type);
+    if (unionType &&
+        llvm::all_of(unionType.getMemberTypes(), [](mlir::Type member) {
+          return mlir::isa<py::TypeType>(member);
+        }))
+      return unionType;
+    return {};
+  };
   for (const Value &target : targets)
-    if (!mlir::isa<py::TypeType>(target.type))
+    if (!mlir::isa<py::TypeType>(target.type) && !classValueUnion(target.type))
       return refuse(target.type);
   if (targets.empty())
     return refuse(types.inferExpr(targetNode));
@@ -9727,10 +9785,26 @@ mlir::Value ModuleEmitter::emitClassValueSubclassBit(
   }
   mlir::Value test;
   for (const Value &target : targets) {
-    mlir::Value one =
-        py::TypeSubclassOp::create(builder, loc(expr), builder.getI1Type(),
-                                   subjectClass, target.value)
-            .getResult();
+    mlir::Value one;
+    if (py::UnionType heldUnion = classValueUnion(target.type)) {
+      Value answered = emitUnionMemberDispatch(
+          expr, target, heldUnion, types.boolType(), [&](Value member) {
+            mlir::Value bit =
+                py::TypeSubclassOp::create(builder, loc(expr),
+                                           builder.getI1Type(), subjectClass,
+                                           member.value)
+                    .getResult();
+            return Value{py::CastFromPrimOp::create(builder, loc(expr),
+                                                    types.boolType(), bit)
+                             .getResult(),
+                         types.boolType()};
+          });
+      one = emitBoolValue(answered, expr);
+    } else {
+      one = py::TypeSubclassOp::create(builder, loc(expr), builder.getI1Type(),
+                                       subjectClass, target.value)
+                .getResult();
+    }
     test = test ? mlir::arith::OrIOp::create(builder, loc(expr), test, one)
                       .getResult()
                 : one;

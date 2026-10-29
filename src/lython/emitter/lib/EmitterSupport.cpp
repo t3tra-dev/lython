@@ -1270,12 +1270,21 @@ const parser::Node *nameComparedWithNone(const parser::Node *left,
                                          const parser::Node *right) {
   if (!left || !right)
     return nullptr;
-  if (left->kind == "Name" && right->kind == "Constant" &&
-      ast::isNoneField(*right, "value"))
-    return left;
-  if (right->kind == "Name" && left->kind == "Constant" &&
-      ast::isNoneField(*left, "value"))
-    return right;
+  // ⭐ A WALRUS COMPARED WITH None NAMES ITS TARGET: `(q := get()) is not
+  // None` proves `q` exactly as binding it first and testing the name does.
+  auto named = [](const parser::Node *side) -> const parser::Node * {
+    if (side->kind == "Name")
+      return side;
+    if (side->kind == "NamedExpr")
+      if (const parser::Node *target = ast::node(*side, "target");
+          target && target->kind == "Name")
+        return side;
+    return nullptr;
+  };
+  if (right->kind == "Constant" && ast::isNoneField(*right, "value"))
+    return named(left);
+  if (left->kind == "Constant" && ast::isNoneField(*left, "value"))
+    return named(right);
   return nullptr;
 }
 
@@ -1302,8 +1311,17 @@ optionalNoneComparison(const parser::Node &test, TypeSystem &types) {
       nameComparedWithNone(ast::node(test, "left"), comparators->front().get());
   if (!name)
     return std::nullopt;
+  // The walrus's target is bound by the test itself, so its type is the
+  // value's rather than a symbol's.
+  std::optional<mlir::Type> currentType;
+  if (name->kind == "NamedExpr") {
+    if (const parser::Node *value = ast::node(*name, "value"))
+      currentType = types.inferExpr(value);
+    name = ast::node(*name, "target");
+  }
   llvm::StringRef spelling = ast::nameSpelling(*name);
-  std::optional<mlir::Type> currentType = types.lookupSymbol(spelling);
+  if (!currentType)
+    currentType = types.lookupSymbol(spelling);
   mlir::Type payloadType =
       currentType ? removeNoneFromType(*currentType, types) : mlir::Type{};
   if (!payloadType)

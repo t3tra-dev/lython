@@ -4,7 +4,10 @@
 # builtins that convert or measure one value, `in`, a slice, and an attribute
 # its members answer differently. The loop target outlives the loop as
 # whichever member's element it was last bound to. A conditional expression
-# between two union values is whichever of them its test picks.
+# between two union values is whichever of them its test picks; one nested in
+# the else of a None test reads the member its own test leaves. A walrus
+# compared with None narrows the name it binds, and two unions of objects
+# and None are the same object member by member.
 #
 # A result holding union values is compared by its repr, which tells 'a', 1
 # and 1.0 apart as the values themselves would.
@@ -215,6 +218,67 @@ class UnionIterationTest(unittest.TestCase):
                          ["x", None])
         self.assertEqual(repr([either(1, "s", True), either(1, "s", False)]),
                          "[1, 's']")
+
+
+    def test_a_nested_conditional_reads_what_its_test_leaves(self):
+        def val(i: int) -> int | str | None:
+            return i if i > 2 else "s" * i
+
+        def size(i: int) -> int:
+            d = val(i)
+            return 1 + (0 if d is None else (d if isinstance(d, int)
+                                             else len(d)))
+
+        self.assertEqual([size(i) for i in range(5)], [1, 2, 3, 4, 5])
+
+    def test_a_walrus_narrows_the_name_it_binds(self):
+        class Node:
+            def __init__(self, n: int) -> None:
+                self.n = n
+
+        def get(i: int) -> Node | None:
+            return Node(i) if i % 2 == 1 else None
+
+        found = [n.n for i in range(5) if (n := get(i)) is not None]
+        total = 0
+        if (first := get(1)) is not None:
+            total += first.n
+        if (none := get(2)) is None:
+            total += 10
+        else:
+            total += none.n
+        self.assertEqual((found, total), ([1, 3], 11))
+
+    def test_identity_of_two_unions(self):
+        class Node:
+            pass
+
+        def get(n: Node, f: bool) -> Node | None:
+            return n if f else None
+
+        def flag(i: int) -> bool | None:
+            if i == 0:
+                return None
+            return i > 1
+
+        n, m = Node(), Node()
+        self.assertEqual([get(n, True) is get(n, True),
+                          get(n, True) is get(m, True),
+                          get(n, False) is get(m, False),
+                          get(n, True) is not get(n, False)],
+                         [True, False, True, True])
+        self.assertEqual([(flag(i) is True, flag(i) is None) for i in range(3)],
+                         [(False, True), (False, False), (True, False)])
+        held: list[int] = [True, 3]
+        self.assertEqual([held[0] is True, held[1] is True], [True, False])
+
+        def classify(n: int):
+            if n < 0:
+                return False
+            return n * 2
+
+        self.assertEqual([classify(-1) is False, classify(0) is False,
+                          classify(-1) is not False], [True, False, False])
 
 
 if __name__ == "__main__":

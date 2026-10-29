@@ -464,7 +464,7 @@ wb_generator_yields_a_str.py AGREE
 wb_generator_yields_what_it_keeps.py AGREE
 wb_global_shadows_stdlib_local.py AGREE
 wb_grid_leftovers_2026_08_16.py AGREE
-wb_identity_against_a_union_member.py GAP
+wb_identity_against_a_union_member.py AGREE
 wb_identity_between_two_function_values.py GAP
 wb_inlined_method_traceback_frame.py BOTH-FAIL
 wb_int_module_global_bigint.py SKIP

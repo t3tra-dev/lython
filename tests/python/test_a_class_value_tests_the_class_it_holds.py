@@ -5,7 +5,9 @@
 # class pattern that fails leaves the subject's later patterns refutable. A
 # class value that may hold one of several classes proves one of them. A
 # class pattern's keyword names any attribute: a class attribute, a property,
-# an exception's args.
+# an exception's args. A class pattern over a class value of several classes
+# tests the one it holds; classes with no common base chosen into one name
+# are a class value of either, which can be called and passed on.
 import unittest
 
 
@@ -216,6 +218,35 @@ class ClassValueTestTest(unittest.TestCase):
             match e:
                 case ValueError(args=a):
                     self.assertEqual(a, ("boom", 2))
+
+
+    def test_a_class_pattern_over_several_classes(self):
+        def route(o: Tagged | Marked | Other,
+                  k: type[Tagged] | type[Marked]) -> str:
+            match o:
+                case k(v=found):
+                    return "hit " + found
+                case Other():
+                    return "other"
+                case _:
+                    return "miss " + type(o).__name__
+
+        self.assertEqual([route(Tagged("t"), Tagged), route(Marked("m"), Tagged),
+                          route(Marked("m"), Marked), route(Other(), Marked)],
+                         ["hit t", "miss Marked", "hit m", "other"])
+
+    def test_classes_with_no_common_base_are_either(self):
+        def named(k: type[Tagged] | type[Marked]) -> str:
+            return k.__name__ + ":" + k("x").v
+
+        def pick(first: bool) -> str:
+            k = Tagged if first else Marked
+            return named(k)
+
+        self.assertEqual([pick(True), pick(False)], ["Tagged:x", "Marked:x"])
+        convert = int if len(str(pick(True))) > 3 else str
+        self.assertEqual((convert("5"), convert.__name__), (5, "int"))
+        self.assertEqual([kind("3") for kind in [int, float]], [3, 3.0])
 
 
 if __name__ == "__main__":

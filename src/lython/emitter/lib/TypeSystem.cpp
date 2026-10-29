@@ -326,23 +326,19 @@ mlir::Type inferredFunctionResult(
   if (results.empty())
     return types.none();
   mlir::Type joined = joinIgnoringEmptyLiterals(types, results, resultNodes);
-  // ⭐ A LITERAL BESIDE ITS OWN CONTRACT IS THAT CONTRACT: `return int(s)`
-  // and `return -1` are both ints, and the union `int | Literal[-1]` they
-  // joined to is no type a `return` inside a `try` can carry -- every
-  // unannotated function returning from its `try` and its handler was
-  // refused, while `-> int` compiled.
+  // ⭐ A UNION RESULT IS WIDENED MEMBER BY MEMBER, as the fixpoint's result
+  // variable is bound (`functionSignature`): `return int(s)` and `return -1`
+  // joined to `int | Literal[-1]`, which no `return` inside a `try` can carry
+  // (every unannotated function returning from its `try` and its handler was
+  // refused, while `-> int` compiled), and `return 1` / `return 0` to
+  // `Literal[1] | Literal[0]`, two members a container slot cannot tell apart
+  // (`sum([sign(1), sign(2)])` failed in the lowering).
+  // ⛔ A lone literal stays itself: `def f(): return 0` is the constant.
   if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(joined)) {
-    llvm::ArrayRef<mlir::Type> members = unionType.getMemberTypes();
-    llvm::SmallVector<mlir::Type, 4> kept;
-    for (mlir::Type member : members) {
-      mlir::Type widened = types.widenLiteral(member);
-      if (mlir::isa<py::LiteralType>(member) && widened != member &&
-          llvm::is_contained(members, widened))
-        continue;
-      kept.push_back(member);
-    }
-    if (kept.size() != members.size())
-      joined = types.join(kept);
+    llvm::SmallVector<mlir::Type, 4> widened;
+    for (mlir::Type member : unionType.getMemberTypes())
+      widened.push_back(types.widenLiteral(member));
+    joined = types.join(widened);
   }
   return joined;
 }
@@ -4841,10 +4837,20 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     // pushed scope as it goes; this is the same thing for the comprehension
     // forms.
     auto generatorScope = pushScope();
+    // ⭐ THE ITERABLE IS READ WITH THE WALK'S LOCALS, and with the targets of
+    // the generators before it, which `bound` holds: asked with no context, a
+    // body walk's `vals = [1, 2]` was unknown, so `return len([v for v in
+    // vals])` in an unannotated function typed the comprehension `object`
+    // while `t = len(...)` then `return t` typed it.
+    static const llvm::StringMap<mlir::Type> kNoIterCallables;
+    ExprInferenceContext iterContext{
+        ctx ? ctx->localCallables : kNoIterCallables, nullptr, &bound,
+        /*strict=*/false, !ctx || ctx->seesEmitterProofs};
     for (const parser::NodePtr &generator : *generators) {
       if (!generator)
         return object();
-      mlir::Type element = iterationElementType(ast::node(*generator, "iter"));
+      mlir::Type element = iterationElementType(ast::node(*generator, "iter"),
+                                                ctx ? &iterContext : nullptr);
       declaredObjectElement = false;
       if (widenLiteral(element) == object())
         if (auto iterable = mlir::dyn_cast_if_present<py::ContractType>(
@@ -5528,23 +5534,34 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     // scope in the Name arm, so a comprehension target bound there would have
     // shadowed the narrowing and this would have changed nothing.
     //
-    // ⛔ The TRUE side only. Eliminating a class on the false side leaves what
-    // the arm already has, and nothing has been measured to need it.
+    // ⭐ AND THE FALSE SIDE what eliminating a class leaves of a union: `d
+    // if isinstance(d, int) else len(d)` over `int | str` asks `len` of the
+    // str the else arm holds, and the arm typed against the whole union
+    // answered `object` -- a ternary nested in the else of `0 if d is None`
+    // then failed in the lowering ("operand 1 type object does not match").
     llvm::SmallVector<std::pair<std::string, mlir::Type>, 2> provedOnTrue;
-    if (narrowedName.empty() && testNode)
+    llvm::SmallVector<std::pair<std::string, mlir::Type>, 2> provedOnFalse;
+    auto guardLookup = [&](llvm::StringRef spelling) -> mlir::Type {
+      if (ctx && ctx->localSymbols) {
+        auto found = ctx->localSymbols->find(spelling);
+        if (found != ctx->localSymbols->end())
+          return found->second;
+      }
+      return mlir::Type();
+    };
+    if (narrowedName.empty() && testNode) {
       applyGuardNarrowing(
-          *this, testNode,
-          [&](llvm::StringRef spelling) -> mlir::Type {
-            if (ctx && ctx->localSymbols) {
-              auto found = ctx->localSymbols->find(spelling);
-              if (found != ctx->localSymbols->end())
-                return found->second;
-            }
-            return mlir::Type();
-          },
+          *this, testNode, guardLookup,
           [&](llvm::StringRef spelling, mlir::Type narrowed) {
             provedOnTrue.emplace_back(spelling.str(), narrowed);
           });
+      applyGuardNarrowing(
+          *this, testNode, guardLookup,
+          [&](llvm::StringRef spelling, mlir::Type narrowed) {
+            provedOnFalse.emplace_back(spelling.str(), narrowed);
+          },
+          /*onFalseSide=*/true);
+    }
     auto armType = [&](const parser::Node *arm,
                        bool conditionIsTrue) -> mlir::Type {
       llvm::SmallVector<std::pair<llvm::StringRef, mlir::Type>, 2> armFacts;
@@ -5552,8 +5569,8 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         armFacts.emplace_back(narrowedName, conditionIsTrue == trueBranchIsNone
                                                 ? none()
                                                 : narrowedPayload);
-      else if (conditionIsTrue)
-        for (const auto &entry : provedOnTrue)
+      else
+        for (const auto &entry : conditionIsTrue ? provedOnTrue : provedOnFalse)
           armFacts.emplace_back(entry.first, entry.second);
       if (armFacts.empty())
         return widenLiteral(lenientRecurse(arm));
@@ -5887,6 +5904,18 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       if (reducer == "sorted" && oneArgument)
         if (mlir::Type element = reducedElement(reducerArgs->front().get()))
           return contract("builtins.list", {widenLiteral(element)});
+      // ⭐ And so are `tuple`, `list` and `set` OF A GENERATOR EXPRESSION,
+      // whose targets only this walk binds: `t = tuple(x * 2 for x in xs)` in
+      // a generator typed `t` as `object` ("does not provide '__getitem__'")
+      // while `sorted(...)` of the same expression, and the same line in a
+      // function, were typed.
+      if ((reducer == "tuple" || reducer == "list" || reducer == "set") &&
+          oneArgument && reducerArgs->front()->kind == "GeneratorExp" &&
+          (!ast::nodeList(*node, "keywords") ||
+           ast::nodeList(*node, "keywords")->empty()))
+        if (mlir::Type element = reducedElement(reducerArgs->front().get()))
+          return contract(("builtins." + reducer).str(),
+                          {widenLiteral(element)});
       // The lazy-iterator builtins are the same story one step further:
       // the emitter synthesizes a generator function for each of them, so
       // the type exists only once that function is emitted. A walk that ran
@@ -5930,7 +5959,16 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
                                "positional argument")
                         : object();
         if (arg && arg->kind == "Starred") {
-          mlir::Type starredType = recurse(ast::node(*arg, "value"));
+          // A generator expression's members are typed by the walk that binds
+          // its targets, as a reducer's are (`reducedElement`).
+          const parser::Node *starredValue = ast::node(*arg, "value");
+          if (starredValue && starredValue->kind == "GeneratorExp")
+            if (mlir::Type element = iterationElementType(starredValue, ctx)) {
+              positional.push_back(py::variadicTailType(widenLiteral(element)));
+              sawVariadicTail = true;
+              continue;
+            }
+          mlir::Type starredType = recurse(starredValue);
           if (strict && !starredType)
             return {};
           if (!appendStarredArgumentTypes(*this, starredType, positional)) {
@@ -7521,6 +7559,34 @@ mlir::Type TypeSystem::join(mlir::ArrayRef<mlir::Type> types) const {
     }
     return py::ContractType::get(&context, "builtins.tuple", positions);
   }
+  // ⭐ TUPLES OF DIFFERENT ARITIES JOIN AT THE TUPLE OF ANY LENGTH OF ALL
+  // THEIR ELEMENTS. `[(1,), (1, 2)]` inferred a union of the two tuple types,
+  // which a slot cannot tell apart (both are `tuple` at run time) -- refused
+  // in the lowering as "cannot be read back from a container slot" -- while
+  // `tuple[int, ...]` is what the list holds, and each element is a box whose
+  // own class answers for it.
+  // ⛔ Only when the arities differ: one arity keeps its positions (above),
+  // and one-member tuples of different element types keep their union.
+  if (present.size() >= 2 &&
+      llvm::all_of(present, [&](mlir::Type member) {
+        auto tuple = mlir::dyn_cast<py::ContractType>(member);
+        return tuple && tuple.getContractName() == "builtins.tuple" &&
+               !tuple.getArguments().empty();
+      }) &&
+      llvm::any_of(present, [&](mlir::Type member) {
+        return mlir::cast<py::ContractType>(member).getArguments().size() !=
+               mlir::cast<py::ContractType>(present.front())
+                   .getArguments()
+                   .size();
+      })) {
+    llvm::SmallVector<mlir::Type, 8> elements;
+    for (mlir::Type member : present)
+      for (mlir::Type element :
+           mlir::cast<py::ContractType>(member).getArguments())
+        elements.push_back(element);
+    return py::ContractType::get(&context, "builtins.tuple",
+                                 {join(elements)});
+  }
   // ⭐ CLASS VALUES JOIN AT THE CLASS VALUE OF THEIR INSTANCES' JOIN.
   // `[A, B]` with `class B(A)` is a `list[type[A]]`, the list a loop that
   // constructs through each element needs, through the subclasses of A.
@@ -7541,9 +7607,15 @@ mlir::Type TypeSystem::join(mlir::ArrayRef<mlir::Type> types) const {
     if (!mlir::isa_and_nonnull<py::ContractType>(instanceJoin))
       if (mlir::Type common = nearestCommonClass(instances))
         instanceJoin = common;
-    return typeObject(mlir::isa_and_nonnull<py::ContractType>(instanceJoin)
-                          ? instanceJoin
-                          : object());
+    if (mlir::isa_and_nonnull<py::ContractType>(instanceJoin) &&
+        !py::isPyObjectType(instanceJoin))
+      return typeObject(instanceJoin);
+    // ⭐ CLASSES WITH NO COMMON BASE ARE A UNION OF THEIR CLASS VALUES. The
+    // probe above kept `type[object]` for the one spelling a union could not
+    // answer, `k is int`, which a union of class values now answers as `==`
+    // does; and `type[object]` can be neither called nor passed where `type[A]
+    // | type[B]` is declared (`name(AA if f else B)`).
+    return py::UnionType::getNormalized(&context, present);
   }
   return py::UnionType::getNormalized(&context, present);
 }

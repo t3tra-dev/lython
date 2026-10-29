@@ -5,7 +5,8 @@
 # collects it: after a written positional, there; alone, after the keywords.
 # Any iterable is collected so. `zip(*rows)` zips as many rows as it is given.
 # A starred generator expression into a method or a format template is the
-# tuple of its members.
+# tuple of its members, in a generator's body too, and `tuple`, `list` of one
+# there have its members' type.
 import os.path
 import unittest
 
@@ -162,6 +163,18 @@ class StarredParametersTest(unittest.TestCase):
                           acc.add(1, *(v * 2 for v in range(3))),
                           acc.pair(*(v for v in (3, 4)))], [16, 17, 34])
         self.assertEqual("{} {}".format(*(w.upper() for w in words)), "X Y")
+
+
+    def test_generator_expressions_in_a_generator_body(self):
+        from typing import Iterator
+
+        def gen(xs: list[int]) -> Iterator[int]:
+            doubled = tuple(x * 2 for x in xs)
+            yield doubled[0]
+            yield list(x + 1 for x in xs)[1]
+            yield Accumulator(1).add(*(x for x in xs))
+
+        self.assertEqual(list(gen([4, 5])), [8, 6, 10])
 
 
 if __name__ == "__main__":

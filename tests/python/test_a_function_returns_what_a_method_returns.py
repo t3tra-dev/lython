@@ -2,7 +2,10 @@
 # in the same module returns: called on a parameter, on a local, on a fresh
 # instance, on a parameter typed only by its callers, and through iteration
 # of the instance. One that returns from a `try` and from its handler
-# returns the type both give, a literal among them included.
+# returns the type both give, a literal among them included; one that returns
+# only literals of one class returns that class; and one that returns a
+# builtin of a comprehension over its own local returns what the builtin
+# does.
 import unittest
 from typing import Iterator
 
@@ -19,6 +22,22 @@ def named(s: str):
         return s.upper()
     except ValueError:
         return "none"
+
+
+def sign(x: int):
+    if x > 0:
+        return 1
+    return 0
+
+
+def summed():
+    values = [1, 2]
+    return sum([v + 1 for v in values])
+
+
+def kept():
+    values = [1, 2, 3]
+    return len([v for v in values if v > 1])
 
 
 class Box:
@@ -85,6 +104,12 @@ class MethodResultTest(unittest.TestCase):
         self.assertEqual([parsed("12"), parsed("x"), parsed("3") + 1],
                          [12, -1, 4])
         self.assertEqual(named("a"), "A")
+
+
+    def test_literal_returns_and_builtins_of_comprehensions(self):
+        self.assertEqual([sum([sign(1), sign(2)]), max([sign(-1), sign(3)]) + 5],
+                         [2, 6])
+        self.assertEqual([summed(), kept()], [5, 2])
 
 
 if __name__ == "__main__":

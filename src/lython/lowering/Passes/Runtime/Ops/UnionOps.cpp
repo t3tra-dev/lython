@@ -125,9 +125,10 @@ mlir::LogicalResult RuntimeBundleLowerer::appendUnionRuntimeValues(
     return mlir::success();
   };
 
-  auto appendMappedMember =
+  auto appendMappedMemberTo =
       [&](py::UnionType sourceUnionType, unsigned sourceIndex,
-          mlir::Type resultMember) -> mlir::LogicalResult {
+          mlir::Type resultMember,
+          llvm::SmallVectorImpl<mlir::Value> &into) -> mlir::LogicalResult {
     mlir::Type sourceMember = sourceUnionType.getMemberTypes()[sourceIndex];
     mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> sourceTypes =
         RuntimeBundleLowerer::runtimeValueTypesFor(op, sourceMember,
@@ -148,7 +149,7 @@ mlir::LogicalResult RuntimeBundleLowerer::appendUnionRuntimeValues(
     if (mlir::failed(offset))
       return mlir::failure();
     appendValueSlice(sourceBundle->physicalValues(), *offset,
-                     static_cast<unsigned>(sourceTypes->size()), values);
+                     static_cast<unsigned>(sourceTypes->size()), into);
     return mlir::success();
   };
 
@@ -175,7 +176,7 @@ mlir::LogicalResult RuntimeBundleLowerer::appendUnionRuntimeValues(
            llvm::enumerate(sourceUnion.getMemberTypes())) {
         std::optional<unsigned> resultIndex =
             RuntimeBundleLowerer::findUnionMemberIndex(resultUnion,
-                                                       sourceMember);
+                                                       sourceMember, op);
         if (!resultIndex || *resultIndex != sourceIndex) {
           memberOrderPreserved = false;
           break;
@@ -213,17 +214,52 @@ mlir::LogicalResult RuntimeBundleLowerer::appendUnionRuntimeValues(
               .getResult();
     }
     values.push_back(remappedTag);
-    for (mlir::Type resultMember : resultUnion.getMemberTypes()) {
-      std::optional<unsigned> sourceIndex =
-          RuntimeBundleLowerer::findUnionMemberIndex(sourceUnion, resultMember);
-      if (!sourceIndex) {
+    // ⭐ A RESULT MEMBER'S LANES ARE THOSE OF THE SOURCE MEMBERS THE TAG IS
+    // SENT TO IT FROM -- the same question the remap above asks, with the
+    // module. This loop asked the reverse question WITHOUT it, where a
+    // subclass is assignable to nothing: `SubE | None` handed to `E | None`
+    // remapped the tag to E and filled E's lanes with the dead placeholder,
+    // so the callee read an object with no class (`type(e).__name__` was
+    // "object", the base's method ran) and a field read crashed.
+    // ⭐ And several source members sent to one (`A | AA` into `A | B`) take
+    // the lanes of whichever the source tag names, lane by lane.
+    for (auto [resultIndex, resultMember] :
+         llvm::enumerate(resultUnion.getMemberTypes())) {
+      llvm::SmallVector<unsigned, 2> feeding;
+      for (auto [sourceIndex, sourceMember] :
+           llvm::enumerate(sourceUnion.getMemberTypes()))
+        if (std::optional<unsigned> mapped =
+                RuntimeBundleLowerer::findUnionMemberIndex(resultUnion,
+                                                           sourceMember, op);
+            mapped && *mapped == resultIndex)
+          feeding.push_back(static_cast<unsigned>(sourceIndex));
+      if (feeding.empty()) {
         if (mlir::failed(appendDeadMember(resultMember)))
           return mlir::failure();
         continue;
       }
-      if (mlir::failed(
-              appendMappedMember(sourceUnion, *sourceIndex, resultMember)))
+      llvm::SmallVector<mlir::Value, 4> chosen;
+      if (mlir::failed(appendMappedMemberTo(sourceUnion, feeding.back(),
+                                            resultMember, chosen)))
         return mlir::failure();
+      for (unsigned sourceIndex : llvm::reverse(
+               llvm::ArrayRef<unsigned>(feeding).drop_back())) {
+        llvm::SmallVector<mlir::Value, 4> lanes;
+        if (mlir::failed(appendMappedMemberTo(sourceUnion, sourceIndex,
+                                              resultMember, lanes)))
+          return mlir::failure();
+        mlir::Value isThisMember = mlir::arith::CmpIOp::create(
+            builder, op->getLoc(), mlir::arith::CmpIPredicate::eq, sourceTag,
+            mlir::arith::ConstantIntOp::create(
+                builder, op->getLoc(), static_cast<std::int64_t>(sourceIndex),
+                64)
+                .getResult());
+        for (auto [lane, kept] : llvm::zip(lanes, chosen))
+          kept = mlir::arith::SelectOp::create(builder, op->getLoc(),
+                                               isThisMember, lane, kept)
+                     .getResult();
+      }
+      values.append(chosen.begin(), chosen.end());
     }
   } else {
     mlir::FailureOr<unsigned> activeIndex =
