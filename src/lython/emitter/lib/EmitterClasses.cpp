@@ -6592,6 +6592,33 @@ bool ModuleEmitter::inlineArgumentFits(mlir::Type actual,
   // solver (TypeConstraintSolver.cpp): `type[int]` meets
   // `Callable[[str], object]` because `int(str)` builds what `object` takes,
   // and the union rule above then lets it meet `Callable[...] | None`.
+  // ⭐ A FUNCTION RETURNING A SUBCLASS IS A CALLABLE OF THE BASE: its result
+  // fits where the declared one does, and its parameters take what the
+  // declared ones are given. `run(self, f: Callable[[int], E | None])` was
+  // refused `check -> F | None` while the same parameter of a module-level
+  // function took it; the body is inlined with the function value itself, so
+  // what it calls is `check`.
+  if (auto expectedCallable = mlir::dyn_cast<py::CallableType>(expected))
+    if (auto actualCallable = mlir::dyn_cast<py::CallableType>(actual))
+      if (!expectedCallable.hasVararg() && !expectedCallable.hasKwarg() &&
+          !actualCallable.hasVararg() && !actualCallable.hasKwarg() &&
+          expectedCallable.getKwOnlyTypes().empty() &&
+          actualCallable.getKwOnlyTypes().empty() &&
+          expectedCallable.getPositionalTypes().size() ==
+              actualCallable.getPositionalTypes().size() &&
+          expectedCallable.getResultTypes().size() == 1 &&
+          actualCallable.getResultTypes().size() == 1 &&
+          llvm::all_of(llvm::zip(expectedCallable.getPositionalTypes(),
+                                 actualCallable.getPositionalTypes()),
+                       [&](auto pair) {
+                         return inlineArgumentFits(
+                             types.widenLiteral(std::get<0>(pair)),
+                             types.widenLiteral(std::get<1>(pair)));
+                       }) &&
+          inlineArgumentFits(
+              types.widenLiteral(actualCallable.getResultTypes().front()),
+              types.widenLiteral(expectedCallable.getResultTypes().front())))
+        return true;
   if (auto expectedCallable = mlir::dyn_cast<py::CallableType>(expected))
     if (auto actualClass = mlir::dyn_cast<py::TypeType>(actual))
       if (!expectedCallable.hasVararg() && !expectedCallable.hasKwarg() &&

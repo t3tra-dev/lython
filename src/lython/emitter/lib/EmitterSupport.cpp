@@ -76,7 +76,26 @@ bool isAssignableWithStaticEvidence(mlir::Type actual, mlir::Type expected,
   if (from && isSourceDefinedContract(actual) &&
       isSourceDefinedContract(expected))
     return py::isAssignableTo(actual, expected, from);
-  return py::isAssignableTo(actual, expected);
+  if (py::isAssignableTo(actual, expected))
+    return true;
+  // ⭐ A UNION MEMBER BY MEMBER, each asked with the module: `U | None` is an
+  // `M | None` when `U` is declared under `M`, and the module-free question
+  // above knows no class hierarchy -- `yield u` of a `U | None` under
+  // `-> Iterator[M | None]` was refused while `yield U()` under
+  // `-> Iterator[M]` compiled. The injection that carries it is the one a
+  // subclass argument already takes.
+  if (from) {
+    if (auto actualUnion = mlir::dyn_cast_if_present<py::UnionType>(actual))
+      return llvm::all_of(actualUnion.getMemberTypes(), [&](mlir::Type member) {
+        return isAssignableWithStaticEvidence(member, expected, from);
+      });
+    if (auto expectedUnion = mlir::dyn_cast_if_present<py::UnionType>(expected))
+      return llvm::any_of(
+          expectedUnion.getMemberTypes(), [&](mlir::Type member) {
+            return isAssignableWithStaticEvidence(actual, member, from);
+          });
+  }
+  return false;
 }
 
 std::string pythonTypeSpelling(mlir::Type type) {
@@ -1535,27 +1554,13 @@ optionalBranchTypeNarrowing(const parser::Node &test, TypeSystem &types,
               if (sourceType && targetTypes) {
                 IsInstanceAnalysis memberAnalysis =
                     analyzeIsInstanceAny(sourceType, *targetTypes, types, from);
-                // ⛔ A UNION FIELD ONLY WHERE IT IS AN OPTIONAL, and this is
-                // measured rather than cautious. Narrowing an `int | str`
-                // field to `str` produces a value the ownership walk marks
-                // owned and the frame never acquired, which is a WORSE answer
-                // than the refusal it replaces. `T | None` is the shape the
-                // `is None` arm already narrows and the one this is measured
-                // clean on.
-                //
-                // ⛔ RE-MEASURED 2026-09-07, after the borrowed-return retain
-                // fix (which is about exactly that phrase, "a value this frame
-                // never acquired"). Dropping the gate no longer produces that
-                // sentence -- it produces two worse ones. Of the eight
-                // programs in the `int | str` field matrix, three now DOUBLE
-                // FREE at run time ("Ly_DecRef observed non-positive
-                // refcount": `len(self.v)` inside the guard, `print(self.v)`,
-                // and the free-function spelling `if isinstance(b.v, str)`),
-                // and four are refused with "owned resource ... reaches
-                // function exit without release". A crash is further from
-                // "never silently mis-execute" than the refusal is, so the
-                // gate stays until the element token has an owner
-                // (rfc/memory-safety-proof.md, Aggregates).
+                // A union field narrows by its members, and a class below one
+                // member by that member's tag and its class: each read of the
+                // field re-tests what was proved (`emitCheckedNarrowedRead`).
+                // ⛔ The gate that once kept this to `T | None` measured the
+                // dead value an instance starts at, whose tag was wrong; with
+                // that repaired the double frees were gone (cad0c03e), so they
+                // are no reason to keep one now.
                 bool optionalUnion =
                     memberAnalysis.kind == IsInstanceAnalysis::Kind::UnionTest &&
                     memberAnalysis.trueType &&
@@ -1565,7 +1570,13 @@ optionalBranchTypeNarrowing(const parser::Node &test, TypeSystem &types,
                     memberAnalysis.kind ==
                         IsInstanceAnalysis::Kind::ClassTest ||
                     optionalUnion ||
-                    memberAnalysis.kind == IsInstanceAnalysis::Kind::UnionTest;
+                    memberAnalysis.kind == IsInstanceAnalysis::Kind::UnionTest ||
+                    // A class below one member: the checked read tests the
+                    // tag and the class, and refines that member.
+                    (memberAnalysis.kind ==
+                         IsInstanceAnalysis::Kind::UnionClassTest &&
+                     mlir::isa_and_nonnull<py::ContractType>(
+                         memberAnalysis.trueType));
                 if (testable && memberAnalysis.trueType) {
                   BranchTypeNarrowing narrowing;
                   narrowing.isMemberPath = true;

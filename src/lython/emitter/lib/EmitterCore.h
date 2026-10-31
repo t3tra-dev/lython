@@ -2543,6 +2543,10 @@ private:
   // `yield` is checked against it at its own site, where the flow facts a guard
   // proved are available and the whole-body walk's are not.
   mlir::Type currentGeneratorYieldType;
+  // The yield type the whole-body walk inferred for a generator WITHOUT an
+  // annotation: not checked against (it has no flow facts), only what a
+  // subclass instance is upcast to so every yield crosses in one lane.
+  mlir::Type currentGeneratorInferredYieldType;
   // The bound-method wrapper emitted for (method body, receiver type, bound
   // class), reused by every later read of the same method off the same type.
   llvm::DenseMap<std::tuple<const parser::Node *, mlir::Type, mlir::Type>,

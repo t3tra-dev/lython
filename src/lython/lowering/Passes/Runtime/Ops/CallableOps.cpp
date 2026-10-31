@@ -1152,9 +1152,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
         op.getCallable().getDefiningOp<py::GetItemOp>() != nullptr;
     bool interiorViewWithoutEvidence =
         !structuralMutation &&
-        (!receiver.sequenceEvidenceBacked || receiverIsContainerElement) &&
-        !RuntimeBundleLowerer::crossesStorageDefiningBlock(
-            op.getOperation(), receiver);
+        (!receiver.sequenceEvidenceBacked || receiverIsContainerElement ||
+         RuntimeBundleLowerer::crossesStorageDefiningBlock(op.getOperation(),
+                                                           receiver));
     if ((structuralMutation &&
          (!receiver.sequenceEvidenceBacked || receiver.sharedWithHolder)) ||
         interiorViewWithoutEvidence) {

@@ -1909,6 +1909,67 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
     mlir::func::ReturnOp::create(builder, loc);
   }
 
+  // ⭐ AN INSTANCE IS RELEASED AS THE CLASS IT IS, which its header's class
+  // word says. A value typed as a base -- `def mk() -> Entry: return
+  // BigEntry([1])`, an `A | B` holding an `AA`, a yield -- is released through
+  // the base's deallocator, which knows only the base's fields: the
+  // subclass's list was never released, 64 B per call. So a base's
+  // deallocator hands an instance of any program subclass to that class's.
+  //
+  // ⛔ Every descendant, not the direct subclasses: a grandchild's word
+  // matches no child, and falling through to the base's own fields is the
+  // leak again. ⛔ And only a deallocator of the same signature; one whose
+  // object ABI differs cannot have been handed this value at all.
+  for (Plan &plan : plans) {
+    std::optional<std::string> qualified =
+        RuntimeBundleLowerer::runtimeClassForClass(plan.classOp);
+    if (!qualified)
+      continue;
+    llvm::SmallVector<std::pair<std::string, mlir::func::FuncOp>, 4>
+        descendants;
+    for (Plan &other : plans) {
+      if (other.function == plan.function ||
+          other.function.getFunctionType() != plan.function.getFunctionType())
+        continue;
+      if (!llvm::is_contained(
+              RuntimeBundleLowerer::classAncestors(other.classOp), *qualified))
+        continue;
+      if (std::optional<std::string> otherName =
+              RuntimeBundleLowerer::runtimeClassForClass(other.classOp))
+        descendants.push_back({*otherName, other.function});
+    }
+    if (descendants.empty())
+      continue;
+    mlir::Block *entry = &plan.function.front();
+    mlir::Block *own = entry->splitBlock(entry->begin());
+    mlir::Location loc = plan.function.getLoc();
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(entry);
+    mlir::Value classSlot =
+        mlir::arith::ConstantIndexOp::create(builder, loc,
+                                             type_objects::kTypeWord)
+            .getResult();
+    mlir::Value word = mlir::memref::LoadOp::create(
+                           builder, loc, entry->getArgument(0), classSlot)
+                           .getResult();
+    for (auto &[name, deallocator] : descendants) {
+      mlir::Block *hit = plan.function.addBlock();
+      mlir::Block *next = plan.function.addBlock();
+      mlir::Value isIt =
+          mlir::arith::CmpIOp::create(
+              builder, loc, mlir::arith::CmpIPredicate::eq, word,
+              type_objects::classWord(builder, loc, module, name))
+              .getResult();
+      mlir::cf::CondBranchOp::create(builder, loc, isIt, hit, next);
+      builder.setInsertionPointToStart(hit);
+      mlir::func::CallOp::create(builder, loc, deallocator,
+                                 entry->getArguments());
+      mlir::func::ReturnOp::create(builder, loc);
+      builder.setInsertionPointToStart(next);
+    }
+    mlir::cf::BranchOp::create(builder, loc, own);
+  }
+
   return mlir::success();
 }
 

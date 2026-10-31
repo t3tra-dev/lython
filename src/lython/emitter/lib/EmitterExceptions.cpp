@@ -5,6 +5,7 @@
 #include "AstAccess.h"
 #include "AstSynth.h"
 
+#include <functional>
 #include <variant>
 #include "Contracts.h"
 
@@ -348,7 +349,8 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
       completionEligible && currentReturnType != types.none() &&
       protectedBodyHasReturn &&
       (isSupportedFinallyReturnCarrierType(currentReturnType) ||
-       (!hasFinally && mlir::isa<py::ContractType>(currentReturnType)));
+       (!hasFinally &&
+        mlir::isa<py::ContractType, py::UnionType>(currentReturnType)));
   bool supportsReturnThroughFinally =
       supportsNoneReturnThroughFinally || supportsValueReturnThroughFinally;
   bool supportsLoopControlThroughFinally =
@@ -893,7 +895,8 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
     yieldValues.push_back(mlir::arith::ConstantIntOp::create(
         builder, loc(statement), value ? 1 : 0, 1));
   };
-  auto emitDefaultReturnValue = [&](mlir::Type target) -> Value {
+  std::function<Value(mlir::Type)> emitDefaultReturnValue;
+  emitDefaultReturnValue = [&](mlir::Type target) -> Value {
     if (auto literal = mlir::dyn_cast<py::LiteralType>(target)) {
       llvm::StringRef spelling = literal.getSpelling();
       if (spelling == "None") {
@@ -921,8 +924,20 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
     }
     // The None member the carrier check found: wrapped into the union, which
     // is what an ordinary `x: int | None = None` already emits.
-    if (mlir::isa<py::UnionType>(target))
-      return coerceValue(emitNone(statement), target, statement);
+    //
+    // A union with no None member takes its first member's default. Without
+    // a finally nobody reads it -- the try region's payload on a path that
+    // fell through -- but a None there is no member at all, and `try: return
+    // int(s)` / `except ValueError: pass` / `return s` was refused by the
+    // union injection for `-> int | str`.
+    if (auto unionType = mlir::dyn_cast<py::UnionType>(target)) {
+      if (isSupportedFinallyReturnCarrierType(unionType) ||
+          unionType.getMemberTypes().empty())
+        return coerceValue(emitNone(statement), target, statement);
+      return coerceValue(
+          emitDefaultReturnValue(unionType.getMemberTypes().front()), target,
+          statement);
+    }
     if (auto contract = mlir::dyn_cast<py::ContractType>(target)) {
       llvm::StringRef name = contract.getContractName();
       if (name == "types.NoneType" || name == "builtins.object") {

@@ -1543,6 +1543,12 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
               sig.generatorYieldTypeIsAnnotated
           ? sig.generatorYieldType
           : mlir::Type();
+  llvm::SaveAndRestore<mlir::Type> savedInferredYield(
+      currentGeneratorInferredYieldType,
+      (sig.isGeneratorFunction || sig.isAsyncGeneratorFunction) &&
+              !sig.generatorYieldTypeIsAnnotated
+          ? sig.generatorYieldType
+          : mlir::Type());
   currentFunctionPrefix = symbolName.str();
   llvm::SaveAndRestore<std::optional<NotImplementedFallback>> savedFallback(
       notImplementedFallback,
@@ -2560,9 +2566,11 @@ Value ModuleEmitter::emitLambda(const parser::Node &expr,
           parser::Severity::Error, expr.range.start,
           "lambda Callable annotation does not resolve all Unknown types"});
     }
+    // With the module: a lambda returning a subclass of the declared result
+    // is the annotation's callable, as the function it wraps is.
     if (!unresolvedUnknown &&
         !py::isAssignableTo(widenInferredLiterals(sig.callable, types),
-                            expected)) {
+                            expected, module)) {
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, expr.range.start,
           "lambda body is not compatible with its Callable annotation"});
