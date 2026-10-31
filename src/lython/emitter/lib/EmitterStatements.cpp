@@ -2453,7 +2453,17 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
     // closure) writes THROUGH the cell: the binding itself never changes.
     auto bound = values.find(name);
     if (bound != values.end() && isCellContract(bound->second.type)) {
+      // Read before the store, which may add to `values` and move `bound`.
+      mlir::Type cellType = bound->second.type;
       emitCellStore(target, bound->second, value);
+      // ⭐ AND SO DOES A CELL'S, which is re-read with a check just as a
+      // module global is: `[e for i in r if (e := get(i)) is not None]`
+      // makes `e` a cell of `E | None`, and `for e in xs: e.n` then read the
+      // union it was declared as rather than the element just stored.
+      if (auto declared = mlir::dyn_cast_if_present<py::UnionType>(
+              types.widenLiteral(cellContentType(cellType))))
+        if (mlir::Type proved = storeProvedMember(declared, value.type))
+          memberNarrowingsFromStores[name.str()] = proved;
       return;
     }
     if (bound == values.end() && currentBoxedLocals.contains(name)) {

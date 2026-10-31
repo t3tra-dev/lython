@@ -1786,6 +1786,12 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
     loopControlContexts.push_back(loop);
     emitAssignTarget(*ast::node(statement, "target"),
                      Value{next.getElement(), elem});
+    // The target's store proves what it wrote for the body it heads; the
+    // statement-level channel would install it only after the body's first
+    // statement, which is the statement that reads it.
+    for (const auto &entry : memberNarrowingsFromStores)
+      narrowedMemberTypes[entry.getKey()] = entry.second;
+    memberNarrowingsFromStores.clear();
     emitStatements(ast::nodeList(statement, "body"));
     loopControlContexts.pop_back();
     if (!insertionBlockTerminated(builder))

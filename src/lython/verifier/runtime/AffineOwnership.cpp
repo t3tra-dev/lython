@@ -4266,6 +4266,20 @@ mlir::LogicalResult verifyFunctionAffineOwnership(
       collectBorrowedEntryResources(function, deallocators);
   appendRetainMintedResources(resources, borrowedEntryResources, function,
                               contracts, aliases);
+  // A walk stops at a raise, so a resource produced past one in its block is
+  // a path that cannot run -- and the insertion wrote no cleanup there. A raise
+  // the lowering decided statically (`{"a": 1}["b"]`) leaves the rest of its
+  // statement behind it, and verifying that tail refused the program.
+  if (!function.isDeclaration()) {
+    own::DeadAfterRaiseCache deadAfterRaise;
+    mlir::Region *body = &function.getBody();
+    llvm::erase_if(resources, [&](const TrackedResource &resource) {
+      mlir::Operation *top = resource.producer;
+      while (top && top->getParentRegion() != body)
+        top = top->getParentOp();
+      return top && deadAfterRaise.deadAfter(contracts, top);
+    });
+  }
 
   if (isSingleBlockStraightLineFunction(function) &&
       borrowedEntryResources.empty()) {

@@ -514,6 +514,17 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
         return emitNone(*expr);
       }
       yielded = coerceValue(yielded, currentGeneratorYieldType, *expr);
+    } else if (auto inferred = mlir::dyn_cast_if_present<py::ContractType>(
+                   currentGeneratorInferredYieldType)) {
+      // ⭐ A SUBCLASS INSTANCE IS YIELDED AS THE JOINED BASE, which is how the
+      // frame carries it: `yield M()` then `yield U()` joined at `M`, and the
+      // `U` reached the state machine as a second lane ("its yields have no
+      // single lane to cross in") while `x: M = U(); yield x` compiled.
+      auto actual = mlir::dyn_cast_if_present<py::ContractType>(
+          types.widenLiteral(yielded.type));
+      if (actual && actual != inferred &&
+          declaredSubclassOfType(actual, inferred, types))
+        yielded = coerceValue(yielded, inferred, *expr);
     }
     mlir::Type sentType =
         currentGeneratorSendType ? currentGeneratorSendType : types.none();
@@ -3199,22 +3210,75 @@ Value ModuleEmitter::emitCheckedNarrowedRead(const parser::Node &anchor,
   auto rawUnion = mlir::dyn_cast_if_present<py::UnionType>(raw.value.getType());
   auto rawContract =
       mlir::dyn_cast_if_present<py::ContractType>(raw.value.getType());
-  bool testableUnion = rawUnion && rawUnion.hasMember(proved);
+  // ⭐ THE MEMBERS THE PROOF KEEPS, which are not always one member. `z: A |
+  // B | None` proved not None is `A | B`, no member of the three, and the read
+  // went on as the whole union ("'show' runs on whichever member ... None");
+  // with `B(A)` the proof is `A`, and testing for the member `A` alone raised
+  // NameError for a `B` CPython runs. The test is any kept member's tag, and
+  // the read is the kept members, upcast to the proof.
+  llvm::SmallVector<mlir::Type, 4> kept;
+  if (rawUnion) {
+    auto provedUnion = mlir::dyn_cast<py::UnionType>(proved);
+    for (mlir::Type member : rawUnion.getMemberTypes())
+      if (member == proved || (provedUnion && provedUnion.hasMember(member)) ||
+          (mlir::isa<py::ContractType>(member) &&
+           mlir::isa<py::ContractType>(proved) &&
+           declaredSubclassOfType(member, proved, types)))
+        kept.push_back(member);
+    if (kept.size() == rawUnion.getMemberTypes().size())
+      kept.clear();
+  }
+  // ⭐ OR A CLASS BELOW ONE MEMBER: `isinstance(h.one, AA)` over `A | B`
+  // proves the member `A` holding an `AA`, which is two tests -- the tag, then
+  // the class -- and the read is that member refined. Neither shape above
+  // matched, so the field was read as the whole union and `h.one.extra`
+  // failed in the lowering ("class A has no field 'extra'").
+  mlir::Type refinedMember;
+  if (rawUnion && kept.empty() && mlir::isa<py::ContractType>(proved))
+    for (mlir::Type member : rawUnion.getMemberTypes())
+      if (mlir::isa<py::ContractType>(member) && member != proved &&
+          declaredSubclassOfType(proved, member, types)) {
+        refinedMember = member;
+        break;
+      }
+  bool testableUnion = !kept.empty();
   bool testableClass =
       !rawUnion && rawContract &&
       mlir::isa_and_nonnull<py::ContractType>(proved) &&
       proved != raw.value.getType() &&
       declaredSubclassOfType(proved, raw.value.getType(), types);
-  if (!testableUnion && !testableClass)
+  if (!testableUnion && !testableClass && !refinedMember)
     return raw;
-  mlir::Value bit =
-      testableUnion
-          ? py::UnionTestOp::create(builder, loc(anchor), builder.getI1Type(),
-                                    raw.value, mlir::TypeAttr::get(proved))
-                .getResult()
-          : py::ClassTestOp::create(builder, loc(anchor), builder.getI1Type(),
-                                    raw.value, mlir::TypeAttr::get(proved))
-                .getResult();
+  mlir::Value bit;
+  if (refinedMember) {
+    mlir::Value holds =
+        py::UnionTestOp::create(builder, loc(anchor), builder.getI1Type(),
+                                raw.value, mlir::TypeAttr::get(refinedMember))
+            .getResult();
+    mlir::Value member = py::UnionUnwrapOp::create(builder, loc(anchor),
+                                                   refinedMember, raw.value)
+                             .getResult();
+    mlir::Value isClass =
+        py::ClassTestOp::create(builder, loc(anchor), builder.getI1Type(),
+                                member, mlir::TypeAttr::get(proved))
+            .getResult();
+    bit = mlir::arith::AndIOp::create(builder, loc(anchor), holds, isClass)
+              .getResult();
+  } else if (testableUnion) {
+    for (mlir::Type member : kept) {
+      mlir::Value holds =
+          py::UnionTestOp::create(builder, loc(anchor), builder.getI1Type(),
+                                  raw.value, mlir::TypeAttr::get(member))
+              .getResult();
+      bit = bit ? mlir::arith::OrIOp::create(builder, loc(anchor), bit, holds)
+                      .getResult()
+                : holds;
+    }
+  } else {
+    bit = py::ClassTestOp::create(builder, loc(anchor), builder.getI1Type(),
+                                  raw.value, mlir::TypeAttr::get(proved))
+              .getResult();
+  }
   mlir::Block *origin = builder.getInsertionBlock();
   mlir::Region *region = origin->getParent();
   mlir::Block *bad =
@@ -3234,11 +3298,13 @@ Value ModuleEmitter::emitCheckedNarrowedRead(const parser::Node &anchor,
   // shape a field guard narrowed; for `int | str` the reader was told the
   // value is None when it is an int, which sends them looking for a `= None`
   // that no line performs.
-  auto provedContract = mlir::dyn_cast_if_present<py::ContractType>(proved);
+  auto provedContract = kept.size() == 1
+                            ? mlir::dyn_cast<py::ContractType>(kept.front())
+                            : mlir::dyn_cast_if_present<py::ContractType>(proved);
   bool provedIsOptionalPayload =
       rawUnion && rawUnion.isOptional() &&
       rawUnion.getOptionalPayloadType() == proved;
-  if (!testableUnion)
+  if (!testableUnion && !refinedMember)
     what += "' is not the class a guard or an assignment above proved it "
             "was: it changed in between";
   else if (provedIsOptionalPayload || !provedContract)
@@ -3275,12 +3341,26 @@ Value ModuleEmitter::emitCheckedNarrowedRead(const parser::Node &anchor,
     raw = emitExpr(&anchor);
     suppressMemberNarrowing = false;
   }
+  if (refinedMember) {
+    mlir::Value member = py::UnionUnwrapOp::create(builder, loc(anchor),
+                                                   refinedMember, raw.value)
+                             .getResult();
+    return Value{py::ClassRefineOp::create(builder, loc(anchor), proved, member)
+                     .getResult(),
+                 proved};
+  }
+  if (testableUnion) {
+    mlir::Type keptType = kept.size() == 1 ? kept.front() : types.join(kept);
+    Value unwrapped{py::UnionUnwrapOp::create(builder, loc(anchor), keptType,
+                                              raw.value)
+                        .getResult(),
+                    keptType};
+    return keptType == proved ? unwrapped
+                              : coerceValue(unwrapped, proved, anchor);
+  }
   mlir::Value narrowedValue =
-      testableUnion
-          ? py::UnionUnwrapOp::create(builder, loc(anchor), proved, raw.value)
-                .getResult()
-          : py::ClassRefineOp::create(builder, loc(anchor), proved, raw.value)
-                .getResult();
+      py::ClassRefineOp::create(builder, loc(anchor), proved, raw.value)
+          .getResult();
   return Value{narrowedValue, proved};
 }
 

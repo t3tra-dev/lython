@@ -1724,9 +1724,13 @@ private:
 };
 thread_local ExceptionEdgeMemo *ExceptionEdgeMemo::active = nullptr;
 
+// `replacement`, when given, receives the terminator that now ends the block:
+// a `cf.cond_br` is rebuilt to route one edge through the release block, and
+// a caller holding another edge of the same branch must ask that one.
 bool releaseOnTerminatorEdge(mlir::Operation *terminator, unsigned succIndex,
                              const own::ResourceGroup &group, mlir::Location loc,
-                             bool ownsReference) {
+                             bool ownsReference,
+                             mlir::Operation **replacement = nullptr) {
   mlir::OpBuilder builder(terminator);
   if (mlir::isa<mlir::cf::BranchOp>(terminator)) {
     builder.setInsertionPoint(terminator);
@@ -1749,16 +1753,20 @@ bool releaseOnTerminatorEdge(mlir::Operation *terminator, unsigned succIndex,
   mlir::cf::BranchOp::create(builder, loc, successor,
                              succIndex == 0 ? trueOps : falseOps);
   builder.setInsertionPoint(condbr);
-  if (succIndex == 0)
-    mlir::cf::CondBranchOp::create(builder, condbr.getLoc(),
-                                   condbr.getCondition(), releaseBlock,
-                                   mlir::ValueRange{}, condbr.getFalseDest(),
-                                   falseOps);
-  else
-    mlir::cf::CondBranchOp::create(builder, condbr.getLoc(),
-                                   condbr.getCondition(), condbr.getTrueDest(),
-                                   trueOps, releaseBlock, mlir::ValueRange{});
+  mlir::Operation *rebuilt =
+      succIndex == 0
+          ? mlir::cf::CondBranchOp::create(
+                builder, condbr.getLoc(), condbr.getCondition(), releaseBlock,
+                mlir::ValueRange{}, condbr.getFalseDest(), falseOps)
+                .getOperation()
+          : mlir::cf::CondBranchOp::create(
+                builder, condbr.getLoc(), condbr.getCondition(),
+                condbr.getTrueDest(), trueOps, releaseBlock,
+                mlir::ValueRange{})
+                .getOperation();
   condbr.erase();
+  if (replacement)
+    *replacement = rebuilt;
   return true;
 }
 
@@ -3199,10 +3207,19 @@ bool releaseOwnedGroupByLiveness(
     mlir::OpBuilder builder(&block->front());
     emitGroupRelease(builder, loc, group, group.values, ownsReference);
   }
-  for (auto &edge : edgeReleases)
+  // ⛔ BOTH EDGES OF ONE BRANCH. Releasing on one rebuilds the `cf.cond_br`,
+  // so the other entry named an erased op: `if d[k] > 0: return None` /
+  // `return None` crashed the compiler with the group dying on both edges.
+  for (auto [index, edge] : llvm::enumerate(edgeReleases)) {
+    mlir::Operation *rebuilt = nullptr;
     if (!releaseOnTerminatorEdge(edge.first, edge.second, group, loc,
-                                 ownsReference))
+                                 ownsReference, &rebuilt))
       return false;
+    if (rebuilt)
+      for (auto &later : llvm::drop_begin(edgeReleases, index + 1))
+        if (later.first == edge.first)
+          later.first = rebuilt;
+  }
   for (mlir::Operation *consume : unfoldRetainBefore) {
     if (mlir::failed(insertRetain(aliases.function(consume, "Ly_IncRef"),
                                   consume, group.values.front(),
@@ -5459,50 +5476,6 @@ TokenAtPoint groupTokenAtPoint(UnwindCleanupAnalysis &analysis,
   return result;
 }
 
-// Is `op` syntactically after a no-return raise in its block? The normal-path
-// release machinery parks releases before the TERMINATOR, which in a raising
-// block is after the raise call: such a release never executes (the raise
-// unwinds first), so counting it as a consume would poison the token state of
-// every point its block can (exceptionally) reach with a false "maybe
-// already released" -- exactly the mixed state that made loop bodies with a
-// guarded raise skip their per-call-site cleanups.
-// Is `op` unreachable because a raise-like call already ran earlier in its
-// block? A raise primitive never returns, so everything after it in the block
-// is dead code and its effects on a token are not effects at all.
-//
-// ONE FACT PER BLOCK, asked once. Written as a backward scan -- every preceding
-// operation, with a contract lookup on each call -- it cost O(ops) per query
-// and the query runs once per consuming use, which is O(ops) of them: measured
-// at 5.9 s of a 45.7 s compile of a 400-statement module, all of it re-deriving
-// where the block's first raise is. Whether ANY raise precedes `op` is the same
-// question as whether the FIRST one does.
-class DeadAfterRaiseCache {
-public:
-  bool deadAfter(FuncContractCache &contracts, mlir::Operation *op) {
-    mlir::Block *block = op->getBlock();
-    auto found = firstRaise.find(block);
-    if (found == firstRaise.end())
-      found = firstRaise.insert({block, findFirstRaise(contracts, block)}).first;
-    return found->second && found->second->isBeforeInBlock(op);
-  }
-
-private:
-  static mlir::Operation *findFirstRaise(FuncContractCache &contracts,
-                                         mlir::Block *block) {
-    for (mlir::Operation &op : *block) {
-      auto call = mlir::dyn_cast<mlir::func::CallOp>(&op);
-      if (!call)
-        continue;
-      auto cached = contracts.lookup(call.getCallee());
-      if (mlir::succeeded(cached) && *cached &&
-          own::isRaiseLikeFunction((*cached)->function))
-        return &op;
-    }
-    return nullptr;
-  }
-
-  llvm::DenseMap<mlir::Block *, mlir::Operation *> firstRaise;
-};
 
 
 
@@ -5533,7 +5506,7 @@ void collectUnwindGroupSites(FuncContractCache &contracts,
                              const own::ReferenceMap &references,
                              mlir::Region *region,
                              mlir::DominanceInfo &dominance,
-                             DeadAfterRaiseCache &deadAfterRaise,
+                             own::DeadAfterRaiseCache &deadAfterRaise,
                              UnwindTrackedGroup &group) {
   // Operations before the producer belong to the token's production (e.g.
   // the boxing Ly_IncRef that mints an owned-local token): the token walk
@@ -6115,11 +6088,23 @@ mlir::LogicalResult insertUnwindCleanupReleases(
     // release-then-rethrow cleanup handler on the unwind edge -- releasing
     // before the call would free values the normal path still uses.
     llvm::SmallVector<mlir::func::CallOp, 8> unguardedMayRaiseCalls;
+    // ⛔ NO EXIT POINT PAST A RAISE. `collectUnwindGroupSites` reads a consume
+    // after a raise in its block as no consume at all, so an exit point there
+    // would see every token still held and release it a second time. A raise
+    // the lowering decided statically (`{"a": 1}["b"]`, `(1, 2)[5]`) is
+    // followed by the rest of its statement, and `Err(str(d["b"]))` was refused
+    // as "released or transferred more than once". Judging both from one
+    // answer keeps the dead tail dead on both sides.
+    own::DeadAfterRaiseCache deadExitPoints;
+    auto pastARaise = [&](mlir::Operation *op) {
+      mlir::Operation *top = ancestorInRegion(op, region);
+      return top && deadExitPoints.deadAfter(contracts, top);
+    };
     for (mlir::Block &block : *region) {
       bool cleanupBlock = isGeneratedUnwindCleanupBlock(&block);
       for (mlir::Operation &op : block) {
         auto call = mlir::dyn_cast<mlir::func::CallOp>(&op);
-        if (!call)
+        if (!call || pastARaise(call))
           continue;
         if (call.getCallee() == "LyEH_TryCallSiteMarker") {
           std::optional<std::int64_t> id = own::exceptionMarkerId(call);
@@ -6152,7 +6137,7 @@ mlir::LogicalResult insertUnwindCleanupReleases(
     llvm::SmallVector<mlir::func::CallOp, 8> nestedUnguardedMayRaiseCalls;
     if (ehPhaseProcessesFunction) {
       function.walk([&](mlir::func::CallOp call) {
-        if (call->getParentRegion() == region)
+        if (call->getParentRegion() == region || pastARaise(call))
           return; // handled by the top-level scan above
         if (call.getCallee() == "LyEH_TryCallSiteMarker") {
           std::optional<std::int64_t> id = own::exceptionMarkerId(call);
@@ -6207,7 +6192,7 @@ mlir::LogicalResult insertUnwindCleanupReleases(
 
       // Owned groups whose token could be held at an exceptional exit.
       llvm::DenseSet<std::pair<own::Reference, mlir::Value>> seenGroupKeys;
-      DeadAfterRaiseCache deadAfterRaise;
+      own::DeadAfterRaiseCache deadAfterRaise;
       static const bool traceUnwindHoldGroups =
           std::getenv("LYTHON_TRACE_UNWIND_HOLD") != nullptr;
       auto addGroup = [&](const own::ResourceGroup &g) {

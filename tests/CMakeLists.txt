@@ -1045,7 +1045,10 @@ set(LYTHON_LEAK_GATE_CASES
     # One object chosen among several -- by a ternary arm reading a display at
     # a run-time index, past an IndexError caught in the same function, and
     # kept across a generator's `yield` -- holds exactly one reference.
-    a_chosen_element_is_released_on_every_path)
+    a_chosen_element_is_released_on_every_path
+    # An instance held as its base, or as a union of its base, is released by
+    # its own class's deallocator: the subclass's fields are freed.
+    a_subclass_is_released_as_the_class_it_is)
 
 # Cases that end with a non-zero status BY DESIGN, as `<dir>/<case>=<code>`.
 #

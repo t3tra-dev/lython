@@ -1,4 +1,5 @@
 #include "TypeSystem.h"
+#include "EmitterSupport.h"
 #include "RuntimeClasses.h"
 
 #include "TypeSystemSolver.h"
@@ -642,6 +643,17 @@ void applyGuardNarrowing(
   if (test->kind != "Compare" && !truthTest)
     return;
   const parser::Node *left = truthTest ? test : ast::node(*test, "left");
+  // ⭐ A WALRUS COMPARED WITH None PROVES ITS TARGET, as the emitter reads it:
+  // `[y for x in xs if (y := get(x)) is not None]` built a list of the
+  // payload and this walk typed it `list[int | None]`, so `-> list[int]` was
+  // refused for returning exactly that. Its type is the value's.
+  const parser::Node *walrusValue = nullptr;
+  if (!truthTest && left && left->kind == "NamedExpr")
+    if (const parser::Node *target = ast::node(*left, "target");
+        target && target->kind == "Name") {
+      walrusValue = ast::node(*left, "value");
+      left = target;
+    }
   const auto *ops = ast::nodeList(*test, "ops");
   const auto *comparators = ast::nodeList(*test, "comparators");
   // ⭐ A `name.attr` SUBJECT TOO, reported under its dotted path. `if
@@ -667,7 +679,8 @@ void applyGuardNarrowing(
                              : llvm::StringRef(ast::nameSpelling(*left));
   if (subjectIsAPath && name.empty())
     return;
-  mlir::Type current = currentType(name);
+  mlir::Type current =
+      walrusValue ? types.inferExpr(walrusValue) : currentType(name);
   if (!current && !subjectIsAPath)
     if (std::optional<mlir::Type> bound = types.lookupSymbol(name))
       current = *bound;
@@ -4874,6 +4887,10 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       // return list[str]" for a comprehension that returns exactly that. The
       // spellings whose element is an EXPRESSION (`len(v)`, `str(v)`) hid it,
       // because their type does not depend on the narrowing.
+      // The targets are in scope for the filters: a walrus there is typed by
+      // its value, which reads them.
+      for (const auto &entry : bound)
+        bindLocalSymbol(entry.getKey(), entry.getValue());
       if (const auto *filters = ast::nodeList(*generator, "ifs"))
         for (const parser::NodePtr &filter : *filters)
           applyGuardNarrowing(
@@ -8178,6 +8195,31 @@ TypeSystem::functionSignature(const parser::Node &function,
       // ...]` and was refused. The yields are still checked at their sites.
       bool takesAnnotatedYield =
           annotatedYield && *annotatedYield && generator.hasYield;
+      // ⭐ A RUNG BELOW THE ANNOTATION IS YIELDED AS ITSELF, as a function
+      // annotated `-> float` returns its int: CPython does not convert, and
+      // `yield v * 2` under `-> Iterator[float]` was refused ("yield of
+      // builtins.int in a generator annotated to yield builtins.float") where
+      // `return v * 2` under `-> float` printed 4. ⛔ Not under complex, for
+      // the reason the return rung walk below gives.
+      bool yieldsBelowItsRung = false;
+      if (takesAnnotatedYield && sig.generatorYieldType) {
+        int declaredRung = numericTowerRung(*this, *annotatedYield);
+        mlir::Type supplied = sig.generatorYieldType;
+        if (auto unionType = mlir::dyn_cast<py::UnionType>(supplied)) {
+          llvm::SmallVector<mlir::Type, 4> widened;
+          for (mlir::Type member : unionType.getMemberTypes())
+            widened.push_back(widenLiteral(member));
+          supplied = join(widened);
+        } else {
+          supplied = widenLiteral(supplied);
+        }
+        if (declaredRung > 0 && declaredRung <= 2)
+          if (mlir::Type below =
+                  belowDeclaredRung(*this, supplied, *annotatedYield)) {
+            annotatedYield = below;
+            yieldsBelowItsRung = true;
+          }
+      }
       if (takesAnnotatedYield) {
         sig.generatorYieldType = *annotatedYield;
         sig.generatorYieldTypeIsAnnotated = true;
@@ -8190,7 +8232,8 @@ TypeSystem::functionSignature(const parser::Node &function,
                             sig.generatorReturnType});
       }
       if (!takesAnnotatedYield ||
-          !py::isAssignableTo(sig.inferredGeneratorType, annotatedReturn))
+          (!yieldsBelowItsRung &&
+           !py::isAssignableTo(sig.inferredGeneratorType, annotatedReturn)))
         // An annotation with no yield type to take (`-> int`), or a generator
         // type the annotation does not accept (its send or return type).
         sig.generatorAnnotationMismatch =
@@ -8254,6 +8297,14 @@ TypeSystem::functionSignature(const parser::Node &function,
     mlir::Type walked = inferredFunctionResult(
         *this, function, &sig.bodyInferenceFailures, &generator.localSymbols,
         &generator.returnTypeAt);
+    // ⭐ A BODY THAT CAN REACH ITS END RETURNS None THERE, so the result holds
+    // it. Reading only the `return` statements typed `if v is not None:
+    // return len(v)` as `int`, and the emitter then refused the fallthrough
+    // against a result nobody declared ("its declared result builtins.int
+    // cannot hold the None a fallthrough returns").
+    if (walked && walked != none() &&
+        bodyCanComplete(ast::nodeList(function, "body")))
+      walked = join({walked, none()});
     auto overridden = resultTypeOverrides.find(&function);
     if (overridden == resultTypeOverrides.end()) {
       sig.resultType = walked;

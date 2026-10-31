@@ -809,6 +809,55 @@ private:
   llvm::StringMap<CachedFuncContract> contracts;
 };
 
+// Is `op` syntactically after a no-return raise in its block? The normal-path
+// release machinery parks releases before the TERMINATOR, which in a raising
+// block is after the raise call: such a release never executes (the raise
+// unwinds first), so counting it as a consume would poison the token state of
+// every point its block can (exceptionally) reach with a false "maybe
+// already released" -- exactly the mixed state that made loop bodies with a
+// guarded raise skip their per-call-site cleanups.
+// Is `op` unreachable because a raise-like call already ran earlier in its
+// block? A raise primitive never returns, so everything after it in the block
+// is dead code and its effects on a token are not effects at all.
+//
+// The refcount insertion and the affine verifier ask it of the same IR, so
+// they share this one answer: an exit point the insertion writes no cleanup
+// for is one the verifier must not walk to either.
+//
+// ONE FACT PER BLOCK, asked once. Written as a backward scan -- every preceding
+// operation, with a contract lookup on each call -- it cost O(ops) per query
+// and the query runs once per consuming use, which is O(ops) of them: measured
+// at 5.9 s of a 45.7 s compile of a 400-statement module, all of it re-deriving
+// where the block's first raise is. Whether ANY raise precedes `op` is the same
+// question as whether the FIRST one does.
+class DeadAfterRaiseCache {
+public:
+  bool deadAfter(FuncContractCache &contracts, mlir::Operation *op) {
+    mlir::Block *block = op->getBlock();
+    auto found = firstRaise.find(block);
+    if (found == firstRaise.end())
+      found = firstRaise.insert({block, findFirstRaise(contracts, block)}).first;
+    return found->second && found->second->isBeforeInBlock(op);
+  }
+
+private:
+  static mlir::Operation *findFirstRaise(FuncContractCache &contracts,
+                                         mlir::Block *block) {
+    for (mlir::Operation &op : *block) {
+      auto call = mlir::dyn_cast<mlir::func::CallOp>(&op);
+      if (!call)
+        continue;
+      auto cached = contracts.lookup(call.getCallee());
+      if (mlir::succeeded(cached) && *cached &&
+          isRaiseLikeFunction((*cached)->function))
+        return &op;
+    }
+    return nullptr;
+  }
+
+  llvm::DenseMap<mlir::Block *, mlir::Operation *> firstRaise;
+};
+
 bool returnTransfersGroup(FuncContractCache &contracts,
                           mlir::func::FuncOp function,
                           mlir::func::ReturnOp returnOp,
