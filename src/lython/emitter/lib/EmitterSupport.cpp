@@ -8,6 +8,7 @@
 #include "ExceptionTaxonomy.h"
 #include "Contracts.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Block.h"
@@ -948,13 +949,32 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
       setAlwaysTrue();
       return analysis;
     }
+    // ⭐ A MEMBER THE TARGET IS BELOW IS ASKED ITS CLASS, beside the members
+    // the tag answers alone: `isinstance(x, Wide)` over `Wide | Cell` is the
+    // tag Wide, or the tag Cell holding a Wide. Both kinds of member were
+    // refused together ("cannot yet combine exact union member tests with
+    // dynamic class tests"), and so was more than one member to ask.
+    // ⛔ Not with a member the test cannot ask (`object`): its payload has no
+    // class word this test reads.
+    if (!runtimeClassTestMembers.empty() && !sawUnsupportedMember &&
+        mlir::isa<py::ContractType>(analysis.targetType)) {
+      analysis.kind = IsInstanceAnalysis::Kind::UnionClassTest;
+      analysis.classTestMembers.assign(runtimeClassTestMembers.begin(),
+                                       runtimeClassTestMembers.end());
+      analysis.classTestTargets.assign(runtimeClassTestMembers.size(),
+                                       analysis.targetType);
+      llvm::SmallVector<mlir::Type, 4> proved(analysis.unionMembers.begin(),
+                                              analysis.unionMembers.end());
+      proved.push_back(analysis.targetType);
+      analysis.trueType = types.join(proved);
+      // The members the class test may refuse stay on the false side.
+      llvm::SmallVector<mlir::Type, 4> rest(remaining.begin(), remaining.end());
+      rest.append(runtimeClassTestMembers.begin(),
+                  runtimeClassTestMembers.end());
+      analysis.falseType = types.join(rest);
+      return analysis;
+    }
     if (analysis.unionMembers.empty()) {
-      if (!sawUnsupportedMember && runtimeClassTestMembers.size() == 1) {
-        analysis.kind = IsInstanceAnalysis::Kind::UnionClassTest;
-        analysis.unionMembers.push_back(runtimeClassTestMembers.front());
-        analysis.trueType = analysis.targetType;
-        return analysis;
-      }
       if (sawUnsupportedMember || !runtimeClassTestMembers.empty()) {
         analysis.failureReason =
             "isinstance over this union would require an unsupported dynamic "
@@ -986,8 +1006,8 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
     if (!runtimeClassTestMembers.empty()) {
       analysis.kind = IsInstanceAnalysis::Kind::Unsupported;
       analysis.failureReason =
-          "isinstance cannot yet combine exact union member tests with dynamic "
-          "class tests";
+          "isinstance over this union would require a dynamic class test "
+          "inside a member whose payload has no class to read";
     }
     return analysis;
   }
@@ -1145,6 +1165,45 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
   return analysis;
 }
 
+mlir::Value emitUnionMembershipBit(mlir::OpBuilder &builder,
+                                   mlir::Location location, mlir::Value input,
+                                   const IsInstanceAnalysis &analysis) {
+  mlir::Value bit;
+  auto either = [&](mlir::Value next) {
+    bit = bit ? mlir::arith::OrIOp::create(builder, location, bit, next)
+                    .getResult()
+              : next;
+  };
+  for (mlir::Type member : analysis.unionMembers)
+    either(py::UnionTestOp::create(builder, location, builder.getI1Type(),
+                                   input, mlir::TypeAttr::get(member))
+               .getResult());
+  if (analysis.kind == IsInstanceAnalysis::Kind::UnionClassTest)
+    for (auto [index, member] : llvm::enumerate(analysis.classTestMembers)) {
+      mlir::Type target = index < analysis.classTestTargets.size()
+                              ? analysis.classTestTargets[index]
+                              : analysis.targetType;
+      mlir::Value holds =
+          py::UnionTestOp::create(builder, location, builder.getI1Type(), input,
+                                  mlir::TypeAttr::get(member))
+              .getResult();
+      mlir::Value payload =
+          py::UnionUnwrapOp::create(builder, location, member, input)
+              .getResult();
+      mlir::Value isClass =
+          py::ClassTestOp::create(builder, location, builder.getI1Type(),
+                                  payload, mlir::TypeAttr::get(target))
+              .getResult();
+      either(mlir::arith::AndIOp::create(builder, location, holds, isClass)
+                 .getResult());
+    }
+  if (!bit)
+    bit = mlir::arith::ConstantOp::create(builder, location,
+                                          builder.getBoolAttr(false))
+              .getResult();
+  return bit;
+}
+
 IsInstanceAnalysis analyzeIsInstanceAny(mlir::Type sourceType,
                                         llvm::ArrayRef<mlir::Type> targetTypes,
                                         TypeSystem &types,
@@ -1195,8 +1254,22 @@ IsInstanceAnalysis analyzeIsInstanceAny(mlir::Type sourceType,
   }
 
   llvm::SmallVector<mlir::Type, 4> selected;
+  llvm::SmallVector<mlir::Type, 2> classTestMembers, classTestTargets;
   for (mlir::Type target : targetTypes) {
     IsInstanceAnalysis one = analyzeIsInstance(sourceType, target, types, from);
+    // ⭐ A MEMBER AN ELEMENT IS BELOW is asked that element's class, beside
+    // the members the tags answer: `isinstance(v, (Wide, Other))` over `Wide
+    // | Cell | Other`. The tests stay per-member ops over one union value.
+    if (one.kind == IsInstanceAnalysis::Kind::UnionClassTest) {
+      for (mlir::Type member : one.unionMembers)
+        if (!llvm::is_contained(selected, member))
+          selected.push_back(member);
+      for (auto [index, member] : llvm::enumerate(one.classTestMembers)) {
+        classTestMembers.push_back(member);
+        classTestTargets.push_back(one.classTestTargets[index]);
+      }
+      continue;
+    }
     if (one.kind == IsInstanceAnalysis::Kind::AlwaysTrue) {
       merged.kind = IsInstanceAnalysis::Kind::AlwaysTrue;
       merged.trueType = merged.sourceType;
@@ -1219,6 +1292,21 @@ IsInstanceAnalysis analyzeIsInstanceAny(mlir::Type sourceType,
     for (mlir::Type member : one.unionMembers)
       if (!llvm::is_contained(selected, member))
         selected.push_back(member);
+  }
+  if (!classTestMembers.empty()) {
+    // ⛔ NO NARROWING, as for a merged class test: the true side is one of
+    // several classes, some of them only below a member.
+    merged.kind = IsInstanceAnalysis::Kind::UnionClassTest;
+    merged.targetType = classTestTargets.front();
+    for (auto [index, member] : llvm::enumerate(classTestMembers)) {
+      // A member an element's tag already answers needs no class test.
+      if (llvm::is_contained(selected, member))
+        continue;
+      merged.classTestMembers.push_back(member);
+      merged.classTestTargets.push_back(classTestTargets[index]);
+    }
+    merged.unionMembers.assign(selected.begin(), selected.end());
+    return merged;
   }
   if (selected.empty()) {
     merged.kind = IsInstanceAnalysis::Kind::AlwaysFalse;
@@ -1700,9 +1788,19 @@ optionalBranchTypeNarrowing(const parser::Node &test, TypeSystem &types,
   narrowing.trueType = analysis.trueType;
   if (!analyzed->classValueTarget)
     narrowing.falseType = analysis.falseType;
+  // The members the test keeps, by tag or by class: one is unwrapped and
+  // refined, several are the sub-union, upcast to their base and refined.
   if (analysis.kind == IsInstanceAnalysis::Kind::UnionClassTest &&
-      analysis.unionMembers.size() == 1)
-    narrowing.trueSourceType = analysis.unionMembers.front();
+      analysis.trueType) {
+    llvm::SmallVector<mlir::Type, 4> kept(analysis.unionMembers.begin(),
+                                          analysis.unionMembers.end());
+    kept.append(analysis.classTestMembers.begin(),
+                analysis.classTestMembers.end());
+    narrowing.trueSourceType =
+        kept.size() == 1
+            ? kept.front()
+            : py::UnionType::getNormalized(&types.getContext(), kept);
+  }
   // Several members the test keeps join at their common base (`join`); the
   // value is the sub-union of them, which the arm unwraps and then upcasts.
   if (analysis.kind == IsInstanceAnalysis::Kind::UnionTest &&

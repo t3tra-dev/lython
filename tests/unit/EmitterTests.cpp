@@ -4448,3 +4448,53 @@ TEST(EmitterTest, AnOverloadIsTheWholeSignatureItsCallsSee) {
       std::string(declared) + "print(f(1).upper(), C().m('s') + 1)\n", context);
   EXPECT_TRUE(accepted.ok());
 }
+
+// What: a named list or dict passed where a list or dict of a wider element
+// type is declared -- a supertype class, `object`, a dict's value -- is
+// refused at the call, naming the argument and the invariance, as a call to a
+// method already was; a display passed there, a matching element type and a
+// type parameter are accepted.
+TEST(EmitterTest, AListOrADictIsPassedOnlyAtItsOwnElementType) {
+  mlir::MLIRContext context(testRegistry());
+  auto refusedWith = [&](llvm::StringRef source, llvm::StringRef message) {
+    lython::emitter::EmitResult emitted = emitSource(source, context);
+    EXPECT_FALSE(emitted.ok()) << source.str();
+    bool found = false;
+    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+      found = found || diagnostic.message.find(message.str()) != std::string::npos;
+    EXPECT_TRUE(found) << source.str();
+  };
+  refusedWith("def total(xs: list[object]) -> int:\n"
+              "    return len(xs)\n"
+              "ys: list[int] = [1, 2]\n"
+              "print(total(ys))\n",
+              "a list is invariant in its element type");
+  refusedWith("class A:\n"
+              "    pass\n"
+              "class B(A):\n"
+              "    pass\n"
+              "def total(xs: list[A]) -> int:\n"
+              "    return len(xs)\n"
+              "print(total([B()][:]))\n",
+              "a list is invariant in its element type");
+  refusedWith("def total(d: dict[str, object]) -> int:\n"
+              "    return len(d)\n"
+              "d = {'a': 1}\n"
+              "print(total(d))\n",
+              "a dict is invariant in its element type");
+  for (llvm::StringRef accepted :
+       {llvm::StringRef("def total(xs: list[object]) -> int:\n"
+                        "    return len(xs)\n"
+                        "print(total(['a', 'b']))\n"),
+        llvm::StringRef("def total(xs: list[int]) -> int:\n"
+                        "    return len(xs)\n"
+                        "ys = [1, 2]\n"
+                        "print(total(ys))\n"),
+        llvm::StringRef("def first[T](xs: list[T]) -> T:\n"
+                        "    return xs[0]\n"
+                        "ys = [1, 2]\n"
+                        "print(first(ys))\n")}) {
+    lython::emitter::EmitResult emitted = emitSource(accepted, context);
+    EXPECT_TRUE(emitted.ok()) << accepted.str();
+  }
+}

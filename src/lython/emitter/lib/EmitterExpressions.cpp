@@ -3233,47 +3233,34 @@ Value ModuleEmitter::emitCheckedNarrowedRead(const parser::Node &anchor,
   // the class -- and the read is that member refined. Neither shape above
   // matched, so the field was read as the whole union and `h.one.extra`
   // failed in the lowering ("class A has no field 'extra'").
-  mlir::Type refinedMember;
-  if (rawUnion && kept.empty() && mlir::isa<py::ContractType>(proved))
+  // ⛔ AND BOTH AT ONCE: `isinstance(h.one, Wide)` over `Wide | Cell` keeps
+  // the member Wide by its tag and the member Cell holding a Wide by its class.
+  // The class half was asked only when no member was kept, so a Cell holding
+  // a Wide would have raised here.
+  llvm::SmallVector<mlir::Type, 2> refinedMembers;
+  if (rawUnion && mlir::isa<py::ContractType>(proved))
     for (mlir::Type member : rawUnion.getMemberTypes())
       if (mlir::isa<py::ContractType>(member) && member != proved &&
-          declaredSubclassOfType(proved, member, types)) {
-        refinedMember = member;
-        break;
-      }
+          !llvm::is_contained(kept, member) &&
+          declaredSubclassOfType(proved, member, types))
+        refinedMembers.push_back(member);
   bool testableUnion = !kept.empty();
   bool testableClass =
       !rawUnion && rawContract &&
       mlir::isa_and_nonnull<py::ContractType>(proved) &&
       proved != raw.value.getType() &&
       declaredSubclassOfType(proved, raw.value.getType(), types);
-  if (!testableUnion && !testableClass && !refinedMember)
+  if (!testableUnion && !testableClass && refinedMembers.empty())
     return raw;
   mlir::Value bit;
-  if (refinedMember) {
-    mlir::Value holds =
-        py::UnionTestOp::create(builder, loc(anchor), builder.getI1Type(),
-                                raw.value, mlir::TypeAttr::get(refinedMember))
-            .getResult();
-    mlir::Value member = py::UnionUnwrapOp::create(builder, loc(anchor),
-                                                   refinedMember, raw.value)
-                             .getResult();
-    mlir::Value isClass =
-        py::ClassTestOp::create(builder, loc(anchor), builder.getI1Type(),
-                                member, mlir::TypeAttr::get(proved))
-            .getResult();
-    bit = mlir::arith::AndIOp::create(builder, loc(anchor), holds, isClass)
-              .getResult();
-  } else if (testableUnion) {
-    for (mlir::Type member : kept) {
-      mlir::Value holds =
-          py::UnionTestOp::create(builder, loc(anchor), builder.getI1Type(),
-                                  raw.value, mlir::TypeAttr::get(member))
-              .getResult();
-      bit = bit ? mlir::arith::OrIOp::create(builder, loc(anchor), bit, holds)
-                      .getResult()
-                : holds;
-    }
+  if (rawUnion) {
+    IsInstanceAnalysis membership;
+    membership.kind = IsInstanceAnalysis::Kind::UnionClassTest;
+    membership.targetType = proved;
+    membership.unionMembers.assign(kept.begin(), kept.end());
+    membership.classTestMembers.assign(refinedMembers.begin(),
+                                       refinedMembers.end());
+    bit = emitUnionMembershipBit(builder, loc(anchor), raw.value, membership);
   } else {
     bit = py::ClassTestOp::create(builder, loc(anchor), builder.getI1Type(),
                                   raw.value, mlir::TypeAttr::get(proved))
@@ -3304,7 +3291,7 @@ Value ModuleEmitter::emitCheckedNarrowedRead(const parser::Node &anchor,
   bool provedIsOptionalPayload =
       rawUnion && rawUnion.isOptional() &&
       rawUnion.getOptionalPayloadType() == proved;
-  if (!testableUnion && !refinedMember)
+  if (!testableUnion && refinedMembers.empty())
     what += "' is not the class a guard or an assignment above proved it "
             "was: it changed in between";
   else if (provedIsOptionalPayload || !provedContract)
@@ -3341,11 +3328,21 @@ Value ModuleEmitter::emitCheckedNarrowedRead(const parser::Node &anchor,
     raw = emitExpr(&anchor);
     suppressMemberNarrowing = false;
   }
-  if (refinedMember) {
-    mlir::Value member = py::UnionUnwrapOp::create(builder, loc(anchor),
-                                                   refinedMember, raw.value)
-                             .getResult();
-    return Value{py::ClassRefineOp::create(builder, loc(anchor), proved, member)
+  if (!refinedMembers.empty()) {
+    llvm::SmallVector<mlir::Type, 4> held(kept.begin(), kept.end());
+    held.append(refinedMembers.begin(), refinedMembers.end());
+    mlir::Type heldType =
+        held.size() == 1
+            ? held.front()
+            : py::UnionType::getNormalized(&types.getContext(), held);
+    Value member{py::UnionUnwrapOp::create(builder, loc(anchor), heldType,
+                                           raw.value)
+                     .getResult(),
+                 heldType};
+    if (held.size() > 1)
+      member = coerceValue(member, types.join(held), anchor);
+    return Value{py::ClassRefineOp::create(builder, loc(anchor), proved,
+                                           member.value)
                      .getResult(),
                  proved};
   }

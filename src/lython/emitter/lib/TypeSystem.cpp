@@ -7078,6 +7078,100 @@ void TypeSystem::bindFunctionOverloadAlias(llvm::StringRef name,
   functionOverloadAliases[name] = target.str();
 }
 
+
+// ⛔ A list or a dict is INVARIANT in an element its declaration writes
+// ground, as the lattice the lowering checks a call with says (`isSubtypeOf`).
+// The solver matches elements covariantly, so `total(ys)` with `ys:
+// list[int]` for `xs: list[object]` got past here and was refused in the
+// lowering instead -- and accepting it in both would let `xs.append("s")` put
+// a str where the caller reads an int.
+// ⛔ Asked here, of a function's DECLARED parameters, and not in the solver:
+// there a method's parameter arrives with its receiver's arguments already
+// substituted (`dict.update(m: dict[K, V])` with V solved to `float | int`),
+// which is what the call solves and not a declaration to keep.
+static bool holdsAnInferenceVariable(mlir::Type type) {
+  if (!type)
+    return false;
+  if (py::isPyInferVarType(type))
+    return true;
+  if (auto contract = mlir::dyn_cast<py::ContractType>(type))
+    return llvm::any_of(contract.getArguments(), holdsAnInferenceVariable);
+  if (auto unionType = mlir::dyn_cast<py::UnionType>(type))
+    return llvm::any_of(unionType.getMemberTypes(), holdsAnInferenceVariable);
+  return false;
+}
+
+// `object`, or a container of nothing but: what an empty display infers, and
+// the display is built at the declared type.
+static bool erasedByAnEmptyDisplay(const TypeSystem &types, mlir::Type type) {
+  if (isObjectTop(types, type))
+    return true;
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+  return contract && !contract.getArguments().empty() &&
+         llvm::all_of(contract.getArguments(), [&](mlir::Type argument) {
+           return erasedByAnEmptyDisplay(types, argument);
+         });
+}
+
+static std::optional<std::string>
+invariantContainerMismatch(const TypeSystem &types, py::CallableType callable,
+                           llvm::ArrayRef<mlir::Type> positional,
+                           llvm::ArrayRef<CallKeywordType> keywords) {
+  auto mismatch = [&](mlir::Type declaredType,
+                      mlir::Type actual) -> std::optional<std::string> {
+    auto declared = mlir::dyn_cast_if_present<py::ContractType>(declaredType);
+    if (!declared || (declared.getContractName() != "builtins.list" &&
+                      declared.getContractName() != "builtins.dict") ||
+        unboundStaticParameterCount(declared) != 0 ||
+        holdsAnInferenceVariable(declared))
+      return std::nullopt;
+    auto given = mlir::dyn_cast_if_present<py::ContractType>(
+        types.inference().zonk(actual));
+    if (!given || given == declared ||
+        given.getContractName() != declared.getContractName() ||
+        given.getArguments().size() != declared.getArguments().size() ||
+        holdsAnInferenceVariable(given))
+      return std::nullopt;
+    for (auto [wanted, element] :
+         llvm::zip(declared.getArguments(), given.getArguments()))
+      if (!erasedByAnEmptyDisplay(types, element) &&
+          types.widenLiteral(element) != wanted) {
+        std::string givenText, wantedText;
+        llvm::raw_string_ostream(givenText) << given;
+        llvm::raw_string_ostream(wantedText) << declared;
+        return "an argument is " + givenText + ", and a " +
+               declared.getContractName().drop_front(9).str() +
+               " is invariant in its element type: the parameter's " +
+               wantedText + " would let the callee store what the caller "
+               "cannot read";
+      }
+    return std::nullopt;
+  };
+  llvm::ArrayRef<mlir::Type> declared = callable.getPositionalTypes();
+  for (auto [index, argument] : llvm::enumerate(positional)) {
+    if (index >= declared.size())
+      break;
+    if (std::optional<std::string> found = mismatch(declared[index], argument))
+      return found;
+  }
+  llvm::ArrayRef<mlir::StringAttr> names = callable.getPositionalNames();
+  llvm::ArrayRef<mlir::StringAttr> kwNames = callable.getKwOnlyNames();
+  for (const CallKeywordType &keyword : keywords) {
+    for (auto [index, name] : llvm::enumerate(names))
+      if (name && name.getValue() == keyword.name && index < declared.size())
+        if (std::optional<std::string> found =
+                mismatch(declared[index], keyword.type))
+          return found;
+    for (auto [index, name] : llvm::enumerate(kwNames))
+      if (name && name.getValue() == keyword.name &&
+          index < callable.getKwOnlyTypes().size())
+        if (std::optional<std::string> found =
+                mismatch(callable.getKwOnlyTypes()[index], keyword.type))
+          return found;
+  }
+  return std::nullopt;
+}
+
 CallInferenceResult TypeSystem::inferCallWithEvidence(
     mlir::Type calleeType, mlir::ArrayRef<mlir::Type> positional,
     mlir::ArrayRef<CallKeywordType> keywords) const {
@@ -7105,6 +7199,9 @@ CallInferenceResult TypeSystem::inferCallWithEvidence(
         "class instantiation leaves unbound static type parameters");
   }
   if (auto callable = mlir::dyn_cast_if_present<py::CallableType>(calleeType)) {
+    if (std::optional<std::string> invariant =
+            invariantContainerMismatch(*this, callable, positional, keywords))
+      return unresolvedCallable(calleeType, *invariant);
     if (std::optional<CallSolution> result =
             tryCallableApplication(*this, callable, positional, keywords))
       return CallInferenceResult{result->result,

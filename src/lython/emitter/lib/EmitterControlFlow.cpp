@@ -522,7 +522,11 @@ void ModuleEmitter::applyBranchNarrowing(const parser::Node &anchor,
           found->second.value.getType() != narrowed) {
         auto unionType =
             mlir::cast<py::UnionType>(found->second.value.getType());
-        if (unionType.hasMember(narrowed)) {
+        // ⛔ Not when the test kept more members than the one proved: `Wide
+        // | Cell` under `isinstance(x, Wide)` is Wide by its tag OR a Cell
+        // holding a Wide, and unwrapping the Wide lane read a Cell's as one.
+        if (unionType.hasMember(narrowed) &&
+            (!sourceType || sourceType == narrowed)) {
           auto unwrap = py::UnionUnwrapOp::create(
               builder, loc(anchor), narrowed, found->second.value);
           found->second.value = unwrap.getResult();
@@ -559,7 +563,23 @@ void ModuleEmitter::applyBranchNarrowing(const parser::Node &anchor,
           auto unwrap = py::UnionUnwrapOp::create(
               builder, loc(anchor), sourceUnion, found->second.value);
           Value kept{unwrap.getResult(), sourceUnion};
-          found->second.value = coerceValue(kept, narrowed, anchor).value;
+          // ⭐ A MEMBER THE TEST ASKED ITS CLASS is above what was proved
+          // (`Wide | Cell` under `isinstance(x, Wide)` keeps Cell holding a
+          // Wide): the members meet at their base, which the test refines.
+          if (!llvm::all_of(sourceUnion.getMemberTypes(), [&](mlir::Type m) {
+                return py::isAssignableTo(m, narrowed, module);
+              })) {
+            mlir::Type base = types.join(sourceUnion.getMemberTypes());
+            if (!mlir::isa_and_nonnull<py::ContractType>(base))
+              return;
+            Value upcast = coerceValue(kept, base, anchor);
+            found->second.value =
+                py::ClassRefineOp::create(builder, loc(anchor), narrowed,
+                                          upcast.value)
+                    .getResult();
+          } else {
+            found->second.value = coerceValue(kept, narrowed, anchor).value;
+          }
         } else if (sourceType && unionType.hasMember(sourceType)) {
           auto unwrap = py::UnionUnwrapOp::create(
               builder, loc(anchor), sourceType, found->second.value);
