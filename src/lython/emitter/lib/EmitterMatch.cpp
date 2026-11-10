@@ -682,8 +682,18 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
               ? analyzeIsInstance(matchSubjectType, *target, types, module)
               : analyzeIsInstanceAny(matchSubjectType, heldTargets, types,
                                      module);
+      // ⛔ A CLASS VALUE IS TESTED BY THE CLASS IT HOLDS (below), so the
+      // analysis of its bounds only says what the case body may assume: one
+      // that cannot be merged proves nothing, as `if isinstance(c, k):` does.
+      if (classValueTarget &&
+          analysis.kind == IsInstanceAnalysis::Kind::Unsupported) {
+        analysis = IsInstanceAnalysis{};
+        analysis.kind = IsInstanceAnalysis::Kind::AlwaysTrue;
+        analysis.sourceType = matchSubjectType;
+        analysis.targetType = matchSubjectType;
+        analysis.trueType = matchSubjectType;
+      }
       if (analysis.kind == IsInstanceAnalysis::Kind::Unsupported ||
-          analysis.kind == IsInstanceAnalysis::Kind::UnionClassTest ||
           (analysis.kind == IsInstanceAnalysis::Kind::UnionTest &&
            !analysis.trueType)) {
         diagnostics.push_back(parser::Diagnostic{
@@ -710,11 +720,14 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
           if (!bit)
             return;
           testEnd = builder.getInsertionBlock();
-        } else if (analysis.kind == IsInstanceAnalysis::Kind::UnionTest) {
-          bit = py::UnionTestOp::create(
-                    builder, loc(statement), builder.getI1Type(), subject.value,
-                    mlir::TypeAttr::get(analysis.trueType))
-                    .getResult();
+        } else if (analysis.kind == IsInstanceAnalysis::Kind::UnionTest ||
+                   analysis.kind ==
+                       IsInstanceAnalysis::Kind::UnionClassTest) {
+          // ⛔ Each member it keeps, not the true type: two subclasses of the
+          // pattern's class (`File | Pipe | Rock` under `case Closer():`)
+          // join at Closer, which is no member to test a tag for.
+          bit = emitUnionMembershipBit(builder, loc(statement), subject.value,
+                                       analysis);
         } else { // ClassTest
           bit = py::ClassTestOp::create(
                     builder, loc(statement), builder.getI1Type(), subject.value,
@@ -731,16 +744,33 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
       }
 
       Value narrowed = subject;
-      if (analysis.kind == IsInstanceAnalysis::Kind::UnionTest) {
-        auto unwrap = py::UnionUnwrapOp::create(builder, loc(statement),
-                                                analysis.trueType,
-                                                subject.value);
-        narrowed = Value{unwrap.getResult(), analysis.trueType};
-        if (analysis.trueType != analysis.targetType &&
-            mlir::isa<py::ContractType>(analysis.trueType) &&
+      if ((analysis.kind == IsInstanceAnalysis::Kind::UnionTest ||
+           analysis.kind == IsInstanceAnalysis::Kind::UnionClassTest) &&
+          analysis.trueType &&
+          mlir::isa<py::UnionType>(subject.value.getType())) {
+        // The members kept, met at their base when several, and refined to
+        // the pattern's class when it is below them.
+        llvm::SmallVector<mlir::Type, 4> held(analysis.unionMembers.begin(),
+                                              analysis.unionMembers.end());
+        held.append(analysis.classTestMembers.begin(),
+                    analysis.classTestMembers.end());
+        mlir::Type heldType =
+            held.size() == 1
+                ? held.front()
+                : py::UnionType::getNormalized(&types.getContext(), held);
+        narrowed = Value{py::UnionUnwrapOp::create(builder, loc(statement),
+                                                   heldType, subject.value)
+                             .getResult(),
+                         heldType};
+        if (held.size() > 1 && analysis.trueType &&
+            !mlir::isa<py::UnionType>(analysis.trueType))
+          narrowed = coerceValue(narrowed, types.join(held), statement);
+        if (narrowed.type != analysis.targetType &&
+            mlir::isa<py::ContractType>(narrowed.type) &&
             mlir::isa<py::ContractType>(analysis.targetType) &&
-            py::isAssignableTo(analysis.targetType, analysis.trueType,
-                               module)) {
+            (analysis.kind == IsInstanceAnalysis::Kind::UnionClassTest ||
+             py::isAssignableTo(analysis.targetType, narrowed.type,
+                                module))) {
           auto refine = py::ClassRefineOp::create(
               builder, loc(statement), analysis.targetType, narrowed.value);
           narrowed = Value{refine.getResult(), analysis.targetType};

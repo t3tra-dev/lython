@@ -7855,7 +7855,8 @@ ModuleEmitter::tryEmitIsInstanceCall(const parser::Node &expr,
     bit = constantBool(builder, loc(expr), true);
   } else if (analysis.kind == IsInstanceAnalysis::Kind::AlwaysFalse) {
     bit = constantBool(builder, loc(expr), false);
-  } else if (analysis.kind == IsInstanceAnalysis::Kind::UnionTest) {
+  } else if (analysis.kind == IsInstanceAnalysis::Kind::UnionTest ||
+             analysis.kind == IsInstanceAnalysis::Kind::UnionClassTest) {
     if (!mlir::isa<py::UnionType>(input.value.getType())) {
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, expr.range.start,
@@ -7863,38 +7864,7 @@ ModuleEmitter::tryEmitIsInstanceCall(const parser::Node &expr,
               typeText(input.value.getType())});
       return emitNone(expr);
     }
-    for (mlir::Type member : analysis.unionMembers) {
-      auto test =
-          py::UnionTestOp::create(builder, loc(expr), builder.getI1Type(),
-                                  input.value, mlir::TypeAttr::get(member));
-      bit = bit ? mlir::arith::OrIOp::create(builder, loc(expr), bit,
-                                             test.getResult())
-                      .getResult()
-                : test.getResult();
-    }
-    if (!bit)
-      bit = constantBool(builder, loc(expr), false);
-  } else if (analysis.kind == IsInstanceAnalysis::Kind::UnionClassTest) {
-    if (!mlir::isa<py::UnionType>(input.value.getType()) ||
-        analysis.unionMembers.size() != 1) {
-      diagnostics.push_back(parser::Diagnostic{
-          parser::Severity::Error, expr.range.start,
-          "isinstance union class evidence expected one union member"});
-      return emitNone(expr);
-    }
-    mlir::Type member = analysis.unionMembers.front();
-    auto unionTest =
-        py::UnionTestOp::create(builder, loc(expr), builder.getI1Type(),
-                                input.value, mlir::TypeAttr::get(member));
-    auto unwrap =
-        py::UnionUnwrapOp::create(builder, loc(expr), member, input.value);
-    auto classTest = py::ClassTestOp::create(
-        builder, loc(expr), builder.getI1Type(), unwrap.getResult(),
-        mlir::TypeAttr::get(analysis.targetType));
-    bit =
-        mlir::arith::AndIOp::create(builder, loc(expr), unionTest.getResult(),
-                                    classTest.getResult())
-            .getResult();
+    bit = emitUnionMembershipBit(builder, loc(expr), input.value, analysis);
   } else if (analysis.kind == IsInstanceAnalysis::Kind::HostTest) {
     // The constructor is the host's value and the test is the host's.
     Value constructor = emitExpr((*args)[1].get());

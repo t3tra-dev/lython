@@ -148,7 +148,15 @@ struct IsInstanceAnalysis {
   mlir::Type sourceType;
   mlir::Type targetType;
   Kind kind = Kind::Unsupported;
+  // UnionTest: the members the tag alone proves. UnionClassTest: the same,
+  // beside `classTestMembers`.
   llvm::SmallVector<mlir::Type, 4> unionMembers;
+  // UnionClassTest only: the members the target is a class BELOW, proved by
+  // the tag and then the class word of the member's payload.
+  llvm::SmallVector<mlir::Type, 2> classTestMembers;
+  // Beside each of them, the class its payload is asked for: the target, or
+  // in a merged tuple test the element that member is below.
+  llvm::SmallVector<mlir::Type, 2> classTestTargets;
   // ClassTest only, and only when the source is `object`: every class the
   // taxonomy says answers YES, because the class word the test compares is the
   // EXACT class and a subclass carries its own. Empty means the target's own
@@ -222,6 +230,11 @@ IsInstanceAnalysis analyzeIsInstanceAny(mlir::Type sourceType,
                                         llvm::ArrayRef<mlir::Type> targetTypes,
                                         TypeSystem &types,
                                         mlir::Operation *from);
+// The bit of a UnionTest or a UnionClassTest over a union value: each tag
+// member's tag, each class-test member's tag and its payload's class.
+mlir::Value emitUnionMembershipBit(mlir::OpBuilder &builder,
+                                   mlir::Location location, mlir::Value input,
+                                   const IsInstanceAnalysis &analysis);
 mlir::Type widenInferredLiterals(mlir::Type type, const TypeSystem &types);
 bool hasUnexpectedObjectTop(mlir::Type actual, mlir::Type expected,
                             const TypeSystem &types);
